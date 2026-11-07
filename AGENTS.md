@@ -12,6 +12,23 @@ reaches the title screen, and is playable (1P battle, practice, story, VS).
 3. `recomp/codegen.py` — exactly what C each MIPS instruction becomes.
 4. `runtime/psx.h`, `runtime/recomp.h` — the contract between generated code and runtime.
 5. `runtime/rt.c` (dispatch, interrupts), `runtime/bios.c` (kernel HLE), `runtime/bus.c` (memory map, DMA, timers, scheduler).
+6. `analysis/NOTES.md` and `analysis/symbols.txt` — what we know about the *game's* code and data.
+
+## Record what you learn about the game (required)
+
+Every task that touches game code teaches something about it. Before you open a PR, add what
+you learned to `analysis/symbols.txt` (one line per address: name, confidence, evidence, note)
+and, for anything bigger than a line (data layouts, how a subsystem works, a cleanup candidate
+and why it matters), to `analysis/NOTES.md`. Commit it in the same PR as the work.
+
+- Tag every fact `verified`, `likely` or `guess` as defined in NOTES.md ("Confidence"), and
+  pick the lowest level that applies. Verified means you saw it at runtime (probe, trace,
+  test, `--verify-overrides`) or read the whole function and it is unambiguous; a clear
+  decompilation you did not run is `likely`; anything inferred indirectly is a `guess`.
+- Never raise a level without new evidence. Fix or delete anything you find to be wrong.
+- If a function would be worth turning into readable C later, add it to NOTES.md's
+  "Cleanup priority" list with the reason, instead of doing it inside an unrelated task.
+- Unknown is fine: an address with name `-` and what you observed still saves the next person time.
 
 ## Pipeline (real commands)
 
