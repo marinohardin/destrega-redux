@@ -65,6 +65,11 @@ scheduler event (`frontend_vblank`: present, input, audio, 60 Hz pacing).
   native code at the first recompiled entry. A `dispatch: no recompiled function`
   log line means a missing seed: add it to `analysis/extra_seeds.txt`
   (`<hex> [OVLNAME]`) or improve seeding in `recomp.py`.
+  In normal play the interpreter is never entered: the one mid-function address it
+  used to bridge (0x8009b924, the libetc `setjmp` return point resumed on every
+  IRQ) is a seeded native entry. `--no-interp` makes any interpreter entry fatal;
+  `tools/run_tests.sh` runs the smoke test with it. The fallback stays in release
+  builds as a safety net for paths not yet exercised.
 - Cycle accounting: `CYC(n)` (2 cycles/insn), `EVT_CHECK()` at function entry and
   backward branches runs `rt_event()` → scheduler + IRQ delivery.
 
@@ -79,8 +84,9 @@ P2 slot `0x8001a268` (`Mxxx2.BIN`, `EVENTOVL.BIN`). See `recomp/overlays.py`.
 - libetc's `ResetCallback` (0x8009b8bc) `setjmp`s into a buffer at 0x800be224 and
   passes it to `HookEntryInt`. On an IRQ, `rt.c:take_interrupt` saves the CPU,
   runs SysEnqIntRP chains (libpad's VBlank handler), loads the hook buffer and
-  resumes at its `ra` **through the interpreter** (mid-function address); the
-  dispatcher at 0x8009b994 ends in `ReturnFromException` = C `longjmp` back.
+  resumes at its `ra` (0x8009b924, a mid-function address seeded as its own
+  recompiled entry via `extra_seeds.txt`); the dispatcher at 0x8009b994 ends in
+  `ReturnFromException` = C `longjmp` back.
 - Pads: libpad drives **SIO0 directly** (`runtime/sio.c`), not BIOS InitPAD.
 - CD: libcd at register level (`runtime/cdrom.c`); BIOS leaves CD int-enable = 0x1f.
   XA audio + STR video (5 movies, file channel 1) live in `XADATA.BNS`.

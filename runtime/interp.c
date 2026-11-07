@@ -107,8 +107,12 @@ static void interp_call(u32 t, u32 ret) {
     else interp_run(t, ret);
 }
 
+int g_no_interp;   /* --no-interp: entering the interpreter is fatal */
+
 void interp_run(u32 pc, u32 ret_addr) {
     u32 *r = g_cpu.r;
+    if (g_no_interp)
+        rt_fatal("interpreter entered at %08x (ra=%08x): missing recompiled entry", pc, g_cpu.r[31]);
     u32 entry_sp = r[29];
     if (g_trace) rt_log("interp: enter %08x (ret %08x)", pc, ret_addr);
     for (;;) {

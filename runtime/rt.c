@@ -193,7 +193,7 @@ static void take_interrupt(void) {
             g_cpu.r[28] = hook[11];
             g_cpu.r[2] = 1;
             /* resume after the setjmp() call that filled the hook buffer */
-            interp_run(hook[0], 0xffffffffu);
+            rt_call(hook[0]);   /* 0x8009b924 is a recompiled entry (extra_seeds.txt) */
             rt_log("interrupt hook returned without ReturnFromException");
         }
         s_exc_env = prev;

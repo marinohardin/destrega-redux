@@ -213,5 +213,6 @@ void interp_run(u32 entry, u32 ret_addr);
 void rt_log(const char *fmt, ...);
 void rt_fatal(const char *fmt, ...);
 extern int g_trace;
+extern int g_no_interp;
 
 #endif
