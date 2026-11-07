@@ -32,7 +32,24 @@ cmake --build build/cmake
 brew install sdl3 cmake ninja python
 ```
 
-Then run the build steps above and start the game with `./build/cmake/destrega`.
+Then run the build steps above. On macOS the build also produces
+`build/cmake/Destrega.app`: a self-contained app (SDL3 bundled, with an icon)
+that you can drag to `/Applications` and launch from Finder. The plain
+`./build/cmake/destrega` binary is still there for the command-line options.
+
+The app is ad-hoc signed, which is enough to run it on the Mac that built it.
+To give it to someone else without Gatekeeper warnings, sign it with a
+Developer ID and notarize it:
+
+```sh
+cmake -S . -B build/cmake -DDESTREGA_APP_SIGN="Developer ID Application: Your Name (TEAMID)"
+cmake --build build/cmake
+tools/make_app.sh --help    # bundling options, including --dmg
+```
+
+Turn the bundle off with `-DDESTREGA_MACOS_APP=OFF`. The icon
+(`assets/icon/destrega.png`) is original artwork drawn by `tools/make_icon.py`;
+it uses no game assets.
 
 ### Linux
 
