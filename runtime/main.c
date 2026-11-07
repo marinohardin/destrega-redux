@@ -310,7 +310,8 @@ static void usage(void) {
         "  --dump-every N        screenshot every N frames\n"
         "  --press F:MASK,...    headless input script (MASK = hex PSX button bits, active high)\n"
         "  --wav FILE            record audio output (headless)\n"
-        "  --trace               verbose runtime logging (repeat for more)\n");
+        "  --trace               verbose runtime logging (repeat for more)\n"
+        "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n");
 }
 
 /* ---- first-launch import (bring your own disc) ----------------------------------- */
@@ -389,6 +390,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) s_dump_dir = argv[++i];
         else if (!strcmp(argv[i], "--dump-every") && i + 1 < argc) s_dump_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--trace")) g_trace++;
+        else if (!strcmp(argv[i], "--no-interp")) g_no_interp = 1;
         else if (!strcmp(argv[i], "--profile")) s_profile_on = 1;
         else if (!strcmp(argv[i], "--watch") && i + 1 < argc && s_watch_n < 8) s_watch[s_watch_n++] = (u32)strtoul(argv[++i], 0, 16);
         else if (!strcmp(argv[i], "--profile-from") && i + 1 < argc) { s_profile_on = 1; s_profile_from = strtoull(argv[++i], 0, 0); }

@@ -28,7 +28,7 @@ fi
 
 # Boot -> intro FMV -> title -> 1P battle -> fight, via scripted Start/Cross presses.
 rm -f build/smoke/*.png
-./build/cmake/destrega --headless --frames 4000 --dump build/smoke --dump-every 1000 \
+./build/cmake/destrega --headless --no-interp --frames 4000 --dump build/smoke --dump-every 1000 \
   --press 1200:8,1500:8,1800:8,2100:8,2400:4000,2700:4000,3000:4000,3300:4000,3600:4000 \
   > build/smoke/log.txt 2>&1
 if grep -E "FATAL|dispatch: no recompiled|unhandled" build/smoke/log.txt; then
