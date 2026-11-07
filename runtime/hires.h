@@ -37,6 +37,11 @@ typedef struct {
      * draw sampled nothing, has_uvr is false and the vertex UV range is used */
     bool has_uvr;
     int uvr_umin, uvr_umax, uvr_vmin, uvr_vmax;
+    /* gouraud triangles: per-channel (r, g, b) colour range the 1x rasterizer actually produced
+     * (its 8-bit values, which wrap on thin slivers); if the 1x draw covered nothing, has_cr is
+     * false and the vertex colour range is used */
+    bool has_cr;
+    int cr_min[3], cr_max[3];
 } HiresPrim;
 
 /* A rectangle of the render target, as presented. */

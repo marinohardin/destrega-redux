@@ -401,6 +401,8 @@ typedef struct {
 
 typedef struct { HiresPrim p; HiresVtx v[3]; } TriArgs;
 
+static inline int ccol_clamp(s64 c, int lo, int hi) { return c < lo ? lo : (c > hi ? hi : (int)c); }
+
 static inline __attribute__((always_inline)) void
 tri_impl(const TriArgs *ta, int by0, int by1,
          const int TEX, const int DEPTH, const int RAW, const int SEMI,
@@ -445,6 +447,27 @@ tri_impl(const TriArgs *ta, int by0, int by1,
         gstep_x[i] = (u32)((s32)dx / Sx);
     }
     const s64 ustep = (s64)(s32)gstep_x[3], vstep = (s64)(s32)gstep_x[4];
+    /* Gouraud colour clamp. A hi-res pixel centre can lie outside every 1x sample position of
+     * the triangle, and thin slivers have steep colour gradients, so plain interpolation there
+     * extrapolates far past the colours the 1x draw produced; the 1x rasterizer's u32 colour then
+     * wraps (a near-black additive sliver came out as saturated yellow-white lines). Clamp to the
+     * per-channel range the 1x draw actually produced, taken from the wrapped 8-bit value exactly
+     * as 1x computes it (so S=1 stays bit-identical: every hi-res sample is a 1x sample). If 1x
+     * covered nothing, clamp the unwrapped value to the vertex colour range instead. */
+    const s64 gs[3] = { (s64)(s32)gstep_x[0], (s64)(s32)gstep_x[1], (s64)(s32)gstep_x[2] };
+    int cmin[3], cmax[3];
+    const bool c1x = GOUR && p->has_cr;
+    for (int i = 0; i < 3; i++) {
+        if (c1x) { cmin[i] = p->cr_min[i]; cmax[i] = p->cr_max[i]; continue; }
+        int lo = (int)av[i], hi = (int)av[i];
+        if ((int)bv[i] < lo) lo = (int)bv[i];
+        if ((int)bv[i] > hi) hi = (int)bv[i];
+        if ((int)cv[i] < lo) lo = (int)cv[i];
+        if ((int)cv[i] > hi) hi = (int)cv[i];
+        cmin[i] = lo; cmax[i] = hi;
+    }
+#define CCOL(VAL, I) ((u32)(!GOUR ? (int)((VAL) >> FRAC) \
+    : ccol_clamp(c1x ? (s64)(((u32)(VAL)) >> FRAC) : ((VAL) >> FRAC), cmin[I], cmax[I])))
     /* UV range samples are clamped to: what the 1x draw of this triangle sampled (see the file
      * comment), else the vertex range */
     int umin = 0, umax = 255, vmin = 0, vmax = 255;
@@ -495,12 +518,13 @@ tri_impl(const TriArgs *ta, int by0, int by1,
             if (xs < xe) {
                 /* attribute values at the first pixel of the span */
                 const double P = ((double)xs + 0.5) / Sx - 0.5, Q = ((double)y + 0.5) / Sy - 0.5;
-                u32 r = base[0], g = base[1], bb = base[2];
+                /* colours are kept signed and unwrapped (s64) so they can be clamped; see CCOL */
+                s64 r = base[0], g = base[1], bb = base[2];
                 s64 U = 0, V = 0;
                 if (GOUR) {
-                    r = (u32)(s64)floor((double)base[0] + gdx[0] * (P - ax) + gdy[0] * (Q - ay));
-                    g = (u32)(s64)floor((double)base[1] + gdx[1] * (P - ax) + gdy[1] * (Q - ay));
-                    bb = (u32)(s64)floor((double)base[2] + gdx[2] * (P - ax) + gdy[2] * (Q - ay));
+                    r = (s64)floor((double)base[0] + gdx[0] * (P - ax) + gdy[0] * (Q - ay));
+                    g = (s64)floor((double)base[1] + gdx[1] * (P - ax) + gdy[1] * (Q - ay));
+                    bb = (s64)floor((double)base[2] + gdx[2] * (P - ax) + gdy[2] * (Q - ay));
                 }
                 if (TEX) {   /* true (unwrapped) fixed-point values, so the clamp sees real excursions */
                     U = (s64)floor((double)base[3] + gdx[3] * (P - ax) + gdy[3] * (Q - ay));
@@ -524,10 +548,10 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                                 n_escaped += (ui < umin) | (ui > umax) | (vi < vmin) | (vi > vmax);
                             }
                             if (ui != lu || vi != lv) { lu = ui; lv = vi; lt = tex_fetch(p, DEPTH, (u32)ui, (u32)vi); }
-                            ok = shade_tex(p, lt, DITHER ? x / Sx : 0, y1, r >> FRAC, g >> FRAC, bb >> FRAC,
+                            ok = shade_tex(p, lt, DITHER ? x / Sx : 0, y1, CCOL(r, 0), CCOL(g, 1), CCOL(bb, 2),
                                            RAW, SEMI, DITHER, &out, &blend);
                         } else {
-                            ok = shade(p, DITHER ? x / Sx : 0, y1, r >> FRAC, g >> FRAC, bb >> FRAC, 0, 0,
+                            ok = shade(p, DITHER ? x / Sx : 0, y1, CCOL(r, 0), CCOL(g, 1), CCOL(bb, 2), 0, 0,
                                        0, DEPTH, RAW, SEMI, DITHER, &out, &blend);
                         }
                         if (ok) {
@@ -535,7 +559,7 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                             *dst = out | mo;
                         }
                     }
-                    if (GOUR) { r += gstep_x[0]; g += gstep_x[1]; bb += gstep_x[2]; }
+                    if (GOUR) { r += gs[0]; g += gs[1]; bb += gs[2]; }
                     if (TEX) { U += ustep; V += vstep; }
                 }
                 if (TEX) { tl_samples += (u64)(xe - xs); tl_clamped += n_clamped; tl_escaped += n_escaped; }

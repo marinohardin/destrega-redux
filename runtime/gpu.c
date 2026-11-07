@@ -242,6 +242,19 @@ typedef struct {
  * in x, so the extremes are at its ends. Bookkeeping only; 1x output is unchanged. */
 static bool s_uv_track;
 static int s_trk_umin, s_trk_umax, s_trk_vmin, s_trk_vmax;
+static bool s_col_track;
+static int s_trk_cmin[3], s_trk_cmax[3];
+
+/* Range of the 8-bit colour values a gouraud span produces (c >> FRAC of a u32 that may wrap). */
+static void col_track_span(int i, u32 c, u32 dcdx, int n)
+{
+    u32 c1 = c + dcdx * (u32)(n - 1);
+    int a = (int)(c >> FRAC), b = (int)(c1 >> FRAC);
+    if (n > 1 && (((s32)dcdx >= 0) ? c1 < c : c1 > c)) { a = 0; b = 255; }
+    if (a > b) { int t = a; a = b; b = t; }
+    if (a < s_trk_cmin[i]) s_trk_cmin[i] = a;
+    if (b > s_trk_cmax[i]) s_trk_cmax[i] = b;
+}
 
 static void uv_track_span(u32 u, u32 v, u32 dudx, u32 dvdx, int n)
 {
@@ -267,6 +280,11 @@ span(const Prim *p, const Grad *gr, int y, int xs, int xe,
 {
     const u32 drdx = gr->drdx, dgdx = gr->dgdx, dbdx = gr->dbdx, dudx = gr->dudx, dvdx = gr->dvdx;
     if (TEX && s_uv_track) uv_track_span(u, v, dudx, dvdx, xe - xs);
+    if (GOUR && s_col_track && xe > xs) {
+        col_track_span(0, r, drdx, xe - xs);
+        col_track_span(1, g, dgdx, xe - xs);
+        col_track_span(2, b, dbdx, xe - xs);
+    }
     for (int x = xs; x < xe; x++) {
         plot(p, x, y, r >> FRAC, g >> FRAC, b >> FRAC, u >> FRAC, v >> FRAC,
              TEX, DEPTH, RAW, SEMI, DITHER);
@@ -414,6 +432,7 @@ static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool sem
     h->tw_and_v = p->tw_and_v; h->tw_or_v = p->tw_or_v;
     h->mask_or = p->mask_or; h->mask_check = p->mask_check;
     h->has_uvr = false;
+    h->has_cr = false;
     h->clip_x1 = s_clip_x1; h->clip_y1 = s_clip_y1; h->clip_x2 = s_clip_x2; h->clip_y2 = s_clip_y2;
 }
 
@@ -434,6 +453,8 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
 
     s_uv_track = g_hires && tex;
     if (s_uv_track) { s_trk_umin = s_trk_vmin = 1 << 20; s_trk_umax = s_trk_vmax = -1; }
+    s_col_track = g_hires && gour;
+    if (s_col_track) for (int i = 0; i < 3; i++) { s_trk_cmin[i] = 1 << 20; s_trk_cmax[i] = -1; }
 
     if (!tex) {
         int idx = (semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0);
@@ -454,7 +475,12 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
             hp.uvr_umin = s_trk_umin; hp.uvr_umax = s_trk_umax;
             hp.uvr_vmin = s_trk_vmin; hp.uvr_vmax = s_trk_vmax;
         }
+        if (s_col_track && s_trk_cmax[0] >= 0) {
+            hp.has_cr = true;
+            for (int i = 0; i < 3; i++) { hp.cr_min[i] = s_trk_cmin[i]; hp.cr_max[i] = s_trk_cmax[i]; }
+        }
         s_uv_track = false;
+        s_col_track = false;
         const Vtx *vs[3] = { a, b, c };
         HiresVtx hv[3];
         for (int i = 0; i < 3; i++) {
