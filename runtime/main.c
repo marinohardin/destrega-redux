@@ -28,8 +28,15 @@ static int s_profile_on;
 static u32 s_wav_bytes;
 
 /* hi-res options (see hires.h / AGENTS.md) */
-static int s_scale_opt = -1;       /* --scale N: -1 = auto from the window, 0 = off, 1..8 fixed */
-static int s_max_scale = 4;   /* S>4 does not hold 60 fps on the dev Mac (see AGENTS.md) */
+static int s_opt_sx = -1, s_opt_sy = -1;   /* --scale N|NxM: -1 = auto from the window, 0 = off */
+static int s_max_sx = 4, s_max_sy = 6;     /* auto-scale caps per axis (see AGENTS.md) */
+static int s_win_w = 960, s_win_h = 720;   /* --window WxH (logical points) */
+static u64 s_fight_from = 3700;            /* frames >= this count as "fight" in the hi-res stats */
+static int s_hires_min_fight = -1;         /* --hires-min-fight PCT: fail unless this % of fight frames used hi-res */
+static u64 s_hr_used[2], s_hr_fallback[2]; /* [0] all frames, [1] frames >= s_fight_from */
+static u64 s_verify_fight;
+static double s_f_emu, s_f_present;        /* windowed: host time over fight frames */
+static u64 s_f_n;
 static bool s_hires_dither;
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
@@ -254,14 +261,51 @@ static void write_state_hash(void) {
 
 static void present_frame(void);
 
-/* Pick the render scale for a window of pw x ph physical pixels. */
-static void apply_window_size(int pw, int ph) {
-    if (s_scale_opt >= 0) return;
-    int s = hires_pick_scale(pw, ph, s_max_scale);
-    if (s != hires_scale()) {
-        rt_log("hires: window %dx%d -> render scale %d", pw, ph, s);
-        hires_set_scale(s);
+/* Pick the render scales for a window of pw x ph physical pixels, from the display mode
+ * currently shown (24-bit / disabled displays keep the 512x240 reference). */
+static void apply_window_size(int pw, int ph, bool simulated) {
+    if (!simulated && s_opt_sx >= 0) return;
+    GpuDisplay d;
+    gpu_get_display(&d);
+    int dw = 512, dh = 240;
+    if (d.enabled && !d.rgb24 && d.w > 0 && d.h > 0) { dw = d.w; dh = d.h; }
+    int sx, sy, cx, cy;
+    hires_pick_scale(pw, ph, dw, dh, s_max_sx, s_max_sy, &sx, &sy);
+    hires_get_scale(&cx, &cy);
+    if (sx != cx || sy != cy) {
+        rt_log("hires: window %dx%d, display %dx%d -> render scale %dx%d", pw, ph, dw, dh, sx, sy);
+        hires_set_scale(sx, sy);
     }
+}
+
+static void finish(void) {
+    if (s_state_hash) fclose(s_state_hash);
+    int rc = 0;
+    int sx, sy;
+    if (hires_get_scale(&sx, &sy) || s_hr_used[0] + s_hr_fallback[0]) {
+        u64 ft = s_hr_used[1] + s_hr_fallback[1];
+        double pct = ft ? 100.0 * (double)s_hr_used[1] / (double)ft : 0;
+        rt_log("hires-frames: all %llu hi-res / %llu 1x-fallback; fight window (frame >= %llu): "
+               "%llu hi-res / %llu 1x-fallback (%.1f%% hi-res)",
+               (unsigned long long)s_hr_used[0], (unsigned long long)s_hr_fallback[0],
+               (unsigned long long)s_fight_from, (unsigned long long)s_hr_used[1],
+               (unsigned long long)s_hr_fallback[1], pct);
+        if (s_hires_min_fight >= 0 && pct < s_hires_min_fight) {
+            rt_log("hires-frames: FAIL: %.1f%% < required %d%%", pct, s_hires_min_fight);
+            rc = 4;
+        }
+    }
+    if (s_verify) {
+        rt_log("hires-verify: %llu frames checked (%llu in fight window), %llu mismatching",
+               (unsigned long long)s_verify_frames, (unsigned long long)s_verify_fight,
+               (unsigned long long)s_verify_bad_frames);
+        if (s_verify_bad_frames || !s_verify_fight) rc = 3;
+    }
+    if (s_f_n)
+        rt_log("windowed fight frames (>= %llu): %llu frames, emu %.2f ms, present+convert %.2f ms per frame",
+               (unsigned long long)s_fight_from, (unsigned long long)s_f_n,
+               s_f_emu / (double)s_f_n / 1e6, s_f_present / (double)s_f_n / 1e6);
+    exit(rc);
 }
 
 void frontend_vblank(void) {
@@ -269,19 +313,34 @@ void frontend_vblank(void) {
     static s16 audio[2048 * 2];
     for (int i = 0; i < s_resize_n; i++)
         if (s_resizes[i].frame == s_frame) {
-            int s = hires_pick_scale(s_resizes[i].w, s_resizes[i].h, s_max_scale);
-            rt_log("resize %dx%d -> render scale %d", s_resizes[i].w, s_resizes[i].h, s);
-            hires_set_scale(s);
+            rt_log("resize %dx%d", s_resizes[i].w, s_resizes[i].h);
+            apply_window_size(s_resizes[i].w, s_resizes[i].h, true);
         }
-    if (s_verify && hires_scale() == 1) {
+    {   /* which path would present this frame: hi-res target or the 1x fallback */
+        int cx, cy;
+        if (hires_get_scale(&cx, &cy)) {
+            GpuDisplay d;
+            HiresView hv;
+            gpu_get_display(&d);
+            bool used = hires_get_view(&d, &hv);
+            int f = s_frame >= s_fight_from;
+            (used ? s_hr_used : s_hr_fallback)[0]++;
+            if (f) (used ? s_hr_used : s_hr_fallback)[1]++;
+        }
+    }
+    {
+        int cx, cy;
+        if (s_verify && hires_get_scale(&cx, &cy) && cx == 1 && cy == 1) {
         int fx = 0, fy = 0;
         u32 bad = hires_verify_1x(&fx, &fy);
         s_verify_frames++;
+        if (s_frame >= s_fight_from) s_verify_fight++;
         if (bad) {
             if (!s_verify_bad_frames)
                 rt_log("hires-verify: MISMATCH at frame %llu: %u pixels differ, first at (%d,%d)",
                        (unsigned long long)s_frame, bad, fx, fy);
             s_verify_bad_frames++;
+        }
         }
     }
     if (s_state_hash) write_state_hash();
@@ -341,14 +400,10 @@ void frontend_vblank(void) {
                 frontend_screenshot(p);
             }
             if (s_wav) { wav_header(s_wav, s_wav_bytes); fclose(s_wav); }
-            if (s_state_hash) fclose(s_state_hash);
-            if (s_verify)
-                rt_log("hires-verify: %llu frames checked, %llu mismatching",
-                       (unsigned long long)s_verify_frames, (unsigned long long)s_verify_bad_frames);
             rt_log("headless: reached %llu frames", (unsigned long long)s_frame);
             void rt_dump_stack(void); rt_dump_stack();
             void rt_profile_dump(void); rt_profile_dump();
-            exit(s_verify && (s_verify_bad_frames || !s_verify_frames) ? 3 : 0);
+            finish();
         }
         return;
     }
@@ -359,6 +414,15 @@ void frontend_vblank(void) {
     present_frame();
     u64 t_after_present = SDL_GetTicksNS();
     t_present += t_after_present - t_start;
+    if (s_frame >= s_fight_from && t_prev_end) {
+        s_f_emu += (double)(t_start - t_prev_end);
+        s_f_present += (double)(t_after_present - t_start);
+        s_f_n++;
+    }
+    if (s_max_frames && s_frame >= s_max_frames) {
+        rt_log("windowed: reached %llu frames", (unsigned long long)s_frame);
+        finish();
+    }
 
     /* audio: keep ~3 frames queued */
     spu_render(audio, 735);
@@ -398,7 +462,7 @@ static SDL_FRect letterbox(int pw, int ph) {
 static void present_frame(void) {
     int pw = 0, ph = 0;
     SDL_GetWindowSizeInPixels(s_win, &pw, &ph);
-    apply_window_size(pw, ph);
+    apply_window_size(pw, ph, false);
     SDL_FRect dst = letterbox(pw, ph);
     GpuDisplay d;
     HiresView hv;
@@ -443,9 +507,12 @@ static void usage(void) {
         "  --dump-every N        screenshot every N frames\n"
         "  --press F:MASK,...    headless input script (MASK = hex PSX button bits, active high)\n"
         "  --wav FILE            record audio output (headless)\n"
-        "  --scale N             internal render scale: 0 = hi-res off, 1..8 fixed (default: auto from\n"
-        "                        the window size; headless: off)\n"
-        "  --max-scale N         cap for the automatic scale (default 4; 5..8 may not hold 60 fps)\n"
+        "  --scale N|NxM         internal render scale (horizontal x vertical): 0 = hi-res off, 1..8\n"
+        "                        fixed (default: auto from the window size; headless: off)\n"
+        "  --max-scale N|NxM     per-axis cap for the automatic scale (default 4x6)\n"
+        "  --window WxH          initial window size in points (default 960x720)\n"
+        "  --fight-from F        first frame counted as 'fight' in the hi-res frame stats (default 3700)\n"
+        "  --hires-min-fight P   exit non-zero unless P%% of fight frames were shown from the hi-res target\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
@@ -515,7 +582,7 @@ static void create_window(void) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         exit(1);
     }
-    s_win = SDL_CreateWindow("Destrega (recompiled)", 960, 720,
+    s_win = SDL_CreateWindow("Destrega (recompiled)", s_win_w, s_win_h,
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     s_ren = SDL_CreateRenderer(s_win, NULL);
     SDL_SetRenderLogicalPresentation(s_ren, 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
@@ -545,8 +612,20 @@ int main(int argc, char **argv) {
                 if (*s == ',') s++;
             }
         }
-        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) s_scale_opt = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--max-scale") && i + 1 < argc) s_max_scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) {
+            char *e; s_opt_sx = (int)strtol(argv[++i], &e, 10);
+            s_opt_sy = (*e == 'x' || *e == 'X') ? (int)strtol(e + 1, NULL, 10) : s_opt_sx;
+        }
+        else if (!strcmp(argv[i], "--max-scale") && i + 1 < argc) {
+            char *e; s_max_sx = (int)strtol(argv[++i], &e, 10);
+            s_max_sy = (*e == 'x' || *e == 'X') ? (int)strtol(e + 1, NULL, 10) : s_max_sx;
+        }
+        else if (!strcmp(argv[i], "--window") && i + 1 < argc) {
+            char *e; s_win_w = (int)strtol(argv[++i], &e, 10);
+            if (*e == 'x' || *e == 'X') s_win_h = (int)strtol(e + 1, NULL, 10);
+        }
+        else if (!strcmp(argv[i], "--fight-from") && i + 1 < argc) s_fight_from = strtoull(argv[++i], 0, 0);
+        else if (!strcmp(argv[i], "--hires-min-fight") && i + 1 < argc) s_hires_min_fight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
         else if (!strcmp(argv[i], "--hires-verify")) s_verify = true;
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
@@ -606,7 +685,8 @@ int main(int argc, char **argv) {
     gte_init();
     gpu_init();
     hires_set_dither(s_hires_dither);
-    if (s_scale_opt > 0 && !hires_set_scale(s_scale_opt)) rt_log("hires: cannot allocate scale %d", s_scale_opt);
+    if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))
+        rt_log("hires: cannot allocate scale %dx%d", s_opt_sx, s_opt_sy);
     spu_init();
     mdec_init();
 

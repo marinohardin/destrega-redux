@@ -40,14 +40,14 @@ typedef struct {
     const u16 *pixels;   /* 15-bit PS1 pixels (bit 15 = mask bit) */
     int stride;          /* in pixels */
     int w, h;            /* in target pixels */
-    int scale;
+    int scale_x, scale_y;
 } HiresView;
 
 typedef struct HiresBackend {
     const char *name;
-    /* (Re)allocate the target for `scale` over the 1x VRAM rectangle (rx,ry,rw,rh)
+    /* (Re)allocate the target for scales sx (horizontal) x sy (vertical) over the 1x VRAM rectangle (rx,ry,rw,rh)
      * and seed it from `vram1x` by nearest-neighbour upscale. */
-    bool (*configure)(const u16 *vram1x, int scale, int rx, int ry, int rw, int rh);
+    bool (*configure)(const u16 *vram1x, int sx, int sy, int rx, int ry, int rw, int rh);
     void (*tri)(const HiresPrim *p, const HiresVtx v[3]);
     void (*rect)(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g, u32 b,
                  u32 u0, u32 v0, bool flipx, bool flipy);
@@ -64,10 +64,11 @@ extern const HiresBackend *g_hires;
 
 /* ---- control (runtime/hires.c) ------------------------------------------- */
 
-/* Set the render scale: 0 = off, 1..HIRES_MAX_SCALE. A changed scale reallocates the
- * target and seeds it from the current 1x VRAM. Never touches emulated state. */
-bool hires_set_scale(int scale);
-int hires_scale(void);
+/* Set the render scales: sx = horizontal, sy = vertical (independent integers 1..HIRES_MAX_SCALE);
+ * sx = 0 turns hi-res off. A changed scale reallocates the target and seeds it from the
+ * current 1x VRAM. Never touches emulated state. */
+bool hires_set_scale(int sx, int sy);
+bool hires_get_scale(int *sx, int *sy);   /* false when off */
 /* 1x VRAM rectangle the target tracks (default 0,0,512,480). Takes effect on the
  * next hires_set_scale(). */
 void hires_set_region(int rx, int ry, int rw, int rh);
@@ -75,10 +76,11 @@ void hires_set_dither(bool enable);           /* dither at scale > 1 (default of
 /* Presentable view of the current display area, or false (24-bit display, display
  * not inside the target, hi-res off): present from 1x VRAM then. */
 bool hires_get_view(const GpuDisplay *d, HiresView *v);
-/* Integer scale for a window of `pw` x `ph` physical pixels: smallest S such that the
- * 4:3-corrected target (512*S x 384*S) covers the 4:3 letterbox viewport; 1..max_scale. */
-int hires_pick_scale(int pw, int ph, int max_scale);
-/* Compare the target against the 1x VRAM region (meaningful at scale 1, where they must
+/* Scales for a window of pw x ph physical pixels showing a dw x dh display: the 4:3 letterbox
+ * viewport (vw x vh) is covered without ever upsampling on either axis,
+ * sx = ceil(vw/dw), sy = ceil(vh/dh), each capped to 1..max_x / 1..max_y. */
+void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int *sx, int *sy);
+/* Compare the target against the 1x VRAM region (meaningful at scale 1x1, where they must
  * be identical). Returns the number of differing pixels; reports the first one. */
 u32 hires_verify_1x(int *first_x, int *first_y);
 

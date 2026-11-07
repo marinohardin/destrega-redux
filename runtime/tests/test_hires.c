@@ -1,4 +1,5 @@
-/* Self-checking tests for the scaled rasterizer (runtime/hires.c) driven through gpu.c.
+/* Self-checking tests for the scaled rasterizer (runtime/hires.c) driven through gpu.c,
+ * with independent horizontal (Sx) and vertical (Sy) scales.
  * Build: clang -std=c11 -O2 -Wall -Iruntime runtime/gpu.c runtime/hires.c runtime/tests/test_hires.c -o build/test_hires -lm
  */
 #include "psx.h"
@@ -22,19 +23,18 @@ static int g_fail, g_pass;
 static void gp0(u32 v) { gpu_write_gp0(v); }
 static u32 xy(int x, int y) { return ((u32)(y & 0xFFFF) << 16) | (u32)(x & 0xFFFF); }
 
-static void setup(int scale)
+static void setup(int sx, int sy)
 {
     gpu_init();
     hires_set_region(0, 0, 512, 480);
-    hires_set_scale(0);
-    hires_set_scale(scale);
+    hires_set_scale(0, 0);
+    hires_set_scale(sx, sy);
     gp0(0xE3000000);
     gp0(0xE4000000 | (479u << 10) | 511u);
     gp0(0xE5000000);
     gp0(0xE6000000);
 }
 
-/* Target pixel access (1x coords scaled by S). */
 static const u16 *tgt(int *stride)
 {
     HiresView v;
@@ -47,11 +47,12 @@ static const u16 *tgt(int *stride)
 typedef struct { u32 count; int minx, miny, maxx, maxy; } Cov;
 static Cov coverage(u16 color)
 {
-    int st, S = hires_scale();
+    int st, Sx, Sy;
+    hires_get_scale(&Sx, &Sy);
     const u16 *t = tgt(&st);
     Cov c = { 0, 1 << 30, 1 << 30, -1, -1 };
-    for (int y = 0; y < 480 * S; y++)
-        for (int x = 0; x < 512 * S; x++)
+    for (int y = 0; y < 480 * Sy; y++)
+        for (int x = 0; x < 512 * Sx; x++)
             if ((t[y * st + x] & 0x7FFF) == color) {
                 c.count++;
                 if (x < c.minx) c.minx = x;
@@ -62,91 +63,94 @@ static Cov coverage(u16 color)
     return c;
 }
 
-#define RED 0x1F   /* rgb(255,0,0) -> 15-bit */
+#define RED 0x1F   /* GP0 colour 0x0000FF -> 15-bit 0x1F */
 
-static void test_rect(int S)
+static void test_rect(int Sx, int Sy)
 {
-    setup(S);
+    setup(Sx, Sy);
     gp0(0x600000FF);                 /* flat rect, variable size, red */
     gp0(xy(10, 20));
     gp0(xy(7, 5));
     Cov c = coverage(RED);
-    CHECK(c.count == (u32)(S * 7 * S * 5), "S=%d rect count %u != %d", S, c.count, 35 * S * S);
-    CHECK(c.minx == 10 * S && c.maxx == 17 * S - 1 && c.miny == 20 * S && c.maxy == 25 * S - 1,
-          "S=%d rect bounds %d..%d x %d..%d", S, c.minx, c.maxx, c.miny, c.maxy);
+    CHECK(c.count == (u32)(Sx * 7 * Sy * 5), "%dx%d rect count %u != %d", Sx, Sy, c.count, 35 * Sx * Sy);
+    CHECK(c.minx == 10 * Sx && c.maxx == 17 * Sx - 1 && c.miny == 20 * Sy && c.maxy == 25 * Sy - 1,
+          "%dx%d rect bounds %d..%d x %d..%d", Sx, Sy, c.minx, c.maxx, c.miny, c.maxy);
 }
 
-static void test_tri(int S)
+static void test_tri(int Sx, int Sy)
 {
-    setup(S);
+    setup(Sx, Sy);
     gp0(0x200000FF);                 /* flat triangle: right triangle with 8px legs */
     gp0(xy(20, 20));
     gp0(xy(28, 20));
     gp0(xy(20, 28));
     Cov c = coverage(RED);
-    int n = 8 * S;
-    CHECK(c.count == (u32)(n * (n + 1) / 2), "S=%d tri count %u != %d", S, c.count, n * (n + 1) / 2);
-    CHECK(c.minx == 20 * S && c.miny == 20 * S && c.maxy == 28 * S - 1, "S=%d tri bounds", S);
-    /* gouraud triangle: colours stay within the vertex range and the 1x VRAM is unaffected by S */
+    /* hi-res legs are nx = 8*Sx wide and ny = 8*Sy tall; the top-left rule gives, for row Y,
+     * pixels 0 .. ceil(nx*(ny-Y)/ny)-1 */
+    int nx = 8 * Sx, ny = 8 * Sy;
+    u32 expect = 0;
+    for (int Y = 0; Y < ny; Y++) expect += (u32)((nx * (ny - Y) + ny - 1) / ny);
+    CHECK(c.count == expect, "%dx%d tri count %u != %u", Sx, Sy, c.count, expect);
+    CHECK(c.minx == 20 * Sx && c.miny == 20 * Sy && c.maxy == 28 * Sy - 1, "%dx%d tri bounds", Sx, Sy);
 }
 
-static void test_line(int S)
+static void test_line(int Sx, int Sy)
 {
-    setup(S);
-    gp0(0x400000FF);                 /* flat line (10,5)-(20,5): 11 1x pixels long, S thick */
+    setup(Sx, Sy);
+    gp0(0x400000FF);                 /* horizontal (10,5)-(20,5): 11 1x pixels long, Sy thick */
     gp0(xy(10, 5));
     gp0(xy(20, 5));
     Cov c = coverage(RED);
-    CHECK(c.count == (u32)(11 * S * S), "S=%d hline count %u != %d", S, c.count, 11 * S * S);
-    CHECK(c.minx == 10 * S && c.maxx == 21 * S - 1 && c.miny == 5 * S && c.maxy == 6 * S - 1,
-          "S=%d hline bounds %d..%d %d..%d", S, c.minx, c.maxx, c.miny, c.maxy);
-    setup(S);
-    gp0(0x400000FF);                 /* vertical */
+    CHECK(c.count == (u32)(11 * Sx * Sy), "%dx%d hline count %u != %d", Sx, Sy, c.count, 11 * Sx * Sy);
+    CHECK(c.minx == 10 * Sx && c.maxx == 21 * Sx - 1 && c.miny == 5 * Sy && c.maxy == 6 * Sy - 1,
+          "%dx%d hline bounds %d..%d %d..%d", Sx, Sy, c.minx, c.maxx, c.miny, c.maxy);
+    setup(Sx, Sy);
+    gp0(0x400000FF);                 /* vertical: 8 1x pixels long, Sx thick */
     gp0(xy(30, 10));
     gp0(xy(30, 17));
     c = coverage(RED);
-    CHECK(c.count == (u32)(8 * S * S), "S=%d vline count %u != %d", S, c.count, 8 * S * S);
-    CHECK(c.minx == 30 * S && c.maxx == 31 * S - 1 && c.miny == 10 * S && c.maxy == 18 * S - 1,
-          "S=%d vline bounds", S);
-    setup(S);
+    CHECK(c.count == (u32)(8 * Sx * Sy), "%dx%d vline count %u != %d", Sx, Sy, c.count, 8 * Sx * Sy);
+    CHECK(c.minx == 30 * Sx && c.maxx == 31 * Sx - 1 && c.miny == 10 * Sy && c.maxy == 18 * Sy - 1,
+          "%dx%d vline bounds", Sx, Sy);
+    setup(Sx, Sy);
     gp0(0x400000FF);                 /* single point */
     gp0(xy(40, 40));
     gp0(xy(40, 40));
     c = coverage(RED);
-    CHECK(c.count == (u32)(S * S), "S=%d point count %u", S, c.count);
+    CHECK(c.count == (u32)(Sx * Sy), "%dx%d point count %u", Sx, Sy, c.count);
 }
 
-static void test_fill_upload_copy(int S)
+static void test_fill_upload_copy(int Sx, int Sy)
 {
-    setup(S);
+    setup(Sx, Sy);
     gp0(0x020000FF);                 /* fill (16,16) 32x8 */
     gp0(xy(16, 16));
     gp0(xy(32, 8));
     Cov c = coverage(RED);
-    CHECK(c.count == (u32)(32 * 8 * S * S), "S=%d fill count %u", S, c.count);
-    CHECK(c.minx == 16 * S && c.maxx == 48 * S - 1 && c.miny == 16 * S && c.maxy == 24 * S - 1,
-          "S=%d fill bounds", S);
+    CHECK(c.count == (u32)(32 * 8 * Sx * Sy), "%dx%d fill count %u", Sx, Sy, c.count);
+    CHECK(c.minx == 16 * Sx && c.maxx == 48 * Sx - 1 && c.miny == 16 * Sy && c.maxy == 24 * Sy - 1,
+          "%dx%d fill bounds", Sx, Sy);
 
     gp0(0xA0000000);                 /* upload 4x2 green pixels to (100,100) */
     gp0(xy(100, 100));
     gp0(xy(4, 2));
     for (int i = 0; i < 4; i++) gp0(0x03E003E0);
     Cov g = coverage(0x3E0);
-    CHECK(g.count == (u32)(8 * S * S), "S=%d upload count %u", S, g.count);
-    CHECK(g.minx == 100 * S && g.maxx == 104 * S - 1 && g.miny == 100 * S && g.maxy == 102 * S - 1,
-          "S=%d upload bounds", S);
+    CHECK(g.count == (u32)(8 * Sx * Sy), "%dx%d upload count %u", Sx, Sy, g.count);
+    CHECK(g.minx == 100 * Sx && g.maxx == 104 * Sx - 1 && g.miny == 100 * Sy && g.maxy == 102 * Sy - 1,
+          "%dx%d upload bounds", Sx, Sy);
 
     gp0(0x80000000);                 /* copy the 32x8 red block to (200,300) */
     gp0(xy(16, 16));
     gp0(xy(200, 300));
     gp0(xy(32, 8));
     c = coverage(RED);
-    CHECK(c.count == (u32)(2 * 32 * 8 * S * S), "S=%d copy count %u", S, c.count);
-    CHECK(c.maxx == 232 * S - 1 && c.maxy == 308 * S - 1, "S=%d copy bounds", S);
+    CHECK(c.count == (u32)(2 * 32 * 8 * Sx * Sy), "%dx%d copy count %u", Sx, Sy, c.count);
+    CHECK(c.maxx == 232 * Sx - 1 && c.maxy == 308 * Sy - 1, "%dx%d copy bounds", Sx, Sy);
 
     /* mask bit: with mask-check on, a masked pixel is not overwritten in the target */
     gp0(0xE6000001);                 /* set mask bit on draw */
-    gp0(0x60001F00);                 /* blue-ish rect 4x4 at (300,100) */
+    gp0(0x60001F00);
     gp0(xy(300, 100));
     gp0(xy(4, 4));
     gp0(0xE6000002);                 /* check mask */
@@ -155,7 +159,7 @@ static void test_fill_upload_copy(int S)
     gp0(xy(4, 4));
     gp0(0xE6000000);
     c = coverage(RED);
-    CHECK(c.count == (u32)(2 * 32 * 8 * S * S), "S=%d masked rect must not draw (count %u)", S, c.count);
+    CHECK(c.count == (u32)(2 * 32 * 8 * Sx * Sy), "%dx%d masked rect must not draw (count %u)", Sx, Sy, c.count);
 }
 
 static u64 vram_hash(void)
@@ -191,35 +195,78 @@ static void busy_stream(void)
 
 static void test_s1_equivalence_and_invariance(void)
 {
-    setup(1);
+    setup(1, 1);
     busy_stream();
     int fx, fy;
     u32 bad = hires_verify_1x(&fx, &fy);
-    CHECK(bad == 0, "S=1 target differs from 1x VRAM in %u pixels (first %d,%d)", bad, fx, fy);
+    CHECK(bad == 0, "1x1 target differs from 1x VRAM in %u pixels (first %d,%d)", bad, fx, fy);
     u64 h1 = vram_hash();
-    for (int S = 0; S <= 4; S += 2) {
-        setup(S);
+    static const int sc[][2] = { { 0, 0 }, { 2, 2 }, { 4, 4 }, { 2, 3 }, { 4, 6 }, { 1, 3 }, { 3, 1 } };
+    for (unsigned i = 0; i < sizeof sc / sizeof sc[0]; i++) {
+        setup(sc[i][0], sc[i][1]);
         busy_stream();
-        CHECK(vram_hash() == h1, "1x VRAM differs at scale %d", S);
+        CHECK(vram_hash() == h1, "1x VRAM differs at scale %dx%d", sc[i][0], sc[i][1]);
     }
+}
+
+/* Non-uniform scale of a busy stream, downsampled by box-averaging, must stay close to the 1x
+ * picture: catches axis mix-ups (e.g. x/y swapped scales) that coverage counts alone might miss. */
+static void test_nonuniform_matches_1x_shape(int Sx, int Sy)
+{
+    setup(1, 1);
+    busy_stream();
+    int st1, Sx1, Sy1;
+    hires_get_scale(&Sx1, &Sy1);
+    const u16 *t1 = tgt(&st1);
+    static u16 ref[512 * 480];
+    for (int y = 0; y < 480; y++) memcpy(&ref[y * 512], &t1[y * st1], 512 * 2);
+    setup(Sx, Sy);
+    busy_stream();
+    int st;
+    const u16 *t = tgt(&st);
+    /* a 1x pixel is "mostly the same" if the sub-pixel at its centre has the same colour */
+    long same = 0, total = 0;
+    for (int y = 0; y < 480; y++)
+        for (int x = 0; x < 512; x++) {
+            u16 a = ref[y * 512 + x] & 0x7FFF, b = t[(y * Sy + Sy / 2) * st + x * Sx + Sx / 2] & 0x7FFF;
+            total++;
+            if (a == b) same++;
+            else {
+                int dr = abs((a & 31) - (b & 31)), dg = abs(((a >> 5) & 31) - ((b >> 5) & 31)),
+                    db = abs(((a >> 10) & 31) - ((b >> 10) & 31));
+                if (dr + dg + db <= 12) same++;   /* close colours / blended edges */
+            }
+        }
+    CHECK(same * 100 >= total * 98, "%dx%d picture deviates from 1x: %ld/%ld similar", Sx, Sy, same, total);
+}
+
+static void check_pick(int pw, int ph, int dw, int dh, int mx, int my, int ex, int ey)
+{
+    int sx, sy;
+    hires_pick_scale(pw, ph, dw, dh, mx, my, &sx, &sy);
+    CHECK(sx == ex && sy == ey, "pick %dx%d disp %dx%d cap %dx%d -> %dx%d, want %dx%d",
+          pw, ph, dw, dh, mx, my, sx, sy, ex, ey);
 }
 
 int main(void)
 {
-    for (int S = 2; S <= 4; S += 2) {
-        test_rect(S);
-        test_tri(S);
-        test_line(S);
-        test_fill_upload_copy(S);
+    static const int sc[][2] = { { 1, 1 }, { 2, 2 }, { 4, 4 }, { 2, 3 }, { 4, 6 }, { 3, 1 }, { 1, 5 } };
+    for (unsigned i = 0; i < sizeof sc / sizeof sc[0]; i++) {
+        test_rect(sc[i][0], sc[i][1]);
+        test_tri(sc[i][0], sc[i][1]);
+        test_line(sc[i][0], sc[i][1]);
+        test_fill_upload_copy(sc[i][0], sc[i][1]);
     }
-    test_rect(1); test_tri(1); test_line(1); test_fill_upload_copy(1);
     test_s1_equivalence_and_invariance();
-    CHECK(hires_pick_scale(1920, 1440, 8) == 4, "pick 1920x1440");
-    CHECK(hires_pick_scale(960, 720, 8) == 2, "pick 960x720");
-    CHECK(hires_pick_scale(640, 480, 8) == 2, "pick 640x480");
-    CHECK(hires_pick_scale(512, 384, 8) == 1, "pick 512x384");
-    CHECK(hires_pick_scale(3840, 2160, 8) == 6, "pick 4k (letterboxed 2880x2160)");
-    CHECK(hires_pick_scale(3840, 2160, 3) == 3, "pick cap");
+    test_nonuniform_matches_1x_shape(2, 3);
+    test_nonuniform_matches_1x_shape(4, 6);
+    check_pick(1920, 1440, 512, 240, 8, 8, 4, 6);     /* 1440p-ish window: 2048x1440 */
+    check_pick(960, 720, 512, 240, 8, 8, 2, 3);
+    check_pick(1920, 1080, 512, 240, 8, 8, 3, 5);     /* letterboxed 1440x1080 */
+    check_pick(512, 384, 512, 240, 8, 8, 1, 2);
+    check_pick(3840, 2160, 512, 240, 8, 8, 6, 9 > 8 ? 8 : 9);
+    check_pick(3840, 2160, 512, 240, 4, 6, 4, 6);     /* caps */
+    check_pick(1920, 1440, 320, 240, 8, 8, 6, 6);     /* narrower display mode */
     printf("hires: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

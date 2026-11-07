@@ -1,36 +1,67 @@
 #!/bin/sh
-# Hi-res rendering must never influence emulation, and must implement the same
-# rasterization rules as the 1x GPU.
-#  1. Same scripted input (boot -> 1P battle -> fight) with hi-res off, S=2, S=4, S=8 and a
-#     live-resize schedule that changes S several times mid-fight: the per-frame hash of all
-#     emulated state (RAM, scratchpad, 1x VRAM, SPU RAM, CPU regs) must be identical.
-#  2. At S=1 the hi-res target must equal the 1x VRAM region at every frame.
-# Usage: tools/test_hires_determinism.sh [frames]   (default 7000; needs build/cmake/destrega)
-set -e
+# Hi-res rendering must never influence emulation, must implement the same rasterization
+# rules as the 1x GPU, and must actually be what gets shown during gameplay.
+#  1. Same scripted input (boot -> 1P battle -> fight) with hi-res off, uniform scales (2x2, 4x4,
+#     8x8), non-uniform scales (2x3, 4x6) and a live-resize schedule that changes Sx and Sy
+#     (including Sx != Sy) mid-fight: the per-frame hash of all emulated state (RAM, scratchpad,
+#     1x VRAM, SPU RAM, CPU regs) must be identical.
+#  2. At 1x1 the hi-res target must equal the 1x VRAM region at every frame (also in the fight).
+#  3. In every hi-res run >= 95% of the fight-window frames (frame >= 3700) must be presentable
+#     from the hi-res target rather than the 1x fallback.
+# The runs are independent processes and run concurrently (JOBS at a time, default: performance
+# cores). Usage: tools/test_hires_determinism.sh [frames]   (default 7000; needs build/cmake/destrega)
 cd "$(dirname "$0")/.."
-FRAMES=${1:-7000}
+if [ "$1" != "--job" ]; then FRAMES=${1:-7000}; fi
 OUT=build/hires
-mkdir -p $OUT
-rm -f $OUT/*.hash $OUT/*.log
-PRESS=$(python3 tools/fight_script.py "$FRAMES")
 BIN=./build/cmake/destrega
-run() { # name args...
-  name=$1; shift
-  $BIN --headless --no-interp --frames "$FRAMES" --press "$PRESS" --state-hash $OUT/$name.hash "$@" > $OUT/$name.log 2>&1 || { echo "hires: $name run FAILED"; tail -5 $OUT/$name.log; exit 1; }
-  if grep -E "FATAL|dispatch: no recompiled|unhandled" $OUT/$name.log; then echo "hires: $name: FAIL"; exit 1; fi
-}
-run off --scale 0
-for s in 2 4 8; do run s$s --scale $s; done
-run resize --scale 0 --max-scale 8 --resize 3000:640x480,3700:1920x1440,4300:960x720,4900:3840x2880,5500:480x360,6100:1280x960,6700:2560x1920
-echo "hires: resize steps applied: $(grep -c 'render scale' $OUT/resize.log)"
+export FRAMES OUT BIN
+
+if [ "$1" = "--job" ]; then   # worker: --job name args...
+  name=$2; shift 2
+  PRESS=$(python3 tools/fight_script.py "$FRAMES")
+  $BIN --headless --no-interp --frames "$FRAMES" --press "$PRESS" --state-hash $OUT/$name.hash "$@" > $OUT/$name.log 2>&1
+  rc=$?
+  if grep -qE "FATAL|dispatch: no recompiled|unhandled" $OUT/$name.log; then rc=9; fi
+  echo $rc > $OUT/$name.rc
+  exit 0
+fi
+
+mkdir -p $OUT
+rm -f $OUT/*.hash $OUT/*.log $OUT/*.rc
+JOBS=${JOBS:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
+FIGHT="--hires-min-fight 95"
+RESIZE="--max-scale 8 --resize 3000:640x480,3700:960x720,4300:1920x1440,4900:3840x2880,5400:480x360,5900:1920x1080,6400:1280x960,6800:2560x1920"
+# longest first so the pool stays busy
+cat > $OUT/jobs.txt <<EOF
+s8x8 --scale 8 $FIGHT
+resize --scale 0 $RESIZE $FIGHT
+s4x6 --scale 4x6 $FIGHT
+s4x4 --scale 4 $FIGHT
+verify1 --scale 1 --hires-verify $FIGHT
+s2x3 --scale 2x3 $FIGHT
+s2x2 --scale 2 $FIGHT
+off --scale 0
+EOF
+START=$(date +%s)
+xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
+ELAPSED=$(( $(date +%s) - START ))
+
+fail=0
+echo "hires: ran $(wc -l < $OUT/jobs.txt) runs of $FRAMES frames, $JOBS at a time, in ${ELAPSED}s"
+for n in off s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1; do
+  rc=$(cat $OUT/$n.rc 2>/dev/null || echo missing)
+  if [ "$rc" != 0 ]; then echo "hires: $n: run FAILED (exit $rc)"; tail -5 $OUT/$n.log; fail=1; fi
+done
+[ $fail = 0 ] || exit 1
 lines=$(wc -l < $OUT/off.hash)
 [ "$lines" -ge "$FRAMES" ] || { echo "hires: FAIL (only $lines hashed frames)"; exit 1; }
-for n in s2 s4 s8 resize; do
+echo "hires: resize steps applied: $(grep -c 'render scale' $OUT/resize.log) ($(grep -o 'render scale [0-9x]*' $OUT/resize.log | sed 's/render scale //' | tr '\n' ' '))"
+for n in s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1; do
   if cmp -s $OUT/off.hash $OUT/$n.hash; then echo "hires: state hash $n == off ($lines frames): ok"
-  else echo "hires: state hash $n DIFFERS from off:"; diff $OUT/off.hash $OUT/$n.hash | head -3; exit 1; fi
+  else echo "hires: state hash $n DIFFERS from off:"; diff $OUT/off.hash $OUT/$n.hash | head -3; fail=1; fi
+  grep -h "hires-frames" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
 done
-run verify1 --scale 1 --hires-verify
-grep "hires-verify" $OUT/verify1.log
-grep -q "hires-verify: $FRAMES frames checked, 0 mismatching" $OUT/verify1.log || { echo "hires: S=1 equivalence FAIL"; exit 1; }
-cmp -s $OUT/off.hash $OUT/verify1.hash || { echo "hires: S=1 state hash differs"; exit 1; }
-echo "hires: determinism + S=1 equivalence ok"
+grep -h "hires-verify" $OUT/verify1.log | sed 's/^\[ *[0-9]*\] /hires: verify1: /'
+[ $fail = 0 ] || exit 1
+grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/verify1.log || { echo "hires: 1x1 equivalence FAIL"; exit 1; }
+echo "hires: determinism + 1x1 equivalence + hi-res coverage of fight frames ok"

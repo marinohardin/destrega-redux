@@ -23,7 +23,7 @@
 
 static const u16 *s_vram;              /* 1x VRAM (texture/CLUT source) */
 static u16 *s_t;                       /* target pixels */
-static int s_S;                        /* current scale; 0 = none */
+static int s_Sx, s_Sy;                 /* current horizontal / vertical scale; 0 = none */
 static int s_rx = 0, s_ry = 0, s_rw = 512, s_rh = 480;   /* tracked 1x region (in use) */
 static int s_cfg_rx = 0, s_cfg_ry = 0, s_cfg_rw = 512, s_cfg_rh = 480;   /* requested */
 static int s_tw, s_th;                 /* target size in pixels */
@@ -181,10 +181,10 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
          const int TEX, const int DEPTH, const int RAW, const int SEMI,
          const int GOUR, const int DITHER)
 {
-    const int S = s_S;
-    HV h0 = { v0->x, v0->y, (s64)v0->x * S, (s64)v0->y * S, v0 };
-    HV h1 = { v1->x, v1->y, (s64)v1->x * S, (s64)v1->y * S, v1 };
-    HV h2 = { v2->x, v2->y, (s64)v2->x * S, (s64)v2->y * S, v2 };
+    const int Sx = s_Sx, Sy = s_Sy;
+    HV h0 = { v0->x, v0->y, (s64)v0->x * Sx, (s64)v0->y * Sy, v0 };
+    HV h1 = { v1->x, v1->y, (s64)v1->x * Sx, (s64)v1->y * Sy, v1 };
+    HV h2 = { v2->x, v2->y, (s64)v2->x * Sx, (s64)v2->y * Sy, v2 };
     HV *a = &h0, *b = &h1, *c = &h2, *t;
     if (b->Y1 < a->Y1) { t = a; a = b; b = t; }
     if (c->Y1 < b->Y1) { t = b; b = c; c = t; }
@@ -197,7 +197,7 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
 
     /* Attribute plane gradients per 1x pixel: identical to gpu.c (12-bit quotient << 12). */
     double gdx[5] = { 0 }, gdy[5] = { 0 };
-    u32 gstep_x[5] = { 0 }, gstep_y[5] = { 0 };   /* per hi-res pixel */
+    u32 gstep_x[5] = { 0 };   /* per hi-res pixel along x */
     u32 base[5];
     const u32 av[5] = { a->v->r, a->v->g, a->v->b, a->v->u, a->v->v };
     const u32 bv[5] = { b->v->r, b->v->g, b->v->b, b->v->u, b->v->v };
@@ -215,19 +215,17 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
         u32 dy = (u32)(s32)(s64)(((__int128)n_y << 28) / denom) << 12;
         gdx[i] = (double)(s32)dx;
         gdy[i] = (double)(s32)dy;
-        gstep_x[i] = (u32)((s32)dx / S);
-        gstep_y[i] = (u32)((s32)dy / S);
+        gstep_x[i] = (u32)((s32)dx / Sx);
     }
-    (void)gstep_y;
     const double ax = (double)a->X1 / 65536.0, ay = (double)a->Y1 / 65536.0;
 
     const bool long_left = denom > 0;
     const s64 long_step = floor_div128(((__int128)(c->Xh - a->Xh)) << 32, c->Yh - a->Yh);
 
-    const int cx1 = imax(p->clip_x1 * S, s_ox);
-    const int cx2 = imin((p->clip_x2 + 1) * S, s_ox + s_tw) - 1;
-    const int cy1 = imax(p->clip_y1 * S, s_oy);
-    const int cy2 = imin((p->clip_y2 + 1) * S, s_oy + s_th) - 1;
+    const int cx1 = imax(p->clip_x1 * Sx, s_ox);
+    const int cx2 = imin((p->clip_x2 + 1) * Sx, s_ox + s_tw) - 1;
+    const int cy1 = imax(p->clip_y1 * Sy, s_oy);
+    const int cy2 = imin((p->clip_y2 + 1) * Sy, s_oy + s_th) - 1;
 
     for (int part = 0; part < 2; part++) {
         const HV *sa = part ? b : a, *sb = part ? c : b;
@@ -247,7 +245,7 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
             if (xe > cx2 + 1) xe = cx2 + 1;
             if (xs < xe) {
                 /* attribute values at the first pixel of the span */
-                const double P = ((double)xs + 0.5) / S - 0.5, Q = ((double)y + 0.5) / S - 0.5;
+                const double P = ((double)xs + 0.5) / Sx - 0.5, Q = ((double)y + 0.5) / Sy - 0.5;
                 u32 val[5];
                 for (int i = 0; i < 5; i++) {
                     if ((i < 3 && !GOUR) || (i >= 3 && !TEX)) { val[i] = base[i]; continue; }
@@ -256,11 +254,11 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
                 }
                 u32 r = val[0], g = val[1], bb = val[2], u = val[3], v = val[4];
                 u16 *dst = s_t + (size_t)(y - s_oy) * s_tw + (xs - s_ox);
-                const int y1 = y / S;
+                const int y1 = y / Sy;
                 for (int x = xs; x < xe; x++, dst++) {
                     u16 out; bool blend;
                     if (!(p->mask_check && (*dst & 0x8000)) &&
-                        shade(p, x / S, y1, r >> FRAC, g >> FRAC, bb >> FRAC, u >> FRAC, v >> FRAC,
+                        shade(p, x / Sx, y1, r >> FRAC, g >> FRAC, bb >> FRAC, u >> FRAC, v >> FRAC,
                               TEX, DEPTH, RAW, SEMI, DITHER, &out, &blend)) {
                         if (blend) out = blend_px(p->blend, *dst, out);
                         *dst = out | p->mask_or;
@@ -316,7 +314,7 @@ static const TriFn s_tri_tex[3][10] = {
     TRI_TEX_TABLE(0), TRI_TEX_TABLE(1), TRI_TEX_TABLE(2),
 };
 
-static inline bool dither_on(const HiresPrim *p) { return p->dither && (s_S == 1 || s_dither_hi); }
+static inline bool dither_on(const HiresPrim *p) { return p->dither && ((s_Sx == 1 && s_Sy == 1) || s_dither_hi); }
 
 static void be_tri(const HiresPrim *p, const HiresVtx v[3])
 {
@@ -344,7 +342,7 @@ rect_impl(const HiresPrim *p, int x0, int y0, int w, int h, u32 r, u32 g, u32 b,
           u32 u0, u32 v0, bool flipx, bool flipy,
           const int TEX, const int DEPTH, const int RAW, const int SEMI)
 {
-    const int S = s_S;
+    const int Sx = s_Sx, Sy = s_Sy;
     int xs = x0, xe = x0 + w, ys = y0, ye = y0 + h;
     if (xs < p->clip_x1) xs = p->clip_x1;
     if (xe > p->clip_x2 + 1) xe = p->clip_x2 + 1;
@@ -369,11 +367,11 @@ rect_impl(const HiresPrim *p, int x0, int y0, int w, int h, u32 r, u32 g, u32 b,
             outs[i] = o;
             vis[i] = ok ? (blend ? 2 : 1) : 0;
         }
-        for (int sy = 0; sy < S; sy++) {
-            u16 *dst = s_t + (size_t)(y * S + sy - s_oy) * s_tw + (xs * S - s_ox);
+        for (int sy = 0; sy < Sy; sy++) {
+            u16 *dst = s_t + (size_t)(y * Sy + sy - s_oy) * s_tw + (xs * Sx - s_ox);
             for (int i = 0; i < cnt; i++) {
-                if (!vis[i]) { dst += S; continue; }
-                for (int sx = 0; sx < S; sx++, dst++) store_px(p, dst, outs[i], vis[i] == 2);
+                if (!vis[i]) { dst += Sx; continue; }
+                for (int sx = 0; sx < Sx; sx++, dst++) store_px(p, dst, outs[i], vis[i] == 2);
             }
         }
     }
@@ -417,7 +415,7 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
 static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, u32 c1)
 {
     if (!s_t) return;
-    const int S = s_S;
+    const int Sx = s_Sx, Sy = s_Sy;
     int dx = x1 - x0, dy = y1 - y0;
     int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
     const bool gour = p->gour;
@@ -425,8 +423,8 @@ static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, 
     const bool dith = dither_on(p);
     const int k = adx > ady ? adx : ady;
     const bool xmajor = adx > ady;
-    const int cx1 = imax(p->clip_x1 * S, s_ox), cx2 = imin((p->clip_x2 + 1) * S, s_ox + s_tw) - 1;
-    const int cy1 = imax(p->clip_y1 * S, s_oy), cy2 = imin((p->clip_y2 + 1) * S, s_oy + s_th) - 1;
+    const int cx1 = imax(p->clip_x1 * Sx, s_ox), cx2 = imin((p->clip_x2 + 1) * Sx, s_ox + s_tw) - 1;
+    const int cy1 = imax(p->clip_y1 * Sy, s_oy), cy2 = imin((p->clip_y2 + 1) * Sy, s_oy + s_th) - 1;
 
 #define LINE_PLOT(PX, PY, CR, CG, CB)                                                          \
     do {                                                                                        \
@@ -435,7 +433,7 @@ static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, 
             u16 o_; bool bl_;                                                                   \
             u16 *d_ = s_t + (size_t)(py_ - s_oy) * s_tw + (px_ - s_ox);                         \
             if (!(p->mask_check && (*d_ & 0x8000)) &&                                           \
-                shade(p, px_ / S, py_ / S, (CR), (CG), (CB), 0, 0, 0, 0, 0, p->semi, dith,      \
+                shade(p, px_ / Sx, py_ / Sy, (CR), (CG), (CB), 0, 0, 0, 0, 0, p->semi, dith,    \
                       &o_, &bl_)) {                                                             \
                 if (bl_) o_ = blend_px(p->blend, *d_, o_);                                      \
                 *d_ = o_ | p->mask_or;                                                          \
@@ -444,34 +442,38 @@ static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, 
     } while (0)
 
     if (k == 0) {
-        for (int j = 0; j < S; j++)
-            for (int i = 0; i < S; i++)
-                LINE_PLOT(x0 * S + i, y0 * S + j, c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF);
+        for (int j = 0; j < Sy; j++)
+            for (int i = 0; i < Sx; i++)
+                LINE_PLOT(x0 * Sx + i, y0 * Sy + j, c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF);
         return;
     }
-    /* centre of the first 1x pixel in hi-res coordinates, 32.32; the line is extended by
-     * half a 1x pixel at each end so that it covers whole 1x pixels like the 1x one. */
-    s64 xf = (((s64)x0 * S) << 32) + ((s64)S << 31);
-    s64 yf = (((s64)y0 * S) << 32) + ((s64)S << 31);
-    s64 sx = ((s64)dx << 32) / k, sy = ((s64)dy << 32) / k;
-    xf -= sx * (S - 1) / 2;
-    yf -= sy * (S - 1) / 2;
+    /* Thickness follows the scale of the axis perpendicular to the line's major axis
+     * (x-major lines are Sy thick, y-major lines Sx thick). The major axis advances one
+     * hi-res pixel per step; Sa is its scale. The line is extended by half a 1x pixel at
+     * each end so that it covers whole 1x pixels like the 1x one. */
+    const int Sa = xmajor ? Sx : Sy;
+    /* centre of the first 1x pixel in hi-res coordinates, 32.32 */
+    s64 xf = (((s64)x0 * Sx) << 32) + ((s64)Sx << 31);
+    s64 yf = (((s64)y0 * Sy) << 32) + ((s64)Sy << 31);
+    const int kh = k * Sa;
+    s64 sx = (((s64)dx * Sx) << 32) / kh, sy = (((s64)dy * Sy) << 32) / kh;
+    xf -= sx * (Sa - 1) / 2;
+    yf -= sy * (Sa - 1) / 2;
     s32 r = (s32)((c0 & 0xFF) << 12), g = (s32)(((c0 >> 8) & 0xFF) << 12), b = (s32)(((c0 >> 16) & 0xFF) << 12);
-    const int kh = k * S;
     s32 dr = (s32)(((s32)(c1 & 0xFF) - (s32)(c0 & 0xFF)) * 4096 / kh);
     s32 dg = (s32)(((s32)((c1 >> 8) & 0xFF) - (s32)((c0 >> 8) & 0xFF)) * 4096 / kh);
     s32 db = (s32)(((s32)((c1 >> 16) & 0xFF) - (s32)((c0 >> 16) & 0xFF)) * 4096 / kh);
     if (dx < 0) xf -= 1;
     if (dy < 0) yf -= 1;
     r += 1 << 11; g += 1 << 11; b += 1 << 11;
-    const int steps = kh + (S - 1);
+    const int steps = kh + (Sa - 1);
     for (int i = 0; i <= steps; i++) {
         int x = (int)(xf >> 32), y = (int)(yf >> 32);
         u32 cr = (u32)(r >> 12), cg = (u32)(g >> 12), cb = (u32)(b >> 12);
         if (xmajor) {
-            for (int j = 0; j < S; j++) LINE_PLOT(x, y - S / 2 + j, cr, cg, cb);
+            for (int j = 0; j < Sy; j++) LINE_PLOT(x, y - Sy / 2 + j, cr, cg, cb);
         } else {
-            for (int j = 0; j < S; j++) LINE_PLOT(x - S / 2 + j, y, cr, cg, cb);
+            for (int j = 0; j < Sx; j++) LINE_PLOT(x - Sx / 2 + j, y, cr, cg, cb);
         }
         xf += sx; yf += sy;
         r += dr; g += dg; b += db;
@@ -484,11 +486,10 @@ static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, 
 /* Fill the 1x columns [x0, x1) of 1x row y (both inside the region) with c. */
 static void fill_span(int x0, int x1, int y, u16 c)
 {
-    const int S = s_S;
-    u16 *row0 = s_t + (size_t)(y * S - s_oy) * s_tw + (x0 * S - s_ox);
-    const int n = (x1 - x0) * S;
+    u16 *row0 = s_t + (size_t)(y * s_Sy - s_oy) * s_tw + (x0 * s_Sx - s_ox);
+    const int n = (x1 - x0) * s_Sx;
     for (int i = 0; i < n; i++) row0[i] = c;
-    for (int j = 1; j < S; j++) memcpy(row0 + (size_t)j * s_tw, row0, (size_t)n * sizeof(u16));
+    for (int j = 1; j < s_Sy; j++) memcpy(row0 + (size_t)j * s_tw, row0, (size_t)n * sizeof(u16));
 }
 
 static void be_fill(int x, int y, int w, int h, u16 c)
@@ -520,11 +521,10 @@ static void be_put(int x, int y, u16 v, bool mc, bool ms)
     if (!s_t) return;
     x &= 1023; y &= 511;
     if (!in_region(x, y)) return;
-    const int S = s_S;
     const u16 val = v | (ms ? 0x8000 : 0);
-    for (int sy = 0; sy < S; sy++) {
-        u16 *d = s_t + (size_t)(y * S + sy - s_oy) * s_tw + (x * S - s_ox);
-        for (int sx = 0; sx < S; sx++, d++) {
+    for (int sy = 0; sy < s_Sy; sy++) {
+        u16 *d = s_t + (size_t)(y * s_Sy + sy - s_oy) * s_tw + (x * s_Sx - s_ox);
+        for (int sx = 0; sx < s_Sx; sx++, d++) {
             if (mc && (*d & 0x8000)) continue;
             *d = val;
         }
@@ -534,7 +534,7 @@ static void be_put(int x, int y, u16 v, bool mc, bool ms)
 static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, bool ms)
 {
     if (!s_t) return;
-    const int S = s_S;
+    const int Sx = s_Sx, Sy = s_Sy;
     /* skip when the destination can't touch the region at all */
     bool any = false;
     for (int j = 0; j < ht && !any; j++) {
@@ -543,27 +543,27 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
     }
     if (!any) return;
     static u16 buf[(size_t)HIRES_MAX_SCALE * VRAM_W * HIRES_MAX_SCALE];
-    const size_t stride = (size_t)wd * S;
+    const size_t stride = (size_t)wd * Sx;
     for (int j = 0; j < ht; j++) {
         int srow = (sy + j) & 511, drow = (dy + j) & 511;
         if (drow < s_ry || drow >= s_ry + s_rh) continue;
         for (int i = 0; i < wd; i++) {
             int scol = (sx + i) & 1023;
             bool in = in_region(scol, srow);
-            for (int a = 0; a < S; a++)
-                for (int b = 0; b < S; b++)
-                    buf[a * stride + (size_t)i * S + b] = in
-                        ? s_t[(size_t)(srow * S + a - s_oy) * s_tw + (scol * S + b - s_ox)]
+            for (int a = 0; a < Sy; a++)
+                for (int b = 0; b < Sx; b++)
+                    buf[a * stride + (size_t)i * Sx + b] = in
+                        ? s_t[(size_t)(srow * Sy + a - s_oy) * s_tw + (scol * Sx + b - s_ox)]
                         : s_vram[srow * VRAM_W + scol];
         }
         for (int i = 0; i < wd; i++) {
             int dcol = (dx + i) & 1023;
             if (!in_region(dcol, drow)) continue;
-            for (int a = 0; a < S; a++) {
-                u16 *d = s_t + (size_t)(drow * S + a - s_oy) * s_tw + (dcol * S - s_ox);
-                for (int b = 0; b < S; b++, d++) {
+            for (int a = 0; a < Sy; a++) {
+                u16 *d = s_t + (size_t)(drow * Sy + a - s_oy) * s_tw + (dcol * Sx - s_ox);
+                for (int b = 0; b < Sx; b++, d++) {
                     if (mc && (*d & 0x8000)) continue;
-                    *d = buf[a * stride + (size_t)i * S + b] | (ms ? 0x8000 : 0);
+                    *d = buf[a * stride + (size_t)i * Sx + b] |(ms ? 0x8000 : 0);
                 }
             }
         }
@@ -572,13 +572,12 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
 
 static void seed(void)
 {
-    const int S = s_S;
     for (int y = 0; y < s_rh; y++) {
-        u16 *row0 = s_t + (size_t)y * S * s_tw;
+        u16 *row0 = s_t + (size_t)y * s_Sy * s_tw;
         const u16 *src = &s_vram[(s_ry + y) * VRAM_W + s_rx];
         for (int x = 0; x < s_rw; x++)
-            for (int i = 0; i < S; i++) row0[x * S + i] = src[x];
-        for (int j = 1; j < S; j++) memcpy(row0 + (size_t)j * s_tw, row0, (size_t)s_tw * sizeof(u16));
+            for (int i = 0; i < s_Sx; i++) row0[x * s_Sx + i] = src[x];
+        for (int j = 1; j < s_Sy; j++) memcpy(row0 + (size_t)j * s_tw, row0, (size_t)s_tw * sizeof(u16));
     }
 }
 
@@ -586,23 +585,23 @@ static void be_destroy(void)
 {
     free(s_t);
     s_t = NULL;
-    s_S = 0;
+    s_Sx = s_Sy = 0;
 }
 
-static bool be_configure(const u16 *vram1x, int scale, int rx, int ry, int rw, int rh)
+static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int rw, int rh)
 {
-    if (scale < 1 || scale > HIRES_MAX_SCALE || rw <= 0 || rh <= 0 ||
+    if (sx < 1 || sx > HIRES_MAX_SCALE || sy < 1 || sy > HIRES_MAX_SCALE || rw <= 0 || rh <= 0 ||
         rx < 0 || ry < 0 || rx + rw > VRAM_W || ry + rh > VRAM_H)
         return false;
-    u16 *nt = malloc((size_t)rw * scale * rh * scale * sizeof(u16));
+    u16 *nt = malloc((size_t)rw * sx * rh * sy * sizeof(u16));
     if (!nt) return false;
     free(s_t);
     s_t = nt;
     s_vram = vram1x;
-    s_S = scale;
+    s_Sx = sx; s_Sy = sy;
     s_rx = rx; s_ry = ry; s_rw = rw; s_rh = rh;
-    s_tw = rw * scale; s_th = rh * scale;
-    s_ox = rx * scale; s_oy = ry * scale;
+    s_tw = rw * sx; s_th = rh * sy;
+    s_ox = rx * sx; s_oy = ry * sy;
     memset(s_fb_tex_seen, 0, sizeof s_fb_tex_seen);
     seed();
     return true;
@@ -612,11 +611,12 @@ static bool be_view(int x, int y, int w, int h, HiresView *out)
 {
     if (!s_t || w <= 0 || h <= 0) return false;
     if (x < s_rx || y < s_ry || x + w > s_rx + s_rw || y + h > s_ry + s_rh) return false;
-    out->pixels = s_t + (size_t)(y * s_S - s_oy) * s_tw + (x * s_S - s_ox);
+    out->pixels = s_t + (size_t)(y * s_Sy - s_oy) * s_tw + (x * s_Sx - s_ox);
     out->stride = s_tw;
-    out->w = w * s_S;
-    out->h = h * s_S;
-    out->scale = s_S;
+    out->w = w * s_Sx;
+    out->h = h * s_Sy;
+    out->scale_x = s_Sx;
+    out->scale_y = s_Sy;
     return true;
 }
 
@@ -626,19 +626,20 @@ static const HiresBackend s_soft = {
 
 /* ---- control --------------------------------------------------------------------- */
 
-bool hires_set_scale(int scale)
+bool hires_set_scale(int sx, int sy)
 {
-    if (scale < 0) scale = 0;
-    if (scale > HIRES_MAX_SCALE) scale = HIRES_MAX_SCALE;
-    if (scale == 0) {
+    if (sx <= 0 || sy <= 0) sx = sy = 0;
+    if (sx > HIRES_MAX_SCALE) sx = HIRES_MAX_SCALE;
+    if (sy > HIRES_MAX_SCALE) sy = HIRES_MAX_SCALE;
+    if (sx == 0) {
         if (g_hires) g_hires->destroy();
         g_hires = NULL;
         return true;
     }
-    if (g_hires && s_S == scale && s_rx == s_cfg_rx && s_ry == s_cfg_ry &&
+    if (g_hires && s_Sx == sx && s_Sy == sy && s_rx == s_cfg_rx && s_ry == s_cfg_ry &&
         s_rw == s_cfg_rw && s_rh == s_cfg_rh)
         return true;
-    if (!s_soft.configure(gpu_vram(), scale, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh)) {
+    if (!s_soft.configure(gpu_vram(), sx, sy, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh)) {
         g_hires = NULL;
         return false;
     }
@@ -646,7 +647,12 @@ bool hires_set_scale(int scale)
     return true;
 }
 
-int hires_scale(void) { return g_hires ? s_S : 0; }
+bool hires_get_scale(int *sx, int *sy)
+{
+    if (sx) *sx = g_hires ? s_Sx : 0;
+    if (sy) *sy = g_hires ? s_Sy : 0;
+    return g_hires != NULL;
+}
 
 void hires_set_region(int rx, int ry, int rw, int rh)
 {
@@ -661,22 +667,27 @@ bool hires_get_view(const GpuDisplay *d, HiresView *v)
     return g_hires->view(d->x, d->y, d->w, d->h, v);
 }
 
-int hires_pick_scale(int pw, int ph, int max_scale)
+void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int *sx, int *sy)
 {
-    if (max_scale < 1) max_scale = 1;
-    if (max_scale > HIRES_MAX_SCALE) max_scale = HIRES_MAX_SCALE;
-    if (pw < 1 || ph < 1) return 1;
-    int vw, vh;                              /* 4:3 letterbox viewport */
-    if ((s64)pw * 3 > (s64)ph * 4) { vh = ph; vw = ph * 4 / 3; }
-    else { vw = pw; vh = pw * 3 / 4; }
-    /* corrected target size at scale S is 512*S x 384*S */
-    int s = imax((vw + 511) / 512, (vh + 383) / 384);
-    return s < 1 ? 1 : (s > max_scale ? max_scale : s);
+    if (max_x < 1) max_x = 1;
+    if (max_x > HIRES_MAX_SCALE) max_x = HIRES_MAX_SCALE;
+    if (max_y < 1) max_y = 1;
+    if (max_y > HIRES_MAX_SCALE) max_y = HIRES_MAX_SCALE;
+    if (dw < 1) dw = 512;
+    if (dh < 1) dh = 240;
+    int vw = 1, vh = 1;
+    if (pw >= 1 && ph >= 1) {                    /* 4:3 letterbox viewport */
+        if ((s64)pw * 3 > (s64)ph * 4) { vh = ph; vw = ph * 4 / 3; }
+        else { vw = pw; vh = pw * 3 / 4; }
+    }
+    /* never upsample at present: at least one target pixel per viewport pixel on each axis */
+    *sx = imin(imax((vw + dw - 1) / dw, 1), max_x);
+    *sy = imin(imax((vh + dh - 1) / dh, 1), max_y);
 }
 
 u32 hires_verify_1x(int *first_x, int *first_y)
 {
-    if (!g_hires || s_S != 1) return 0;
+    if (!g_hires || s_Sx != 1 || s_Sy != 1) return 0;
     u32 bad = 0;
     for (int y = 0; y < s_rh; y++)
         for (int x = 0; x < s_rw; x++)

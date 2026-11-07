@@ -120,34 +120,47 @@ Presentation-only. `gpu.c` stays the authoritative 1x GPU: every GP0 command sti
 on the 1x VRAM and all CPU-visible state (VRAM reads, GPUSTAT, copies, CLUTs) comes from it.
 Each drawing command is *also* forwarded through `g_hires` (a `HiresBackend`: command in ->
 target out; swap it for a GPU backend later) to a separate target covering VRAM
-(0,0)-(512,480) at S times the resolution (`hires_set_region` changes it). Nothing in the
-target is ever read by the emulated machine, so resolution cannot affect gameplay
-(`tools/test_hires_determinism.sh` proves it by hashing all emulated state per frame).
+(0,0)-(512,480) at independent integer scales Sx (horizontal) x Sy (vertical)
+(`hires_set_region` changes the region). Nothing in the target is ever read by the emulated
+machine, so resolution cannot affect gameplay (`tools/test_hires_determinism.sh` proves it by
+hashing all emulated state per frame).
 
 - Rules match the 1x GPU: same top-left fill rule, colour/texture math, mask bit and
-  semi-transparency (applied against hi-res destination pixels). At S=1 the target is
+  semi-transparency (applied against hi-res destination pixels). At 1x1 the target is
   bit-identical to the 1x VRAM region (`--hires-verify`).
-- Coverage = 1x geometry scaled by S (a w*h rect covers exactly S*w x S*h pixels).
+- Coverage = 1x geometry scaled by Sx/Sy (a w*h rect covers exactly Sx*w x Sy*h pixels).
   Colour/u/v come from the 1x plane equations at each hi-res pixel centre. Vertices are
   16.16 fixed point in 1x units (integers today) so GTE sub-pixel precision can be fed later.
-- Textures/CLUTs are sampled from the 1x VRAM (they are 1x assets, so texels are S x S
+- Textures/CLUTs are sampled from the 1x VRAM (they are 1x assets, so texels are Sx x Sy
   blocks). A textured primitive whose page overlaps the framebuffer region samples 1x VRAM
-  and is logged once per page. Dither is off at S>1 (`--hires-dither` keeps it). Lines are
-  S pixels thick. Uploads (FMV slices) are nearest-upscaled into the target; fills and
-  VRAM copies are scaled.
+  and is logged once per page. Dither is off above 1x1 (`--hires-dither` keeps it). Lines: the
+  thickness follows the scale of the axis perpendicular to the line's major axis (x-major
+  lines are Sy thick, y-major lines Sx thick). Uploads (FMV slices) are nearest-upscaled into
+  the target; fills and VRAM copies are scaled.
 - Falls back to presenting 1x VRAM when the display is 24-bit (FMV), disabled, wider than
   the region (e.g. 640 px modes) or outside it.
-- Scale: `S = ceil(max(vw/512, vh/384))` for the 4:3 letterbox viewport (vw x vh) inside the
-  window's physical pixels (`SDL_GetWindowSizeInPixels`; window is HiDPI), capped by
-  `--max-scale` (default 4: S=6 and S=8 cost ~12 and ~20 ms/frame of emulation in a fight on the dev Mac, so they are opt-in); `--scale N` forces N (0 = off). On window resize the scale is recomputed;
-  if it changed, the target is reallocated and seeded from the current 1x VRAM.
+- Auto scale (default): the 4:3 letterbox viewport (vw x vh) inside the window's physical
+  pixels (`SDL_GetWindowSizeInPixels`; the window is HiDPI) is covered without ever
+  upsampling at present: `Sx = ceil(vw / display_w)`, `Sy = ceil(vh / display_h)` using the
+  actual display mode (normally 512x240), capped per axis by `--max-scale N|NxM`
+  (default 4x6, see measurements in the PR). A 1440p-ish window renders 2048x1440 (4x6).
+  `--scale N|NxM` forces a scale (0 = off). On a resize the scales are recomputed; if they
+  changed, the target is reallocated and seeded from the current 1x VRAM.
   Presented with linear filtering into the letterboxed viewport.
-- Headless/test options: `--scale N`, `--max-scale N`, `--resize F:WxH,...` (simulated window
-  sizes), `--state-hash FILE`, `--hires-verify`, `--hires-dither`; `--dump` writes frames at
-  the render scale; `tools/contact_sheet.py --cell WxH --cols N` tiles them;
-  `tools/fight_script.py` prints a boot->fight `--press` script.
-- Tests: `runtime/tests/test_hires.c` (scaled rasterizer vs hand-checked counts),
-  `tools/test_hires_determinism.sh` (called by `run_tests.sh`).
+- Options: `--scale N|NxM`, `--max-scale N|NxM`, `--hires-dither`, `--window WxH` (initial
+  window, points), `--resize F:WxH,...` (headless: simulated window sizes in physical pixels),
+  `--state-hash FILE`, `--hires-verify`, `--fight-from F` (default 3700) and
+  `--hires-min-fight PCT` (exit 4 unless that % of frames >= F could be shown from the hi-res
+  target; the run prints `hires-frames: ...` with hi-res vs 1x-fallback counts). `--press`,
+  `--frames` and these work windowed too; a windowed `--frames` run prints the host
+  emu/present time over the fight frames. `--dump` writes frames at the render scale;
+  `tools/contact_sheet.py --cell WxH --cols N` tiles them; `tools/fight_script.py` prints a
+  boot->fight `--press` script.
+- Tests: `runtime/tests/test_hires.c` (rasterizer vs hand-checked counts at several
+  Sx x Sy, including Sx != Sy), `tools/test_hires_determinism.sh` (8 concurrent runs: off,
+  2x2, 4x4, 8x8, 2x3, 4x6, a resize schedule with Sx != Sy, and the 1x1 equivalence run; all
+  state hashes equal, >=95% of fight frames hi-res). `tools/run_tests.sh` runs the unit
+  tests, `tools/smoke_test.sh` and the determinism script concurrently (~2.3 min).
 
 ## Pitfalls
 
