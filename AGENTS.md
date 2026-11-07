@@ -114,6 +114,41 @@ Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
 Headless runs ~200x real time (30k frames ≈ 13 s).
 
+## High-resolution rendering (`runtime/hires.[ch]`)
+
+Presentation-only. `gpu.c` stays the authoritative 1x GPU: every GP0 command still runs
+on the 1x VRAM and all CPU-visible state (VRAM reads, GPUSTAT, copies, CLUTs) comes from it.
+Each drawing command is *also* forwarded through `g_hires` (a `HiresBackend`: command in ->
+target out; swap it for a GPU backend later) to a separate target covering VRAM
+(0,0)-(512,480) at S times the resolution (`hires_set_region` changes it). Nothing in the
+target is ever read by the emulated machine, so resolution cannot affect gameplay
+(`tools/test_hires_determinism.sh` proves it by hashing all emulated state per frame).
+
+- Rules match the 1x GPU: same top-left fill rule, colour/texture math, mask bit and
+  semi-transparency (applied against hi-res destination pixels). At S=1 the target is
+  bit-identical to the 1x VRAM region (`--hires-verify`).
+- Coverage = 1x geometry scaled by S (a w*h rect covers exactly S*w x S*h pixels).
+  Colour/u/v come from the 1x plane equations at each hi-res pixel centre. Vertices are
+  16.16 fixed point in 1x units (integers today) so GTE sub-pixel precision can be fed later.
+- Textures/CLUTs are sampled from the 1x VRAM (they are 1x assets, so texels are S x S
+  blocks). A textured primitive whose page overlaps the framebuffer region samples 1x VRAM
+  and is logged once per page. Dither is off at S>1 (`--hires-dither` keeps it). Lines are
+  S pixels thick. Uploads (FMV slices) are nearest-upscaled into the target; fills and
+  VRAM copies are scaled.
+- Falls back to presenting 1x VRAM when the display is 24-bit (FMV), disabled, wider than
+  the region (e.g. 640 px modes) or outside it.
+- Scale: `S = ceil(max(vw/512, vh/384))` for the 4:3 letterbox viewport (vw x vh) inside the
+  window's physical pixels (`SDL_GetWindowSizeInPixels`; window is HiDPI), capped by
+  `--max-scale`; `--scale N` forces N (0 = off). On window resize the scale is recomputed;
+  if it changed, the target is reallocated and seeded from the current 1x VRAM.
+  Presented with linear filtering into the letterboxed viewport.
+- Headless/test options: `--scale N`, `--max-scale N`, `--resize F:WxH,...` (simulated window
+  sizes), `--state-hash FILE`, `--hires-verify`, `--hires-dither`; `--dump` writes frames at
+  the render scale; `tools/contact_sheet.py --cell WxH --cols N` tiles them;
+  `tools/fight_script.py` prints a boot->fight `--press` script.
+- Tests: `runtime/tests/test_hires.c` (scaled rasterizer vs hand-checked counts),
+  `tools/test_hires_determinism.sh` (called by `run_tests.sh`).
+
 ## Pitfalls
 
 - Branches may target another branch's delay slot (e.g. 0x800951c0); the tracer

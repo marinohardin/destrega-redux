@@ -9,12 +9,17 @@
  * always reports ready), the GPU FIFO depth.
  */
 #include "psx.h"
+#include "hires.h"
 #include <string.h>
 
 #define VRAM_W 1024
 #define VRAM_H 512
 
 static u16 s_vram[VRAM_W * VRAM_H];
+
+/* Optional presentation-only hi-res target (hires.c). Every drawing command is also
+ * forwarded there; nothing in it is ever read back into the emulated machine. */
+const HiresBackend *g_hires;
 
 /* ---- state ------------------------------------------------------------- */
 
@@ -375,6 +380,17 @@ static const TriFn s_tri_tex[3][10] = {
     TRI_TEX_TABLE(0), TRI_TEX_TABLE(1), TRI_TEX_TABLE(2),
 };
 
+static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool semi, bool gour)
+{
+    h->tex = tex; h->raw = raw; h->semi = semi; h->gour = gour; h->dither = p->dither;
+    h->blend = p->blend; h->depth = p->depth;
+    h->tp_x = p->tp_x; h->tp_y = p->tp_y; h->clut_x = p->clut_x; h->clut_y = p->clut_y;
+    h->tw_and_u = p->tw_and_u; h->tw_or_u = p->tw_or_u;
+    h->tw_and_v = p->tw_and_v; h->tw_or_v = p->tw_or_v;
+    h->mask_or = p->mask_or; h->mask_check = p->mask_check;
+    h->clip_x1 = s_clip_x1; h->clip_y1 = s_clip_y1; h->clip_x2 = s_clip_x2; h->clip_y2 = s_clip_y2;
+}
+
 static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
                      bool tex, bool raw, bool semi, bool gour)
 {
@@ -389,6 +405,19 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     if (c->y > maxy) maxy = c->y;
     if (maxx - minx >= 1024 || maxy - miny >= 512) return;
     if (maxx < s_clip_x1 || minx > s_clip_x2 || maxy < s_clip_y1 || miny > s_clip_y2) return;
+
+    if (g_hires) {
+        HiresPrim hp;
+        hires_prim(&hp, p, tex, raw, semi, gour);
+        const Vtx *vs[3] = { a, b, c };
+        HiresVtx hv[3];
+        for (int i = 0; i < 3; i++) {
+            hv[i].x = vs[i]->x * 65536; hv[i].y = vs[i]->y * 65536;
+            hv[i].r = vs[i]->r; hv[i].g = vs[i]->g; hv[i].b = vs[i]->b;
+            hv[i].u = vs[i]->u; hv[i].v = vs[i]->v;
+        }
+        g_hires->tri(&hp, hv);
+    }
 
     if (!tex) {
         int idx = (semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0);
@@ -542,6 +571,11 @@ static void gp0_rect(const u32 *w)
     p.clut_y = (clut >> 6) & 0x1FF;
     u32 r = color & 0xFF, g = (color >> 8) & 0xFF, b = (color >> 16) & 0xFF;
     bool fx = (s_drawmode >> 12) & 1, fy = (s_drawmode >> 13) & 1;
+    if (g_hires) {
+        HiresPrim hp;
+        hires_prim(&hp, &p, tex, raw, semi, false);
+        g_hires->rect(&hp, x, y, wd, ht, r, g, b, u0, v0, fx, fy);
+    }
     if (!tex) {
         (semi ? rect_u1 : rect_u0)(&p, x, y, wd, ht, r, g, b, 0, 0, false, false);
     } else {
@@ -564,6 +598,12 @@ static void draw_line(int x0, int y0, u32 c0, int x1, int y1, u32 c1, bool gour,
     prim_common(&p);
     bool dither = gour && ((s_drawmode >> 9) & 1);
     if (!gour) c1 = c0;
+    if (g_hires) {
+        HiresPrim hp;
+        hires_prim(&hp, &p, false, false, semi, gour);
+        hp.dither = dither;
+        g_hires->line(&hp, x0, y0, c0, x1, y1, c1);
+    }
     int k = adx > ady ? adx : ady;
     /* 32.32 fixed point positions, centered */
     s64 xf = ((s64)x0 << 32) + (1ll << 31);
@@ -608,6 +648,7 @@ static void gp0_fill(const u32 *w)
     int y = (int)((w[1] >> 16) & 0x1FF);
     int wd = (int)(((w[2] & 0x3FF) + 0xF) & ~0xFu);
     int ht = (int)((w[2] >> 16) & 0x1FF);
+    if (g_hires) g_hires->fill(x, y, wd, ht, c);
     for (int j = 0; j < ht; j++) {
         u16 *row = &s_vram[((y + j) & 511) * VRAM_W];
         if (x + wd <= VRAM_W) {
@@ -632,6 +673,7 @@ static void gp0_copy(const u32 *w)
     int wd = (int)(((w[3] & 0xFFFF) - 1) & 0x3FF) + 1;
     int ht = (int)((((w[3] >> 16) & 0xFFFF) - 1) & 0x1FF) + 1;
     static u16 buf[1024];
+    if (g_hires) g_hires->copy(sx, sy, dx, dy, wd, ht, s_mask_check, s_mask_set);
     for (int j = 0; j < ht; j++) {
         const u16 *src = &s_vram[((sy + j) & 511) * VRAM_W];
         for (int i = 0; i < wd; i++) buf[i] = src[(sx + i) & 1023];
@@ -658,6 +700,9 @@ static inline void xfer_advance(Xfer *t)
 static void cpu2vram_word(u32 v)
 {
     for (int k = 0; k < 2 && s_wr.remaining; k++) {
+        if (g_hires)
+            g_hires->put(s_wr.x + s_wr.cx, s_wr.y + s_wr.cy, (u16)(k ? v >> 16 : v),
+                         s_mask_check, s_mask_set);
         vram_put(s_wr.x + s_wr.cx, s_wr.y + s_wr.cy, (u16)(k ? v >> 16 : v));
         xfer_advance(&s_wr);
     }

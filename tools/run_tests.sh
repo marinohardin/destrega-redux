@@ -8,9 +8,10 @@ mkdir -p build/tests build/smoke
 CC="clang -std=c11 -O2 -Wall -Wextra -Iruntime"
 $CC runtime/gte.c runtime/tests/test_gte.c -o build/tests/test_gte
 $CC runtime/gpu.c runtime/tests/test_gpu.c -o build/tests/test_gpu
+$CC runtime/gpu.c runtime/hires.c runtime/tests/test_hires.c -o build/tests/test_hires -lm
 $CC runtime/spu.c runtime/xa.c runtime/tests/test_spu.c -o build/tests/test_spu
 $CC runtime/mdec.c runtime/tests/test_mdec.c -o build/tests/test_mdec -lm
-for t in gte gpu spu mdec; do
+for t in gte gpu hires spu mdec; do
   printf '%-6s ' "$t"; ./build/tests/test_$t > build/tests/test_$t.log 2>&1 && echo ok || { echo FAIL; tail build/tests/test_$t.log; exit 1; }
 done
 
@@ -51,3 +52,6 @@ print(f'smoke: frame 4000 is {w}x{h}, {frac:.0%} lit pixels')
 sys.exit(0 if frac > 0.2 else 1)
 EOF
 echo "smoke: ok"
+
+# Hi-res rendering: determinism across scales/resizes + S=1 rasterizer equivalence.
+tools/test_hires_determinism.sh

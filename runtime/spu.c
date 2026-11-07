@@ -591,6 +591,8 @@ static void tick(s16 *out) {
 
 /* ---- Public API --------------------------------------------------------- */
 
+const u8 *spu_ram_ptr(size_t *n) { *n = sizeof ram; return ram; }
+
 void spu_init(void) {
     memset(ram, 0, sizeof ram);
     memset(regs, 0, sizeof regs);

@@ -137,6 +137,7 @@ void gpu_get_display(GpuDisplay *d);
 /* ---- SPU (runtime/spu.c) ------------------------------------------------- */
 
 void spu_init(void);
+const u8 *spu_ram_ptr(size_t *n);    /* SPU RAM, for state hashing */
 u16 spu_read16(u32 offset);            /* offset from 0x1f801c00 */
 void spu_write16(u32 offset, u16 v);
 void spu_dma_write(const u16 *src, u32 halfwords);

@@ -1,6 +1,7 @@
 /* Frontend: boot, SDL3 window/audio/input, headless test mode. */
 #include "recomp.h"
 #include "mdec.h"
+#include "hires.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,19 @@ static u32 s_watch[8]; static int s_watch_n;   /* --watch ADDR: log 32-bit value
 static u64 s_profile_from = 1;
 static int s_profile_on;
 static u32 s_wav_bytes;
+
+/* hi-res options (see hires.h / AGENTS.md) */
+static int s_scale_opt = -1;       /* --scale N: -1 = auto from the window, 0 = off, 1..8 fixed */
+static int s_max_scale = 8;
+static bool s_hires_dither;
+static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
+static u64 s_verify_frames, s_verify_bad_frames;
+static FILE *s_state_hash;         /* --state-hash FILE */
+typedef struct { u64 frame; int w, h; } ResizeStep;
+static ResizeStep s_resizes[256];
+static int s_resize_n;
+static SDL_Texture *s_hitex;
+static int s_hitex_w, s_hitex_h;
 
 static void wav_header(FILE *f, u32 bytes) {
     u32 hdr[11] = {0x46464952, 36 + bytes, 0x45564157, 0x20746d66, 16, 0x00020001, 44100,
@@ -103,7 +117,36 @@ static void write_png(const char *path, const u32 *rgba, int w, int h) {
     free(raw); free(z);
 }
 
+/* Convert a hi-res view to RGBA8888 (R in the low byte, as ABGR8888 on little endian). */
+static u32 s_lut15[32768];
+static void init_lut15(void) {
+    for (int p = 0; p < 32768; p++) {
+        u32 r = (p & 31) << 3, g = ((p >> 5) & 31) << 3, b = ((p >> 10) & 31) << 3;
+        s_lut15[p] = 0xff000000u | (b << 16) | (g << 8) | r;
+    }
+}
+static void convert_view(const HiresView *v, u32 *dst, size_t dst_pitch_px) {
+    if (!s_lut15[1]) init_lut15();
+    for (int y = 0; y < v->h; y++) {
+        const u16 *src = v->pixels + (size_t)y * v->stride;
+        u32 *d = dst + y * dst_pitch_px;
+        for (int x = 0; x < v->w; x++) d[x] = s_lut15[src[x] & 0x7fff];
+    }
+}
+
 void frontend_screenshot(const char *path) {
+    GpuDisplay d;
+    HiresView hv;
+    gpu_get_display(&d);
+    if (hires_get_view(&d, &hv)) {
+        u32 *buf = malloc((size_t)hv.w * hv.h * 4);
+        if (buf) {
+            convert_view(&hv, buf, (size_t)hv.w);
+            write_png(path, buf, hv.w, hv.h);
+            free(buf);
+            return;
+        }
+    }
     int w, h;
     convert_display(&w, &h);
     write_png(path, s_rgba, w, h);
@@ -191,9 +234,62 @@ static void poll_input(void) {
 
 /* ---- per-frame hook (called from the VBlank event) --------------------------------- */
 
+/* ---- determinism hash: everything the emulated machine (gameplay) can see ------------ */
+
+static u64 hash_mix(u64 h, const void *p, size_t n) {
+    const u64 *w = p;
+    for (size_t i = 0; i < n / 8; i++) { h = (h ^ w[i]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+    return h;
+}
+
+static void write_state_hash(void) {
+    u64 h = 0xcbf29ce484222325ull;
+    h = hash_mix(h, g_ram, RAM_SIZE);
+    h = hash_mix(h, g_scratch, sizeof g_scratch);
+    h = hash_mix(h, gpu_vram(), 1024 * 512 * 2);
+    size_t spu_n;
+    h = hash_mix(h, spu_ram_ptr(&spu_n), spu_n);
+    h = hash_mix(h, g_cpu.r, sizeof g_cpu.r);
+    u64 misc[4 + 32 + 2] = { g_cpu.hi, g_cpu.lo, g_cpu.pc, g_cpu.cycles, 0 };
+    for (int i = 0; i < 32; i++) misc[4 + i] = g_cpu.cop0[i];
+    misc[36] = g_cpu.next_event;
+    h = hash_mix(h, misc, sizeof misc);
+    fprintf(s_state_hash, "%llu %016llx\n", (unsigned long long)s_frame, (unsigned long long)h);
+}
+
+static void present_frame(void);
+
+/* Pick the render scale for a window of pw x ph physical pixels. */
+static void apply_window_size(int pw, int ph) {
+    if (s_scale_opt >= 0) return;
+    int s = hires_pick_scale(pw, ph, s_max_scale);
+    if (s != hires_scale()) {
+        rt_log("hires: window %dx%d -> render scale %d", pw, ph, s);
+        hires_set_scale(s);
+    }
+}
+
 void frontend_vblank(void) {
     s_frame++;
     static s16 audio[2048 * 2];
+    for (int i = 0; i < s_resize_n; i++)
+        if (s_resizes[i].frame == s_frame) {
+            int s = hires_pick_scale(s_resizes[i].w, s_resizes[i].h, s_max_scale);
+            rt_log("resize %dx%d -> render scale %d", s_resizes[i].w, s_resizes[i].h, s);
+            hires_set_scale(s);
+        }
+    if (s_verify && hires_scale() == 1) {
+        int fx = 0, fy = 0;
+        u32 bad = hires_verify_1x(&fx, &fy);
+        s_verify_frames++;
+        if (bad) {
+            if (!s_verify_bad_frames)
+                rt_log("hires-verify: MISMATCH at frame %llu: %u pixels differ, first at (%d,%d)",
+                       (unsigned long long)s_frame, bad, fx, fy);
+            s_verify_bad_frames++;
+        }
+    }
+    if (s_state_hash) write_state_hash();
     if (g_trace && s_frame % 60 == 0) {
         extern u32 g_mdec_in_dmas, g_cd_dma_words;
         static u32 lm, lc;
@@ -250,10 +346,14 @@ void frontend_vblank(void) {
                 frontend_screenshot(p);
             }
             if (s_wav) { wav_header(s_wav, s_wav_bytes); fclose(s_wav); }
+            if (s_state_hash) fclose(s_state_hash);
+            if (s_verify)
+                rt_log("hires-verify: %llu frames checked, %llu mismatching",
+                       (unsigned long long)s_verify_frames, (unsigned long long)s_verify_bad_frames);
             rt_log("headless: reached %llu frames", (unsigned long long)s_frame);
             void rt_dump_stack(void); rt_dump_stack();
             void rt_profile_dump(void); rt_profile_dump();
-            exit(0);
+            exit(s_verify && (s_verify_bad_frames || !s_verify_frames) ? 3 : 0);
         }
         return;
     }
@@ -261,13 +361,7 @@ void frontend_vblank(void) {
     u64 t_start = SDL_GetTicksNS();
     if (t_prev_end) t_emu += t_start - t_prev_end;
     poll_input();
-    int w, h;
-    convert_display(&w, &h);
-    SDL_UpdateTexture(s_tex, &(SDL_Rect){0, 0, w, h}, s_rgba, w * 4);
-    SDL_RenderClear(s_ren);
-    SDL_FRect src = {0, 0, (float)w, (float)h};
-    SDL_RenderTexture(s_ren, s_tex, &src, NULL);
-    SDL_RenderPresent(s_ren);
+    present_frame();
     u64 t_after_present = SDL_GetTicksNS();
     t_present += t_after_present - t_start;
 
@@ -296,6 +390,50 @@ void frontend_vblank(void) {
     t_sleep += t_prev_end - now;
 }
 
+/* ---- presentation ------------------------------------------------------------------- */
+
+/* 4:3 letterbox viewport inside a pw x ph window. */
+static SDL_FRect letterbox(int pw, int ph) {
+    float w, h;
+    if ((s64)pw * 3 > (s64)ph * 4) { h = (float)ph; w = h * 4.0f / 3.0f; }
+    else { w = (float)pw; h = w * 3.0f / 4.0f; }
+    return (SDL_FRect){ ((float)pw - w) / 2, ((float)ph - h) / 2, w, h };
+}
+
+static void present_frame(void) {
+    int pw = 0, ph = 0;
+    SDL_GetWindowSizeInPixels(s_win, &pw, &ph);
+    apply_window_size(pw, ph);
+    SDL_FRect dst = letterbox(pw, ph);
+    GpuDisplay d;
+    HiresView hv;
+    gpu_get_display(&d);
+    SDL_RenderClear(s_ren);
+    if (hires_get_view(&d, &hv)) {
+        /* true hi-res target: downsampled/filtered into the viewport, never an upsampled 1x image */
+        if (!s_hitex || s_hitex_w != hv.w || s_hitex_h != hv.h) {
+            if (s_hitex) SDL_DestroyTexture(s_hitex);
+            s_hitex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
+                                        hv.w, hv.h);
+            if (s_hitex) SDL_SetTextureScaleMode(s_hitex, SDL_SCALEMODE_LINEAR);
+            s_hitex_w = hv.w; s_hitex_h = hv.h;
+        }
+        void *px; int pitch;
+        if (s_hitex && SDL_LockTexture(s_hitex, NULL, &px, &pitch)) {
+            convert_view(&hv, px, (size_t)pitch / 4);
+            SDL_UnlockTexture(s_hitex);
+            SDL_RenderTexture(s_ren, s_hitex, NULL, &dst);
+        }
+    } else {
+        int w, h;
+        convert_display(&w, &h);
+        SDL_UpdateTexture(s_tex, &(SDL_Rect){0, 0, w, h}, s_rgba, w * 4);
+        SDL_FRect src = {0, 0, (float)w, (float)h};
+        SDL_RenderTexture(s_ren, s_tex, &src, &dst);
+    }
+    SDL_RenderPresent(s_ren);
+}
+
 /* ---- boot ---------------------------------------------------------------------------------- */
 
 static void usage(void) {
@@ -310,6 +448,13 @@ static void usage(void) {
         "  --dump-every N        screenshot every N frames\n"
         "  --press F:MASK,...    headless input script (MASK = hex PSX button bits, active high)\n"
         "  --wav FILE            record audio output (headless)\n"
+        "  --scale N             internal render scale: 0 = hi-res off, 1..8 fixed (default: auto from\n"
+        "                        the window size; headless: off)\n"
+        "  --max-scale N         cap for the automatic scale (default 8)\n"
+        "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
+        "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
+        "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
+        "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n");
 }
@@ -375,7 +520,8 @@ static void create_window(void) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         exit(1);
     }
-    s_win = SDL_CreateWindow("Destrega (recompiled)", 960, 720, SDL_WINDOW_RESIZABLE);
+    s_win = SDL_CreateWindow("Destrega (recompiled)", 960, 720,
+                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     s_ren = SDL_CreateRenderer(s_win, NULL);
     SDL_SetRenderLogicalPresentation(s_ren, 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 640, 512);
@@ -401,6 +547,25 @@ int main(int argc, char **argv) {
                 s_script[s_script_n].frame = strtoull(s, &s, 0);
                 if (*s == ':') s++;
                 s_script[s_script_n++].mask = (u16)strtoul(s, &s, 16);
+                if (*s == ',') s++;
+            }
+        }
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) s_scale_opt = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-scale") && i + 1 < argc) s_max_scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
+        else if (!strcmp(argv[i], "--hires-verify")) s_verify = true;
+        else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
+            s_state_hash = fopen(argv[++i], "w");
+            if (!s_state_hash) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
+        }
+        else if (!strcmp(argv[i], "--resize") && i + 1 < argc) {
+            char *s = argv[++i];
+            while (*s && s_resize_n < 256) {
+                s_resizes[s_resize_n].frame = strtoull(s, &s, 0);
+                if (*s == ':') s++;
+                s_resizes[s_resize_n].w = (int)strtol(s, &s, 10);
+                if (*s == 'x' || *s == 'X') s++;
+                s_resizes[s_resize_n++].h = (int)strtol(s, &s, 10);
                 if (*s == ',') s++;
             }
         }
@@ -445,6 +610,8 @@ int main(int argc, char **argv) {
     bus_init();
     gte_init();
     gpu_init();
+    hires_set_dither(s_hires_dither);
+    if (s_scale_opt > 0 && !hires_set_scale(s_scale_opt)) rt_log("hires: cannot allocate scale %d", s_scale_opt);
     spu_init();
     mdec_init();
 
@@ -459,6 +626,8 @@ int main(int argc, char **argv) {
     free(exe);
 
     if (!s_headless) {
+        /* the import UI used a fixed 640x480 logical canvas; from here on we letterbox ourselves */
+        SDL_SetRenderLogicalPresentation(s_ren, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
         SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, 44100};
         s_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
         if (s_audio) SDL_ResumeAudioStreamDevice(s_audio);
