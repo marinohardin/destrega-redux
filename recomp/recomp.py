@@ -63,6 +63,22 @@ def extra_seeds():
     return res
 
 
+def overrides():
+    """Main-exe functions replaced by hand-written C (analysis/overrides.txt).
+
+    The generated body is kept as `f_<addr>_orig` (for differential checks);
+    `f_<addr>` itself is then defined by the runtime (runtime/overrides/).
+    """
+    path = 'analysis/overrides.txt'
+    res = set()
+    if os.path.exists(path):
+        for line in open(path):
+            line = line.split('#')[0].split()
+            if line:
+                res.add(int(line[0], 16))
+    return res
+
+
 def prologue_seeds(img, lo, hi):
     """Heuristic entries: `addiu sp,sp,-N` right after a `jr ra` + delay slot."""
     out = []
@@ -172,6 +188,15 @@ def main():
 
     # ---- main executable --------------------------------------------------
     chunks = emit_funcs(main_funcs, set(main_funcs), lambda a: main_names[a], '')
+    for a in sorted(overrides()):
+        if a not in main_funcs:
+            raise SystemExit(f'analysis/overrides.txt: {a:08x} is not a recompiled main function')
+        head = f'void {main_names[a]}(void) {{'
+        idx = [k for k, c in enumerate(chunks) if c.startswith(head)]
+        if len(idx) != 1:
+            raise SystemExit(f'override {a:08x}: cannot locate generated body')
+        chunks[idx[0]] = f'void {main_names[a]}_orig(void) {{' + chunks[idx[0]][len(head):]
+        protos.append(f'void {main_names[a]}_orig(void);')
     for n in range(0, len(chunks), FUNCS_PER_FILE):
         write_file(f'{args.out}/main_{n // FUNCS_PER_FILE:02d}.c', chunks[n:n + FUNCS_PER_FILE])
     for e, f in sorted(main_funcs.items()):
