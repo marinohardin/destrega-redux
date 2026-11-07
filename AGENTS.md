@@ -26,6 +26,16 @@ cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake -j10
 tools/run_tests.sh                                         # verification (see below)
 ```
 
+On macOS the default build also runs `tools/make_app.sh` (target
+`destrega_app`) to produce `build/cmake/Destrega.app`: the binary plus every
+non-system dylib (Homebrew SDL3) relinked via `@rpath`, the icon from
+`assets/icon/destrega.png`, ad-hoc signed. Options: `DESTREGA_MACOS_APP`,
+`DESTREGA_APP_SIGN`, `DESTREGA_APP_VERSION`, `DESTREGA_APP_ICON`. The icon is
+original procedural art from `tools/make_icon.py` (deterministic; needs
+Pillow, NumPy and macOS's Herculanum font). Never put game-derived art in the
+repo. Launching the bundle's binary from a non-GUI shell can stall in macOS's
+first-launch check; test it from Finder/`open`, or use the plain binary.
+
 The main-exe REA export is `analysis/rea_list_procedures_main.json` (MCP
 `list_procedures`); a reusable REA snapshot is `analysis/SLUS_007.32.rea-snapshot`
 (`open_binary` with `snapshot_path`). REA's Ghidra MIPS lane only admits

@@ -38,3 +38,30 @@ add_executable(destrega
 target_include_directories(destrega PRIVATE runtime gen)
 target_compile_options(destrega PRIVATE -Wall -Wno-unused-function -fno-strict-aliasing)
 target_link_libraries(destrega PRIVATE gen SDL3::SDL3 ZLIB::ZLIB m)
+
+# macOS: also wrap the binary in a self-contained Destrega.app (bundled SDL3,
+# app icon, ad-hoc signature). The plain `destrega` binary is left in place for
+# the CLI/headless flags and tools/run_tests.sh.
+if(APPLE)
+  option(DESTREGA_MACOS_APP "Build Destrega.app next to the destrega binary" ON)
+  set(DESTREGA_APP_VERSION "1.0" CACHE STRING "CFBundle version of Destrega.app")
+  set(DESTREGA_APP_ICON ${CMAKE_SOURCE_DIR}/assets/icon/destrega.png CACHE FILEPATH
+      "App icon (PNG >= 512px or .icns)")
+  set(DESTREGA_APP_SIGN "-" CACHE STRING "codesign identity for Destrega.app (- = ad-hoc)")
+  if(DESTREGA_MACOS_APP)
+    set(APP_STAMP ${CMAKE_BINARY_DIR}/Destrega.app.stamp)
+    add_custom_command(
+      OUTPUT ${APP_STAMP}
+      COMMAND ${CMAKE_SOURCE_DIR}/tools/make_app.sh
+              --bin $<TARGET_FILE:destrega>
+              --out ${CMAKE_BINARY_DIR}/Destrega.app
+              --icon ${DESTREGA_APP_ICON}
+              --version ${DESTREGA_APP_VERSION}
+              --sign ${DESTREGA_APP_SIGN}
+      COMMAND ${CMAKE_COMMAND} -E touch ${APP_STAMP}
+      DEPENDS destrega ${CMAKE_SOURCE_DIR}/tools/make_app.sh ${DESTREGA_APP_ICON}
+      COMMENT "Bundling Destrega.app"
+      VERBATIM)
+    add_custom_target(destrega_app ALL DEPENDS ${APP_STAMP})
+  endif()
+endif()
