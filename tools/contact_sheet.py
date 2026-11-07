@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tile PNG screenshots (from --dump) into one contact sheet: contact_sheet.py OUT.png IN..."""
+"""Tile PNG screenshots (from --dump) into one contact sheet:
+   contact_sheet.py [--cell WxH] [--cols N] OUT.png IN...   (default cell 320x240, 4 columns)"""
 import struct, sys, zlib
 
 def read_png(path):
@@ -20,8 +21,13 @@ def write_png(path, w, h, rows):
     open(path, 'wb').write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
                            + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
 
-out, files = sys.argv[1], sys.argv[2:]
+args = sys.argv[1:]
 cols, cw, ch = 4, 320, 240
+while args and args[0].startswith('--'):
+    if args[0] == '--cell': cw, ch = map(int, args[1].lower().split('x'))
+    elif args[0] == '--cols': cols = int(args[1])
+    args = args[2:]
+out, files = args[0], args[1:]
 rows_n = (len(files) + cols - 1) // cols
 canvas = [bytearray(cols * cw * 4) for _ in range(rows_n * ch)]
 for k, f in enumerate(files):
