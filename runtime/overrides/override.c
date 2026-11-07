@@ -91,11 +91,12 @@ void override_call(const char *name, RecompFn orig, RecompFn fresh) {
     s_stats[slot].calls++;
     s_stats[slot].nonzero += after_orig.r[2] != 0;
     bool regs_ok = g_cpu.r[2] == after_orig.r[2] && callee_saved_equal(&g_cpu, &after_orig);
+    bool timing_ok = g_cpu.cycles == after_orig.cycles;
     bool mem_ok = mem_equal_live(&s_orig, entry_sp);
-    if (!regs_ok || !mem_ok) {
+    if (!regs_ok || !mem_ok || !timing_ok) {
         if (s_stats[slot].bad++ < 10)
             rt_log("override %s MISMATCH (%s %08x): args %08x %08x %08x %08x  result orig=%08x new=%08x sp=%08x",
-                   name, !regs_ok ? "registers" : "memory", s_first_diff, saved.r[4], saved.r[5],
+                   name, !regs_ok ? "registers" : !mem_ok ? "memory" : "cycles", s_first_diff, saved.r[4], saved.r[5],
                    saved.r[6], saved.r[7], after_orig.r[2], g_cpu.r[2], entry_sp);
         /* Keep the original's behaviour so a bad override cannot change the game. */
         g_cpu = after_orig;

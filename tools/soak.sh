@@ -10,6 +10,6 @@ verify=--verify-overrides
 [ "${VERIFY:-1}" = 0 ] && verify=
 mkdir -p build/soak
 python3 -I tools/mash_inputs.py "$seed" "$frames" > build/soak/press$seed.txt
-./build/cmake/destrega --headless --no-interp $verify --frames "$frames" \
+"${BIN:-./build/cmake/destrega}" --headless --no-interp $verify --frames "$frames" \
   --press "$(cat build/soak/press$seed.txt)" > build/soak/log$seed.txt 2>&1
 echo "seed $seed exit $?: $(grep -E '^override|^FATAL' build/soak/log$seed.txt | tr '\n' ' ')"
