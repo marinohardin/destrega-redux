@@ -37,6 +37,17 @@ static u64 s_hr_used[2], s_hr_fallback[2]; /* [0] all frames, [1] frames >= s_fi
 static u64 s_verify_fight;
 static double s_f_emu, s_f_present;        /* windowed: host time over fight frames */
 static u64 s_f_n;
+static int s_hires_threads = -1;           /* --hires-threads N: -1 = auto */
+/* per-segment host timing (--segments F,F,...: segment k = frames [bound[k-1], bound[k])) */
+static u64 s_seg_bound[16] = { 1200, 1800, 2400, 3000 };
+static int s_seg_n = 4;
+static struct { u64 frames, wall_ns, emu_ns, present_ns; } s_seg[17];
+static u64 s_last_vb_ns;
+static int seg_of(u64 frame) {
+    int k = 0;
+    while (k < s_seg_n && frame >= s_seg_bound[k]) k++;
+    return k;
+}
 static bool s_hires_dither;
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
@@ -125,15 +136,22 @@ static void write_png(const char *path, const u32 *rgba, int w, int h) {
 }
 
 /* Convert a hi-res view to RGBA8888 (R in the low byte, as ABGR8888 on little endian). */
-static void convert_view(const HiresView *v, u32 *dst, size_t dst_pitch_px) {
-    for (int y = 0; y < v->h; y++) {
-        const u16 *src = v->pixels + (size_t)y * v->stride;
-        u32 *d = dst + y * dst_pitch_px;
-        for (int x = 0; x < v->w; x++) {   /* plain arithmetic: auto-vectorizes, unlike a LUT gather */
+typedef struct { const HiresView *v; u32 *dst; size_t pitch; } ConvJob;
+static void convert_rows(void *c, int y0, int y1) {
+    const ConvJob *j = c;
+    if (y1 > j->v->h) y1 = j->v->h;
+    for (int y = y0; y < y1; y++) {
+        const u16 *src = j->v->pixels + (size_t)y * j->v->stride;
+        u32 *d = j->dst + y * j->pitch;
+        for (int x = 0; x < j->v->w; x++) {   /* plain arithmetic: auto-vectorizes */
             u32 p = src[x];
             d[x] = 0xff000000u | ((p & 0x7c00) << 9) | ((p & 0x03e0) << 6) | ((p & 0x001f) << 3);
         }
     }
+}
+static void convert_view(const HiresView *v, u32 *dst, size_t dst_pitch_px) {
+    ConvJob j = { v, dst, dst_pitch_px };
+    hires_parallel_rows(convert_rows, &j, v->h);
 }
 
 void frontend_screenshot(const char *path) {
@@ -278,7 +296,9 @@ static void apply_window_size(int pw, int ph, bool simulated) {
     }
 }
 
+extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g_hires_stat_inline_jobs;
 static void finish(void) {
+    if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
     if (s_state_hash) fclose(s_state_hash);
     int rc = 0;
     int sx, sy;
@@ -301,6 +321,30 @@ static void finish(void) {
                (unsigned long long)s_verify_bad_frames);
         if (s_verify_bad_frames || !s_verify_fight) rc = 3;
     }
+    {
+        HiresUvStats uv;
+        hires_get_uv_stats(&uv);
+        if (uv.samples || hires_get_scale(&sx, &sy))
+            rt_log("hires-uv: %llu textured samples, %llu clamped to the vertex UV range, %llu out of range when fetched",
+                   (unsigned long long)uv.samples, (unsigned long long)uv.clamped,
+                   (unsigned long long)uv.escaped);
+        if (uv.escaped) rc = 5;
+    }
+    for (int k = 0; k <= s_seg_n; k++) {
+        if (!s_seg[k].frames) continue;
+        u64 lo = k ? s_seg_bound[k - 1] : 0;
+        char hi[32];
+        if (k < s_seg_n) snprintf(hi, sizeof hi, "%llu", (unsigned long long)s_seg_bound[k]);
+        else snprintf(hi, sizeof hi, "end");
+        double n = (double)s_seg[k].frames;
+        if (s_headless)
+            rt_log("segment %llu-%s: %llu frames, %.2f ms/frame (emulation + hi-res)",
+                   (unsigned long long)lo, hi, (unsigned long long)s_seg[k].frames, s_seg[k].wall_ns / n / 1e6);
+        else
+            rt_log("segment %llu-%s: %llu frames, emu %.2f ms + present %.2f ms = %.2f ms/frame (budget 16.7)",
+                   (unsigned long long)lo, hi, (unsigned long long)s_seg[k].frames, s_seg[k].emu_ns / n / 1e6,
+                   s_seg[k].present_ns / n / 1e6, (s_seg[k].emu_ns + s_seg[k].present_ns) / n / 1e6);
+    }
     if (s_f_n)
         rt_log("windowed fight frames (>= %llu): %llu frames, emu %.2f ms, present+convert %.2f ms per frame",
                (unsigned long long)s_fight_from, (unsigned long long)s_f_n,
@@ -310,6 +354,15 @@ static void finish(void) {
 
 void frontend_vblank(void) {
     s_frame++;
+    if (s_headless) {
+        u64 now = SDL_GetTicksNS();
+        if (s_last_vb_ns) {
+            int k = seg_of(s_frame);
+            s_seg[k].frames++;
+            s_seg[k].wall_ns += now - s_last_vb_ns;
+        }
+        s_last_vb_ns = now;
+    }
     static s16 audio[2048 * 2];
     for (int i = 0; i < s_resize_n; i++)
         if (s_resizes[i].frame == s_frame) {
@@ -414,6 +467,12 @@ void frontend_vblank(void) {
     present_frame();
     u64 t_after_present = SDL_GetTicksNS();
     t_present += t_after_present - t_start;
+    if (t_prev_end) {
+        int k = seg_of(s_frame);
+        s_seg[k].frames++;
+        s_seg[k].emu_ns += t_start - t_prev_end;
+        s_seg[k].present_ns += t_after_present - t_start;
+    }
     if (s_frame >= s_fight_from && t_prev_end) {
         s_f_emu += (double)(t_start - t_prev_end);
         s_f_present += (double)(t_after_present - t_start);
@@ -477,12 +536,23 @@ static void present_frame(void) {
             if (s_hitex) SDL_SetTextureScaleMode(s_hitex, SDL_SCALEMODE_LINEAR);
             s_hitex_w = hv.w; s_hitex_h = hv.h;
         }
-        void *px; int pitch;
-        if (s_hitex && SDL_LockTexture(s_hitex, NULL, &px, &pitch)) {
-            convert_view(&hv, px, (size_t)pitch / 4);
-            SDL_UnlockTexture(s_hitex);
-            SDL_RenderTexture(s_ren, s_hitex, NULL, &dst);
+        /* Upload only if the displayed rows were drawn since the last upload (fights draw at
+         * 30 fps but present at 60), or the view/target changed. */
+        static const u16 *up_pixels; static int up_stride, up_w, up_h; static u64 up_epoch; static bool up_ok;
+        bool same = up_ok && up_pixels == hv.pixels && up_stride == hv.stride && up_w == hv.w &&
+                    up_h == hv.h && up_epoch == hires_epoch();
+        if (!same || hires_dirty_rows(d.y, d.y + d.h - 1)) {
+            void *px; int pitch;
+            up_ok = false;
+            if (s_hitex && SDL_LockTexture(s_hitex, NULL, &px, &pitch)) {
+                convert_view(&hv, px, (size_t)pitch / 4);
+                SDL_UnlockTexture(s_hitex);
+                up_pixels = hv.pixels; up_stride = hv.stride; up_w = hv.w; up_h = hv.h;
+                up_epoch = hires_epoch(); up_ok = true;
+                hires_clear_dirty();
+            }
         }
+        if (s_hitex) SDL_RenderTexture(s_ren, s_hitex, NULL, &dst);
     } else {
         int w, h;
         convert_display(&w, &h);
@@ -511,6 +581,8 @@ static void usage(void) {
         "                        fixed (default: auto from the window size; headless: off)\n"
         "  --max-scale N|NxM     per-axis cap for the automatic scale (default 4x6)\n"
         "  --window WxH          initial window size in points (default 960x720)\n"
+        "  --hires-threads N     hi-res rasterizer worker threads: -1 auto (performance cores - 1), 0 serial\n"
+        "  --segments F,F,...    frame boundaries for the per-segment timing report (default 1200,1800,2400,3000)\n"
         "  --fight-from F        first frame counted as 'fight' in the hi-res frame stats (default 3700)\n"
         "  --hires-min-fight P   exit non-zero unless P%% of fight frames were shown from the hi-res target\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
@@ -624,6 +696,13 @@ int main(int argc, char **argv) {
             char *e; s_win_w = (int)strtol(argv[++i], &e, 10);
             if (*e == 'x' || *e == 'X') s_win_h = (int)strtol(e + 1, NULL, 10);
         }
+        else if (!strcmp(argv[i], "--hires-threads") && i + 1 < argc) s_hires_threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--hires-par-min") && i + 1 < argc) hires_set_parallel_threshold(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "--segments") && i + 1 < argc) {
+            char *e = argv[++i];
+            s_seg_n = 0;
+            while (*e && s_seg_n < 16) { s_seg_bound[s_seg_n++] = strtoull(e, &e, 0); if (*e == ',') e++; }
+        }
         else if (!strcmp(argv[i], "--fight-from") && i + 1 < argc) s_fight_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--hires-min-fight") && i + 1 < argc) s_hires_min_fight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
@@ -685,6 +764,7 @@ int main(int argc, char **argv) {
     gte_init();
     gpu_init();
     hires_set_dither(s_hires_dither);
+    hires_set_threads(s_hires_threads);
     if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))
         rt_log("hires: cannot allocate scale %dx%d", s_opt_sx, s_opt_sy);
     spu_init();

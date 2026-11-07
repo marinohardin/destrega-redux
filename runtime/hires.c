@@ -12,11 +12,25 @@
  *  - Textures and CLUTs are fetched from the 1x VRAM (they are 1x assets).
  *  - Dither is off at S > 1 unless enabled (it then uses the 1x pixel position).
  *  - Lines are S pixels thick.
+ *  - u/v are clamped to each triangle's vertex UV range before the texture-window mask:
+ *    sampling a hi-res pixel centre may fall outside the polygon, and would otherwise read
+ *    a neighbouring texture (stage tile seams). Skipped at 1x1 (bit-identical there).
+ *  - Large primitives are rasterized in row chunks on a worker pool (fork-join per
+ *    primitive, so command order is preserved); only this path is threaded.
  */
 #include "hires.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
+#ifndef _WIN32
+#include <pthread.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#include <sys/sysctl.h>
+#endif
+#endif
 
 #define VRAM_W 1024
 #define VRAM_H 512
@@ -116,6 +130,33 @@ static inline u16 blend_px(int mode, u16 b, u16 f)
     return (u16)(r | (g << 5) | (bl << 10) | (f & 0x8000));
 }
 
+/* Colour of a textured pixel from an already fetched texel t. False for a transparent texel. */
+static inline __attribute__((always_inline)) bool
+shade_tex(const HiresPrim *p, u16 t, int x1, int y1, u32 r, u32 g, u32 b,
+          const int RAW, const int SEMI, const int DITHER, u16 *out, bool *blend)
+{
+    if (t == 0) return false;
+    if (RAW) {
+        *out = t;
+    } else {
+        int tr = t & 0x1F, tg = (t >> 5) & 0x1F, tb = (t >> 10) & 0x1F;
+        if (DITHER) {
+            int d = s_dither[y1 & 3][x1 & 3];
+            tr = clamp255((int)((tr * r) >> 4) + d) >> 3;
+            tg = clamp255((int)((tg * g) >> 4) + d) >> 3;
+            tb = clamp255((int)((tb * b) >> 4) + d) >> 3;
+        } else {
+            tr = (int)((tr * r) >> 7); if (tr > 31) tr = 31;
+            tg = (int)((tg * g) >> 7); if (tg > 31) tg = 31;
+            tb = (int)((tb * b) >> 7); if (tb > 31) tb = 31;
+        }
+        *out = (u16)(tr | (tg << 5) | (tb << 10) | (t & 0x8000));
+    }
+    *blend = SEMI && (t & 0x8000);
+    (void)p;
+    return true;
+}
+
 /* Compute the colour of one pixel. Returns false for a transparent texel.
  * (x1, y1) is the 1x pixel the sample belongs to (dither pattern position). */
 static inline __attribute__((always_inline)) bool
@@ -123,39 +164,18 @@ shade(const HiresPrim *p, int x1, int y1, u32 r, u32 g, u32 b, u32 u, u32 v,
       const int TEX, const int DEPTH, const int RAW, const int SEMI, const int DITHER,
       u16 *out, bool *blend)
 {
-    if (TEX) {
-        u16 t = tex_fetch(p, DEPTH, u, v);
-        if (t == 0) return false;
-        if (RAW) {
-            *out = t;
-        } else {
-            int tr = t & 0x1F, tg = (t >> 5) & 0x1F, tb = (t >> 10) & 0x1F;
-            if (DITHER) {
-                int d = s_dither[y1 & 3][x1 & 3];
-                tr = clamp255((int)((tr * r) >> 4) + d) >> 3;
-                tg = clamp255((int)((tg * g) >> 4) + d) >> 3;
-                tb = clamp255((int)((tb * b) >> 4) + d) >> 3;
-            } else {
-                tr = (int)((tr * r) >> 7); if (tr > 31) tr = 31;
-                tg = (int)((tg * g) >> 7); if (tg > 31) tg = 31;
-                tb = (int)((tb * b) >> 7); if (tb > 31) tb = 31;
-            }
-            *out = (u16)(tr | (tg << 5) | (tb << 10) | (t & 0x8000));
-        }
-        *blend = SEMI && (t & 0x8000);
+    if (TEX) return shade_tex(p, tex_fetch(p, DEPTH, u, v), x1, y1, r, g, b, RAW, SEMI, DITHER, out, blend);
+    int cr, cg, cb;
+    if (DITHER) {
+        int d = s_dither[y1 & 3][x1 & 3];
+        cr = clamp255((int)r + d) >> 3;
+        cg = clamp255((int)g + d) >> 3;
+        cb = clamp255((int)b + d) >> 3;
     } else {
-        int cr, cg, cb;
-        if (DITHER) {
-            int d = s_dither[y1 & 3][x1 & 3];
-            cr = clamp255((int)r + d) >> 3;
-            cg = clamp255((int)g + d) >> 3;
-            cb = clamp255((int)b + d) >> 3;
-        } else {
-            cr = (int)r >> 3; cg = (int)g >> 3; cb = (int)b >> 3;
-        }
-        *out = (u16)(cr | (cg << 5) | (cb << 10));
-        *blend = SEMI;
+        cr = (int)r >> 3; cg = (int)g >> 3; cb = (int)b >> 3;
     }
+    *out = (u16)(cr | (cg << 5) | (cb << 10));
+    *blend = SEMI;
     return true;
 }
 
@@ -164,6 +184,205 @@ static inline void store_px(const HiresPrim *p, u16 *dst, u16 out, bool blend)
     if (p->mask_check && (*dst & 0x8000)) return;
     if (blend) out = blend_px(p->blend, *dst, out);
     *dst = out | p->mask_or;
+}
+
+/* ---- worker pool, counters, dirty tracking ----------------------------------------- */
+
+typedef void (*BandFn)(const void *ctx, int y0, int y1);   /* rows [y0, y1) in target coordinates */
+
+static atomic_ullong s_uv_samples, s_uv_clamped, s_uv_escaped;
+static _Thread_local u64 tl_samples, tl_clamped, tl_escaped;
+
+static void flush_counters(void)
+{
+    if (tl_samples) { atomic_fetch_add_explicit(&s_uv_samples, tl_samples, memory_order_relaxed); tl_samples = 0; }
+    if (tl_clamped) { atomic_fetch_add_explicit(&s_uv_clamped, tl_clamped, memory_order_relaxed); tl_clamped = 0; }
+    if (tl_escaped) { atomic_fetch_add_explicit(&s_uv_escaped, tl_escaped, memory_order_relaxed); tl_escaped = 0; }
+}
+
+void hires_get_uv_stats(HiresUvStats *st)
+{
+    st->samples = atomic_load(&s_uv_samples);
+    st->clamped = atomic_load(&s_uv_clamped);
+    st->escaped = atomic_load(&s_uv_escaped);
+}
+
+u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g_hires_stat_inline_jobs;
+static int s_par_threshold = 4000;   /* hi-res pixels (bbox) below which a primitive runs inline */
+void hires_set_parallel_threshold(int px) { s_par_threshold = px; }
+
+static u64 s_epoch;                   /* bumped when the target is (re)allocated */
+static int s_dirty_y0 = 1 << 30, s_dirty_y1 = -1;   /* 1x rows drawn since the last clear */
+static inline void mark_dirty(int y0, int y1)
+{
+    if (y0 < s_dirty_y0) s_dirty_y0 = y0;
+    if (y1 > s_dirty_y1) s_dirty_y1 = y1;
+}
+static inline void mark_rows_wrapped(int y, int h)
+{
+    int a = y & 511, b = (y + h - 1) & 511;
+    if (b < a || h > 511) { a = 0; b = 511; }
+    mark_dirty(a, b);
+}
+u64 hires_epoch(void) { return s_epoch; }
+bool hires_dirty_rows(int y0, int y1) { return s_dirty_y1 >= y0 && s_dirty_y0 < y1; }
+void hires_clear_dirty(void) { s_dirty_y0 = 1 << 30; s_dirty_y1 = -1; }
+
+#ifndef _WIN32
+#define HIRES_MAX_THREADS 15
+#define RING 64
+#define SPIN_ITERS 40000
+
+typedef struct {
+    BandFn fn;
+    const void *ctx;
+    int ylo, chunk_rows, nchunks;
+    _Atomic u64 ctr;                  /* (job tag << 32) | next chunk index */
+    atomic_int done;
+} PoolJob;
+
+static struct {
+    pthread_t th[HIRES_MAX_THREADS];
+    int nth;
+    PoolJob ring[RING];
+    atomic_uint gen;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    atomic_bool quit;
+} P = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+static inline void cpu_relax(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("yield");
+#elif defined(__x86_64__)
+    __asm__ volatile("pause");
+#endif
+}
+
+/* Claim and run chunks of job `g`. Safe against stale workers: a chunk can only be claimed
+ * while the slot still holds job g (tag in the counter), and a claimed chunk keeps the
+ * dispatcher from reusing the slot until it is done. */
+static void run_chunks(unsigned g)
+{
+    PoolJob *j = &P.ring[g % RING];
+    for (;;) {
+        u64 c = atomic_load_explicit(&j->ctr, memory_order_acquire);
+        for (;;) {
+            if ((unsigned)(c >> 32) != g || (unsigned)c >= (unsigned)j->nchunks) return;
+            if (atomic_compare_exchange_weak_explicit(&j->ctr, &c, c + 1, memory_order_acq_rel,
+                                                      memory_order_acquire))
+                break;
+        }
+        int idx = (int)(unsigned)c;
+        int y0 = j->ylo + idx * j->chunk_rows;
+        int y1 = y0 + j->chunk_rows;
+        int yend = j->ylo + j->chunk_rows * j->nchunks;   /* callers pass exact ranges; clamp below */
+        (void)yend;
+        j->fn(j->ctx, y0, y1);
+        flush_counters();
+        atomic_fetch_add_explicit(&j->done, 1, memory_order_release);
+    }
+}
+
+static void *worker_main(void *arg)
+{
+    (void)arg;
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    unsigned seen = atomic_load(&P.gen);
+    for (;;) {
+        unsigned g;
+        long spins = 0;
+        while ((g = atomic_load_explicit(&P.gen, memory_order_acquire)) == seen) {
+            if (atomic_load_explicit(&P.quit, memory_order_relaxed)) return NULL;
+            if (++spins < SPIN_ITERS) { cpu_relax(); continue; }
+            pthread_mutex_lock(&P.mu);
+            while (atomic_load(&P.gen) == seen && !atomic_load(&P.quit)) pthread_cond_wait(&P.cv, &P.mu);
+            pthread_mutex_unlock(&P.mu);
+            spins = 0;
+        }
+        /* process every job published since we last looked (the latest is normally the only
+         * one with chunks left) */
+        for (unsigned k = seen + 1; k != g + 1; k++) run_chunks(k);
+        seen = g;
+    }
+}
+
+static void stop_workers(void)
+{
+    if (!P.nth) return;
+    pthread_mutex_lock(&P.mu);
+    atomic_store(&P.quit, true);
+    pthread_cond_broadcast(&P.cv);
+    pthread_mutex_unlock(&P.mu);
+    for (int i = 0; i < P.nth; i++) pthread_join(P.th[i], NULL);
+    P.nth = 0;
+    atomic_store(&P.quit, false);
+}
+
+void hires_set_threads(int n)
+{
+    if (n < 0) {   /* auto: performance cores - 1 */
+        long cores = 0;
+#ifdef __APPLE__
+        int v = 0; size_t sz = sizeof v;
+        if (sysctlbyname("hw.perflevel0.logicalcpu", &v, &sz, NULL, 0) == 0) cores = v;
+#endif
+        if (cores <= 0) cores = sysconf(_SC_NPROCESSORS_ONLN);
+        n = (int)cores - 1;
+    }
+    if (n > HIRES_MAX_THREADS) n = HIRES_MAX_THREADS;
+    if (n < 0) n = 0;
+    if (n == P.nth) return;
+    stop_workers();
+    for (int i = 0; i < n; i++)
+        if (pthread_create(&P.th[i], NULL, worker_main, NULL) != 0) break;
+        else P.nth++;
+}
+
+int hires_threads(void) { return P.nth; }
+
+static void par_rows(BandFn fn, const void *ctx, int ylo, int yhi)
+{
+    int rows = yhi - ylo;
+    if (rows <= 0) return;
+    if (P.nth == 0 || rows < 8) { fn(ctx, ylo, yhi); flush_counters(); return; }
+    int parts = (P.nth + 1) * 4;
+    int chunk_rows = (rows + parts - 1) / parts;
+    if (chunk_rows < 4) chunk_rows = 4;
+    int nchunks = (rows + chunk_rows - 1) / chunk_rows;
+    unsigned g = atomic_load_explicit(&P.gen, memory_order_relaxed) + 1;
+    PoolJob *j = &P.ring[g % RING];
+    j->fn = fn; j->ctx = ctx; j->ylo = ylo; j->chunk_rows = chunk_rows; j->nchunks = nchunks;
+    /* the last chunk may extend past yhi: BandFn implementations clip to their own bounds */
+    atomic_store_explicit(&j->done, 0, memory_order_relaxed);
+    atomic_store_explicit(&j->ctr, (u64)g << 32, memory_order_release);
+    pthread_mutex_lock(&P.mu);
+    atomic_store_explicit(&P.gen, g, memory_order_release);
+    pthread_cond_broadcast(&P.cv);
+    pthread_mutex_unlock(&P.mu);
+    run_chunks(g);
+    while (atomic_load_explicit(&j->done, memory_order_acquire) != nchunks) cpu_relax();
+}
+#else
+void hires_set_threads(int n) { (void)n; }
+int hires_threads(void) { return 0; }
+static void par_rows(BandFn fn, const void *ctx, int ylo, int yhi) { fn(ctx, ylo, yhi); flush_counters(); }
+#endif
+
+typedef struct { void (*fn)(void *, int, int); void *ctx; } UserJob;
+static void user_band(const void *c, int y0, int y1)
+{
+    const UserJob *u = c;
+    u->fn(u->ctx, y0, y1);
+}
+/* Public: run fn(ctx, y0, y1) over [0, rows) on the pool (fn must clip y1 to rows). */
+void hires_parallel_rows(void (*fn)(void *ctx, int y0, int y1), void *ctx, int rows)
+{
+    UserJob u = { fn, ctx };
+    par_rows(user_band, &u, 0, rows);
 }
 
 /* ---- triangles ------------------------------------------------------------- */
@@ -176,11 +395,15 @@ typedef struct {
     const HiresVtx *v;
 } HV;
 
+typedef struct { HiresPrim p; HiresVtx v[3]; } TriArgs;
+
 static inline __attribute__((always_inline)) void
-tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const HiresVtx *v2,
+tri_impl(const TriArgs *ta, int by0, int by1,
          const int TEX, const int DEPTH, const int RAW, const int SEMI,
          const int GOUR, const int DITHER)
 {
+    const HiresPrim *p = &ta->p;
+    const HiresVtx *v0 = &ta->v[0], *v1 = &ta->v[1], *v2 = &ta->v[2];
     const int Sx = s_Sx, Sy = s_Sy;
     HV h0 = { v0->x, v0->y, (s64)v0->x * Sx, (s64)v0->y * Sy, v0 };
     HV h1 = { v1->x, v1->y, (s64)v1->x * Sx, (s64)v1->y * Sy, v1 };
@@ -217,6 +440,19 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
         gdy[i] = (double)(s32)dy;
         gstep_x[i] = (u32)((s32)dx / Sx);
     }
+    const s64 ustep = (s64)(s32)gstep_x[3], vstep = (s64)(s32)gstep_x[4];
+    /* vertex UV range: samples are clamped to it (see the file comment) */
+    int umin = 0, umax = 255, vmin = 0, vmax = 255;
+    if (TEX) {
+        umin = (int)av[3]; umax = umin; vmin = (int)av[4]; vmax = vmin;
+        const u32 *o[2] = { bv, cv };
+        for (int k = 0; k < 2; k++) {
+            if ((int)o[k][3] < umin) umin = (int)o[k][3];
+            if ((int)o[k][3] > umax) umax = (int)o[k][3];
+            if ((int)o[k][4] < vmin) vmin = (int)o[k][4];
+            if ((int)o[k][4] > vmax) vmax = (int)o[k][4];
+        }
+    }
     const double ax = (double)a->X1 / 65536.0, ay = (double)a->Y1 / 65536.0;
 
     const bool long_left = denom > 0;
@@ -224,8 +460,14 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
 
     const int cx1 = imax(p->clip_x1 * Sx, s_ox);
     const int cx2 = imin((p->clip_x2 + 1) * Sx, s_ox + s_tw) - 1;
-    const int cy1 = imax(p->clip_y1 * Sy, s_oy);
-    const int cy2 = imin((p->clip_y2 + 1) * Sy, s_oy + s_th) - 1;
+    const int cy1 = imax(imax(p->clip_y1 * Sy, s_oy), by0);
+    const int cy2 = imin(imin((p->clip_y2 + 1) * Sy, s_oy + s_th) - 1, by1 - 1);
+    /* at 1x1 the sample positions equal the 1x GPU's (which wraps rather than clamps), so the
+     * clamp is skipped to stay bit-identical; it only matters for sub-pixel sample offsets */
+    const bool do_clamp = Sx > 1 || Sy > 1;
+    const bool mc = p->mask_check;
+    const u16 mo = p->mask_or;
+    const int blendm = p->blend;
 
     for (int part = 0; part < 2; part++) {
         const HV *sa = part ? b : a, *sb = part ? c : b;
@@ -246,26 +488,50 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
             if (xs < xe) {
                 /* attribute values at the first pixel of the span */
                 const double P = ((double)xs + 0.5) / Sx - 0.5, Q = ((double)y + 0.5) / Sy - 0.5;
-                u32 val[5];
-                for (int i = 0; i < 5; i++) {
-                    if ((i < 3 && !GOUR) || (i >= 3 && !TEX)) { val[i] = base[i]; continue; }
-                    double d = (double)base[i] + gdx[i] * (P - ax) + gdy[i] * (Q - ay);
-                    val[i] = (u32)(s64)floor(d);
+                u32 r = base[0], g = base[1], bb = base[2];
+                s64 U = 0, V = 0;
+                if (GOUR) {
+                    r = (u32)(s64)floor((double)base[0] + gdx[0] * (P - ax) + gdy[0] * (Q - ay));
+                    g = (u32)(s64)floor((double)base[1] + gdx[1] * (P - ax) + gdy[1] * (Q - ay));
+                    bb = (u32)(s64)floor((double)base[2] + gdx[2] * (P - ax) + gdy[2] * (Q - ay));
                 }
-                u32 r = val[0], g = val[1], bb = val[2], u = val[3], v = val[4];
+                if (TEX) {   /* true (unwrapped) fixed-point values, so the clamp sees real excursions */
+                    U = (s64)floor((double)base[3] + gdx[3] * (P - ax) + gdy[3] * (Q - ay));
+                    V = (s64)floor((double)base[4] + gdx[4] * (P - ax) + gdy[4] * (Q - ay));
+                }
                 u16 *dst = s_t + (size_t)(y - s_oy) * s_tw + (xs - s_ox);
                 const int y1 = y / Sy;
+                int lu = -1, lv = -1;
+                u16 lt = 0;
+                u32 n_clamped = 0, n_escaped = 0;
                 for (int x = xs; x < xe; x++, dst++) {
-                    u16 out; bool blend;
-                    if (!(p->mask_check && (*dst & 0x8000)) &&
-                        shade(p, x / Sx, y1, r >> FRAC, g >> FRAC, bb >> FRAC, u >> FRAC, v >> FRAC,
-                              TEX, DEPTH, RAW, SEMI, DITHER, &out, &blend)) {
-                        if (blend) out = blend_px(p->blend, *dst, out);
-                        *dst = out | p->mask_or;
+                    u16 out; bool blend, ok;
+                    if (!(mc && (*dst & 0x8000))) {
+                        if (TEX) {
+                            int ui = (int)(U >> FRAC), vi = (int)(V >> FRAC);
+                            if (do_clamp) {
+                                n_clamped += (ui < umin) | (ui > umax) | (vi < vmin) | (vi > vmax);
+                                ui = ui < umin ? umin : (ui > umax ? umax : ui);
+                                vi = vi < vmin ? vmin : (vi > vmax ? vmax : vi);
+                                __asm__ volatile("" : "+r"(ui), "+r"(vi));   /* check what is really fetched */
+                                n_escaped += (ui < umin) | (ui > umax) | (vi < vmin) | (vi > vmax);
+                            }
+                            if (ui != lu || vi != lv) { lu = ui; lv = vi; lt = tex_fetch(p, DEPTH, (u32)ui, (u32)vi); }
+                            ok = shade_tex(p, lt, DITHER ? x / Sx : 0, y1, r >> FRAC, g >> FRAC, bb >> FRAC,
+                                           RAW, SEMI, DITHER, &out, &blend);
+                        } else {
+                            ok = shade(p, DITHER ? x / Sx : 0, y1, r >> FRAC, g >> FRAC, bb >> FRAC, 0, 0,
+                                       0, DEPTH, RAW, SEMI, DITHER, &out, &blend);
+                        }
+                        if (ok) {
+                            if (blend) out = blend_px(blendm, *dst, out);
+                            *dst = out | mo;
+                        }
                     }
                     if (GOUR) { r += gstep_x[0]; g += gstep_x[1]; bb += gstep_x[2]; }
-                    if (TEX) { u += gstep_x[3]; v += gstep_x[4]; }
+                    if (TEX) { U += ustep; V += vstep; }
                 }
+                if (TEX) { tl_samples += (u64)(xe - xs); tl_clamped += n_clamped; tl_escaped += n_escaped; }
             }
             lx += long_step;
             sx += short_step;
@@ -273,12 +539,9 @@ tri_impl(const HiresPrim *p, const HiresVtx *v0, const HiresVtx *v1, const Hires
     }
 }
 
-typedef void (*TriFn)(const HiresPrim *, const HiresVtx *, const HiresVtx *, const HiresVtx *);
-
 #define TRI_FN(name, TEX, DEPTH, RAW, SEMI, GOUR, DITHER)                                  \
-    static void name(const HiresPrim *p, const HiresVtx *a, const HiresVtx *b,             \
-                     const HiresVtx *c)                                                    \
-    { tri_impl(p, a, b, c, TEX, DEPTH, RAW, SEMI, GOUR, DITHER); }
+    static void name(const void *ctx, int y0, int y1)                                      \
+    { tri_impl((const TriArgs *)ctx, y0, y1, TEX, DEPTH, RAW, SEMI, GOUR, DITHER); }
 
 TRI_FN(tri_u000, 0, 0, 0, 0, 0, 0)
 TRI_FN(tri_u001, 0, 0, 0, 0, 0, 1)
@@ -288,7 +551,7 @@ TRI_FN(tri_u100, 0, 0, 0, 1, 0, 0)
 TRI_FN(tri_u101, 0, 0, 0, 1, 0, 1)
 TRI_FN(tri_u110, 0, 0, 0, 1, 1, 0)
 TRI_FN(tri_u111, 0, 0, 0, 1, 1, 1)
-static const TriFn s_tri_untex[8] = {
+static const BandFn s_tri_untex[8] = {
     tri_u000, tri_u001, tri_u010, tri_u011, tri_u100, tri_u101, tri_u110, tri_u111,
 };
 
@@ -310,7 +573,7 @@ TRI_TEX_DEPTH(2)
     { tri_t##D##_raw0, tri_t##D##_raw1, tri_t##D##_m000, tri_t##D##_m001,         \
       tri_t##D##_m010, tri_t##D##_m011, tri_t##D##_m100, tri_t##D##_m101,         \
       tri_t##D##_m110, tri_t##D##_m111 }
-static const TriFn s_tri_tex[3][10] = {
+static const BandFn s_tri_tex[3][10] = {
     TRI_TEX_TABLE(0), TRI_TEX_TABLE(1), TRI_TEX_TABLE(2),
 };
 
@@ -319,40 +582,70 @@ static inline bool dither_on(const HiresPrim *p) { return p->dither && ((s_Sx ==
 static void be_tri(const HiresPrim *p, const HiresVtx v[3])
 {
     if (!s_t) return;
-    bool dith = dither_on(p);
+    TriArgs ta;
+    ta.p = *p;
+    ta.p.dither = dither_on(p);
+    memcpy(ta.v, v, sizeof ta.v);
+    BandFn fn;
     if (!p->tex) {
-        int idx = (p->semi ? 4 : 0) | (p->gour ? 2 : 0) | (dith ? 1 : 0);
-        s_tri_untex[idx](p, &v[0], &v[1], &v[2]);
+        int idx = (p->semi ? 4 : 0) | (p->gour ? 2 : 0) | (ta.p.dither ? 1 : 0);
+        fn = s_tri_untex[idx];
     } else {
         note_tex_page(p);
         int d = p->depth;
-        if (p->raw) {
-            s_tri_tex[d][p->semi ? 1 : 0](p, &v[0], &v[1], &v[2]);
-        } else {
-            int idx = 2 + ((p->semi ? 4 : 0) | (p->gour ? 2 : 0) | (dith ? 1 : 0));
-            s_tri_tex[d][idx](p, &v[0], &v[1], &v[2]);
-        }
+        if (p->raw) fn = s_tri_tex[d][p->semi ? 1 : 0];
+        else fn = s_tri_tex[d][2 + ((p->semi ? 4 : 0) | (p->gour ? 2 : 0) | (ta.p.dither ? 1 : 0))];
     }
+    /* hi-res row / column extent of the triangle, intersected with clip and target */
+    s32 miny = v[0].y, maxy = v[0].y, minx = v[0].x, maxx = v[0].x;
+    for (int i = 1; i < 3; i++) {
+        if (v[i].y < miny) miny = v[i].y;
+        if (v[i].y > maxy) maxy = v[i].y;
+        if (v[i].x < minx) minx = v[i].x;
+        if (v[i].x > maxx) maxx = v[i].x;
+    }
+    int ylo = imax(imax((int)(((s64)miny * s_Sy) >> 16), p->clip_y1 * s_Sy), s_oy);
+    int yhi = imin(imin((int)((((s64)maxy * s_Sy) >> 16) + 1), (p->clip_y2 + 1) * s_Sy), s_oy + s_th);
+    int xlo = imax(imax((int)(((s64)minx * s_Sx) >> 16), p->clip_x1 * s_Sx), s_ox);
+    int xhi = imin(imin((int)((((s64)maxx * s_Sx) >> 16) + 1), (p->clip_x2 + 1) * s_Sx), s_ox + s_tw);
+    if (yhi <= ylo || xhi <= xlo) return;
+    mark_dirty(ylo / s_Sy, (yhi - 1) / s_Sy);
+    s64 area = (s64)(yhi - ylo) * (xhi - xlo);
+    if (area >= s_par_threshold) { g_hires_stat_par_px += (u64)area; g_hires_stat_par_jobs++; par_rows(fn, &ta, ylo, yhi); }
+    else { g_hires_stat_inline_px += (u64)area; g_hires_stat_inline_jobs++; fn(&ta, ylo, yhi); flush_counters(); }
 }
 
 /* ---- rectangles -------------------------------------------------------------- */
 
+typedef struct {
+    HiresPrim p;
+    int x0, y0, w, h;
+    u32 r, g, b, u0, v0;
+    bool flipx, flipy;
+} RectArgs;
+
 static inline __attribute__((always_inline)) void
-rect_impl(const HiresPrim *p, int x0, int y0, int w, int h, u32 r, u32 g, u32 b,
-          u32 u0, u32 v0, bool flipx, bool flipy,
+rect_impl(const RectArgs *ra, int by0, int by1,
           const int TEX, const int DEPTH, const int RAW, const int SEMI)
 {
+    const HiresPrim *p = &ra->p;
     const int Sx = s_Sx, Sy = s_Sy;
-    int xs = x0, xe = x0 + w, ys = y0, ye = y0 + h;
+    const int x0 = ra->x0, y0 = ra->y0;
+    int xs = x0, xe = x0 + ra->w, ys = y0, ye = y0 + ra->h;
     if (xs < p->clip_x1) xs = p->clip_x1;
     if (xe > p->clip_x2 + 1) xe = p->clip_x2 + 1;
     if (ys < p->clip_y1) ys = p->clip_y1;
     if (ye > p->clip_y2 + 1) ye = p->clip_y2 + 1;
     xs = imax(xs, s_rx); xe = imin(xe, s_rx + s_rw);
     ys = imax(ys, s_ry); ye = imin(ye, s_ry + s_rh);
+    /* restrict to the band (hi-res rows [by0, by1)) */
+    ys = imax(ys, by0 / Sy); ye = imin(ye, (by1 + Sy - 1) / Sy);
     if (xs >= xe || ys >= ye) return;
-    int du = flipx ? -1 : 1, dv = flipy ? -1 : 1;
-    if (TEX && flipx) u0 |= 1;
+    const u32 r = ra->r, g = ra->g, b = ra->b;
+    u32 u0 = ra->u0;
+    const u32 v0 = ra->v0;
+    int du = ra->flipx ? -1 : 1, dv = ra->flipy ? -1 : 1;
+    if (TEX && ra->flipx) u0 |= 1;
     u8 ucol[VRAM_W];
     for (int x = xs; x < xe; x++) ucol[x - xs] = (u8)((u0 + (u32)(du * (x - x0))) & 0xFF);
     u16 outs[VRAM_W];
@@ -367,7 +660,8 @@ rect_impl(const HiresPrim *p, int x0, int y0, int w, int h, u32 r, u32 g, u32 b,
             outs[i] = o;
             vis[i] = ok ? (blend ? 2 : 1) : 0;
         }
-        for (int sy = 0; sy < Sy; sy++) {
+        int sy0 = imax(0, by0 - y * Sy), sy1 = imin(Sy, by1 - y * Sy);
+        for (int sy = sy0; sy < sy1; sy++) {
             u16 *dst = s_t + (size_t)(y * Sy + sy - s_oy) * s_tw + (xs * Sx - s_ox);
             for (int i = 0; i < cnt; i++) {
                 if (!vis[i]) { dst += Sx; continue; }
@@ -377,11 +671,9 @@ rect_impl(const HiresPrim *p, int x0, int y0, int w, int h, u32 r, u32 g, u32 b,
     }
 }
 
-typedef void (*RectFn)(const HiresPrim *, int, int, int, int, u32, u32, u32, u32, u32, bool, bool);
 #define RECT_FN(name, TEX, DEPTH, RAW, SEMI)                                                   \
-    static void name(const HiresPrim *p, int x0, int y0, int w, int h, u32 r, u32 g, u32 b,   \
-                     u32 u0, u32 v0, bool fx, bool fy)                                       \
-    { rect_impl(p, x0, y0, w, h, r, g, b, u0, v0, fx, fy, TEX, DEPTH, RAW, SEMI); }
+    static void name(const void *ctx, int y0, int y1)                                          \
+    { rect_impl((const RectArgs *)ctx, y0, y1, TEX, DEPTH, RAW, SEMI); }
 RECT_FN(rect_u0, 0, 0, 0, 0)
 RECT_FN(rect_u1, 0, 0, 0, 1)
 #define RECT_DEPTH(D)                          \
@@ -392,7 +684,7 @@ RECT_FN(rect_u1, 0, 0, 0, 1)
 RECT_DEPTH(0)
 RECT_DEPTH(1)
 RECT_DEPTH(2)
-static const RectFn s_rect_tex[3][4] = {
+static const BandFn s_rect_tex[3][4] = {
     { rect_t0_00, rect_t0_01, rect_t0_10, rect_t0_11 },
     { rect_t1_00, rect_t1_01, rect_t1_10, rect_t1_11 },
     { rect_t2_00, rect_t2_01, rect_t2_10, rect_t2_11 },
@@ -402,12 +694,17 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
                     u32 u0, u32 v0, bool fx, bool fy)
 {
     if (!s_t) return;
-    if (!p->tex) {
-        (p->semi ? rect_u1 : rect_u0)(p, x, y, w, h, r, g, b, 0, 0, false, false);
-    } else {
-        note_tex_page(p);
-        s_rect_tex[p->depth][(p->raw ? 2 : 0) | (p->semi ? 1 : 0)](p, x, y, w, h, r, g, b, u0, v0, fx, fy);
-    }
+    RectArgs ra = { *p, x, y, w, h, r, g, b, u0, v0, fx, fy };
+    BandFn fn;
+    if (!p->tex) fn = p->semi ? rect_u1 : rect_u0;
+    else { note_tex_page(p); fn = s_rect_tex[p->depth][(p->raw ? 2 : 0) | (p->semi ? 1 : 0)]; }
+    int ys = imax(imax(y, p->clip_y1), s_ry), ye = imin(imin(y + h, p->clip_y2 + 1), s_ry + s_rh);
+    int xs = imax(imax(x, p->clip_x1), s_rx), xe = imin(imin(x + w, p->clip_x2 + 1), s_rx + s_rw);
+    if (ys >= ye || xs >= xe) return;
+    mark_dirty(ys, ye - 1);
+    int ylo = ys * s_Sy, yhi = ye * s_Sy;
+    if ((s64)(yhi - ylo) * (xe - xs) * s_Sx >= s_par_threshold) par_rows(fn, &ra, ylo, yhi);
+    else fn(&ra, ylo, yhi);
 }
 
 /* ---- lines ----------------------------------------------------------------- */
@@ -418,6 +715,7 @@ static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, 
     const int Sx = s_Sx, Sy = s_Sy;
     int dx = x1 - x0, dy = y1 - y0;
     int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    mark_dirty(imax((y0 < y1 ? y0 : y1) - 1, 0), (y0 > y1 ? y0 : y1) + 1);
     const bool gour = p->gour;
     if (!gour) c1 = c0;
     const bool dith = dither_on(p);
@@ -495,6 +793,7 @@ static void fill_span(int x0, int x1, int y, u16 c)
 static void be_fill(int x, int y, int w, int h, u16 c)
 {
     if (!s_t) return;
+    mark_rows_wrapped(y, h);
     for (int j = 0; j < h; j++) {
         int row = (y + j) & 511;
         if (row < s_ry || row >= s_ry + s_rh) continue;
@@ -521,6 +820,7 @@ static void be_put(int x, int y, u16 v, bool mc, bool ms)
     if (!s_t) return;
     x &= 1023; y &= 511;
     if (!in_region(x, y)) return;
+    mark_dirty(y, y);
     const u16 val = v | (ms ? 0x8000 : 0);
     for (int sy = 0; sy < s_Sy; sy++) {
         u16 *d = s_t + (size_t)(y * s_Sy + sy - s_oy) * s_tw + (x * s_Sx - s_ox);
@@ -542,6 +842,7 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
         if (drow >= s_ry && drow < s_ry + s_rh) any = true;
     }
     if (!any) return;
+    mark_rows_wrapped(dy, ht);
     static u16 buf[(size_t)HIRES_MAX_SCALE * VRAM_W * HIRES_MAX_SCALE];
     const size_t stride = (size_t)wd * Sx;
     for (int j = 0; j < ht; j++) {
@@ -604,6 +905,8 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     s_ox = rx * sx; s_oy = ry * sy;
     memset(s_fb_tex_seen, 0, sizeof s_fb_tex_seen);
     seed();
+    s_epoch++;
+    mark_dirty(0, VRAM_H);
     return true;
 }
 

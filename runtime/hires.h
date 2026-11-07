@@ -80,6 +80,26 @@ bool hires_get_view(const GpuDisplay *d, HiresView *v);
  * viewport (vw x vh) is covered without ever upsampling on either axis,
  * sx = ceil(vw/dw), sy = ceil(vh/dh), each capped to 1..max_x / 1..max_y. */
 void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int *sx, int *sy);
+/* Worker pool (hi-res path only; 1x GPU and emulated state stay single-threaded). Large
+ * primitives are split into row chunks and rasterized fork-join, so command order is kept.
+ * n = worker threads besides the calling one; -1 = auto (performance cores - 1); 0 = serial. */
+void hires_set_threads(int n);
+int hires_threads(void);
+void hires_set_parallel_threshold(int px);   /* bbox pixels below which a primitive runs inline */
+/* Run fn(ctx, y0, y1) over row chunks of [0, rows) on the pool; fn must clip y1 to rows. */
+void hires_parallel_rows(void (*fn)(void *ctx, int y0, int y1), void *ctx, int rows);
+
+/* Presentation helpers: the target changes only when something was drawn. */
+u64 hires_epoch(void);                       /* bumped whenever the target is (re)allocated */
+bool hires_dirty_rows(int y0, int y1);       /* drawn into 1x rows [y0, y1] since the last clear? */
+void hires_clear_dirty(void);
+
+/* UV sampling diagnostics: textured hi-res pixels sampled; those whose interpolated u/v fell
+ * outside the triangle's vertex UV range and were clamped; and those that still were outside
+ * the range when fetched (must always be 0). */
+typedef struct { u64 samples, clamped, escaped; } HiresUvStats;
+void hires_get_uv_stats(HiresUvStats *st);
+
 /* Compare the target against the 1x VRAM region (meaningful at scale 1x1, where they must
  * be identical). Returns the number of differing pixels; reports the first one. */
 u32 hires_verify_1x(int *first_x, int *first_y);

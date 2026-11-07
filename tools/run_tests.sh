@@ -7,7 +7,7 @@ mkdir -p build/tests build/smoke build/hires
 START=$(date +%s)
 
 # 1. compile the unit tests in parallel
-CC="clang -std=c11 -O2 -Wall -Wextra -Iruntime"
+CC="clang -std=c11 -O2 -Wall -Wextra -pthread -Iruntime"
 rm -f build/tests/*.cc.rc
 cc_job() { # name cmd...
   n=$1; shift

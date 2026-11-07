@@ -131,6 +131,23 @@ hashing all emulated state per frame).
 - Coverage = 1x geometry scaled by Sx/Sy (a w*h rect covers exactly Sx*w x Sy*h pixels).
   Colour/u/v come from the 1x plane equations at each hi-res pixel centre. Vertices are
   16.16 fixed point in 1x units (integers today) so GTE sub-pixel precision can be fed later.
+- UV clamp: a hi-res pixel centre can lie before the polygon's first texel (texture minified
+  by more than ~1.3 texel per pixel), so interpolated u/v are clamped to the triangle's vertex
+  UV range before the texture-window mask (otherwise the lookup reads a neighbouring texture
+  in VRAM: thin lines along stage tile edges). Skipped at 1x1, where sample positions equal the
+  1x GPU's and the result must stay bit-identical. `hires-uv:` in the run summary counts
+  textured samples, those clamped, and those still out of range when fetched (must be 0;
+  checked by the determinism script at every scale).
+- Threading (hi-res path only): `hires_set_threads` / `--hires-threads N` (default: performance
+  cores - 1) starts a worker pool. A primitive whose hi-res bbox is >= 4000 px
+  (`--hires-par-min`) is split into row chunks, rasterized fork-join (the emulation thread
+  takes chunks too and waits), so command order within every pixel is preserved and the result
+  is identical to serial (unit-tested, state hashes unchanged). Workers spin ~50 us after the
+  last job, then sleep. Smaller primitives run inline. Texture reads come from 1x VRAM while
+  the emulation thread waits, so nothing races. The 1x GPU and emulated state stay on the
+  emulation thread. Windowed present converts rows on the same pool and uploads only when the
+  displayed rows were drawn since the last upload (`hires_dirty_rows`); uploading the 15-bit
+  target as XBGR1555 was slower (SDL converts on the CPU), so it is converted to RGBA8888.
 - Textures/CLUTs are sampled from the 1x VRAM (they are 1x assets, so texels are Sx x Sy
   blocks). A textured primitive whose page overlaps the framebuffer region samples 1x VRAM
   and is logged once per page. Dither is off above 1x1 (`--hires-dither` keeps it). Lines: the
@@ -150,17 +167,19 @@ hashing all emulated state per frame).
 - Options: `--scale N|NxM`, `--max-scale N|NxM`, `--hires-dither`, `--window WxH` (initial
   window, points), `--resize F:WxH,...` (headless: simulated window sizes in physical pixels),
   `--state-hash FILE`, `--hires-verify`, `--fight-from F` (default 3700) and
-  `--hires-min-fight PCT` (exit 4 unless that % of frames >= F could be shown from the hi-res
+  `--hires-threads N`, `--hires-par-min PX`, `--segments F,F,...` (frame boundaries of the
+  per-segment ms/frame report printed at exit, headless and windowed; default 1200,1800,2400,3000
+  = intro, title, character select, stage intro, then fight), `--hires-min-fight PCT` (exit 4 unless that % of frames >= F could be shown from the hi-res
   target; the run prints `hires-frames: ...` with hi-res vs 1x-fallback counts). `--press`,
   `--frames` and these work windowed too; a windowed `--frames` run prints the host
   emu/present time over the fight frames. `--dump` writes frames at the render scale;
   `tools/contact_sheet.py --cell WxH --cols N` tiles them; `tools/fight_script.py` prints a
   boot->fight `--press` script.
 - Tests: `runtime/tests/test_hires.c` (rasterizer vs hand-checked counts at several
-  Sx x Sy, including Sx != Sy), `tools/test_hires_determinism.sh` (8 concurrent runs: off,
+  Sx x Sy, including Sx != Sy; UV-bleed regression; 0 vs 4 worker threads identical), `tools/test_hires_determinism.sh` (8 concurrent runs, some with worker threads: off,
   2x2, 4x4, 8x8, 2x3, 4x6, a resize schedule with Sx != Sy, and the 1x1 equivalence run; all
-  state hashes equal, >=95% of fight frames hi-res). `tools/run_tests.sh` runs the unit
-  tests, `tools/smoke_test.sh` and the determinism script concurrently (~2.3 min).
+  state hashes equal, >=95% of fight frames hi-res, 0 out-of-range UV fetches, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
+  tests, `tools/smoke_test.sh` and the determinism script concurrently (~1.7 min).
 
 ## Pitfalls
 

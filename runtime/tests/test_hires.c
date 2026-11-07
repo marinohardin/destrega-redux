@@ -240,6 +240,92 @@ static void test_nonuniform_matches_1x_shape(int Sx, int Sy)
     CHECK(same * 100 >= total * 98, "%dx%d picture deviates from 1x: %ld/%ld similar", Sx, Sy, same, total);
 }
 
+static u64 target_hash(int Sx, int Sy)
+{
+    int st;
+    const u16 *t = tgt(&st);
+    u64 h = 1469598103934665603ull;
+    for (int y = 0; y < 480 * Sy; y++)
+        for (int x = 0; x < 512 * Sx; x++) h = (h ^ t[y * st + x]) * 1099511628211ull;
+    return h;
+}
+
+/* The worker pool must not change the result: same target with 0 and 4 workers, with every
+ * primitive dispatched (threshold 0). */
+static void test_threads_identical(int Sx, int Sy)
+{
+    hires_set_threads(0);
+    hires_set_parallel_threshold(0);
+    setup(Sx, Sy);
+    busy_stream();
+    u64 h0 = target_hash(Sx, Sy);
+    hires_set_threads(4);
+    setup(Sx, Sy);
+    busy_stream();
+    u64 h4 = target_hash(Sx, Sy);
+    CHECK(hires_threads() == 4, "pool did not start");
+    CHECK(h0 == h4, "%dx%d target differs between 0 and 4 worker threads", Sx, Sy);
+    hires_set_threads(0);
+    hires_set_parallel_threshold(4000);
+}
+
+/* Texture bleed: a quad with UVs 0..15 sits next to differently coloured texels at u=255 (wraps
+ * to the left of u=0) and u=16 (right of u=15). Sampling at hi-res pixel centres reaches
+ * outside the polygon's UV range; no pixel of the neighbouring colours may appear. */
+static void test_uv_clamp(int Sx, int Sy)
+{
+    setup(Sx, Sy);
+    /* 8bpp texture page x=640 (page 10): 16 rows; CLUT at (0,500): index1 = green(inside),
+     * index2 = blue (u=255 column), index3 = white (u=16 column) */
+    gp0(0xA0000000); gp0(xy(0, 500)); gp0(xy(16, 1));
+    u16 clut[16] = { 0, 0x03E0, 0x7C00, 0x7FFF };
+    for (int i = 0; i < 8; i++) gp0((u32)clut[2 * i] | ((u32)clut[2 * i + 1] << 16));
+    /* texture rows v=0..15 at texture x 640..  (8bpp: 2 texels per halfword, 128 hw per row) */
+    gp0(0xA0000000); gp0(xy(640, 0)); gp0(xy(128, 16));
+    for (int v = 0; v < 16; v++)
+        for (int hw = 0; hw < 128; hw += 2) {
+            u32 w[2];
+            for (int k = 0; k < 2; k++) {
+                int u0 = (hw + k) * 2;
+                u16 val = 0;
+                for (int b = 0; b < 2; b++) {
+                    int u = u0 + b, idx = 0;
+                    if (u < 16) idx = 1;
+                    else if (u == 16) idx = 3;
+                    else if (u == 255) idx = 2;
+                    val |= (u16)(idx << (8 * b));
+                }
+                w[k] = val;
+            }
+            gp0(w[0] | (w[1] << 16));
+        }
+    /* a textured quad, UV 0..15 on both axes, covering 8x8 1x pixels at (100,100), so the texture is minified (~2 texels per pixel): a slightly
+     * sheared quad so that interpolation is not axis aligned */
+    u32 clutw = (500u << 6) << 16;                    /* CLUT (0,500) */
+    u32 tpage = 10u | (1u << 7);                      /* page 10, 8bpp */
+    gp0(0x2C808080);
+    gp0(xy(100, 100)); gp0(clutw | 0x0000);
+    gp0(xy(108, 101)); gp0((tpage << 16) | 0x000F);
+    gp0(xy(100, 109)); gp0(0x0F00);
+    gp0(xy(108, 110)); gp0(0x0F0F);
+    int st;
+    const u16 *t = tgt(&st);
+    long green = 0, blue = 0, white = 0;
+    for (int y = 90 * Sy; y < 130 * Sy; y++)
+        for (int x = 90 * Sx; x < 130 * Sx; x++) {
+            u16 px = t[y * st + x] & 0x7FFF;
+            if (px == 0x03E0 || ((px & 0x3E0) > 0x200 && (px & 0x7C1F) < 0x2000 && px != 0x7FFF)) green++;
+            if (px == 0x7C00) blue++;
+            if (px == 0x7FFF) white++;
+        }
+    CHECK(green > 0, "%dx%d no inside texels drawn", Sx, Sy);
+    CHECK(blue == 0, "%dx%d %ld pixels of the u=255 neighbour texels leaked in", Sx, Sy, blue);
+    CHECK(white == 0, "%dx%d %ld pixels of the u=16 neighbour texels leaked in", Sx, Sy, white);
+    HiresUvStats uv;
+    hires_get_uv_stats(&uv);
+    CHECK(uv.escaped == 0, "%dx%d %llu samples escaped the UV range", Sx, Sy, (unsigned long long)uv.escaped);
+}
+
 static void check_pick(int pw, int ph, int dw, int dh, int mx, int my, int ex, int ey)
 {
     int sx, sy;
@@ -260,6 +346,12 @@ int main(void)
     test_s1_equivalence_and_invariance();
     test_nonuniform_matches_1x_shape(2, 3);
     test_nonuniform_matches_1x_shape(4, 6);
+    test_uv_clamp(1, 1);
+    test_uv_clamp(2, 2);
+    test_uv_clamp(4, 6);
+    test_uv_clamp(3, 5);
+    test_threads_identical(2, 3);
+    test_threads_identical(4, 6);
     check_pick(1920, 1440, 512, 240, 8, 8, 4, 6);     /* 1440p-ish window: 2048x1440 */
     check_pick(960, 720, 512, 240, 8, 8, 2, 3);
     check_pick(1920, 1080, 512, 240, 8, 8, 3, 5);     /* letterboxed 1440x1080 */
