@@ -63,9 +63,9 @@ for n in s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1; do
   else echo "hires: state hash $n DIFFERS from off:"; diff $OUT/off.hash $OUT/$n.hash | head -3; fail=1; fi
   grep -h "hires-frames" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -h "hires-uv" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
-  grep -q "hires-uv: [0-9]* textured samples, [0-9]* clamped to the vertex UV range, 0 out of range when fetched" $OUT/$n.log || { echo "hires: $n: UV out-of-range samples (or no UV report)"; fail=1; }
+  grep -q "hires-uv: [0-9]* textured samples, [0-9]* clamped to the 1x-sampled UV range, 0 out of range when fetched" $OUT/$n.log || { echo "hires: $n: UV out-of-range samples (or no UV report)"; fail=1; }
 done
-grep -q "hires-uv: [0-9]* textured samples, 0 clamped" $OUT/verify1.log || { echo "hires: verify1: UV clamp is not a no-op at 1x1"; fail=1; }
+grep -q "hires-uv: [0-9]* textured samples, 0 clamped to the 1x-sampled" $OUT/verify1.log || { echo "hires: verify1: UV clamp is not a no-op at 1x1"; fail=1; }
 grep -h "hires-verify" $OUT/verify1.log | sed 's/^\[ *[0-9]*\] /hires: verify1: /'
 [ $fail = 0 ] || exit 1
 grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/verify1.log || { echo "hires: 1x1 equivalence FAIL"; exit 1; }

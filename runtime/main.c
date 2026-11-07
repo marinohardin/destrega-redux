@@ -325,9 +325,11 @@ static void finish(void) {
         HiresUvStats uv;
         hires_get_uv_stats(&uv);
         if (uv.samples || hires_get_scale(&sx, &sy))
-            rt_log("hires-uv: %llu textured samples, %llu clamped to the vertex UV range, %llu out of range when fetched",
+            rt_log("hires-uv: %llu textured samples, %llu clamped to the 1x-sampled UV range, %llu out of range when fetched "
+                   "(1x-sampled range used for %llu of %llu textured triangles)",
                    (unsigned long long)uv.samples, (unsigned long long)uv.clamped,
-                   (unsigned long long)uv.escaped);
+                   (unsigned long long)uv.escaped, (unsigned long long)uv.tris_1x_range,
+                   (unsigned long long)uv.tris);
         if (uv.escaped) rc = 5;
     }
     for (int k = 0; k <= s_seg_n; k++) {

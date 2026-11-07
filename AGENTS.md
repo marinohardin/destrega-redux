@@ -131,13 +131,21 @@ hashing all emulated state per frame).
 - Coverage = 1x geometry scaled by Sx/Sy (a w*h rect covers exactly Sx*w x Sy*h pixels).
   Colour/u/v come from the 1x plane equations at each hi-res pixel centre. Vertices are
   16.16 fixed point in 1x units (integers today) so GTE sub-pixel precision can be fed later.
-- UV clamp: a hi-res pixel centre can lie before the polygon's first texel (texture minified
-  by more than ~1.3 texel per pixel), so interpolated u/v are clamped to the triangle's vertex
-  UV range before the texture-window mask (otherwise the lookup reads a neighbouring texture
-  in VRAM: thin lines along stage tile edges). Skipped at 1x1, where sample positions equal the
-  1x GPU's and the result must stay bit-identical. `hires-uv:` in the run summary counts
-  textured samples, those clamped, and those still out of range when fetched (must be 0;
-  checked by the determinism script at every scale).
+- UV clamp: a hi-res pixel centre can lie outside the polygon (texture minified by more than
+  ~1.3 texel per pixel, and always near the right/bottom edges), so interpolated u/v are clamped
+  before the texture-window mask, otherwise the lookup reads a neighbouring texture in VRAM
+  (thin lines along tile and polygon edges). The clamp range is the u/v range the **1x
+  rasterizer actually sampled for that triangle** (`gpu.c` `uv_track_span`, recorded only while
+  a hi-res target exists, extremes taken at span ends because u/v are linear in x; the 1x draw
+  now runs before the hi-res tri is forwarded). The vertex UV range is not tight enough: the 1x
+  GPU never draws a triangle's last column/row, so it never reads the far-end texels, which are
+  often an adjacent tile's border. If 1x sampled nothing the vertex range is the fallback.
+  Textured rects sample one texel per 1x pixel with the same u/v as 1x, so they need nothing.
+  Skipped at 1x1, where sample positions equal the 1x GPU's (it wraps rather than clamps in
+  rare pixels) and the result must stay bit-identical. `hires-uv:` in the run summary counts
+  textured samples, those clamped, those still outside the 1x-sampled range when fetched (must
+  be 0; checked by the determinism script at every scale) and how many triangles used the
+  1x-sampled range.
 - Threading (hi-res path only): `hires_set_threads` / `--hires-threads N` (default: performance
   cores - 1) starts a worker pool. A primitive whose hi-res bbox is >= 4000 px
   (`--hires-par-min`) is split into row chunks, rasterized fork-join (the emulation thread
@@ -176,9 +184,9 @@ hashing all emulated state per frame).
   `tools/contact_sheet.py --cell WxH --cols N` tiles them; `tools/fight_script.py` prints a
   boot->fight `--press` script.
 - Tests: `runtime/tests/test_hires.c` (rasterizer vs hand-checked counts at several
-  Sx x Sy, including Sx != Sy; UV-bleed regression; 0 vs 4 worker threads identical), `tools/test_hires_determinism.sh` (8 concurrent runs, some with worker threads: off,
+  Sx x Sy, including Sx != Sy; UV-bleed and 1x-sampled-range regressions; 0 vs 4 worker threads identical), `tools/test_hires_determinism.sh` (8 concurrent runs, some with worker threads: off,
   2x2, 4x4, 8x8, 2x3, 4x6, a resize schedule with Sx != Sy, and the 1x1 equivalence run; all
-  state hashes equal, >=95% of fight frames hi-res, 0 out-of-range UV fetches, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
+  state hashes equal, >=95% of fight frames hi-res, 0 UV fetches outside the 1x-sampled range, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
   tests, `tools/smoke_test.sh` and the determinism script concurrently (~1.7 min).
 
 ## Pitfalls

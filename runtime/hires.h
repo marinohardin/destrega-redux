@@ -33,6 +33,10 @@ typedef struct {
     u16 mask_or;
     bool mask_check;
     int clip_x1, clip_y1, clip_x2, clip_y2;   /* draw area, inclusive, 1x pixels */
+    /* triangles: u/v range the 1x rasterizer actually sampled (pre texture window); if the 1x
+     * draw sampled nothing, has_uvr is false and the vertex UV range is used */
+    bool has_uvr;
+    int uvr_umin, uvr_umax, uvr_vmin, uvr_vmax;
 } HiresPrim;
 
 /* A rectangle of the render target, as presented. */
@@ -95,9 +99,10 @@ bool hires_dirty_rows(int y0, int y1);       /* drawn into 1x rows [y0, y1] sinc
 void hires_clear_dirty(void);
 
 /* UV sampling diagnostics: textured hi-res pixels sampled; those whose interpolated u/v fell
- * outside the triangle's vertex UV range and were clamped; and those that still were outside
- * the range when fetched (must always be 0). */
-typedef struct { u64 samples, clamped, escaped; } HiresUvStats;
+ * outside the UV range the 1x draw of that triangle sampled (or, if it sampled nothing, the
+ * vertex range) and were clamped; and those that still were outside it when fetched (must
+ * always be 0). tris / tris_1x_range: textured triangles drawn / using the 1x-sampled range. */
+typedef struct { u64 samples, clamped, escaped, tris, tris_1x_range; } HiresUvStats;
 void hires_get_uv_stats(HiresUvStats *st);
 
 /* Compare the target against the 1x VRAM region (meaningful at scale 1x1, where they must

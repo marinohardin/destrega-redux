@@ -12,9 +12,11 @@
  *  - Textures and CLUTs are fetched from the 1x VRAM (they are 1x assets).
  *  - Dither is off at S > 1 unless enabled (it then uses the 1x pixel position).
  *  - Lines are S pixels thick.
- *  - u/v are clamped to each triangle's vertex UV range before the texture-window mask:
- *    sampling a hi-res pixel centre may fall outside the polygon, and would otherwise read
- *    a neighbouring texture (stage tile seams). Skipped at 1x1 (bit-identical there).
+ *  - u/v are clamped before the texture-window mask to the range the 1x GPU actually sampled
+ *    for that triangle (gpu.c records it; the vertex range if 1x sampled nothing): a hi-res
+ *    pixel centre may fall outside the polygon, and the 1x GPU never draws a triangle's last
+ *    column/row, so the vertex range still contains texels (often a neighbouring tile's border)
+ *    that 1x never reads. Skipped at 1x1 (bit-identical there).
  *  - Large primitives are rasterized in row chunks on a worker pool (fork-join per
  *    primitive, so command order is preserved); only this path is threaded.
  */
@@ -190,7 +192,7 @@ static inline void store_px(const HiresPrim *p, u16 *dst, u16 out, bool blend)
 
 typedef void (*BandFn)(const void *ctx, int y0, int y1);   /* rows [y0, y1) in target coordinates */
 
-static atomic_ullong s_uv_samples, s_uv_clamped, s_uv_escaped;
+static atomic_ullong s_uv_samples, s_uv_clamped, s_uv_escaped, s_uv_tris, s_uv_tris_1x;
 static _Thread_local u64 tl_samples, tl_clamped, tl_escaped;
 
 static void flush_counters(void)
@@ -205,6 +207,8 @@ void hires_get_uv_stats(HiresUvStats *st)
     st->samples = atomic_load(&s_uv_samples);
     st->clamped = atomic_load(&s_uv_clamped);
     st->escaped = atomic_load(&s_uv_escaped);
+    st->tris = atomic_load(&s_uv_tris);
+    st->tris_1x_range = atomic_load(&s_uv_tris_1x);
 }
 
 u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g_hires_stat_inline_jobs;
@@ -441,9 +445,12 @@ tri_impl(const TriArgs *ta, int by0, int by1,
         gstep_x[i] = (u32)((s32)dx / Sx);
     }
     const s64 ustep = (s64)(s32)gstep_x[3], vstep = (s64)(s32)gstep_x[4];
-    /* vertex UV range: samples are clamped to it (see the file comment) */
+    /* UV range samples are clamped to: what the 1x draw of this triangle sampled (see the file
+     * comment), else the vertex range */
     int umin = 0, umax = 255, vmin = 0, vmax = 255;
-    if (TEX) {
+    if (TEX && p->has_uvr) {
+        umin = p->uvr_umin; umax = p->uvr_umax; vmin = p->uvr_vmin; vmax = p->uvr_vmax;
+    } else if (TEX) {
         umin = (int)av[3]; umax = umin; vmin = (int)av[4]; vmax = vmin;
         const u32 *o[2] = { bv, cv };
         for (int k = 0; k < 2; k++) {
@@ -587,6 +594,10 @@ static void be_tri(const HiresPrim *p, const HiresVtx v[3])
     ta.p.dither = dither_on(p);
     memcpy(ta.v, v, sizeof ta.v);
     BandFn fn;
+    if (p->tex) {
+        atomic_fetch_add_explicit(&s_uv_tris, 1, memory_order_relaxed);
+        if (p->has_uvr) atomic_fetch_add_explicit(&s_uv_tris_1x, 1, memory_order_relaxed);
+    }
     if (!p->tex) {
         int idx = (p->semi ? 4 : 0) | (p->gour ? 2 : 0) | (ta.p.dither ? 1 : 0);
         fn = s_tri_untex[idx];

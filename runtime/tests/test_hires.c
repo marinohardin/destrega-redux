@@ -326,6 +326,54 @@ static void test_uv_clamp(int Sx, int Sy)
     CHECK(uv.escaped == 0, "%dx%d %llu samples escaped the UV range", Sx, Sy, (unsigned long long)uv.escaped);
 }
 
+/* The 1x GPU never draws a triangle's last column/row, so it never samples the texels at the far
+ * end of the vertex UV range. Here those (u or v = 14, 15) are bright white while everything 1x
+ * can reach is green; hi-res sub-pixel samples near the right/bottom edge must not show white. */
+static void test_uv_1x_range(int Sx, int Sy)
+{
+    setup(Sx, Sy);
+    gp0(0xA0000000); gp0(xy(0, 500)); gp0(xy(16, 1));
+    u16 clut[16] = { 0, 0x03E0, 0x7FFF, 0 };
+    for (int i = 0; i < 8; i++) gp0((u32)clut[2 * i] | ((u32)clut[2 * i + 1] << 16));
+    gp0(0xA0000000); gp0(xy(640, 0)); gp0(xy(128, 16));
+    for (int v = 0; v < 16; v++)
+        for (int hw = 0; hw < 128; hw += 2) {
+            u32 w[2];
+            for (int k = 0; k < 2; k++) {
+                u16 val = 0;
+                for (int b = 0; b < 2; b++) {
+                    int u = (hw + k) * 2 + b;
+                    int idx = 0;
+                    if (u < 16 && v < 16) idx = (u >= 14 || v >= 14) ? 2 : 1;
+                    val |= (u16)(idx << (8 * b));
+                }
+                w[k] = val;
+            }
+            gp0(w[0] | (w[1] << 16));
+        }
+    u32 clutw = (500u << 6) << 16, tpage = 10u | (1u << 7);
+    gp0(0x2C808080);
+    gp0(xy(100, 100)); gp0(clutw | 0x0000);
+    gp0(xy(108, 100)); gp0((tpage << 16) | 0x000F);
+    gp0(xy(100, 108)); gp0(0x0F00);
+    gp0(xy(108, 108)); gp0(0x0F0F);
+    int st;
+    const u16 *t = tgt(&st);
+    long green = 0, white = 0;
+    for (int y = 90 * Sy; y < 130 * Sy; y++)
+        for (int x = 90 * Sx; x < 130 * Sx; x++) {
+            u16 px = t[y * st + x] & 0x7FFF;
+            if (px == 0x7FFF || ((px & 0x7C00) > 0x5000 && (px & 0x1F) > 0x14)) white++;
+            else if (px) green++;
+        }
+    CHECK(green > 0, "%dx%d 1x-range quad not drawn", Sx, Sy);
+    CHECK(white == 0, "%dx%d %ld pixels of texels the 1x draw never samples (u/v >= 14) appeared", Sx, Sy, white);
+    HiresUvStats uv;
+    hires_get_uv_stats(&uv);
+    CHECK(uv.escaped == 0, "%dx%d %llu samples escaped the 1x-sampled range", Sx, Sy, (unsigned long long)uv.escaped);
+    if (Sx > 1 || Sy > 1) CHECK(uv.tris_1x_range > 0, "%dx%d the 1x-sampled range was not used", Sx, Sy);
+}
+
 static void check_pick(int pw, int ph, int dw, int dh, int mx, int my, int ex, int ey)
 {
     int sx, sy;
@@ -350,6 +398,10 @@ int main(void)
     test_uv_clamp(2, 2);
     test_uv_clamp(4, 6);
     test_uv_clamp(3, 5);
+    test_uv_1x_range(1, 1);
+    test_uv_1x_range(2, 2);
+    test_uv_1x_range(4, 6);
+    test_uv_1x_range(3, 5);
     test_threads_identical(2, 3);
     test_threads_identical(4, 6);
     check_pick(1920, 1440, 512, 240, 8, 8, 4, 6);     /* 1440p-ish window: 2048x1440 */

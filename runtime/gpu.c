@@ -235,6 +235,30 @@ typedef struct {
 
 #define FRAC 24
 
+/* UV range actually sampled by the 1x rasterizer for the current textured triangle (pre texture
+ * window), recorded only while a hi-res target exists. The hi-res rasterizer clamps its u/v to
+ * it: the 1x GPU never draws a triangle's last column/row, so the vertex UV range includes
+ * texels (often a neighbouring tile's border) that 1x never reads. Along a span u,v are linear
+ * in x, so the extremes are at its ends. Bookkeeping only; 1x output is unchanged. */
+static bool s_uv_track;
+static int s_trk_umin, s_trk_umax, s_trk_vmin, s_trk_vmax;
+
+static void uv_track_span(u32 u, u32 v, u32 dudx, u32 dvdx, int n)
+{
+    u32 u1 = u + dudx * (u32)(n - 1), v1 = v + dvdx * (u32)(n - 1);
+    int a = (int)(u >> FRAC), b = (int)(u1 >> FRAC);
+    int c = (int)(v >> FRAC), d = (int)(v1 >> FRAC);
+    /* a wrap of the 32-bit fixed value inside the span: the sampled values cover 0..255 */
+    if (n > 1 && (((s32)dudx >= 0) ? u1 < u : u1 > u)) { a = 0; b = 255; }
+    if (n > 1 && (((s32)dvdx >= 0) ? v1 < v : v1 > v)) { c = 0; d = 255; }
+    if (a > b) { int t = a; a = b; b = t; }
+    if (c > d) { int t = c; c = d; d = t; }
+    if (a < s_trk_umin) s_trk_umin = a;
+    if (b > s_trk_umax) s_trk_umax = b;
+    if (c < s_trk_vmin) s_trk_vmin = c;
+    if (d > s_trk_vmax) s_trk_vmax = d;
+}
+
 static inline __attribute__((always_inline)) void
 span(const Prim *p, const Grad *gr, int y, int xs, int xe,
      u32 r, u32 g, u32 b, u32 u, u32 v,
@@ -242,6 +266,7 @@ span(const Prim *p, const Grad *gr, int y, int xs, int xe,
      const int GOUR, const int DITHER)
 {
     const u32 drdx = gr->drdx, dgdx = gr->dgdx, dbdx = gr->dbdx, dudx = gr->dudx, dvdx = gr->dvdx;
+    if (TEX && s_uv_track) uv_track_span(u, v, dudx, dvdx, xe - xs);
     for (int x = xs; x < xe; x++) {
         plot(p, x, y, r >> FRAC, g >> FRAC, b >> FRAC, u >> FRAC, v >> FRAC,
              TEX, DEPTH, RAW, SEMI, DITHER);
@@ -388,6 +413,7 @@ static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool sem
     h->tw_and_u = p->tw_and_u; h->tw_or_u = p->tw_or_u;
     h->tw_and_v = p->tw_and_v; h->tw_or_v = p->tw_or_v;
     h->mask_or = p->mask_or; h->mask_check = p->mask_check;
+    h->has_uvr = false;
     h->clip_x1 = s_clip_x1; h->clip_y1 = s_clip_y1; h->clip_x2 = s_clip_x2; h->clip_y2 = s_clip_y2;
 }
 
@@ -406,18 +432,8 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     if (maxx - minx >= 1024 || maxy - miny >= 512) return;
     if (maxx < s_clip_x1 || minx > s_clip_x2 || maxy < s_clip_y1 || miny > s_clip_y2) return;
 
-    if (g_hires) {
-        HiresPrim hp;
-        hires_prim(&hp, p, tex, raw, semi, gour);
-        const Vtx *vs[3] = { a, b, c };
-        HiresVtx hv[3];
-        for (int i = 0; i < 3; i++) {
-            hv[i].x = vs[i]->x * 65536; hv[i].y = vs[i]->y * 65536;
-            hv[i].r = vs[i]->r; hv[i].g = vs[i]->g; hv[i].b = vs[i]->b;
-            hv[i].u = vs[i]->u; hv[i].v = vs[i]->v;
-        }
-        g_hires->tri(&hp, hv);
-    }
+    s_uv_track = g_hires && tex;
+    if (s_uv_track) { s_trk_umin = s_trk_vmin = 1 << 20; s_trk_umax = s_trk_vmax = -1; }
 
     if (!tex) {
         int idx = (semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0);
@@ -427,6 +443,26 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     } else {
         int idx = 2 + ((semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0));
         s_tri_tex[p->depth][idx](p, a, b, c);
+    }
+
+    /* forward to the hi-res target after the 1x draw, with the UV range 1x actually sampled */
+    if (g_hires) {
+        HiresPrim hp;
+        hires_prim(&hp, p, tex, raw, semi, gour);
+        if (s_uv_track && s_trk_umax >= 0) {
+            hp.has_uvr = true;
+            hp.uvr_umin = s_trk_umin; hp.uvr_umax = s_trk_umax;
+            hp.uvr_vmin = s_trk_vmin; hp.uvr_vmax = s_trk_vmax;
+        }
+        s_uv_track = false;
+        const Vtx *vs[3] = { a, b, c };
+        HiresVtx hv[3];
+        for (int i = 0; i < 3; i++) {
+            hv[i].x = vs[i]->x * 65536; hv[i].y = vs[i]->y * 65536;
+            hv[i].r = vs[i]->r; hv[i].g = vs[i]->g; hv[i].b = vs[i]->b;
+            hv[i].u = vs[i]->u; hv[i].v = vs[i]->v;
+        }
+        g_hires->tri(&hp, hv);
     }
 }
 
