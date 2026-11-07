@@ -21,7 +21,7 @@ run() { # name args...
 }
 run off --scale 0
 for s in 2 4 8; do run s$s --scale $s; done
-run resize --scale 0 --resize 3000:640x480,3700:1920x1440,4300:960x720,4900:3840x2880,5500:480x360,6100:1280x960,6700:2560x1920
+run resize --scale 0 --max-scale 8 --resize 3000:640x480,3700:1920x1440,4300:960x720,4900:3840x2880,5500:480x360,6100:1280x960,6700:2560x1920
 echo "hires: resize steps applied: $(grep -c 'render scale' $OUT/resize.log)"
 lines=$(wc -l < $OUT/off.hash)
 [ "$lines" -ge "$FRAMES" ] || { echo "hires: FAIL (only $lines hashed frames)"; exit 1; }
