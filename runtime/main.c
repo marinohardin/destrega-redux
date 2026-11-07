@@ -29,7 +29,7 @@ static u32 s_wav_bytes;
 
 /* hi-res options (see hires.h / AGENTS.md) */
 static int s_scale_opt = -1;       /* --scale N: -1 = auto from the window, 0 = off, 1..8 fixed */
-static int s_max_scale = 8;
+static int s_max_scale = 4;   /* S>4 does not hold 60 fps on the dev Mac (see AGENTS.md) */
 static bool s_hires_dither;
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
@@ -118,19 +118,14 @@ static void write_png(const char *path, const u32 *rgba, int w, int h) {
 }
 
 /* Convert a hi-res view to RGBA8888 (R in the low byte, as ABGR8888 on little endian). */
-static u32 s_lut15[32768];
-static void init_lut15(void) {
-    for (int p = 0; p < 32768; p++) {
-        u32 r = (p & 31) << 3, g = ((p >> 5) & 31) << 3, b = ((p >> 10) & 31) << 3;
-        s_lut15[p] = 0xff000000u | (b << 16) | (g << 8) | r;
-    }
-}
 static void convert_view(const HiresView *v, u32 *dst, size_t dst_pitch_px) {
-    if (!s_lut15[1]) init_lut15();
     for (int y = 0; y < v->h; y++) {
         const u16 *src = v->pixels + (size_t)y * v->stride;
         u32 *d = dst + y * dst_pitch_px;
-        for (int x = 0; x < v->w; x++) d[x] = s_lut15[src[x] & 0x7fff];
+        for (int x = 0; x < v->w; x++) {   /* plain arithmetic: auto-vectorizes, unlike a LUT gather */
+            u32 p = src[x];
+            d[x] = 0xff000000u | ((p & 0x7c00) << 9) | ((p & 0x03e0) << 6) | ((p & 0x001f) << 3);
+        }
     }
 }
 
@@ -450,7 +445,7 @@ static void usage(void) {
         "  --wav FILE            record audio output (headless)\n"
         "  --scale N             internal render scale: 0 = hi-res off, 1..8 fixed (default: auto from\n"
         "                        the window size; headless: off)\n"
-        "  --max-scale N         cap for the automatic scale (default 8)\n"
+        "  --max-scale N         cap for the automatic scale (default 4; 5..8 may not hold 60 fps)\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"

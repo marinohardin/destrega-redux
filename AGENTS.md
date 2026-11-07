@@ -139,7 +139,7 @@ target is ever read by the emulated machine, so resolution cannot affect gamepla
   the region (e.g. 640 px modes) or outside it.
 - Scale: `S = ceil(max(vw/512, vh/384))` for the 4:3 letterbox viewport (vw x vh) inside the
   window's physical pixels (`SDL_GetWindowSizeInPixels`; window is HiDPI), capped by
-  `--max-scale`; `--scale N` forces N (0 = off). On window resize the scale is recomputed;
+  `--max-scale` (default 4: S=6 and S=8 cost ~12 and ~20 ms/frame of emulation in a fight on the dev Mac, so they are opt-in); `--scale N` forces N (0 = off). On window resize the scale is recomputed;
   if it changed, the target is reallocated and seeded from the current 1x VRAM.
   Presented with linear filtering into the letterboxed viewport.
 - Headless/test options: `--scale N`, `--max-scale N`, `--resize F:WxH,...` (simulated window
