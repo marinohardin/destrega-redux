@@ -80,6 +80,17 @@ scheduler event (`frontend_vblank`: present, input, audio, 60 Hz pacing).
   IRQ) is a seeded native entry. `--no-interp` makes any interpreter entry fatal;
   `tools/run_tests.sh` runs the smoke test with it. The fallback stays in release
   builds as a safety net for paths not yet exercised.
+- **Readable overrides:** a function listed in `analysis/overrides.txt` is still
+  generated, but as `f_<addr>_orig`; `f_<addr>` is hand-written C in
+  `runtime/overrides/` (structs/offsets named, fixed-point math explained).
+  `override_call()` (override.c) runs the new version directly, or with
+  `--verify-overrides` runs both from the same snapshot and compares the result,
+  callee-saved registers and all of RAM/scratchpad (except the dead stack).
+  `tools/soak.sh SEED` does a random-input soak with checks on. Guest code the
+  override still calls goes through `guest_call()`; watch for undeclared
+  register arguments (e.g. `f_80044918` reads a3 = normal.y).
+  Done so far: `f_800465a4` -> `sphere_vs_poly` (collision.c).
+  The game's stack moves into the scratchpad (0x1f800000) during fights.
 - Cycle accounting: `CYC(n)` (2 cycles/insn), `EVT_CHECK()` at function entry and
   backward branches runs `rt_event()` → scheduler + IRQ delivery.
 

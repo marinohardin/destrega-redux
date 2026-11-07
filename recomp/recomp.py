@@ -23,6 +23,7 @@ from codegen import FuncEmitter            # noqa: E402
 from overlays import overlay_list          # noqa: E402
 
 MAIN_CODE = (0x80026000, 0x800aa000)
+OVERLAY_SLOTS = (0x80010000, 0x80026000)   # P1 slot 0x80010000, P2 slot 0x8001a268
 FUNCS_PER_FILE = 80
 
 
@@ -60,6 +61,22 @@ def extra_seeds():
             if not line:
                 continue
             res.setdefault(line[1] if len(line) > 1 else 'main', []).append(int(line[0], 16))
+    return res
+
+
+def overrides():
+    """Main-exe functions replaced by hand-written C (analysis/overrides.txt).
+
+    The generated body is kept as `f_<addr>_orig` (for differential checks);
+    `f_<addr>` itself is then defined by the runtime (runtime/overrides/).
+    """
+    path = 'analysis/overrides.txt'
+    res = set()
+    if os.path.exists(path):
+        for line in open(path):
+            line = line.split('#')[0].split()
+            if line:
+                res.add(int(line[0], 16))
     return res
 
 
@@ -135,11 +152,14 @@ def main():
     ps = pointer_seeds(main_img, *MAIN_CODE, set(seeds))
     # Overlays call into the main executable (jal) and pass main-code
     # pointers around as data; both must be recompiled entry points.
+    ovl_refs = set()   # overlay-slot addresses referenced from any overlay (jal or data word)
     for name, load in overlay_list():
         oimg = Image('o', load, open(f'disc/{name}', 'rb').read())
         for a in range(oimg.base, oimg.end - 3, 4):
             i = oimg.ins(a)
             t = i.target if i.op == 'jal' else oimg.word(a)
+            if OVERLAY_SLOTS[0] <= t < OVERLAY_SLOTS[1] and t & 3 == 0:
+                ovl_refs.add(t)
             if MAIN_CODE[0] <= t < MAIN_CODE[1] and t & 3 == 0:
                 p, j = main_img.ins(t - 8), main_img.ins(t)
                 if t in seeds or (p.op == 'jr' and p.rs == 31) or \
@@ -172,6 +192,15 @@ def main():
 
     # ---- main executable --------------------------------------------------
     chunks = emit_funcs(main_funcs, set(main_funcs), lambda a: main_names[a], '')
+    for a in sorted(overrides()):
+        if a not in main_funcs:
+            raise SystemExit(f'analysis/overrides.txt: {a:08x} is not a recompiled main function')
+        head = f'void {main_names[a]}(void) {{'
+        idx = [k for k, c in enumerate(chunks) if c.startswith(head)]
+        if len(idx) != 1:
+            raise SystemExit(f'override {a:08x}: cannot locate generated body')
+        chunks[idx[0]] = f'void {main_names[a]}_orig(void) {{' + chunks[idx[0]][len(head):]
+        protos.append(f'void {main_names[a]}_orig(void);')
     for n in range(0, len(chunks), FUNCS_PER_FILE):
         write_file(f'{args.out}/main_{n // FUNCS_PER_FILE:02d}.c', chunks[n:n + FUNCS_PER_FILE])
     for e, f in sorted(main_funcs.items()):
@@ -194,6 +223,11 @@ def main():
             return t == lo or (p is not None and p.op == 'jr' and p.rs == 31) or \
                 (i.op == 'addiu' and i.rs == 29 and i.rt == 29 and i.imm < 0)
         s += [t for t in main_calls if lo <= t < hi and looks_like_entry(t)]
+        # Overlays also call into each other (the P2 event overlay calls helpers
+        # in the P1 slot): any overlay's jal/data pointer into this slot range
+        # that looks like a function start is an entry. Entries for an overlay
+        # that is not loaded never match (table lookups verify the code hash).
+        s += [t for t in ovl_refs if lo <= t < hi and looks_like_entry(t)]
         s += prologue_seeds(img, lo, hi)
         s += xs.get(base, [])
         s = [x for x in s if lo <= x < hi and x & 3 == 0]
