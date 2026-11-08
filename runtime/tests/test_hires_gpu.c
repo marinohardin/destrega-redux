@@ -8,7 +8,8 @@
  * software backend uses double, the shader 2^-38 fixed point; see AGENTS.md "PGXP").
  *
  * Needs an SDL_GPU device (Metal, or Vulkan: real hardware, MoltenVK, or Mesa lavapipe on CI);
- * exits 77 (CTest "skipped") when there is none. Driver: argv[1] = auto|metal|vulkan.
+ * exits 77 (CTest "skipped") when there is none. argv[1] = auto|metal|vulkan|d3d12 (one API), or
+ * switch: shut down and restart the backend on every available API in turn, comparing each time.
  * Build (macOS): clang -std=c11 -O2 -Iruntime runtime/gpu.c runtime/hires.c runtime/hires_gpu.c
  *   runtime/pgxp.c runtime/platform.c runtime/tests/test_hires_gpu.c -lSDL3 -o build/tests/test_hires_gpu
  */
@@ -256,7 +257,41 @@ int main(int argc, char **argv)
 {
     s_verbose = getenv("TEST_VERBOSE") != NULL;
     const char *drv = argc > 1 ? argv[1] : "auto";
-    if (!hires_gpu_set_driver(drv)) { printf("usage: test_hires_gpu [auto|metal|vulkan]\n"); return 2; }
+    if (!strcmp(drv, "switch")) {
+        /* View > Renderer's API switch, repeated: shut the backend down and start it on the next
+         * available API (each a fresh device of its own), compare after every switch */
+        int order[HGPU_NAPI], n = hires_gpu_api_order(order), avail[HGPU_NAPI], na = 0;
+        s_verbose = true;
+        for (int i = 0; i < n; i++)
+            if (hires_gpu_api_probe(order[i])) avail[na++] = order[i];
+        s_verbose = getenv("TEST_VERBOSE") != NULL;
+        if (!na) { printf("SKIP: no usable SDL_GPU device\n"); return 77; }
+        for (int round = 0; round < 6; round++) {
+            const int api = avail[round % na];
+            hires_set_backend(NULL, NULL);
+            hires_set_scale(0, 0);
+            hires_gpu_shutdown();
+            hires_gpu_set_driver(hires_gpu_api_name(api));
+            CHECK(hires_gpu_init(NULL) && hires_gpu_api() == api, "switch %d: %s did not start", round, hires_gpu_api_name(api));
+            if (hires_gpu_api() != api) continue;
+            char what[64];
+            snprintf(what, sizeof what, "switch %d %s", round, hires_gpu_api_title(api));
+            s_mode = MODE_DEFAULT;
+            s_mode.name = what;
+            run_scale(round % 2 ? 4 : 2, round % 2 ? 6 : 2, round % 3 ? 88 : 0, 600);
+        }
+        hires_set_backend(NULL, NULL);
+        hires_set_scale(0, 0);
+        hires_gpu_shutdown();
+        CHECK(hires_gpu_api() < 0, "shutdown left the backend initialised");
+        printf("test_hires_gpu: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (!hires_gpu_set_driver(drv)) {
+        if (hires_gpu_api_from_name(drv) >= 0) { printf("SKIP: %s is not offered on this platform\n", drv); return 77; }
+        printf("usage: test_hires_gpu [auto|metal|vulkan|d3d12]\n");
+        return 2;
+    }
     s_verbose = true;
     if (!hires_gpu_init(NULL)) { printf("SKIP: no usable SDL_GPU device (%s)\n", drv); return 77; }
     s_verbose = getenv("TEST_VERBOSE") != NULL;

@@ -33,9 +33,13 @@ int net_local_addresses(char *out, size_t n);
 void frontend_menu_action(const char *name, const char *arg);
 /* False for actions that are refused right now (state-changing actions during netplay). */
 bool frontend_menu_action_allowed(const char *name);
-/* Current hi-res renderer ("software", "gpu", "compare") and whether "gpu" can be chosen. */
+/* Current hi-res renderer: "software", "compare" or the GPU backend's graphics API ("metal",
+ * "vulkan", "d3d12"), and whether `name` (one of those, or "gpu") can be chosen here. */
 const char *frontend_renderer(void);
-bool frontend_gpu_available(void);
+bool frontend_renderer_available(const char *name);
+/* This platform's graphics APIs in order of preference (View > Renderer items): action names
+ * ("metal", "vulkan", "d3d12") and titles ("Metal", "Vulkan", "Direct3D 12"). Returns the count. */
+int frontend_graphics_apis(const char **names, const char **titles, int max);
 /* Check mark of a View-menu render-quality item ("tex-filter=bilinear", "smooth-colours",
  * "ssaa=2"): true and *checked set if `action` is one of them. */
 bool frontend_view_checked(const char *action, bool *checked);

@@ -44,7 +44,7 @@ static void from_w(const wchar_t *s, char *out, int n) {
 
 enum { ID_FIRST = 0x7100 };
 typedef struct { UINT id; const char *action; } Item;   /* action: "name" or "name=arg" */
-static Item s_items[32];
+static Item s_items[48];
 static int s_nitems;
 static HMENU s_bar;
 static HWND s_hwnd;
@@ -117,7 +117,7 @@ static void update_items(void) {
         frontend_view_checked(it->action, &checked);
         if (!strcmp(name, "renderer") && eq) {
             checked = !strcmp(eq + 1, frontend_renderer());
-            if (!strcmp(eq + 1, "gpu") && !frontend_gpu_available()) enabled = false;
+            if (!frontend_renderer_available(eq + 1)) enabled = false;   /* not on this machine */
         }
         EnableMenuItem(s_bar, it->id, MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
         CheckMenuItem(s_bar, it->id, MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
@@ -164,8 +164,17 @@ void menu_init(void) {
     HMENU view = CreatePopupMenu();
     add(view, "Widescreen (16:9)\tF9", "widescreen");
     HMENU ren = CreatePopupMenu();
+    {   /* Direct3D 12 / Vulkan / Software: radio-style checks; an API switch rebuilds the renderer */
+        static char acts[4][24];
+        const char *gn[4], *gt[4];
+        const int ng = frontend_graphics_apis(gn, gt, 4);
+        for (int i = 0; i < ng; i++) {
+            snprintf(acts[i], sizeof acts[i], "renderer=%s", gn[i]);
+            add(ren, gt[i], acts[i]);
+        }
+        AppendMenuW(ren, MF_SEPARATOR, 0, NULL);
+    }
     add(ren, "Software", "renderer=software");
-    add(ren, "GPU", "renderer=gpu");
     add_sub(view, "Renderer", ren);
     HMENU tf = CreatePopupMenu();   /* render quality: presentation only, reseeds like a resize */
     add(tf, "Off (Sharp Pixels)", "tex-filter=nearest");

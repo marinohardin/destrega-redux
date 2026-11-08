@@ -1,10 +1,13 @@
 /* SDL_GPU high-resolution backend (see hires.h, AGENTS.md "GPU renderer").
  *
- * Shaders: MSL source below for Metal; SPIR-V for Vulkan from runtime/shaders/hires.glsl
- * (compiled by tools/gen_spirv.py into shaders/hires_spirv.h). The two implement the same
- * rules; the GLSL emulates 64-bit integers with 32-bit pairs (see its header). On Vulkan every
- * triangle takes the exact edge test (F_EDGE, below): Vulkan does not fix the rasterizer's
- * tie-break rule for pixel centres on an edge, Metal and D3D use top-left.
+ * Shaders: MSL source below for Metal; SPIR-V for Vulkan and DXIL for Direct3D 12, both from
+ * runtime/shaders/hires.glsl (tools/gen_spirv.py -> shaders/hires_spirv.h; tools/gen_dxil.py:
+ * GLSL -> SPIR-V -> HLSL (SPIRV-Cross) -> DXIL (DXC) -> shaders/hires_dxil.h). MSL and GLSL
+ * implement the same rules; the GLSL emulates 64-bit integers with 32-bit pairs (see its
+ * header). On Vulkan every triangle takes the exact edge test (F_EDGE, below): Vulkan does not
+ * fix the rasterizer's tie-break rule for pixel centres on an edge; Metal and D3D12 specify
+ * top-left. The graphics API is chosen per device (s_apis, s_order; hires_gpu_shutdown +
+ * hires_gpu_init switch it at runtime).
  *
  * Implements HiresBackend with the same rules as the software rasterizer in hires.c, which
  * stays the reference: same coverage (the scaled vertices are shifted by half a pixel so the
@@ -71,6 +74,7 @@
  */
 #include "hires_gpu.h"
 #include "shaders/hires_spirv.h"
+#include "shaders/hires_dxil.h"
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <stdio.h>
@@ -446,9 +450,9 @@ static u32 s_up_cap, s_down_cap;
 static SDL_GPUFence *s_fences[2];
 static int s_fence_i;
 static bool s_inited, s_ready;
-static bool s_spirv;        /* the device takes SPIR-V (Vulkan); else MSL (Metal) */
+static SDL_GPUShaderFormat s_shfmt;   /* MSL (Metal), SPIR-V (Vulkan) or DXIL (Direct3D 12) */
 static bool s_force_edge;   /* exact edge test for every triangle (Vulkan; DESTREGA_GPU_EDGE=0/1) */
-static char s_driver[16];   /* requested SDL_GPU driver, "" = auto */
+static int s_present_x = -1, s_present_y = -1;   /* view origin of the last present pass */
 
 static const u16 *s_vram;
 static int s_Sx, s_Sy, s_rx, s_ry, s_rw, s_rh, s_tw, s_th, s_ox, s_oy;
@@ -1348,9 +1352,8 @@ static void release_target(void)
     s_put_n = 0;
 }
 
-static void be_destroy(void)
+static void be_destroy_force(void)
 {
-    if (!s_inited) return;
     reset_lists();
     for (int k = 0; k < NKEYS; k++) s_gv[k].n = 0;
     memset(s_gm, 0, sizeof s_gm);
@@ -1360,6 +1363,11 @@ static void be_destroy(void)
     s_ready = false;
     s_Sx = s_Sy = 0;
     s_gx = 0;
+}
+
+static void be_destroy(void)
+{
+    if (s_inited) be_destroy_force();
 }
 
 static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int rw, int rh)
@@ -1468,10 +1476,9 @@ SDL_GPUTexture *hires_gpu_present(const HiresView *v)
         s_dirty_present = true;
         if (!s_present) return NULL;
     }
-    static int last_x = -1, last_y = -1;
-    if (s_dirty_present || last_x != v->gx || last_y != v->gy) {
+    if (s_dirty_present || s_present_x != v->gx || s_present_y != v->gy) {
         submit(false, 0, 0, 0, 0, true, v->gx, v->gy);
-        last_x = v->gx; last_y = v->gy;
+        s_present_x = v->gx; s_present_y = v->gy;
         s_dirty_present = false;
     }
     return s_present;
@@ -1491,15 +1498,22 @@ static SDL_GPUShader *make_shader(const char *entry, SDL_GPUShaderStage stage, u
     SDL_GPUShaderCreateInfo si = { .code = (const Uint8 *)s_msl, .code_size = sizeof s_msl - 1, .entrypoint = entry,
                                    .format = SDL_GPU_SHADERFORMAT_MSL, .stage = stage, .num_samplers = samplers,
                                    .num_storage_buffers = sbufs, .num_uniform_buffers = ubufs };
-    if (s_spirv) {   /* one SPIR-V module per entry point, each with entry "main" */
-        static const struct { const char *name; const unsigned char *code; size_t size; } spv[] = {
-            { "vs_prim", s_spv_vs_prim, sizeof s_spv_vs_prim }, { "fs_prim", s_spv_fs_prim, sizeof s_spv_fs_prim },
-            { "vs_full", s_spv_vs_full, sizeof s_spv_vs_full }, { "fs_present", s_spv_fs_present, sizeof s_spv_fs_present },
-        };
-        for (size_t i = 0; i < sizeof spv / sizeof spv[0]; i++)
-            if (!strcmp(spv[i].name, entry)) { si.code = spv[i].code; si.code_size = spv[i].size; }
+    /* SPIR-V and DXIL: one module per entry point (from hires.glsl), each with entry "main" */
+    static const struct { const char *name; const unsigned char *spv, *dxil; size_t spv_n, dxil_n; } mods[] = {
+        { "vs_prim", s_spv_vs_prim, s_dxil_vs_prim, sizeof s_spv_vs_prim, sizeof s_dxil_vs_prim },
+        { "fs_prim", s_spv_fs_prim, s_dxil_fs_prim, sizeof s_spv_fs_prim, sizeof s_dxil_fs_prim },
+        { "vs_full", s_spv_vs_full, s_dxil_vs_full, sizeof s_spv_vs_full, sizeof s_dxil_vs_full },
+        { "fs_present", s_spv_fs_present, s_dxil_fs_present, sizeof s_spv_fs_present, sizeof s_dxil_fs_present },
+    };
+    if (s_shfmt != SDL_GPU_SHADERFORMAT_MSL) {
+        for (size_t i = 0; i < sizeof mods / sizeof mods[0]; i++)
+            if (!strcmp(mods[i].name, entry)) {
+                const bool dx = s_shfmt == SDL_GPU_SHADERFORMAT_DXIL;
+                si.code = dx ? mods[i].dxil : mods[i].spv;
+                si.code_size = dx ? mods[i].dxil_n : mods[i].spv_n;
+            }
         si.entrypoint = "main";
-        si.format = SDL_GPU_SHADERFORMAT_SPIRV;
+        si.format = s_shfmt;
     }
     SDL_GPUShader *s = SDL_CreateGPUShader(s_dev, &si);
     if (!s) rt_log("hires-gpu: shader %s: %s", entry, SDL_GetError());
@@ -1527,23 +1541,68 @@ static void blend_for_key(int key, SDL_GPUColorTargetBlendState *b)
     }
 }
 
-bool hires_gpu_set_driver(const char *name)
+/* ---- graphics APIs (SDL_GPU drivers) ----------------------------------------------------------------
+ * One backend, three shader formats: Metal takes the MSL above, Vulkan the SPIR-V and Direct3D 12
+ * the DXIL, both compiled from runtime/shaders/hires.glsl. s_order is the platform's preference
+ * (the first that works is the default): macOS Metal, Vulkan (MoltenVK); Windows Direct3D 12,
+ * Vulkan; elsewhere Vulkan. */
+static const struct { const char *name, *title, *sdl; SDL_GPUShaderFormat fmt; } s_apis[HGPU_NAPI] = {
+    [HGPU_METAL] = { "metal", "Metal", "metal", SDL_GPU_SHADERFORMAT_MSL },
+    [HGPU_VULKAN] = { "vulkan", "Vulkan", "vulkan", SDL_GPU_SHADERFORMAT_SPIRV },
+    [HGPU_D3D12] = { "d3d12", "Direct3D 12", "direct3d12", SDL_GPU_SHADERFORMAT_DXIL },
+};
+#if defined(__APPLE__)
+static const int s_order[] = { HGPU_METAL, HGPU_VULKAN };
+#elif defined(_WIN32)
+static const int s_order[] = { HGPU_D3D12, HGPU_VULKAN };
+#else
+static const int s_order[] = { HGPU_VULKAN };
+#endif
+static int s_req_api = -1;               /* --gpu-driver: -1 = auto (s_order) */
+static signed char s_probe[HGPU_NAPI];   /* 0 = not probed yet, 1 = available, -1 = not */
+
+const char *hires_gpu_api_name(int api) { return api >= 0 && api < HGPU_NAPI ? s_apis[api].name : "none"; }
+const char *hires_gpu_api_title(int api) { return api >= 0 && api < HGPU_NAPI ? s_apis[api].title : "none"; }
+int hires_gpu_api_from_name(const char *s)
 {
-    if (!name || !*name || !strcmp(name, "auto")) { s_driver[0] = 0; return true; }
-    if (strcmp(name, "metal") && strcmp(name, "vulkan")) return false;
-    snprintf(s_driver, sizeof s_driver, "%s", name);
-    return true;
+    if (!s) return -1;
+    for (int i = 0; i < HGPU_NAPI; i++)
+        if (!strcmp(s, s_apis[i].name) || !strcmp(s, s_apis[i].sdl)) return i;
+    return -1;
+}
+int hires_gpu_api_order(int out[HGPU_NAPI])
+{
+    int n = 0;
+    for (size_t i = 0; i < sizeof s_order / sizeof s_order[0]; i++) out[n++] = s_order[i];
+    return n;
+}
+bool hires_gpu_api_offered(int api)
+{
+    for (size_t i = 0; i < sizeof s_order / sizeof s_order[0]; i++)
+        if (s_order[i] == api) return true;
+    return false;
 }
 
-SDL_GPUDevice *hires_gpu_create_device(void)
+bool hires_gpu_set_driver(const char *name)
 {
-    if (!SDL_WasInit(SDL_INIT_VIDEO)) {   /* SDL_GPU needs it (the offscreen driver has no GPU backend) */
-        if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { rt_log("hires-gpu: SDL video: %s", SDL_GetError()); return NULL; }
+    if (!name || !*name || !strcmp(name, "auto")) { s_req_api = -1; return true; }
+    const int a = hires_gpu_api_from_name(name);
+    if (a < 0 || !hires_gpu_api_offered(a)) return false;
+    s_req_api = a;
+    return true;
+}
+int hires_gpu_driver(void) { return s_req_api; }
+
+static bool video_up(void)
+{
+    if (!SDL_WasInit(SDL_INIT_VIDEO) && !SDL_InitSubSystem(SDL_INIT_VIDEO)) {   /* SDL_GPU needs it */
+        rt_log("hires-gpu: SDL video: %s", SDL_GetError());
+        return false;
     }
 #ifdef __APPLE__
     /* Vulkan on macOS = MoltenVK through the Vulkan loader, which SDL only finds in the default
      * library paths; point it at Homebrew's loader unless SDL_VULKAN_LIBRARY says otherwise. */
-    if (!strcmp(s_driver, "vulkan") && !SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
+    if (!SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
         static const char *const libs[] = { "/opt/homebrew/lib/libvulkan.1.dylib", "/usr/local/lib/libvulkan.1.dylib" };
         for (size_t i = 0; i < sizeof libs / sizeof libs[0]; i++) {
             SDL_PathInfo pi;
@@ -1551,56 +1610,118 @@ SDL_GPUDevice *hires_gpu_create_device(void)
         }
     }
 #endif
-    /* auto: MSL first on Apple (Metal), SPIR-V elsewhere (Vulkan); never D3D12 (no DXIL here) */
-    SDL_GPUShaderFormat fmts = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_SPIRV;
-    if (!strcmp(s_driver, "metal")) fmts = SDL_GPU_SHADERFORMAT_MSL;
-    if (!strcmp(s_driver, "vulkan")) fmts = SDL_GPU_SHADERFORMAT_SPIRV;
-    SDL_GPUDevice *dev = SDL_CreateGPUDevice(fmts, false, s_driver[0] ? s_driver : NULL);
-    if (!dev) rt_log("hires-gpu: no GPU device%s%s: %s", s_driver[0] ? " for driver " : "", s_driver, SDL_GetError());
+    return true;
+}
+
+bool hires_gpu_api_probe(int api)
+{
+    if (api < 0 || api >= HGPU_NAPI || !hires_gpu_api_offered(api)) return false;
+    if (!s_probe[api]) {
+        /* SDL prepares the driver (loads its library, looks for a device that takes this shader
+         * format) without creating a device; render target formats are checked by init_on */
+        SDL_ClearError();
+        const bool ok = video_up() && SDL_GPUSupportsShaderFormats(s_apis[api].fmt, s_apis[api].sdl);
+        s_probe[api] = ok ? 1 : -1;
+        if (!ok) rt_log("hires-gpu: %s is not available on this computer%s%s", s_apis[api].title,
+                        *SDL_GetError() ? ": " : "", SDL_GetError());
+    }
+    return s_probe[api] > 0;
+}
+void hires_gpu_api_mark_failed(int api) { if (api >= 0 && api < HGPU_NAPI) s_probe[api] = -1; }
+
+SDL_GPUDevice *hires_gpu_create_device(int api)
+{
+    if (api < 0 || api >= HGPU_NAPI || !video_up()) return NULL;
+    SDL_GPUDevice *dev = SDL_CreateGPUDevice(s_apis[api].fmt, false, s_apis[api].sdl);
+    if (!dev) rt_log("hires-gpu: no %s device: %s", s_apis[api].title, SDL_GetError());
     return dev;
 }
+
+static int s_api = -1;              /* API of s_dev while initialised */
+static bool s_own_dev;              /* s_dev was created by hires_gpu_init(NULL) (headless) */
+int hires_gpu_api(void) { return s_inited ? s_api : -1; }
+
+static bool init_on(SDL_GPUDevice *dev);
 
 bool hires_gpu_init(SDL_GPUDevice *dev)
 {
     if (s_inited) return true;
-    if (!dev) {
-        dev = hires_gpu_create_device();
-        if (!dev) return false;
-    }
-    const SDL_GPUShaderFormat have = SDL_GetGPUShaderFormats(dev);
-    if (have & SDL_GPU_SHADERFORMAT_MSL) s_spirv = false;
-    else if (have & SDL_GPU_SHADERFORMAT_SPIRV) s_spirv = true;
-    else {
-        rt_log("hires-gpu: device %s takes neither MSL nor SPIR-V shaders", SDL_GetGPUDeviceDriver(dev));
+    if (dev) {
+        if (init_on(dev)) return true;
+        hires_gpu_shutdown();
         return false;
     }
-    s_force_edge = s_spirv;
-    {
-        const char *e = SDL_getenv("DESTREGA_GPU_EDGE");   /* experiments: 1 = always, 0 = only when needed */
-        if (e && *e) s_force_edge = *e != '0';
+    /* a device of its own: the requested API, else the first of the platform's that works */
+    int order[HGPU_NAPI], n = 0;
+    if (s_req_api >= 0) order[n++] = s_req_api;
+    else n = hires_gpu_api_order(order);
+    for (int i = 0; i < n; i++) {
+        if (!hires_gpu_api_probe(order[i])) continue;
+        dev = hires_gpu_create_device(order[i]);
+        if (!dev) { hires_gpu_api_mark_failed(order[i]); continue; }
+        if (init_on(dev)) { s_own_dev = true; return true; }
+        hires_gpu_shutdown();
+        SDL_DestroyGPUDevice(dev);
+        hires_gpu_api_mark_failed(order[i]);
     }
-    s_dev = dev;
-    const SDL_GPUTextureFormat fmt = SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
-    if (!SDL_GPUTextureSupportsFormat(dev, fmt, SDL_GPU_TEXTURETYPE_2D,
-                                      SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER)) {
-        rt_log("hires-gpu: B5G5R5A1 render targets unsupported on this GPU");
-        return false;
-    }
-    SDL_GPUShader *vs = make_shader("vs_prim", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 1);
-    SDL_GPUShader *fs = make_shader("fs_prim", SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1, 1);
-    SDL_GPUShader *pvs = make_shader("vs_full", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 0);
-    SDL_GPUShader *pfs = make_shader("fs_present", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 1);
-    if (!vs || !fs || !pvs || !pfs) return false;
+    return false;
+}
+
+/* Release everything created on the device (between frames; the hi-res layer must not be using
+ * this backend: hires_set_scale(0, 0) or another backend first). The device itself is destroyed
+ * only if it is our own (headless); a windowed renderer's device belongs to the caller. */
+void hires_gpu_shutdown(void)
+{
+    if (!s_dev) { s_inited = false; return; }
+    if (s_ready) submit(false, 0, 0, 0, 0, false, 0, 0);
+    for (int i = 0; i < 2; i++) wait_fence(&s_fences[i]);
+    SDL_WaitForGPUIdle(s_dev);
+    be_destroy_force();
+    for (int h = 0; h < 2; h++)
+        for (int k = 0; k < NKEYS; k++)
+            if (s_pipe[h][k]) { SDL_ReleaseGPUGraphicsPipeline(s_dev, s_pipe[h][k]); s_pipe[h][k] = NULL; }
+    if (s_present_pipe) SDL_ReleaseGPUGraphicsPipeline(s_dev, s_present_pipe);
+    if (s_samp) SDL_ReleaseGPUSampler(s_dev, s_samp);
+    if (s_vramtex) SDL_ReleaseGPUTexture(s_dev, s_vramtex);
+    if (s_present) SDL_ReleaseGPUTexture(s_dev, s_present);
+    if (s_vbuf) SDL_ReleaseGPUBuffer(s_dev, s_vbuf);
+    if (s_pbuf) SDL_ReleaseGPUBuffer(s_dev, s_pbuf);
+    if (s_up) SDL_ReleaseGPUTransferBuffer(s_dev, s_up);
+    if (s_down) SDL_ReleaseGPUTransferBuffer(s_dev, s_down);
+    s_present_pipe = NULL; s_samp = NULL; s_vramtex = s_present = NULL;
+    s_vbuf = s_pbuf = NULL; s_up = s_down = NULL;
+    s_vbuf_cap = s_pbuf_cap = s_up_cap = s_down_cap = 0;
+    s_pw = s_ph = 0;
+    s_dirty_present = true;
+    s_present_x = s_present_y = -1;
+    if (s_own_dev) SDL_DestroyGPUDevice(s_dev);
+    s_own_dev = false;
+    s_dev = NULL;
+    s_inited = false;
+    s_api = -1;
+}
+
+static char s_devname[128];
+
+const char *hires_gpu_device_name(void) { return s_inited ? s_devname : ""; }
+
+bool hires_gpu_software_adapter(void)
+{
+    if (!s_inited) return false;
+    static const char *const soft[] = { "Basic Render", "WARP", "llvmpipe", "lavapipe", "softpipe", "SwiftShader" };
+    for (size_t i = 0; i < sizeof soft / sizeof soft[0]; i++)
+        if (SDL_strcasestr(s_devname, soft[i])) return true;
+    return false;
+}
+
+static bool create_pipelines(SDL_GPUDevice *dev, SDL_GPUTextureFormat fmt, SDL_GPUShader *vs, SDL_GPUShader *fs,
+                             SDL_GPUShader *pvs, SDL_GPUShader *pfs)
+{
     SDL_GPUVertexBufferDescription vbd = { .slot = 0, .pitch = sizeof(GVtx), .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX };
     SDL_GPUVertexAttribute va[2] = {
         { .location = 0, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
         { .location = 1, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_UINT, .offset = 8 },
     };
-    if (!SDL_GPUTextureSupportsFormat(dev, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, SDL_GPU_TEXTURETYPE_2D,
-                                      SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER)) {
-        rt_log("hires-gpu: RGBA8 render targets unsupported on this GPU");
-        return false;
-    }
     for (int k = 0; k < 2 * NKEYS; k++) {
         SDL_GPUColorTargetDescription cd = { .format = k >= NKEYS ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : fmt };
         blend_for_key(k % NKEYS, &cd.blend_state);
@@ -1615,21 +1736,62 @@ bool hires_gpu_init(SDL_GPUDevice *dev)
         s_pipe[k / NKEYS][k % NKEYS] = SDL_CreateGPUGraphicsPipeline(dev, &pi);
         if (!s_pipe[k / NKEYS][k % NKEYS]) { rt_log("hires-gpu: pipeline %d: %s", k, SDL_GetError()); return false; }
     }
-    {
-        SDL_GPUColorTargetDescription cd = { .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM };
-        SDL_GPUGraphicsPipelineCreateInfo pi = {
-            .vertex_shader = pvs, .fragment_shader = pfs,
-            .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
-            .rasterizer_state = { .fill_mode = SDL_GPU_FILLMODE_FILL, .cull_mode = SDL_GPU_CULLMODE_NONE },
-            .target_info = { .color_target_descriptions = &cd, .num_color_targets = 1 },
-        };
-        s_present_pipe = SDL_CreateGPUGraphicsPipeline(dev, &pi);
-        if (!s_present_pipe) { rt_log("hires-gpu: present pipeline: %s", SDL_GetError()); return false; }
+    SDL_GPUColorTargetDescription cd = { .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM };
+    SDL_GPUGraphicsPipelineCreateInfo pi = {
+        .vertex_shader = pvs, .fragment_shader = pfs,
+        .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .rasterizer_state = { .fill_mode = SDL_GPU_FILLMODE_FILL, .cull_mode = SDL_GPU_CULLMODE_NONE },
+        .target_info = { .color_target_descriptions = &cd, .num_color_targets = 1 },
+    };
+    s_present_pipe = SDL_CreateGPUGraphicsPipeline(dev, &pi);
+    if (!s_present_pipe) { rt_log("hires-gpu: present pipeline: %s", SDL_GetError()); return false; }
+    return true;
+}
+
+/* Everything on `dev`; on failure the caller runs hires_gpu_shutdown() (s_dev is set early so it
+ * releases what was made). */
+static bool init_on(SDL_GPUDevice *dev)
+{
+    const char *drv = SDL_GetGPUDeviceDriver(dev);
+    s_api = hires_gpu_api_from_name(drv);
+    if (s_api < 0 || !(SDL_GetGPUShaderFormats(dev) & s_apis[s_api].fmt)) {
+        rt_log("hires-gpu: device %s takes none of our shader formats (MSL, SPIR-V, DXIL)", drv ? drv : "?");
+        return false;
     }
-    SDL_ReleaseGPUShader(dev, vs);
-    SDL_ReleaseGPUShader(dev, fs);
-    SDL_ReleaseGPUShader(dev, pvs);
-    SDL_ReleaseGPUShader(dev, pfs);
+    s_shfmt = s_apis[s_api].fmt;
+    /* Vulkan leaves the rasterizer's tie-break for pixel centres on an edge open; Metal and D3D12
+     * specify the top-left rule the integer path relies on */
+    s_force_edge = s_api == HGPU_VULKAN;
+    {
+        const char *e = SDL_getenv("DESTREGA_GPU_EDGE");   /* experiments: 1 = always, 0 = only when needed */
+        if (e && *e) s_force_edge = *e != '0';
+    }
+    s_dev = dev;
+    {
+        const SDL_PropertiesID pr = SDL_GetGPUDeviceProperties(dev);
+        const char *nm = pr ? SDL_GetStringProperty(pr, SDL_PROP_GPU_DEVICE_NAME_STRING, "") : "";
+        const char *di = pr ? SDL_GetStringProperty(pr, SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING, "") : "";
+        snprintf(s_devname, sizeof s_devname, "%s%s%s", nm, *di ? ", " : "", di);
+    }
+    const SDL_GPUTextureFormat fmt = SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
+    const SDL_GPUTextureUsageFlags use = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    if (!SDL_GPUTextureSupportsFormat(dev, fmt, SDL_GPU_TEXTURETYPE_2D, use)) {
+        rt_log("hires-gpu: %s: B5G5R5A1 render targets unsupported on this GPU (%s)", s_apis[s_api].title, s_devname);
+        return false;
+    }
+    if (!SDL_GPUTextureSupportsFormat(dev, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, SDL_GPU_TEXTURETYPE_2D, use)) {
+        rt_log("hires-gpu: %s: RGBA8 render targets unsupported on this GPU (%s)", s_apis[s_api].title, s_devname);
+        return false;
+    }
+    SDL_GPUShader *vs = make_shader("vs_prim", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 1);
+    SDL_GPUShader *fs = make_shader("fs_prim", SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1, 1);
+    SDL_GPUShader *pvs = make_shader("vs_full", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 0);
+    SDL_GPUShader *pfs = make_shader("fs_present", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 1);
+    const bool ok = vs && fs && pvs && pfs && create_pipelines(dev, fmt, vs, fs, pvs, pfs);
+    SDL_GPUShader *sh[4] = { vs, fs, pvs, pfs };
+    for (int i = 0; i < 4; i++)
+        if (sh[i]) SDL_ReleaseGPUShader(dev, sh[i]);
+    if (!ok) return false;
     SDL_GPUSamplerCreateInfo sci = { .min_filter = SDL_GPU_FILTER_NEAREST, .mag_filter = SDL_GPU_FILTER_NEAREST,
                                      .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
                                      .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
@@ -1639,7 +1801,8 @@ bool hires_gpu_init(SDL_GPUDevice *dev)
     s_vramtex = make_tex(SDL_GPU_TEXTUREFORMAT_R16_UINT, VRAM_W, VRAM_H, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     if (!s_samp || !s_vramtex) { rt_log("hires-gpu: %s", SDL_GetError()); return false; }
     s_inited = true;
-    rt_log("hires-gpu: SDL_GPU device ready (driver %s, %s shaders%s)", SDL_GetGPUDeviceDriver(dev),
-           s_spirv ? "SPIR-V" : "MSL", s_force_edge ? ", exact edge test on every triangle" : "");
+    rt_log("hires-gpu: SDL_GPU device ready (%s, driver %s, %s shaders%s; %s)", s_apis[s_api].title, drv,
+           s_shfmt == SDL_GPU_SHADERFORMAT_MSL ? "MSL" : s_shfmt == SDL_GPU_SHADERFORMAT_DXIL ? "DXIL" : "SPIR-V",
+           s_force_edge ? ", exact edge test on every triangle" : "", *s_devname ? s_devname : "unnamed adapter");
     return true;
 }

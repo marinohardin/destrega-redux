@@ -62,7 +62,7 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
     if ([a hasPrefix:@"renderer="]) {
         NSString *r = [a substringFromIndex:9];
         item.state = [r isEqualToString:@(frontend_renderer())] ? NSControlStateValueOn : NSControlStateValueOff;
-        if ([r isEqualToString:@"gpu"]) return frontend_gpu_available();
+        return frontend_renderer_available(r.UTF8String);   /* greyed: not available on this Mac */
     }
     return YES;
 }
@@ -231,10 +231,15 @@ void menu_init(void) {
         ws.representedObject = @"widescreen";
         [view insertItem:ws atIndex:0];
 
-        /* View > Renderer: Software / GPU (radio-style check marks; switches between frames) */
+        /* View > Renderer: Metal / Vulkan / Software (radio-style check marks; switches between
+         * frames, an API switch rebuilds the window's renderer; Vulkan greyed out without MoltenVK) */
         NSMenu *ren = [[NSMenu alloc] initWithTitle:@"Renderer"];
+        const char *gn[4], *gt[4];
+        const int ng = frontend_graphics_apis(gn, gt, 4);
+        for (int i = 0; i < ng; i++)
+            add(ren, @(gt[i]), [@"renderer=" stringByAppendingString:@(gn[i])], nil, 0);
+        [ren addItem:[NSMenuItem separatorItem]];
         add(ren, @"Software", @"renderer=software", nil, 0);
-        add(ren, @"GPU", @"renderer=gpu", nil, 0);
         NSMenuItem *renItem = [[NSMenuItem alloc] initWithTitle:@"Renderer" action:nil keyEquivalent:@""];
         renItem.submenu = ren;
         [view insertItem:renItem atIndex:1];
