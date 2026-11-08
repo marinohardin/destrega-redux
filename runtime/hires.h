@@ -8,8 +8,9 @@
  *
  * The renderer sits behind HiresBackend (command in -> target out) so a GPU
  * (Metal/SDL_GPU) backend can replace the software one later. Vertices carry
- * 16.16 fixed-point positions (in 1x pixel units) so sub-pixel inputs (e.g.
- * PGXP-style GTE precision) can be supplied later; today they are integers.
+ * 16.16 fixed-point positions (in 1x pixel units): integers, or sub-pixel
+ * positions from the GTE when PGXP tracking (runtime/pgxp.h) matched the vertex,
+ * in which case `w` (view depth) is also set for perspective-correct texturing.
  */
 #ifndef HIRES_H
 #define HIRES_H
@@ -22,6 +23,10 @@ typedef struct {
     s32 x, y;         /* 1x pixel units, 16.16 fixed point; drawing offset already applied */
     u32 r, g, b;      /* 0..255 */
     u32 u, v;         /* 0..255 */
+    /* PGXP: view depth (> 0) when x/y are precise GTE values, else 0. A backend texturing a
+     * triangle whose three vertices all have w > 0 may interpolate u/v perspective-correctly
+     * (u/w, v/w, 1/w); otherwise affine, as the PS1 does. Backends may ignore it. */
+    float w;
 } HiresVtx;
 
 typedef struct {
@@ -109,6 +114,12 @@ void hires_clear_dirty(void);
  * always be 0). tris / tris_1x_range: textured triangles drawn / using the 1x-sampled range. */
 typedef struct { u64 samples, clamped, escaped, tris, tris_1x_range; } HiresUvStats;
 void hires_get_uv_stats(HiresUvStats *st);
+
+/* Perspective-correct texturing of triangles whose vertices all carry w (default on; with it
+ * off, w is ignored and texturing is affine). */
+void hires_set_perspective(bool enable);
+/* Triangles drawn, and those textured perspective-correctly. */
+void hires_get_persp_stats(u64 *tris, u64 *persp);
 
 /* Compare the target against the 1x VRAM region (meaningful at scale 1x1, where they must
  * be identical). Returns the number of differing pixels; reports the first one. */

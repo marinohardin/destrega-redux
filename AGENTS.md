@@ -158,7 +158,7 @@ hashing all emulated state per frame).
   bit-identical to the 1x VRAM region (`--hires-verify`).
 - Coverage = 1x geometry scaled by Sx/Sy (a w*h rect covers exactly Sx*w x Sy*h pixels).
   Colour/u/v come from the 1x plane equations at each hi-res pixel centre. Vertices are
-  16.16 fixed point in 1x units (integers today) so GTE sub-pixel precision can be fed later.
+  16.16 fixed point in 1x units: integers, or sub-pixel GTE positions with PGXP (below).
 - UV clamp: a hi-res pixel centre can lie outside the polygon (texture minified by more than
   ~1.3 texel per pixel, and always near the right/bottom edges), so interpolated u/v are clamped
   before the texture-window mask, otherwise the lookup reads a neighbouring texture in VRAM
@@ -216,6 +216,44 @@ hashing all emulated state per frame).
   2x2, 4x4, 8x8, 2x3, 4x6, a resize schedule with Sx != Sy, and the 1x1 equivalence run; all
   state hashes equal, >=95% of fight frames hi-res, 0 UV fetches outside the 1x-sampled range, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
   tests, `tools/smoke_test.sh` and the determinism script concurrently (~1.7 min).
+
+## PGXP: sub-pixel vertices and perspective-correct textures (`runtime/pgxp.[ch]`)
+
+Presentation-only, like hi-res. Removes the vertex wobble and affine texture warping in the
+hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x VRAM.
+
+- `gte.c` RTPS/RTPT also compute the projection without the integer steps (`pgxp_project`:
+  H / unrounded SZ instead of UNR on the integer SZ3, unsaturated MAC1/2) and store
+  {integer SXY word, dx, dy, depth} in a ring pool; the tag (pool index) rides in a 3-entry FIFO
+  next to SXY0..2. No value when SX/SY/SZ/IR were clamped or the two differ by >= 4 px.
+- Tags follow the word: `codegen.py` emits `pgxp_lw/sw/mov/mfc2/mtc2/lwc2/swc2` hooks
+  (register moves = `addu/or rd, rs, $zero`, `addiu rt, rs, 0`); `interp.c` mirrors all but
+  moves. Shadow tags: one per CPU register, per RAM/scratchpad word, plus an I/O sink slot that
+  carries an SW to the GP0 port. GPU DMA (block and linked list), the GP0 port and BIOS GPU_cw
+  pass each word's tag to `gpu_write_gp0_tag`. A tag is used only if the pool entry's integer
+  word still equals the GP0 word (`pgxp_lookup`), so stale tags (ALU ops, sh/sb rewrites,
+  ring reuse) just fall back to the integer vertex. No invalidation anywhere.
+- `gpu.c` adds the offsets to polygon vertices for `g_hires` only (`HiresVtx.x/y` 16.16 plus
+  `HiresVtx.w`, 0 = none). Lines and rects (2D sprites, HUD, text) are untouched.
+- `hires.c`: a textured triangle with `w` on all three vertices is textured perspective-
+  correctly (q = 1/w, u*q, v*q planes; exact every 8 hi-res pixels, linear in between);
+  otherwise affine as before. The UV clamp to the 1x-sampled range stays: perspective u/v inside
+  the triangle are a convex combination of the vertex u/v, so the clamp only acts at the edges /
+  outside, as for affine; it is also applied at 1x1 when a triangle has precise vertices
+  (samples are off the 1x grid there too). The gouraud colour clamp is unchanged (colours stay
+  affine).
+- Option `--pgxp on|off|affine` (default on; `affine` = precise positions, PS1 texture mapping).
+  Off = previous output exactly (tracking disabled, `w` = 0). The hooks are guarded by
+  `g_pgxp`. At 1x1 with PGXP on, `--hires-verify` reports mismatches by design (vertices leave
+  the integer grid); equivalence is tested with `--pgxp off`.
+- Run summary: `pgxp: H of N polygon vertices precise, ... misses: S stale tag, G equal to a
+  recent GTE result` (G estimates GTE vertices whose association was lost; the rest of the
+  misses are CPU-computed 2D polygons). Fight at 4x6: see the PR / NOTES.md for numbers.
+- Tests: `runtime/tests/test_pgxp.c` (GTE registers bit-identical on/off; GTE -> register ->
+  RAM -> lw -> move -> sw -> GP0 path; dropped after sh rewrite, stale register, untracked
+  store; FIFO shift; perspective only with three depths), and the determinism matrix runs
+  `--pgxp on/affine` at several scales against a `--pgxp off`, hi-res-off reference.
+- For other backends (`HiresBackend`): `w` is optional; ignore it for affine texturing.
 
 ## Pitfalls
 

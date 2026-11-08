@@ -8,7 +8,11 @@
 #  2. At 1x1 the hi-res target must equal the 1x VRAM region at every frame (also in the fight).
 #  3. Every textured hi-res sample must lie inside its triangle's vertex UV range when fetched (no
 #     texture bleed); at 1x1 nothing may need clamping.
-#  4. In every hi-res run >= 95% of the fight-window frames (frame >= 3700) must be presentable
+#  4. PGXP (sub-pixel GTE vertices, perspective-correct textures) is presentation only: the runs
+#     with --pgxp on/affine must hash the same as the reference run (hi-res off, --pgxp off) and
+#     must report precise vertices; 1x1 equivalence is checked with --pgxp off (with it on the
+#     target intentionally differs from 1x: vertices are no longer on the 1x integer grid).
+#  5. In every hi-res run >= 95% of the fight-window frames (frame >= 3700) must be presentable
 #     from the hi-res target rather than the 1x fallback.
 # The runs are independent processes and run concurrently (JOBS at a time, default: performance
 # cores). Usage: tools/test_hires_determinism.sh [frames]   (default 7000; needs build/cmake/destrega)
@@ -35,14 +39,14 @@ FIGHT="--hires-min-fight 95"
 RESIZE="--max-scale 8 --resize 3000:640x480,3700:960x720,4300:1920x1440,4900:3840x2880,5400:480x360,5900:1920x1080,6400:1280x960,6800:2560x1920"
 # longest first so the pool stays busy
 cat > $OUT/jobs.txt <<EOF
-s8x8 --scale 8 --hires-threads 3 $FIGHT
-resize --scale 0 --hires-threads 3 $RESIZE $FIGHT
-s4x6 --scale 4x6 --hires-threads 3 $FIGHT
-s4x4 --scale 4 --hires-threads 1 $FIGHT
-verify1 --scale 1 --hires-verify --hires-threads 1 $FIGHT
-s2x3 --scale 2x3 --hires-threads 1 $FIGHT
-s2x2 --scale 2 --hires-threads 0 $FIGHT
-off --scale 0
+s8x8 --scale 8 --hires-threads 3 --pgxp on $FIGHT
+resize --scale 0 --hires-threads 3 --pgxp on $RESIZE $FIGHT
+s4x6 --scale 4x6 --hires-threads 3 --pgxp on $FIGHT
+s4x4 --scale 4 --hires-threads 1 --pgxp affine $FIGHT
+verify1 --scale 1 --hires-verify --hires-threads 1 --pgxp off $FIGHT
+s2x3 --scale 2x3 --hires-threads 1 --pgxp on $FIGHT
+s2x2 --scale 2 --hires-threads 0 --pgxp off $FIGHT
+off --scale 0 --pgxp off
 EOF
 START=$(date +%s)
 xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
@@ -65,6 +69,11 @@ for n in s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1; do
   grep -h "hires-uv" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -q "hires-uv: [0-9]* textured samples, [0-9]* clamped to the 1x-sampled UV range, 0 out of range when fetched" $OUT/$n.log || { echo "hires: $n: UV out-of-range samples (or no UV report)"; fail=1; }
 done
+for n in s8x8 resize s4x6 s4x4 s2x3; do
+  grep -h "pgxp:" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
+  grep -q "pgxp: [1-9][0-9]* of" $OUT/$n.log || { echo "hires: $n: no precise PGXP vertices"; fail=1; }
+done
+if grep -q "pgxp:" $OUT/s2x2.log; then echo "hires: s2x2: --pgxp off still tracked vertices"; fail=1; fi
 grep -q "hires-uv: [0-9]* textured samples, 0 clamped to the 1x-sampled" $OUT/verify1.log || { echo "hires: verify1: UV clamp is not a no-op at 1x1"; fail=1; }
 grep -h "hires-verify" $OUT/verify1.log | sed 's/^\[ *[0-9]*\] /hires: verify1: /'
 [ $fail = 0 ] || exit 1

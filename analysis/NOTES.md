@@ -62,6 +62,28 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   clamping to the colour range the 1x draw produced). (verified: pixel probe)
 - About 21% of textured triangles cover no 1x pixel at all (mostly character-mesh slivers).
 
+### GTE projection call sites (PGXP work)
+
+- 34 functions contain RTPS/RTPT (`symbols.txt`, evidence `code`): two families of small
+  per-primitive-type renderers (`8003fcb8..80041c14`, 6 functions with 2 RTPT each, and
+  `80055820..80057100`, 14 functions with 1 RTPT each, lit variants use NCDS/NCCS), plus
+  single sites (`80036b0c`, `8007ec5c`, `80028c70`, ...). They use the scratchpad
+  (`0x1f800000`) as work area. (verified: generated code)
+- The usual pattern is RTPT, then `swc2 SXY0..2` **straight into the primitive packet**
+  (offsets 8/20/32 for GT3-like, 8/12/16 for F3-like), followed by integer compares of the
+  stored X/Y for clipping/culling; some sites store to the stack first and copy with lw/sw.
+  (verified: generated code; the copies are handled by the PGXP lw/sw hooks)
+- Producer probe, fight frames 3700-4400 (Gradd vs Milena, temple stage): of the polygon
+  vertices that reached the GPU with a tracked GTE origin, ~63% came from `80036b0c`, ~16% from
+  `80041c14`, ~10% from `8007ec5c`, ~1.3% from `8004163c`, the rest from the `80055xxx` family.
+  ~95% of all polygon vertices in those fight frames carry a valid precise value; over the whole
+  boot->fight run it is ~62-65% (title, menus and character select draw 2D polygons). Only
+  ~0.5% of the misses equal a recent GTE result, so nearly all misses are CPU-computed 2D
+  polygons (HUD, menus), not lost associations. No stale-tag misses observed. (verified: probe)
+- PGXP never changed the per-frame state hash, i.e. no game code observes the precise values;
+  this says nothing yet about whether gameplay depends on the *integer* GTE results (open
+  question below).
+
 ## Collision
 
 - Stage collision is a separate list of polygons (up to 4 vertices, precomputed 4.12 normal),
@@ -89,7 +111,8 @@ Highest value first. Move items to "done" with the PR that did them.
 2. **Random number generator** (address unknown): rollback needs to know every RNG source.
 3. **Pad input -> fighter commands**: where inputs enter game state (rollback, input display).
 4. **Camera, projection and GTE call sites** (RTPS/RTPT, screen offset/H): PGXP and
-   widescreen work here.
+   widescreen work here. Call sites are now listed (see "GTE projection call sites"); start
+   with `80036b0c` (most fight vertices) and the `8003fcb8..80041c14` family.
 5. **Visibility culling / off-screen tests**: widescreen must widen these without touching
    gameplay.
 6. **Fight frame update** (somewhere under `8002beb0`, see the call stack above).

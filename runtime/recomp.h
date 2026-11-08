@@ -3,6 +3,7 @@
 #define RECOMP_H
 
 #include "psx.h"
+#include "pgxp.h"
 
 #define R1 g_cpu.r[1]
 #define R2 g_cpu.r[2]

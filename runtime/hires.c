@@ -399,7 +399,17 @@ typedef struct {
     const HiresVtx *v;
 } HV;
 
-typedef struct { HiresPrim p; HiresVtx v[3]; } TriArgs;
+typedef struct { HiresPrim p; HiresVtx v[3]; bool persp, precise; } TriArgs;
+
+/* PGXP perspective-correct texturing (see be_tri) */
+static bool s_persp = true;
+static atomic_ullong s_tris_all, s_tris_persp;
+void hires_set_perspective(bool enable) { s_persp = enable; }
+void hires_get_persp_stats(u64 *tris, u64 *persp)
+{
+    *tris = atomic_load(&s_tris_all);
+    *persp = atomic_load(&s_tris_persp);
+}
 
 static inline int ccol_clamp(s64 c, int lo, int hi) { return c < lo ? lo : (c > hi ? hi : (int)c); }
 
@@ -484,6 +494,32 @@ tri_impl(const TriArgs *ta, int by0, int by1,
         }
     }
     const double ax = (double)a->X1 / 65536.0, ay = (double)a->Y1 / 65536.0;
+    /* Perspective-correct u/v (PGXP depth on all three vertices): q = 1/w, u*q and v*q are
+     * linear in screen space; per pixel u = (u*q)/q. Same sample positions as the affine path,
+     * exact (not 12-bit truncated) gradients. The result is still clamped to the UV range the
+     * 1x draw sampled: perspective u/v at a point inside the triangle are a convex combination
+     * of the vertex u/v, so the clamp only bites outside it / at the far edges, as for affine. */
+    const bool PERSP = TEX && ta->persp;
+    double pq[3] = { 0 }, pdx[3] = { 0 }, pdy[3] = { 0 };   /* q, u*q, v*q at a; gradients */
+    if (PERSP) {
+        const HV *vv[3] = { a, b, c };
+        double wmin = a->v->w;
+        if (b->v->w < wmin) wmin = b->v->w;
+        if (c->v->w < wmin) wmin = c->v->w;
+        double f[3][3], X[3], Y[3];
+        for (int k = 0; k < 3; k++) {
+            double q = wmin / (double)vv[k]->v->w;   /* normalised to <= 1 */
+            f[k][0] = q; f[k][1] = (double)vv[k]->v->u * q; f[k][2] = (double)vv[k]->v->v * q;
+            X[k] = (double)vv[k]->X1 / 65536.0; Y[k] = (double)vv[k]->Y1 / 65536.0;
+        }
+        double den = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+        for (int i = 0; i < 3; i++) {
+            pq[i] = f[0][i];
+            pdx[i] = ((f[1][i] - f[0][i]) * (Y[2] - Y[0]) - (f[2][i] - f[0][i]) * (Y[1] - Y[0])) / den;
+            pdy[i] = ((f[2][i] - f[0][i]) * (X[1] - X[0]) - (f[1][i] - f[0][i]) * (X[2] - X[0])) / den;
+        }
+    }
+    const double pstep[3] = { pdx[0] / Sx, pdx[1] / Sx, pdx[2] / Sx };
 
     const bool long_left = denom > 0;
     const s64 long_step = floor_div128(((__int128)(c->Xh - a->Xh)) << 32, c->Yh - a->Yh);
@@ -494,7 +530,7 @@ tri_impl(const TriArgs *ta, int by0, int by1,
     const int cy2 = imin(imin((p->clip_y2 + 1) * Sy, s_oy + s_th) - 1, by1 - 1);
     /* at 1x1 the sample positions equal the 1x GPU's (which wraps rather than clamps), so the
      * clamp is skipped to stay bit-identical; it only matters for sub-pixel sample offsets */
-    const bool do_clamp = Sx > 1 || Sy > 1;
+    const bool do_clamp = Sx > 1 || Sy > 1 || ta->precise;   /* PGXP moves samples off 1x's too */
     const bool mc = p->mask_check;
     const u16 mo = p->mask_or;
     const int blendm = p->blend;
@@ -526,17 +562,37 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                     g = (s64)floor((double)base[1] + gdx[1] * (P - ax) + gdy[1] * (Q - ay));
                     bb = (s64)floor((double)base[2] + gdx[2] * (P - ax) + gdy[2] * (Q - ay));
                 }
-                if (TEX) {   /* true (unwrapped) fixed-point values, so the clamp sees real excursions */
+                if (TEX && !PERSP) {   /* true (unwrapped) fixed-point values, so the clamp sees real excursions */
                     U = (s64)floor((double)base[3] + gdx[3] * (P - ax) + gdy[3] * (Q - ay));
                     V = (s64)floor((double)base[4] + gdx[4] * (P - ax) + gdy[4] * (Q - ay));
+                }
+                double pq0 = 0, pu = 0, pv = 0;
+                if (PERSP) {
+                    pq0 = pq[0] + pdx[0] * (P - ax) + pdy[0] * (Q - ay);
+                    pu = pq[1] + pdx[1] * (P - ax) + pdy[1] * (Q - ay);
+                    pv = pq[2] + pdx[2] * (P - ax) + pdy[2] * (Q - ay);
                 }
                 u16 *dst = s_t + (size_t)(y - s_oy) * s_tw + (xs - s_ox);
                 const int y1 = y / Sy;
                 int lu = -1, lv = -1;
                 u16 lt = 0;
                 u32 n_clamped = 0, n_escaped = 0;
+                s64 pus = 0, pvs = 0;   /* PERSP: affine step inside the current 8-pixel run */
                 for (int x = xs; x < xe; x++, dst++) {
                     u16 out; bool blend, ok;
+                    if (PERSP && !((x - xs) & 7)) {
+                        /* exact u/v every 8 hi-res pixels (2 1x pixels at 4x), linear in between;
+                         * +0.5 texel: same rounding as the affine base */
+                        int n = xe - x < 8 ? xe - x : 8;
+                        double q1 = pq0 + n * pstep[0], u1 = pu + n * pstep[1], v1 = pv + n * pstep[2];
+                        double iq0 = pq0 > 1e-9 ? 16777216.0 / pq0 : 0, iq1 = q1 > 1e-9 ? 16777216.0 / q1 : 0;
+                        U = (s64)floor(pu * iq0) + (1 << (FRAC - 1));
+                        V = (s64)floor(pv * iq0) + (1 << (FRAC - 1));
+                        s64 U1 = (s64)floor(u1 * iq1) + (1 << (FRAC - 1));
+                        s64 V1 = (s64)floor(v1 * iq1) + (1 << (FRAC - 1));
+                        pus = (U1 - U) / n; pvs = (V1 - V) / n;
+                        pq0 = q1; pu = u1; pv = v1;
+                    }
                     if (!(mc && (*dst & 0x8000))) {
                         if (TEX) {
                             int ui = (int)(U >> FRAC), vi = (int)(V >> FRAC);
@@ -560,7 +616,8 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                         }
                     }
                     if (GOUR) { r += gs[0]; g += gs[1]; bb += gs[2]; }
-                    if (TEX) { U += ustep; V += vstep; }
+                    if (PERSP) { U += pus; V += pvs; }
+                    else if (TEX) { U += ustep; V += vstep; }
                 }
                 if (TEX) { tl_samples += (u64)(xe - xs); tl_clamped += n_clamped; tl_escaped += n_escaped; }
             }
@@ -617,6 +674,10 @@ static void be_tri(const HiresPrim *p, const HiresVtx v[3])
     ta.p = *p;
     ta.p.dither = dither_on(p);
     memcpy(ta.v, v, sizeof ta.v);
+    ta.precise = v[0].w > 0 || v[1].w > 0 || v[2].w > 0;
+    ta.persp = s_persp && p->tex && v[0].w > 0 && v[1].w > 0 && v[2].w > 0;
+    atomic_fetch_add_explicit(&s_tris_all, 1, memory_order_relaxed);
+    if (ta.persp) atomic_fetch_add_explicit(&s_tris_persp, 1, memory_order_relaxed);
     BandFn fn;
     if (p->tex) {
         atomic_fetch_add_explicit(&s_uv_tris, 1, memory_order_relaxed);

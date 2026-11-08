@@ -50,6 +50,7 @@ static int seg_of(u64 frame) {
     return k;
 }
 static bool s_hires_dither;
+static int s_pgxp = 2;              /* --pgxp: 0 off, 1 precise positions only (affine), 2 on */
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
 static FILE *s_state_hash;         /* --state-hash FILE */
@@ -322,6 +323,18 @@ static void finish(void) {
                (unsigned long long)s_verify_bad_frames);
         if (s_verify_bad_frames || !s_verify_fight) rc = 3;
     }
+    if (g_pgxp_stat_vtx) {
+        u64 tris, persp;
+        hires_get_persp_stats(&tris, &persp);
+        rt_log("pgxp: %llu of %llu polygon vertices precise (%.1f%%), %llu GTE vertices tracked; "
+               "%llu of %llu hi-res triangles perspective-textured; misses: %llu stale tag, "
+               "%llu equal to a recent GTE result (association lost)",
+               (unsigned long long)g_pgxp_stat_hit, (unsigned long long)g_pgxp_stat_vtx,
+               100.0 * (double)g_pgxp_stat_hit / (double)g_pgxp_stat_vtx,
+               (unsigned long long)g_pgxp_stat_new, (unsigned long long)persp,
+               (unsigned long long)tris, (unsigned long long)g_pgxp_stat_miss_stale,
+               (unsigned long long)g_pgxp_stat_miss_gte);
+    }
     {
         HiresUvStats uv;
         hires_get_uv_stats(&uv);
@@ -589,6 +602,8 @@ static void usage(void) {
         "  --fight-from F        first frame counted as 'fight' in the hi-res frame stats (default 3700)\n"
         "  --hires-min-fight P   exit non-zero unless P%% of fight frames were shown from the hi-res target\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
+        "  --pgxp on|off|affine  sub-pixel GTE vertices + perspective-correct textures in the hi-res\n"
+        "                        target (default on; affine = precise positions, PS1 texture mapping)\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
@@ -711,6 +726,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fight-from") && i + 1 < argc) s_fight_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--hires-min-fight") && i + 1 < argc) s_hires_min_fight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
+        else if (!strcmp(argv[i], "--pgxp") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "on")) s_pgxp = 2;
+            else if (!strcmp(m, "off")) s_pgxp = 0;
+            else if (!strcmp(m, "affine")) s_pgxp = 1;
+            else { fprintf(stderr, "--pgxp: expected on, off or affine\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--hires-verify")) s_verify = true;
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
             s_state_hash = fopen(argv[++i], "w");
@@ -769,6 +791,8 @@ int main(int argc, char **argv) {
     gte_init();
     gpu_init();
     hires_set_dither(s_hires_dither);
+    g_pgxp = s_pgxp > 0;
+    hires_set_perspective(s_pgxp == 2);
     hires_set_threads(s_hires_threads);
     if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))
         rt_log("hires: cannot allocate scale %dx%d", s_opt_sx, s_opt_sy);
