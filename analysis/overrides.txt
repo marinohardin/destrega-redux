@@ -1,1 +1,2 @@
 800465a4
+80044210  # stage_render: widescreen shadow pass (runtime/overrides/widescreen.c)

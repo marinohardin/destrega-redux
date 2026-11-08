@@ -17,4 +17,9 @@ bool menu_executable_path(char *out, size_t n);
 /* ---- provided by main.c ---- */
 /* Queue action NAME[, ARG] (copied). Safe to call from menu callbacks. Names: see main.c. */
 void frontend_menu_action(const char *name, const char *arg);
+/* Current hi-res renderer ("software", "gpu", "compare") and whether "gpu" can be chosen. */
+const char *frontend_renderer(void);
+bool frontend_gpu_available(void);
+/* Whether the window is full screen (View > Enter/Exit Full Screen follows it). */
+bool frontend_fullscreen(void);
 #endif

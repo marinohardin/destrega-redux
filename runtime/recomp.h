@@ -50,6 +50,12 @@ extern u32 g_callstack[1024];
 extern u32 g_depth;
 #define FN_ENTER(a) (g_callstack[g_depth++ & 1023] = (a))
 #define FN_RET() do { g_depth--; return; } while (0)
+/* Widescreen culling patch points (analysis/widescreen_cull.txt): the original immediate
+ * unless --widescreen widened the stage renderer's screen-space culling. g_ws_cull_hits
+ * counts evaluations of a widened bound (the stage was drawn), used to pick 16:9 vs 4:3. */
+extern int g_widescreen_cull;
+extern u32 g_ws_cull_hits;
+#define WS_IMM(orig, wide) (__builtin_expect(g_widescreen_cull, 0) ? (g_ws_cull_hits++, (wide)) : (orig))
 #define EVT_CHECK() do { if (__builtin_expect(g_cpu.cycles >= g_cpu.next_event, 0)) rt_event(); } while (0)
 
 static inline void op_div(u32 a, u32 b) {

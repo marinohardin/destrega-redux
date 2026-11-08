@@ -34,6 +34,13 @@
  * Vertices are float target coordinates plus a primitive index; a wider target (widescreen)
  * only touches GVtx, the projection in vs_prim and configure().
  *
+ * Widescreen guard band (HiresBackend.set_guard, same rules as hires.c): the target is
+ * gx 1x columns wider on each side (s_ox = (rx - gx) * Sx, so absolute hi-res x can be
+ * negative with rx = 0: the clip rectangle is packed as signed 16-bit and the shader's 1x
+ * column uses floor division). Primitives whose draw area touches the region edge are clipped
+ * gx columns further out (guard_clip), untextured full-width rects and full-width fill rows
+ * extend over it, uploads/copies never touch it, and configure() starts it black.
+ *
  * PGXP (runtime/pgxp.h; the vertices arrive already validated and welded by gpu.c):
  * - Fractional 16.16 positions keep the exact coverage. A triangle with a fractional vertex is
  *   drawn as itself grown by 1 px per edge (or its bounding box for slivers), and the shader
@@ -207,7 +214,7 @@ static const char s_msl[] =
 "  device const Prim &p = prims[in.prim];\n"
 "  int X = int(in.pos.x) + u.ox, Y = int(in.pos.y) + u.oy;\n"
 "  uint kf = p.kf, kind = kf & 15u;\n"
-"  int x1 = X / u.sx, y1 = Y / u.sy;\n"
+"  int x1 = (X >= 0 ? X : X - u.sx + 1) / u.sx, y1 = Y / u.sy;\n"
 "  if (kind == 2u) { if (u.pass != 0) discard_fragment(); return pack(p.color & 0xFFFFu, 0, 0); }\n"
 "  if (kind == 6u) return pack(vram_at(vram, uint(x1), uint(y1)), 0, 0);\n"
 "  if (kind == 4u) {\n"
@@ -223,7 +230,7 @@ static const char s_msl[] =
 "      c = unpack(tmp.read(uint2(uint(scol * u.sx + sb - u.ox), uint(srow * u.sy + sa - u.oy))));\n"
 "    else c = vram_at(vram, uint(scol), uint(srow));\n"
 "    return pack(c | ((kf & (1u << 18)) ? 0x8000u : 0u), 0, 0); }\n"
-"  int cx1 = int(p.clip0 & 0xFFFFu), cy1 = int(p.clip0 >> 16), cx2 = int(p.clip1 & 0xFFFFu), cy2 = int(p.clip1 >> 16);\n"
+"  int cx1 = int(p.clip0 << 16) >> 16, cy1 = int(p.clip0 >> 16), cx2 = int(p.clip1 << 16) >> 16, cy2 = int(p.clip1 >> 16);\n"
 "  if (X < cx1 || X >= cx2 || Y < cy1 || Y >= cy2) discard_fragment();\n"
 "  bool tex = (kf & (1u << 4)) != 0u, raw = (kf & (1u << 5)) != 0u, semi = (kf & (1u << 6)) != 0u;\n"
 "  bool gour = (kf & (1u << 7)) != 0u, dith = (kf & (1u << 8)) != 0u;\n"
@@ -335,6 +342,7 @@ static bool s_inited, s_ready;
 
 static const u16 *s_vram;
 static int s_Sx, s_Sy, s_rx, s_ry, s_rw, s_rh, s_tw, s_th, s_ox, s_oy;
+static int s_gx, s_pend_gx;   /* guard band in use / for the next configure() */
 /* Allocated target size: the next powers of two above s_tw x s_th, so the pixel <-> NDC
  * transform is exact. With 480*Sy rows it rounds; vertices then land ~1e-5 px off pixel
  * centres, which Apple GPUs resolve, breaking fill-rule ties on shared edges. */
@@ -382,7 +390,7 @@ static u64 block_cols(int x, int w)
 
 static void mark_vram(int x, int y, int w, int h)
 {
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0 || g_hires_shadow) return;   /* guard-band packets never touch VRAM */
     u64 cm = block_cols(x, w);
     int by0 = (y & 511) >> 4, by1 = ((y & 511) + imin(h, VRAM_H) - 1) >> 4;
     if (by1 - by0 >= 31) { by0 = 0; by1 = 31; }
@@ -468,6 +476,7 @@ static void tex_need(const HiresPrim *p, int u0, int u1, int v0, int v1)
 static void tile_mask(int x0, int y0, int x1, int y1, u64 m[8])
 {
     memset(m, 0, 8 * sizeof(u64));
+    if (s_gx) { x0 += s_gx - 1; x1 += s_gx + 1; }   /* guard columns (and truncated divisions) */
     x0 = imax(x0, 0); y0 = imax(y0, 0); x1 = imin(x1, VRAM_W - 1); y1 = imin(y1, VRAM_H - 1);
     if (x0 > x1 || y0 > y1) return;
     int c0 = x0 >> 5, c1 = x1 >> 5;
@@ -553,8 +562,16 @@ static void set_clip(GPrim *g, const HiresPrim *p)
 {
     int cx1 = imax(p->clip_x1 * s_Sx, s_ox), cy1 = imax(p->clip_y1 * s_Sy, s_oy);
     int cx2 = imin((p->clip_x2 + 1) * s_Sx, s_ox + s_tw), cy2 = imin((p->clip_y2 + 1) * s_Sy, s_oy + s_th);
-    g->clip0 = (u32)imax(cx1, 0) | ((u32)imax(cy1, 0) << 16);
-    g->clip1 = (u32)imax(cx2, 0) | ((u32)imax(cy2, 0) << 16);
+    g->clip0 = ((u32)cx1 & 0xFFFFu) | ((u32)imax(cy1, 0) << 16);   /* x signed (guard band) */
+    g->clip1 = ((u32)cx2 & 0xFFFFu) | ((u32)imax(cy2, 0) << 16);
+}
+
+/* guard band: a draw area that ends at the region's left/right edge extends gx columns further */
+static inline void guard_clip(HiresPrim *p)
+{
+    if (!s_gx || p->clip_x2 < p->clip_x1) return;
+    if (p->clip_x1 == s_rx) p->clip_x1 = s_rx - s_gx;
+    if (p->clip_x2 == s_rx + s_rw - 1) p->clip_x2 = s_rx + s_rw - 1 + s_gx;
 }
 
 static inline bool dither_on(const HiresPrim *p) { return p->dither && ((s_Sx == 1 && s_Sy == 1) || hires_get_dither()); }
@@ -656,6 +673,8 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
         int y0 = imax((int)(miny >> 16), p->clip_y1), y1 = imin((int)((maxy + 0xFFFF) >> 16), p->clip_y2);
         if (x0 <= x1 && y0 <= y1) mark_vram(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
     }
+    HiresPrim gpr;
+    if (s_gx) { gpr = *p; guard_clip(&gpr); p = &gpr; }
     const HiresVtx *a = &vin[0], *b = &vin[1], *c = &vin[2], *t;
     if (b->y < a->y) { t = a; a = b; b = t; }
     if (c->y < b->y) { t = b; b = c; c = t; }
@@ -674,7 +693,8 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
      * too); depth on all three = perspective-correct u/v; fractional positions are drawn with
      * the exact edge test (the GPU rasterizer's sub-pixel snapping would not match hires.c) */
     const bool precise = vin[0].w > 0 || vin[1].w > 0 || vin[2].w > 0;
-    const bool persp = tex && hires_get_perspective() && vin[0].w > 0 && vin[1].w > 0 && vin[2].w > 0;
+    const bool persp = tex && hires_get_perspective() && vin[0].w > 0 && vin[1].w > 0 && vin[2].w > 0 &&
+                       !(vin[0].w == vin[1].w && vin[1].w == vin[2].w);   /* = affine (hires.c) */
     const bool frac = ((vin[0].x | vin[0].y | vin[1].x | vin[1].y | vin[2].x | vin[2].y) & 0xFFFF) != 0;
     s_st.tris++;
     s_st.persp_tris += persp;
@@ -812,8 +832,19 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
     flush_puts();
     int xs = imax(x, p->clip_x1), xe = imin(x + w, p->clip_x2 + 1);
     int ys = imax(y, p->clip_y1), ye = imin(y + h, p->clip_y2 + 1);
+    const int mxs = xs, mxe = xe;   /* what the 1x rect draws */
+    HiresPrim gpr;
+    if (s_gx) {
+        /* an untextured rect over the whole draw-area width (fade, flash) spans the guard band */
+        bool full = !p->tex && x <= p->clip_x1 && x + w >= p->clip_x2 + 1;
+        gpr = *p;
+        guard_clip(&gpr);
+        p = &gpr;
+        if (full) { x = p->clip_x1; w = p->clip_x2 + 1 - x; }
+        xs = imax(x, p->clip_x1); xe = imin(x + w, p->clip_x2 + 1);
+    }
     if (xs >= xe || ys >= ye) return;
-    int rxs = imax(xs, s_rx), rxe = imin(xe, s_rx + s_rw), rys = imax(ys, s_ry), rye = imin(ye, s_ry + s_rh);
+    int rxs = imax(xs, s_rx - s_gx), rxe = imin(xe, s_rx + s_rw + s_gx), rys = imax(ys, s_ry), rye = imin(ye, s_ry + s_rh);
     if (rxs < rxe && rys < rye) {
         if (p->tex) {   /* u/v sampled over the drawn columns/rows, as the 1x rect samples them */
             int uu0 = (int)(u0 | (fx ? 1u : 0u)), du = fx ? -1 : 1, dv = fy ? -1 : 1;
@@ -840,7 +871,7 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
         tile_mask(rxs, rys, rxe - 1, rye - 1, m);
         group_add(keys, nk, v, 6, m);
     }
-    mark_vram(xs, ys, xe - xs, ye - ys);   /* the 1x rect is drawn after this call */
+    if (mxs < mxe) mark_vram(mxs, ys, mxe - mxs, ye - ys);   /* the 1x rect is drawn after this call */
 }
 
 /* ---- lines --------------------------------------------------------------------------------- */
@@ -870,6 +901,8 @@ static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, 
         int ly0 = imax(imin(y0, y1), p->clip_y1), ly1 = imin(y0 > y1 ? y0 : y1, p->clip_y2);
         if (lx0 <= lx1 && ly0 <= ly1) mark_vram(lx0, ly0, lx1 - lx0 + 1, ly1 - ly0 + 1);
     }
+    HiresPrim gpr;
+    if (s_gx) { gpr = *p; guard_clip(&gpr); p = &gpr; }
     const int Sx = s_Sx, Sy = s_Sy;
     int dx = x1 - x0, dy = y1 - y0;
     int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
@@ -937,12 +970,15 @@ static void be_fill(int x, int y, int w, int h, u16 c)
         flush_puts();
         int pc[4][4];
         int n = region_pieces(x, y, w, h, pc);
+        const int fx = x & 1023;
+        const bool wide = s_gx && fx + imin(w, VRAM_W) <= VRAM_W && fx <= s_rx && fx + w >= s_rx + s_rw;
         if (n) {
             u32 idx;
             GPrim *g = new_prim(&idx);
             g->kf = K_FILL;
             g->color = c;
             for (int i = 0; i < n; i++) {
+                if (wide && pc[i][0] == s_rx && pc[i][2] == s_rx + s_rw) { pc[i][0] -= s_gx; pc[i][2] += s_gx; }
                 GVtx v[6];
                 quad1x(v, pc[i][0], pc[i][1], pc[i][2], pc[i][3], idx);
                 u64 m[8];
@@ -1189,6 +1225,7 @@ static void be_destroy(void)
     release_target();
     s_ready = false;
     s_Sx = s_Sy = 0;
+    s_gx = 0;
 }
 
 static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int rw, int rh)
@@ -1202,8 +1239,9 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     s_vram = vram1x;
     s_Sx = sx; s_Sy = sy;
     s_rx = rx; s_ry = ry; s_rw = rw; s_rh = rh;
-    s_tw = rw * sx; s_th = rh * sy;
-    s_ox = rx * sx; s_oy = ry * sy;
+    s_gx = s_pend_gx;
+    s_tw = (rw + 2 * s_gx) * sx; s_th = rh * sy;
+    s_ox = (rx - s_gx) * sx; s_oy = ry * sy;
     const SDL_GPUTextureFormat fmt = SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
     for (s_aw = 64; s_aw < s_tw; s_aw *= 2) {}
     for (s_ah = 64; s_ah < s_th; s_ah *= 2) {}
@@ -1229,13 +1267,26 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     tile_mask(rx, ry, rx + rw - 1, ry + rh - 1, m);
     int key = 0;
     group_add(&key, 1, v, 6, m);
+    if (s_gx) {   /* the guard band starts black */
+        GPrim *f = new_prim(&idx);
+        f->kf = K_FILL;
+        f->color = 0;
+        for (int side = 0; side < 2; side++) {
+            int a = side ? rx + rw : rx - s_gx;
+            quad1x(v, a, ry, a + s_gx, ry + rh, idx);
+            tile_mask(a, ry, a + s_gx - 1, ry + rh - 1, m);
+            group_add(&key, 1, v, 6, m);
+        }
+    }
     return true;
 }
+
+static void be_set_guard(int gx) { s_pend_gx = gx < 0 ? 0 : (gx > HIRES_MAX_GUARD ? HIRES_MAX_GUARD : gx); }
 
 static bool view_rect(int x, int y, int w, int h, HiresView *out)
 {
     if (!s_ready || w <= 0 || h <= 0) return false;
-    if (x < s_rx || y < s_ry || x + w > s_rx + s_rw || y + h > s_ry + s_rh) return false;
+    if (x < s_rx - s_gx || y < s_ry || x + w > s_rx + s_rw + s_gx || y + h > s_ry + s_rh) return false;
     out->pixels = NULL;
     out->stride = 0;
     out->w = w * s_Sx;
@@ -1287,6 +1338,7 @@ SDL_GPUTexture *hires_gpu_present(const HiresView *v)
 
 static const HiresBackend s_gpu = {
     "gpu", be_configure, be_tri, be_rect, be_line, be_fill, be_copy, be_put, be_view, be_read, be_destroy,
+    be_set_guard,
 };
 
 const HiresBackend *hires_gpu_backend(void) { return &s_gpu; }

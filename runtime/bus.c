@@ -212,6 +212,11 @@ static const u32 s_dma_cycles_per_word[7] = {
     1,   /* OTC */
 };
 
+/* Called for every node of a GPU linked-list DMA (RAM offset of its header) and once with
+ * 0xffffffff at the end; used by the widescreen shadow pass to inject presentation-only
+ * packets (runtime/overrides/widescreen.c). Must not change emulated state. */
+void (*g_gpu_ll_hook)(u32 node);
+
 static void dma_run(int ch) {
     u32 chcr = s_dma_chcr[ch];
     u32 madr = s_dma_madr[ch] & 0x1ffffc;
@@ -242,6 +247,7 @@ static void dma_run(int ch) {
             u32 a = madr, guard = 0;
             cost = 0;
             for (;;) {
+                if (g_gpu_ll_hook) g_gpu_ll_hook(a & 0x1ffffc);   /* presentation only */
                 u32 hdr = *(u32 *)(g_ram + (a & 0x1ffffc));
                 u32 n = hdr >> 24;
                 for (u32 i = 0; i < n; i++) {
@@ -252,6 +258,7 @@ static void dma_run(int ch) {
                 if ((hdr & 0x800000) || ++guard > 0x40000) break;
                 a = hdr & 0x1ffffc;
             }
+            if (g_gpu_ll_hook) g_gpu_ll_hook(0xffffffffu);
             madr = 0xffffff;
         } else if (to_ram) {
             for (u32 i = 0; i < words; i++, madr = (madr + step) & 0x1ffffc)
@@ -405,7 +412,13 @@ static void io_write(u32 p, u32 v, int size) {
     if (size == 4) s_io_misc[(off & 0xfff) >> 2] = v;
 }
 
+/* Sandbox (widescreen shadow pass): guest code must not reach hardware; accesses are
+ * dropped (reads return 0) and counted so the caller can reject the pass. */
+int g_bus_sandbox;
+u32 g_bus_sandbox_hits;
+
 u32 bus_read32(u32 a) {
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return 0; }
     u32 p = a & 0x1fffffff;
     if (p >= 0x1f801000 && p < 0x1f802000) return io_read(p, 4);
     if (p >= 0x1fc00000 && p < 0x1fc80000) return 0;   /* BIOS ROM (HLE) */
@@ -414,26 +427,31 @@ u32 bus_read32(u32 a) {
     return 0;
 }
 u32 bus_read16(u32 a) {
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return 0; }
     u32 p = a & 0x1fffffff;
     if (p >= 0x1f801000 && p < 0x1f802000) return io_read(p, 2) & 0xffff;
     if (p >= 0x1f000000 && p < 0x1f800000) return 0xffff;
     return 0;
 }
 u32 bus_read8(u32 a) {
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return 0; }
     u32 p = a & 0x1fffffff;
     if (p >= 0x1f801000 && p < 0x1f802000) return io_read(p, 1) & 0xff;
     if (p >= 0x1f000000 && p < 0x1f800000) return 0xff;
     return 0;
 }
 void bus_write32(u32 a, u32 v) {
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     u32 p = a & 0x1fffffff;
     if (p >= 0x1f801000 && p < 0x1f802000) io_write(p, v, 4);
 }
 void bus_write16(u32 a, u32 v) {
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     u32 p = a & 0x1fffffff;
     if (p >= 0x1f801000 && p < 0x1f802000) io_write(p, v & 0xffff, 2);
 }
 void bus_write8(u32 a, u32 v) {
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     u32 p = a & 0x1fffffff;
     if (p >= 0x1f801000 && p < 0x1f802000) io_write(p, v & 0xff, 1);
 }

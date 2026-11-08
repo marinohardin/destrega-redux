@@ -155,7 +155,8 @@ frame (`--keep`, `tools/contact_sheet.py`), then `scenarios.py record NAME` to s
 `tools/scenario_expect.json`. A scenario that exposes a real bug is `xfail=` (the run must still fail
 that way) and the bug goes in `analysis/NOTES.md`. `run_tests.sh` runs all scenarios (`--no-interp`,
 `--verify-overrides`) and the hi-res determinism / `--hires-verify` check on the `hires`-tagged
-subset (every stage) concurrently with the rest; `SCENARIOS=0 tools/run_tests.sh` skips them.
+subset (every stage; plus widescreen with PGXP on/off and the crack check `tools/check_ws_cracks.py`)
+concurrently with the rest; `SCENARIOS=0 tools/run_tests.sh` skips them.
 Headless runs ~200x real time (30k frames ≈ 13 s).
 
 ## Memory cards (`runtime/memcard.[ch]`, `bios.c`)
@@ -204,8 +205,23 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   Games… (writes a standard .mcd after flushing); Delete Save Game… (the `BASLUS-00732*` file, confirmed).
   Every swap flushes first and goes through `memcard_attach`, which closes open handles and raises the
   card-changed flag like a real swap (`memcard_mark_new` after a delete).
+- **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
+  menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
+- **View > Renderer > Software / GPU**: action `renderer[=software|gpu]`, see "GPU renderer".
+- **Full screen** on every platform from the SDL event loop in `main.c` (so not a Cocoa-only
+  feature): **Alt+Enter** and **F11**, plus **Ctrl+Cmd+F** on macOS, queue the action
+  `fullscreen` (`=on|off`, none = toggle; one toggle per frame, because Ctrl+Cmd+F can arrive both
+  as the menu key equivalent and as an SDL key event). These keys never reach the pad (the Enter
+  of Alt+Enter is not START). macOS: **View > Enter Full Screen / Exit Full Screen** (title
+  follows the state, Ctrl+Cmd+F; replaces SDL's own "Toggle Full Screen" item, which called
+  `-[NSWindow toggleFullScreen:]` behind SDL's back). `SDL_SetWindowFullscreen` uses the desktop
+  mode (a native full-screen Space on macOS); SDL keeps and restores the windowed size and
+  position. The hi-res auto scale follows the new pixel size in `present_frame` like any resize
+  (widescreen and both renderers included); the log shows `fullscreen: entered/left, window WxH
+  px` and the new `render scale`. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
-  `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`. Headless: no dialogs (the file argument is
+  `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
+  `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`. Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
   unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
   Log lines start with `menu:`; errors with `menu: ERROR:`.
@@ -320,7 +336,10 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   `HiresVtx.w`, 0 = none). Lines and rects (2D sprites, HUD, text) are untouched.
 - `hires.c`: a textured triangle with `w` on all three vertices is textured perspective-
   correctly (q = 1/w, u*q, v*q planes; exact every 8 hi-res pixels, linear in between);
-  otherwise affine as before. The UV clamp to the 1x-sampled range stays: perspective u/v inside
+  otherwise affine as before. Equal `w` on all three (walls facing the camera) takes the affine
+  path, which is the same mapping: with q constant, exact texel-boundary ties are common and the
+  double (software) and 2^-38 fixed-point (GPU) planes rounded them differently (whole rows one
+  texel apart; 52K pixels in a 16:9 4x6 compare run before, 28 after). The UV clamp to the 1x-sampled range stays: perspective u/v inside
   the triangle are a convex combination of the vertex u/v, so the clamp only acts at the edges /
   outside, as for affine; it is also applied at 1x1 when a triangle has precise vertices
   (samples are off the 1x grid there too). The gouraud colour clamp is unchanged (colours stay
@@ -360,7 +379,14 @@ contract as the software backend: commands in, target out, presentation only. It
 section). Keep it that way: a rule change in `hires.c`
 needs the same change in the shader. The header comment of `hires_gpu.c` has the details.
 
-- `--renderer software|gpu|compare` (default software). `compare` draws every command on both
+- `--renderer software|gpu|compare`. Default: **gpu in a macOS window** (if the SDL GPU renderer
+  or the backend cannot be created: `hires-gpu: GPU renderer unavailable ...` and software),
+  software headless (the tests' reference). `--renderer software` forces software and the
+  plain SDL renderer (no live switch to GPU then). **View > Renderer > Software / GPU**
+  (radio check marks; menu action `renderer[=software|gpu|compare]`, no argument toggles)
+  switches at any time between frames: `hires_set_backend` + `hires_set_scale` at the current
+  scale, i.e. the old target is destroyed and the new one seeded from the 1x VRAM, as on a
+  resize. The window always uses SDL's GPU renderer, which presents either target. `compare` draws every command on both
   backends, presents the software one and every `--compare-every N` frames (default 30) reads
   both back: `hires-compare:` lines at exit (all / fight frames, pixels differing, by >1 step,
   mask-bit only, worst frame); `--compare-max PCT` exits 6 if a fight frame differs more.
@@ -391,10 +417,87 @@ needs the same change in the shader. The header comment of `hires_gpu.c` has the
   mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
   chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), MSL only
   (no SPIR-V/DXIL), no `--hires-threads` (n/a).
+- Widescreen guard band: supported (`set_guard`): `s_ox` is negative with the default region
+  at x = 0, so the clip rectangle's x is packed signed, the shader's 1x column uses floor
+  division and the 32x32 tile masks are shifted by the guard width. Guard-band-only packets
+  (`g_hires_shadow`, set by gpu.c around `gpu_shadow_packet`) do not mark VRAM blocks dirty
+  (they never touch VRAM; marking them caused re-uploads and 10x the render passes).
+  `--renderer compare` compares the guard band too. `--pgxp off`: 0 differing pixels at 2x2,
+  4:3 and 16:9 (6000 frames; `ws2c` in `test_widescreen.sh`). PGXP on, 4x6, 7000 frames, every
+  10th: 24 (4:3) and 28 (16:9) differing pixels over 331 fight frames (`ws46c`, limit
+  `CMP_MAX_PGXP`). With PGXP the wide pass is bracketed by `pgxp_snapshot_save/restore`
+  (registered with `widescreen_add_state_hook` in `main.c`: tag tables copied, pool and
+  recent-word writes journalled and undone), so the wide pass leaves no trace in the real one.
+  Extra (guard-band) packets carry the precise vertices the wide pass produced: `collect()` copies
+  the pool entry each packet word's tag points to (before the restore undoes it), and
+  `gpu_shadow_packet(w, n, pv)` hands them to `gp0_polygon`, which welds them like any other
+  packet. So a word shared by an extra and real geometry gets one position in the whole batch.
+- **Pitfall (fixed):** `gpu.c` has a second hi-res path for triangles outside the 1x draw area
+  (all extras, and real ones beyond the edge). It built `HiresVtx` from the integer vertices only
+  (and left `w` unset), so those triangles were drawn at integer positions next to precise
+  neighbours: black diagonal cracks along shared edges in the guard band on every stage. Both
+  paths now apply the PGXP offsets. Regression check: `scenarios.py hires` also runs every stage
+  scenario with `--widescreen` at 2x3, PGXP on and off (same state hash, `pgxp-check` clean,
+  shadow triangles included) and `tools/check_ws_cracks.py` on the dumped fight frames: thin
+  black runs with lit pixels at both ends in the PGXP frame, lit everywhere within one 1x pixel
+  in the PGXP-off frame, grouped, at least 16 1x pixels long and not axis-aligned. Before the
+  fix it found 7..36 cracks per stage (7 frames each); after, 0 on all 13.
 - Tests: `tools/test_hires_determinism.sh` adds `g4x6` (state hash), `gverify1` (1x1 ==
   1x VRAM), `c1x1` and `c4x6` (compare vs software, `--pgxp off`, `CMP_MAX` default 0 %), and
   `cp4x6` (compare with `--pgxp on`, `CMP_MAX_PGXP` default 0.001 %). `g4x6` runs with PGXP on
   and must pass the `pgxp-check`.
+  `tools/test_widescreen.sh` adds `ws46g` (16:9 on the GPU) and `wsrender` (renderer and
+  widescreen switched back and forth mid-fight, state hash = 4:3 software run).
+
+## Widescreen (`--widescreen`, default off)
+
+16:9 fights with **zero** change to emulated state (proved per frame by
+`tools/test_widescreen.sh`). Menus, FMV, character select and other non-stage screens stay 4:3.
+
+- Guard band (hi-res only): `hires_set_guard(88)` gives the hi-res target 88 virtual 1x columns
+  left and right of the 512-wide region (`HiresBackend.set_guard`, optional). Primitives whose
+  draw area touches the region edge are clipped against the widened area there; fills that span
+  the whole region and untextured rects across the whole draw area (fades) extend into it;
+  uploads/copies never do. A triangle crossing the edge uses its vertex UV/colour range for the
+  clamp (the 1x-sampled range would smear it outside). 1x VRAM is unchanged: the 512-wide part of
+  the target still equals it at 1x1 (`--hires-verify` in the test).
+- The game culls stage polygons at screen x +-255 and stage objects at +-257 (see NOTES.md
+  "Camera, projection and culling"). Those 50 `slti` immediates are listed in
+  `analysis/widescreen_cull.txt`; `recomp.py` emits them as `WS_IMM(orig, wide)` (`recomp.h`),
+  which is the original value unless `g_widescreen_cull` is set.
+- **Why a shadow pass**: running the widened culling for real changes RAM (packets, OT, per-object
+  animation counters) and emulated time (more instructions, longer GPU DMA), and that measurably
+  changed the fight (different positions within ~2000 frames). So `stage_render` (80044210) is an
+  override (`runtime/overrides/widescreen.c`): snapshot RAM/scratchpad/CPU/GTE, run the renderer
+  with `g_widescreen_cull` on, interrupts held off (`next_event = ~0`) and hardware access
+  blocked (`g_bus_sandbox` in bus.c; any access rejects the pass), record the 2048 OT slots,
+  restore, run it again normally (the run the game sees), record again; per slot the packets the
+  wide pass has and the real one lacks (compared by payload) are the extras. The GPU linked-list
+  DMA calls `g_gpu_ll_hook` per node; on reaching a slot the extras are drawn into the hi-res
+  target only (`gpu_shadow_packet`: no 1x drawing, no IRQ, GPU state restored).
+- Presentation: 16:9 (or the window's aspect, clamped to 4:3 .. 4:3 * 688/512) while the stage
+  is being drawn (a `WS_IMM` evaluated within the last 6 vblanks), 4:3 otherwise; the HUD keeps
+  its 4:3 layout in the centre. The render scale is picked for the widest presentation the window
+  allows (`hires_pick_scale_ar`), so switching never reallocates. Default window 1280x720.
+  Headless dumps use `--window`/`--resize` as the window.
+- Options/diagnostics: `--widescreen`, `--gameplay-trace FILE` (per frame: health, gauge,
+  position of both fighters, round time, wins, RNG seed, fighter-struct hash), `--ram-snap DIR`
+  / `--ram-snap-every N` (raw RAM dumps for diffing). The run summary prints
+  `widescreen: N shadow passes, M extra stage packets, R rejected` and `widescreen-frames: ...`.
+- Runtime switch (`runtime/widescreen.h`): View > Widescreen (16:9) (checkable, `menu_mac.m`)
+  and F9 queue the menu action `widescreen` (`=on`/`=off`, none = toggle), which calls
+  `frontend_set_widescreen(bool)`; the switch takes effect in that vblank, between frames.
+  The first switch-on allocates the guard band (a hi-res reconfigure, like a resize);
+  switching off keeps it and only stops the shadow pass and the wide presentation.
+  `--widescreen` is the startup state. Headless: `--menu-action F:widescreen[=on|off]` or
+  `--widescreen-at F:0|1,...` (both used by `wstoggle` in the test script).
+- `stage_render` deliberately bypasses `override_call`: `--verify-overrides` cannot rewind the
+  scheduler, so interrupts/CD events inside the renderer (story scenes) gave false mismatches.
+  Story-mode EVENTOVL scenes use the same renderer and widen too (checked by hand: 15000 frames
+  of the `story` scenario, state hash identical to 4:3).
+- Host-side state that generated code mutates outside guest state (e.g. PGXP tags) must be
+  registered with `widescreen_add_state_hook(save, restore)`, or the wide pass leaks into the
+  real one.
 
 ## Pitfalls
 

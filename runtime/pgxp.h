@@ -25,7 +25,7 @@
 
 #include "psx.h"
 
-typedef struct {
+typedef struct PgxpVert {
     u32 sxy;        /* the integer SXY word this vertex was produced as */
     float dx, dy;   /* precise screen position minus the integer SX / SY */
     float w;        /* view depth (the unclamped SZ), > 0 */
@@ -101,6 +101,10 @@ static inline const PgxpVert *pgxp_lookup(u32 tag, u32 sxy)
     return v->sxy == sxy ? v : 0;
 }
 void pgxp_reset(void);                       /* drop every association */
+/* Save / restore every tag and pool change around the widescreen shadow pass (registered with
+ * widescreen_add_state_hook in main.c); no-ops while tracking is off. */
+void pgxp_snapshot_save(void);
+void pgxp_snapshot_restore(void);
 
 /* Diagnostics: polygon vertices sent to the hi-res target, and those with a valid precise
  * vertex (counted in gpu.c while hi-res and tracking are on). */

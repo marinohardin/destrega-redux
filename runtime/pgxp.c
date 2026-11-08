@@ -1,5 +1,6 @@
 /* PGXP-style vertex precision tracking: shadow tags and the precise vertex pool.
  * See pgxp.h. Host-only state: never part of the emulated machine. */
+#include <stdlib.h>
 #include <string.h>
 #include "pgxp.h"
 
@@ -119,9 +120,62 @@ void pgxp_check_tri(const PgxpVert *const q[3], const u32 sxy[3])
     }
 }
 
+/* ---- snapshot for the widescreen shadow pass (widescreen_add_state_hook) ----
+ * The wide pass runs guest code whose hooks move tags and produce pool vertices; all of it is
+ * put back so the real pass sees exactly what it would without widescreen. Tags (registers, GTE
+ * FIFO, the per-word table) are copied; pool entries and the recent-word set are journalled
+ * while the snapshot is open (their old values, replayed backwards on restore). */
+typedef struct { u32 t, slot, recent; PgxpVert v; } PgxpUndo;
+static u32 *s_mem_bak;
+static u32 s_reg_bak[32], s_gte_bak[3], s_next_bak;
+static u64 s_stat_new_bak;
+static PgxpUndo *s_undo;
+static size_t s_undo_n, s_undo_cap;
+static bool s_snap;
+
+void pgxp_snapshot_save(void)
+{
+    if (!g_pgxp) return;
+    if (!s_mem_bak) s_mem_bak = malloc(sizeof g_pgxp_mem);
+    if (!s_mem_bak) return;
+    memcpy(s_mem_bak, g_pgxp_mem, sizeof g_pgxp_mem);
+    memcpy(s_reg_bak, g_pgxp_reg, sizeof s_reg_bak);
+    memcpy(s_gte_bak, g_pgxp_gte, sizeof s_gte_bak);
+    s_next_bak = s_next;
+    s_stat_new_bak = g_pgxp_stat_new;
+    s_undo_n = 0;
+    s_snap = true;
+}
+
+void pgxp_snapshot_restore(void)
+{
+    if (!s_snap) return;
+    s_snap = false;
+    while (s_undo_n) {
+        const PgxpUndo *u = &s_undo[--s_undo_n];
+        g_pgxp_pool[u->t] = u->v;
+        g_pgxp_recent[u->slot] = u->recent;
+    }
+    memcpy(g_pgxp_mem, s_mem_bak, sizeof g_pgxp_mem);
+    memcpy(g_pgxp_reg, s_reg_bak, sizeof s_reg_bak);
+    memcpy(g_pgxp_gte, s_gte_bak, sizeof s_gte_bak);
+    s_next = s_next_bak;
+    g_pgxp_stat_new = s_stat_new_bak;
+}
+
 u32 pgxp_new(u32 sxy, float dx, float dy, float w)
 {
     u32 t = s_next;
+    if (s_snap) {
+        if (s_undo_n == s_undo_cap) {
+            size_t cap = s_undo_cap ? s_undo_cap * 2 : 4096;
+            PgxpUndo *n = realloc(s_undo, cap * sizeof *n);
+            if (!n) abort();
+            s_undo = n; s_undo_cap = cap;
+        }
+        u32 slot = pgxp_recent_slot(sxy);
+        s_undo[s_undo_n++] = (PgxpUndo){ t, slot, g_pgxp_recent[slot], g_pgxp_pool[t] };
+    }
     s_next = (s_next + 1) & (PGXP_POOL_SIZE - 1);
     if (!s_next) s_next = 1;   /* tag 0 = no association */
     PgxpVert *v = &g_pgxp_pool[t];

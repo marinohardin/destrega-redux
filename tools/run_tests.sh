@@ -1,9 +1,10 @@
 #!/bin/sh
-# Verification: module unit tests, headless boot-to-gameplay smoke test and the hi-res
-# determinism/equivalence runs. Everything independent runs concurrently.
+# Verification: module unit tests, headless boot-to-gameplay smoke test, the hi-res
+# determinism/equivalence runs and the --widescreen gameplay-equivalence runs. Everything
+# independent runs concurrently.
 # Usage: tools/run_tests.sh   (from anywhere; needs a built build/cmake/destrega)
 cd "$(dirname "$0")/.."
-mkdir -p build/tests build/smoke build/hires
+mkdir -p build/tests build/smoke build/hires build/widescreen
 START=$(date +%s)
 
 # 1. compile the unit tests in parallel
@@ -26,6 +27,8 @@ tools/smoke_test.sh > build/smoke/out.txt 2>&1 &
 SMOKE=$!
 tools/test_hires_determinism.sh > build/hires/out.txt 2>&1 &
 HIRES=$!
+JOBS=4 tools/test_widescreen.sh > build/widescreen/out.txt 2>&1 &
+WIDE=$!
 # 3. scenario library: every mode / stage / character path, --no-interp (SCENARIOS=0 to skip), and the
 #    hi-res determinism + 1x1 equivalence checks on the stage subset
 JOBS_SC=${JOBS_SC:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
@@ -59,6 +62,8 @@ wait $SMOKE || { fail=1; echo "smoke: FAILED"; }
 cat build/smoke/out.txt
 wait $HIRES || { fail=1; echo "hires: FAILED"; }
 cat build/hires/out.txt
+wait $WIDE || { fail=1; echo "widescreen: FAILED"; }
+cat build/widescreen/out.txt
 if [ "${SCENARIOS:-1}" != 0 ]; then
   wait $SCN || { fail=1; echo "scenarios: FAILED"; }
   cat build/scenarios/out.txt

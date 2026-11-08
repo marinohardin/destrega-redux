@@ -22,6 +22,8 @@ static u16 s_vram[VRAM_W * VRAM_H];
 /* Optional presentation-only hi-res target (hires.c). Every drawing command is also
  * forwarded there; nothing in it is ever read back into the emulated machine. */
 const HiresBackend *g_hires;
+int g_hires_guard;
+bool g_hires_shadow;
 
 /* ---- state ------------------------------------------------------------- */
 
@@ -35,6 +37,10 @@ static u32 s_off_raw;
 static bool s_mask_set, s_mask_check;
 static bool s_tex_disable_allowed;
 static u32 s_read_latch;
+static bool s_shadow;         /* executing a presentation-only packet (gpu_shadow_packet) */
+static const PgxpVert *const *s_shadow_pv;   /* its precise vertices per word (or NULL) */
+static int s_shadow_side;     /* shadow packets draw only into the guard band: 0 left, 1 right */
+#define SHADOW_SIDES (s_shadow ? 2 : 1)
 
 /* texture window precomputed */
 static u32 s_tw_and_u, s_tw_or_u, s_tw_and_v, s_tw_or_v;
@@ -437,6 +443,12 @@ static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool sem
     h->has_uvr = false;
     h->has_cr = false;
     h->clip_x1 = s_clip_x1; h->clip_y1 = s_clip_y1; h->clip_x2 = s_clip_x2; h->clip_y2 = s_clip_y2;
+    if (s_shadow) {
+        /* a shadow packet must not touch the 1x draw area (the culled polygons can still reach
+         * its outermost columns): clip it to the guard band on one side */
+        if (s_shadow_side == 0) { h->clip_x2 = s_clip_x1 - 1; h->clip_x1 = s_clip_x1 - g_hires_guard; }
+        else { h->clip_x1 = s_clip_x2 + 1; h->clip_x2 = s_clip_x2 + g_hires_guard; }
+    }
 }
 
 /* Precise (PGXP) position of a polygon vertex for the hi-res target: offsets from the integer
@@ -456,7 +468,35 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     if (c->y < miny) miny = c->y;
     if (c->y > maxy) maxy = c->y;
     if (maxx - minx >= 1024 || maxy - miny >= 512) return;
-    if (maxx < s_clip_x1 || minx > s_clip_x2 || maxy < s_clip_y1 || miny > s_clip_y2) return;
+    if (maxy < s_clip_y1 || miny > s_clip_y2) return;
+    if (maxx < s_clip_x1 || minx > s_clip_x2 || s_shadow) {
+        /* outside the 1x draw area (or a presentation-only shadow packet): nothing to draw in
+         * 1x VRAM, but with a widescreen guard band the hi-res target may still show it */
+        if (g_hires && g_hires_guard) {
+            const Vtx *vs[3] = { a, b, c };
+            HiresVtx hv[3];
+            for (int i = 0; i < 3; i++) {
+                hv[i].x = vs[i]->x * 65536; hv[i].y = vs[i]->y * 65536;
+                hv[i].r = vs[i]->r; hv[i].g = vs[i]->g; hv[i].b = vs[i]->b;
+                hv[i].u = vs[i]->u; hv[i].v = vs[i]->v;
+                hv[i].w = 0;
+                /* the same precise positions as the in-area path below: a guard-band triangle
+                 * drawn at integer positions next to a precise neighbour opened a crack */
+                if (pv && pv[i].ok) {
+                    hv[i].x += (s32)lrintf(pv[i].dx * 65536.0f);
+                    hv[i].y += (s32)lrintf(pv[i].dy * 65536.0f);
+                    hv[i].w = pv[i].w;
+                }
+            }
+            for (s_shadow_side = 0; s_shadow_side < SHADOW_SIDES; s_shadow_side++) {
+                HiresPrim hp;
+                hires_prim(&hp, p, tex, raw, semi, gour);
+                g_hires->tri(&hp, hv);
+            }
+            s_shadow_side = 0;
+        }
+        return;
+    }
 
     s_uv_track = g_hires && tex;
     if (s_uv_track) { s_trk_umin = s_trk_vmin = 1 << 20; s_trk_umax = s_trk_vmax = -1; }
@@ -477,6 +517,29 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     if (g_hires) {
         HiresPrim hp;
         hires_prim(&hp, p, tex, raw, semi, gour);
+        /* With a widescreen guard band, a triangle crossing the draw area's left/right edge is
+         * also drawn beyond it, where the 1x draw sampled nothing: the 1x-sampled UV / colour
+         * ranges alone would smear its texture there, so they are widened by the vertex ranges
+         * (a superset of both, so the part inside the draw area is clamped no tighter). */
+        if (g_hires_guard && (minx < s_clip_x1 || maxx > s_clip_x2)) {
+            const Vtx *vs[3] = { a, b, c };
+            for (int i = 0; i < 3; i++) {
+                if (s_uv_track && s_trk_umax >= 0) {
+                    const int u = (int)vs[i]->u, v = (int)vs[i]->v;
+                    if (u < s_trk_umin) s_trk_umin = u;
+                    if (u > s_trk_umax) s_trk_umax = u;
+                    if (v < s_trk_vmin) s_trk_vmin = v;
+                    if (v > s_trk_vmax) s_trk_vmax = v;
+                }
+                if (s_col_track && s_trk_cmax[0] >= 0) {
+                    const int vc[3] = { (int)vs[i]->r, (int)vs[i]->g, (int)vs[i]->b };
+                    for (int k = 0; k < 3; k++) {
+                        if (vc[k] < s_trk_cmin[k]) s_trk_cmin[k] = vc[k];
+                        if (vc[k] > s_trk_cmax[k]) s_trk_cmax[k] = vc[k];
+                    }
+                }
+            }
+        }
         if (s_uv_track && s_trk_umax >= 0) {
             hp.has_uvr = true;
             hp.uvr_umin = s_trk_umin; hp.uvr_umax = s_trk_umax;
@@ -545,7 +608,13 @@ static void gp0_polygon(const u32 *w)
         if (k == 0 || gour) i++;
         pv[k].ok = false;
         if (want_pv) {
-            const PgxpVert *q = pgxp_weld(w[i], pgxp_lookup(s_cmd_tag[i], w[i]));
+            /* a widescreen extra brings the precise values the wide pass produced for its words
+             * (it has no tags) and is welded like any other packet, so a word it shares with the
+             * real geometry gets one position in the whole batch: no cracks at the 4:3 edge */
+            const PgxpVert *q0 = s_shadow ? (s_shadow_pv && s_shadow_pv[i] && s_shadow_pv[i]->sxy == w[i]
+                                             ? s_shadow_pv[i] : 0)
+                                          : pgxp_lookup(s_cmd_tag[i], w[i]);
+            const PgxpVert *q = pgxp_weld(w[i], q0);
             g_pgxp_stat_vtx++;
             pq[k] = q; pxy[k] = w[i];
             if (q) {
@@ -553,7 +622,7 @@ static void gp0_polygon(const u32 *w)
                 any_pv = true;
                 g_pgxp_stat_hit++;
             } else {
-                g_pgxp_stat_miss_stale += s_cmd_tag[i] != 0;
+                g_pgxp_stat_miss_stale += !s_shadow && s_cmd_tag[i] != 0;
                 g_pgxp_stat_miss_gte += g_pgxp_recent[pgxp_recent_slot(w[i])] == w[i];
             }
         }
@@ -670,10 +739,14 @@ static void gp0_rect(const u32 *w)
     u32 r = color & 0xFF, g = (color >> 8) & 0xFF, b = (color >> 16) & 0xFF;
     bool fx = (s_drawmode >> 12) & 1, fy = (s_drawmode >> 13) & 1;
     if (g_hires) {
-        HiresPrim hp;
-        hires_prim(&hp, &p, tex, raw, semi, false);
-        g_hires->rect(&hp, x, y, wd, ht, r, g, b, u0, v0, fx, fy);
+        for (s_shadow_side = 0; s_shadow_side < SHADOW_SIDES; s_shadow_side++) {
+            HiresPrim hp;
+            hires_prim(&hp, &p, tex, raw, semi, false);
+            g_hires->rect(&hp, x, y, wd, ht, r, g, b, u0, v0, fx, fy);
+        }
+        s_shadow_side = 0;
     }
+    if (s_shadow) return;
     if (!tex) {
         (semi ? rect_u1 : rect_u0)(&p, x, y, wd, ht, r, g, b, 0, 0, false, false);
     } else {
@@ -697,11 +770,15 @@ static void draw_line(int x0, int y0, u32 c0, int x1, int y1, u32 c1, bool gour,
     bool dither = gour && ((s_drawmode >> 9) & 1);
     if (!gour) c1 = c0;
     if (g_hires) {
-        HiresPrim hp;
-        hires_prim(&hp, &p, false, false, semi, gour);
-        hp.dither = dither;
-        g_hires->line(&hp, x0, y0, c0, x1, y1, c1);
+        for (s_shadow_side = 0; s_shadow_side < SHADOW_SIDES; s_shadow_side++) {
+            HiresPrim hp;
+            hires_prim(&hp, &p, false, false, semi, gour);
+            hp.dither = dither;
+            g_hires->line(&hp, x0, y0, c0, x1, y1, c1);
+        }
+        s_shadow_side = 0;
     }
+    if (s_shadow) return;
     int k = adx > ady ? adx : ady;
     /* 32.32 fixed point positions, centered */
     s64 xf = ((s64)x0 << 32) + (1ll << 31);
@@ -950,6 +1027,44 @@ void gpu_write_gp0_tag(u32 v, u32 tag)
         s_cmd_len = 0;
         gp0_execute(s_cmd);
     }
+}
+
+/* Presentation-only packet (widescreen shadow pass): the n words are executed against the
+ * current drawing environment and reach the hi-res target only. Nothing is drawn into the 1x
+ * VRAM, no IRQ is raised, and every piece of GPU state the packet may change (draw mode,
+ * texture window, draw area, offset, mask bits, GPUSTAT) is restored afterwards, so the
+ * emulated machine cannot observe it. Only polygons, rects, single lines and E1-E6 are
+ * executed; fills, copies, transfers, polylines and anything else are skipped. */
+void gpu_shadow_packet(const u32 *w, int n, const PgxpVert *const *pv)
+{
+    if (!g_hires) return;
+    u32 stat = s_stat, drawmode = s_drawmode, texwin = s_texwin, area_tl = s_area_tl, area_br = s_area_br;
+    int cx1 = s_clip_x1, cy1 = s_clip_y1, cx2 = s_clip_x2, cy2 = s_clip_y2, ox = s_off_x, oy = s_off_y;
+    u32 off_raw = s_off_raw;
+    bool mset = s_mask_set, mchk = s_mask_check;
+    u32 tau = s_tw_and_u, tou = s_tw_or_u, tav = s_tw_and_v, tov = s_tw_or_v;
+    s_shadow = true;
+    g_hires_shadow = true;
+    for (int i = 0; i < n;) {
+        u32 cmd = w[i] >> 24;
+        int len = gp0_len(cmd);
+        if (i + len > n) break;
+        switch (cmd >> 5) {
+        case 1: s_shadow_pv = pv ? pv + i : 0; gp0_polygon(&w[i]); s_shadow_pv = 0; break;
+        case 2: if (!(cmd & 0x08)) gp0_execute(&w[i]); break;
+        case 3: gp0_rect(&w[i]); break;
+        case 7: gp0_env(w[i]); break;
+        default: break;
+        }
+        i += len;
+    }
+    s_shadow = false;
+    g_hires_shadow = false;
+    s_stat = stat; s_drawmode = drawmode; s_texwin = texwin; s_area_tl = area_tl; s_area_br = area_br;
+    s_clip_x1 = cx1; s_clip_y1 = cy1; s_clip_x2 = cx2; s_clip_y2 = cy2; s_off_x = ox; s_off_y = oy;
+    s_off_raw = off_raw;
+    s_mask_set = mset; s_mask_check = mchk;
+    s_tw_and_u = tau; s_tw_or_u = tou; s_tw_and_v = tav; s_tw_or_v = tov;
 }
 
 /* ---- GP1 ----------------------------------------------------------------- */

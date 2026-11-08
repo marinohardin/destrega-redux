@@ -340,7 +340,8 @@ def job(name, base, extra, keep):
 
 
 def hires_job(name, kind, base):
-    """One hi-res run of a scenario: kind 'v1' = 1x1 target compared pixel for pixel with VRAM, 's23' = 2x3."""
+    """One hi-res run of a scenario: kind 'v1' = 1x1 target compared pixel for pixel with VRAM, 's23' = 2x3,
+    'wson' / 'wsoff' = 2x3 widescreen with PGXP on / off, fight frames dumped for the crack check."""
     scn = SCENARIOS[name]
     frames = scn.key                 # boot + menus + 300 fight frames is enough for the hi-res checks
     out = os.path.join(base, 'hires_' + name)
@@ -349,7 +350,14 @@ def hires_job(name, kind, base):
              '--hires-min-fight', '95', '--hires-threads', '1', '--frames', str(frames)]
     # 1x1 equivalence needs PGXP off (precise vertices leave the 1x grid); 2x3 runs PGXP on, so the
     # hash comparison also proves PGXP does not change gameplay, on every stage
-    extra += ['--scale', '1', '--hires-verify', '--pgxp', 'off'] if kind == 'v1' else ['--scale', '2x3', '--pgxp', 'on']
+    if kind in ('wson', 'wsoff'):
+        d = os.path.join(out, kind)
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(d): os.remove(os.path.join(d, f))
+        extra += ['--scale', '2x3', '--widescreen', '--window', '1280x720', '--pgxp', kind[2:],
+                  '--dump', d, '--dump-every', '50', '--dump-from', str(scn.fight_from)]
+    else:
+        extra += ['--scale', '1', '--hires-verify', '--pgxp', 'off'] if kind == 'v1' else ['--scale', '2x3', '--pgxp', 'on']
     rc, log, dt = run_one(scn, out, extra, dump_every=0, trace=False, verify=False)
     open(os.path.join(out, kind + '.log'), 'w').write(log)
     return name, kind, rc, log, out, dt
@@ -365,9 +373,12 @@ def hires_main(a, extra):
     per-frame hash of all emulated state must be identical at 1x1 (--hires-verify) and 2x3, the 1x1
     target (PGXP off) must equal VRAM at every frame, the PGXP vertices drawn at 2x3 must pass
     pgxp-check (no cracks / false associations), no textured sample may fetch outside the 1x-sampled UV
-    range and >= 95% of the fight frames must come from the hi-res target."""
+    range and >= 95% of the fight frames must come from the hi-res target. The same scenarios also run
+    with --widescreen at 2x3, PGXP on and off: same state hash, pgxp-check clean, and no crack in the
+    dumped fight frames (tools/check_ws_cracks.py: background showing through between triangles)."""
     names = a.names or [n for n, s in SCENARIOS.items() if 'hires' in s.tags and not s.xfail]
-    jobs = [(n, k) for n in names for k in ('v1', 's23')]
+    kinds = ('v1', 's23', 'wson', 'wsoff')
+    jobs = [(n, k) for n in names for k in kinds]
     res = {}
     t0 = time.time()
     with cf.ThreadPoolExecutor(a.j) as ex:
@@ -377,20 +388,36 @@ def hires_main(a, extra):
     for n in names:
         scn = SCENARIOS[n]
         bad = []
-        for k in ('v1', 's23'):
+        for k in kinds:
             rc, log, out = res[(n, k)]
             if rc != 0 or BAD_LOG.search(log): bad.append(f'{k}: run failed (exit {rc})')
             if not re.search(UV_OK, log): bad.append(f'{k}: UV samples out of range (or no UV report)')
         _, log1, out = res[(n, 'v1')]
         _, log2, _ = res[(n, 's23')]
         if not re.search(PGXP_OK, log2): bad.append('s23: PGXP consistency check failed (or no pgxp-check report)')
+        if not re.search(PGXP_OK, res[(n, 'wson')][1]): bad.append('wson: PGXP consistency check failed')
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import check_ws_cracks
+        ncr = nfr = 0
+        for f in sorted(os.listdir(os.path.join(out, 'wson'))):
+            if not f.startswith('frame_0') or not os.path.exists(os.path.join(out, 'wsoff', f)): continue
+            w, h, on = check_ws_cracks.read_png(os.path.join(out, 'wson', f))
+            w2, h2, off = check_ws_cracks.read_png(os.path.join(out, 'wsoff', f))
+            if (w, h) != (w2, h2): continue
+            nfr += 1
+            cr = check_ws_cracks.cracks(check_ws_cracks.candidates(on, off, w, h, 2, 3), w, h, 2, 3, (w - 1024) // 2)
+            ncr += len(cr)
+            for c in cr: bad.append(f'widescreen PGXP crack in {f}: {c[1]:.0f} 1x px, pixels ({c[2]},{c[3]})-({c[4]},{c[5]})')
+        if not nfr: bad.append('widescreen: no fight frames dumped for the crack check')
         if not re.search(r'hires-verify: %d frames checked \([1-9][0-9]* in fight window\), 0 mismatching' % scn.key, log1):
             bad.append('1x1 hi-res target differs from VRAM (or no fight-window frames)')
         try:
             if open(out + '/v1.hash').read() != open(out + '/s23.hash').read(): bad.append('state hash 2x3 != 1x1')
+            for k in ('wson', 'wsoff'):
+                if open(out + '/v1.hash').read() != open(out + f'/{k}.hash').read(): bad.append(f'state hash {k} != 1x1')
         except OSError: bad.append('missing state hash')
         m = re.search(r'hires-frames: .*', log2)
-        print(f'{"FAIL" if bad else "ok  "} {n:14s} {m.group(0)[:90] if m else ""}')
+        print(f'{"FAIL" if bad else "ok  "} {n:14s} {m.group(0)[:90] if m else ""}; widescreen: {ncr} cracks in {nfr} frames')
         for b in bad: print('       ', b)
         fail += bool(bad)
     print(f'hires scenarios: {len(names) - fail}/{len(names)} ok ({len(jobs)} runs, {time.time() - t0:.0f}s)')
