@@ -4,6 +4,7 @@
 #include "memcard.h"
 #include "menu.h"
 #include "hires.h"
+#include "hires_gpu.h"
 #include "overrides/override.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -76,6 +77,14 @@ static ResizeStep s_resizes[256];
 static int s_resize_n;
 static SDL_Texture *s_hitex;
 static int s_hitex_w, s_hitex_h;
+/* --renderer software|gpu|compare (see AGENTS.md "GPU renderer") */
+enum { R_SOFTWARE, R_GPU, R_COMPARE };
+static int s_renderer = R_SOFTWARE;
+static SDL_GPUTexture *s_gputex_src;       /* GPU texture wrapped by s_gputex */
+static SDL_Texture *s_gputex;
+static int s_compare_every = 30;           /* --compare-every N */
+static double s_compare_max = -1;          /* --compare-max PCT: fail if a fight frame differs more */
+static struct { u64 frames, exact, px, diff, big, mask; double worst; u64 worst_frame; } s_cmp[2];
 
 static void wav_header(FILE *f, u32 bytes) {
     u32 hdr[11] = {0x46464952, 36 + bytes, 0x45564157, 0x20746d66, 16, 0x00020001, 44100,
@@ -179,7 +188,7 @@ void frontend_screenshot(const char *path) {
     GpuDisplay d;
     HiresView hv;
     gpu_get_display(&d);
-    if (hires_get_view(&d, &hv)) {
+    if (hires_read_view(&d, &hv)) {
         u32 *buf = malloc((size_t)hv.w * hv.h * 4);
         if (buf) {
             convert_view(&hv, buf, (size_t)hv.w);
@@ -354,6 +363,33 @@ static void finish(void) {
                    (unsigned long long)uv.tris);
         if (uv.escaped) rc = 5;
     }
+    if (s_renderer == R_COMPARE) {
+        for (int k = 0; k < 2; k++) {
+            if (!s_cmp[k].frames) continue;
+            rt_log("hires-compare: %s: %llu frames compared, %llu identical; %llu of %llu pixels differ (%.5f%%), "
+                   "%llu by more than 1 step in a channel, %llu in the mask bit only; worst frame %llu: %.4f%%",
+                   k ? "fight" : "all", (unsigned long long)s_cmp[k].frames, (unsigned long long)s_cmp[k].exact,
+                   (unsigned long long)s_cmp[k].diff, (unsigned long long)s_cmp[k].px,
+                   100.0 * (double)s_cmp[k].diff / (double)s_cmp[k].px, (unsigned long long)s_cmp[k].big,
+                   (unsigned long long)s_cmp[k].mask, (unsigned long long)s_cmp[k].worst_frame, s_cmp[k].worst);
+        }
+        if (s_compare_max >= 0 && (!s_cmp[1].frames || s_cmp[1].worst > s_compare_max)) {
+            rt_log("hires-compare: FAIL: worst fight frame %.4f%% > %.4f%% (or no fight frames compared)",
+                   s_cmp[1].worst, s_compare_max);
+            rc = 6;
+        }
+    }
+    if (s_renderer != R_SOFTWARE) {
+        HiresGpuStats st;
+        hires_gpu_get_stats(&st);
+        double n = st.submits ? (double)st.submits : 1;
+        rt_log("hires-gpu: %llu submits, %.1f render passes / %.1f draws / %.0f primitives per submit "
+               "(%llu triangles coverage-tested in the shader), "
+               "%llu VRAM texels uploaded, %llu VRAM copies, %llu readbacks",
+               (unsigned long long)st.submits, st.passes / n, st.draws / n, st.prims / n,
+               (unsigned long long)st.edge_tris,
+               (unsigned long long)st.vram_up_texels, (unsigned long long)st.tcopies, (unsigned long long)st.readbacks);
+    }
     for (int k = 0; k <= s_seg_n; k++) {
         if (!s_seg[k].frames) continue;
         u64 lo = k ? s_seg_bound[k - 1] : 0;
@@ -419,6 +455,23 @@ void frontend_vblank(void) {
                        (unsigned long long)s_frame, bad, fx, fy);
             s_verify_bad_frames++;
         }
+        }
+    }
+    if (s_renderer == R_COMPARE && s_compare_every > 0 && s_frame % (u64)s_compare_every == 0) {
+        HiresCompare c;
+        if (hires_compare(&c) && c.pixels) {
+            double pct = 100.0 * (double)c.diff / (double)c.pixels;
+            for (int k = 0; k < 2; k++) {
+                if (k && s_frame < s_fight_from) continue;
+                s_cmp[k].frames++;
+                if (!c.diff) s_cmp[k].exact++;
+                s_cmp[k].px += c.pixels; s_cmp[k].diff += c.diff; s_cmp[k].big += c.diff_big; s_cmp[k].mask += c.mask_diff;
+                if (pct > s_cmp[k].worst || !s_cmp[k].worst_frame) { s_cmp[k].worst = pct; s_cmp[k].worst_frame = s_frame; }
+            }
+            if (c.diff && g_trace)
+                rt_log("hires-compare: frame %llu: %llu pixels differ (%.4f%%), %llu by > 1, first at target (%d,%d)",
+                       (unsigned long long)s_frame, (unsigned long long)c.diff, pct,
+                       (unsigned long long)c.diff_big, c.first_x, c.first_y);
         }
     }
     if (s_state_hash) write_state_hash();
@@ -557,7 +610,25 @@ static void present_frame(void) {
     HiresView hv;
     gpu_get_display(&d);
     SDL_RenderClear(s_ren);
-    if (hires_get_view(&d, &hv)) {
+    if (hires_get_view(&d, &hv) && hv.gpu) {
+        /* GPU backend: present straight from the GPU (target -> RGBA8 conversion pass), no readback */
+        SDL_GPUTexture *t = hires_gpu_present(&hv);
+        if (t && (t != s_gputex_src || !s_gputex || s_gputex->w != hv.w || s_gputex->h != hv.h)) {
+            if (s_gputex) SDL_DestroyTexture(s_gputex);
+            SDL_PropertiesID pr = SDL_CreateProperties();
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, SDL_PIXELFORMAT_ABGR8888);
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STATIC);
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, hv.w);
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, hv.h);
+            SDL_SetPointerProperty(pr, SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER, t);
+            s_gputex = SDL_CreateTextureWithProperties(s_ren, pr);
+            SDL_DestroyProperties(pr);
+            if (!s_gputex) rt_log("hires-gpu: cannot wrap the GPU texture: %s", SDL_GetError());
+            else SDL_SetTextureScaleMode(s_gputex, SDL_SCALEMODE_LINEAR);
+            s_gputex_src = t;
+        }
+        if (t && s_gputex) SDL_RenderTexture(s_ren, s_gputex, NULL, &dst);
+    } else if (hires_get_view(&d, &hv)) {
         /* true hi-res target: downsampled/filtered into the viewport, never an upsampled 1x image */
         if (!s_hitex || s_hitex_w != hv.w || s_hitex_h != hv.h) {
             if (s_hitex) SDL_DestroyTexture(s_hitex);
@@ -625,6 +696,10 @@ static void usage(void) {
         "                        (default: <data dir>/memcard1.mcd; headless runs: no card unless given)\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
+        "  --renderer R          hi-res renderer: software (default), gpu (SDL_GPU/Metal), or compare\n"
+        "                        (software shown, gpu fed the same commands and compared to it)\n"
+        "  --compare-every N     compare mode: compare the targets every N frames (default 30)\n"
+        "  --compare-max PCT     compare mode: exit non-zero if a fight frame differs in more than PCT%% of pixels\n"
         "  --menu-action F:NAME[=ARG]  (testing) run a File-menu action on frame F: load=IMAGE, reveal-game,\n"
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete\n"
         "                        (save actions use card slot 1; headless needs --data-dir or --memcard1)\n"
@@ -970,7 +1045,17 @@ static void create_window(void) {
     }
     s_win = SDL_CreateWindow("Destrega (recompiled)", s_win_w, s_win_h,
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    s_ren = SDL_CreateRenderer(s_win, NULL);
+    s_ren = NULL;
+    if (s_renderer == R_GPU) {   /* SDL's GPU renderer, whose device the hi-res backend draws with */
+        s_ren = SDL_CreateGPURenderer(NULL, s_win);
+        if (!s_ren || !hires_gpu_init(SDL_GetGPURendererDevice(s_ren))) {
+            rt_log("hires-gpu: GPU renderer unavailable (%s); using the software renderer", SDL_GetError());
+            if (s_ren) SDL_DestroyRenderer(s_ren);
+            s_ren = NULL;
+            s_renderer = R_SOFTWARE;
+        }
+    }
+    if (!s_ren) s_ren = SDL_CreateRenderer(s_win, NULL);
     SDL_SetRenderLogicalPresentation(s_ren, 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 640, 512);
     SDL_SetTextureScaleMode(s_tex, SDL_SCALEMODE_NEAREST);
@@ -1032,6 +1117,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--hires-min-fight") && i + 1 < argc) s_hires_min_fight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
         else if (!strcmp(argv[i], "--hires-verify")) s_verify = true;
+        else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) {
+            const char *r = argv[++i];
+            if (!strcmp(r, "software")) s_renderer = R_SOFTWARE;
+            else if (!strcmp(r, "gpu")) s_renderer = R_GPU;
+            else if (!strcmp(r, "compare")) s_renderer = R_COMPARE;
+            else { fprintf(stderr, "--renderer: software, gpu or compare\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--compare-every") && i + 1 < argc) s_compare_every = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--compare-max") && i + 1 < argc) s_compare_max = atof(argv[++i]);
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
             s_state_hash = fopen(argv[++i], "w");
             if (!s_state_hash) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
@@ -1126,6 +1220,12 @@ int main(int argc, char **argv) {
     gpu_init();
     hires_set_dither(s_hires_dither);
     hires_set_threads(s_hires_threads);
+    if (s_renderer != R_SOFTWARE && !hires_gpu_init(NULL)) {
+        rt_log("hires-gpu: GPU renderer unavailable; using the software renderer");
+        s_renderer = R_SOFTWARE;
+    }
+    if (s_renderer == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
+    else if (s_renderer == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
     if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))
         rt_log("hires: cannot allocate scale %dx%d", s_opt_sx, s_opt_sy);
     spu_init();
