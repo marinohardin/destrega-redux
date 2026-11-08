@@ -164,6 +164,41 @@ a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as 
   `memcard_set_write_protect(true)` (in-memory state keeps updating, flushing becomes a no-op);
   card state must also be part of any snapshot (`memcard_hash` shows what it covers).
 
+## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
+
+macOS gets a native **File** menu inserted after the app menu (SDL3 keeps building the standard
+app/Window menus; Quit still works). `menu_mac.m` (Cocoa, ARC, Apple only; `menu_stub.c` no-ops
+elsewhere) only builds items; each item calls `frontend_menu_action(NAME, ARG)` which **queues**. `main.c`
+runs the queue at the top of each VBlank (`menu_script_and_poll`), i.e. between frames on the main
+thread, so menus cannot disturb emulation. Headless runs never create menus.
+
+- **Load Game Image… (Cmd+O)**: native open dialog (SDL), `.cue/.bin/.iso`, then `import_image()` ->
+  `disc_import()` (the same code as the first-launch dialog and `--import`) into the data pack, then
+  `restart_process()` = clean re-exec (`DESTREGA_RESTARTED=1`, same argv minus `--menu-action` and any
+  positional image). Errors show a native alert and the game keeps running. `disc_import` parks the
+  running disc's module state while importing, so it is safe mid-game. Checks live in `disc.c`: wrong type,
+  raw sync pattern (a 2048-byte-sector `.iso` cannot hold the XA/FMV sectors and is refused with that
+  explanation; a raw 2352 `.iso` is fine), whole sectors, SLUS_007.32 CRC, and the ISO9660 volume size vs the
+  file size (catches truncated copies).
+- **Show Game Files in Finder (Cmd+Shift+R)**: opens the folder of the pack in use (or the loose image).
+- **Memory Card** submenu: Show Memory Cards in Finder; per slot (Card 1 / Card 2): Import Save Card…
+  (validates 128 KiB + "MC" header + checksum, confirms, keeps `memcardN-backup-YYYYmmdd-HHMMSS.mcd`, copies in
+  place, re-attaches), Export Save Card…, Insert/Eject Card (slot 2 starts empty; Insert uses
+  `memcard2.mcd` beside the pack, creating a blank card), Delete Save… (the `BASLUS-00732*` file, confirmed).
+  Every swap flushes first and goes through `memcard_attach`, which closes open handles and raises the
+  card-changed flag like a real swap (`memcard_mark_new` after a delete).
+- Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
+  `load=FILE`, `reveal-game`, `reveal-cards`, `card-import=SLOT:FILE`, `card-export=SLOT:FILE`,
+  `card-eject=SLOT`, `card-insert=SLOT[:FILE]`, `card-delete=SLOT`. Headless: no dialogs (the file argument is
+  required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
+  unless `--data-dir` or `--memcardN` says where the cards are (never the user's real folder by accident).
+  Log lines start with `menu:`; errors with `menu: ERROR:`.
+- Tests: `tools/test_menu.sh` (in `run_tests.sh`): load from `.cue` and raw `.iso` into a scratch data dir
+  with state hash equal to a plain run on that pack, 9 rejection cases, card import with backup (the game
+  really loads the imported save: ROUND COUNT byte), export, eject/insert, delete, invalid cards. It rebuilds
+  a disc image from the pack with `tools/pak_to_bin.py` when `Destrega/Destrega.cue` is absent.
+- Not done: Insert Card From File… (arbitrary path), saves other than the game's own file, Windows/Linux menus.
+
 ## High-resolution rendering (`runtime/hires.[ch]`)
 
 Presentation-only. `gpu.c` stays the authoritative 1x GPU: every GP0 command still runs

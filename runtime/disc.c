@@ -254,15 +254,15 @@ static const char *disc_import_inner(const char *src, const char *pak_path, Disc
     if (pre) return pre;
     if (!disc_open(src)) return "Could not open the disc image (expected a MODE2/2352 .bin or a .cue).";
     if (s_pak) { disc_close(); return "That file is already a data pack."; }
-    const char *err = disc_verify();
-    if (err) { disc_close(); return err; }
     {   /* the ISO9660 volume must fit in the file: catches truncated copies of the real disc */
         u8 pvd[SECTOR];
-        if (!disc_read_sector(16, pvd) || le32(pvd + 24 + 80) > s_sectors) {
+        if (disc_read_sector(16, pvd) && !memcmp(pvd + 25, "CD001", 5) && le32(pvd + 24 + 80) > s_sectors) {
             disc_close();
             return "This disc image is incomplete (shorter than the disc it describes). Re-dump or re-copy it.";
         }
     }
+    const char *err = disc_verify();
+    if (err) { disc_close(); return err; }
 
     char tmp[2048];
     snprintf(tmp, sizeof tmp, "%s.tmp", pak_path);

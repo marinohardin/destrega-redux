@@ -27,6 +27,8 @@ tools/test_hires_determinism.sh > build/hires/out.txt 2>&1 &
 HIRES=$!
 tools/test_memcard.sh > build/memcard.out 2>&1 &
 MCARD=$!
+tools/test_menu.sh > build/menu.out 2>&1 &
+MENU=$!
 
 wait %1 %2 %3 %4 %5 %6 2>/dev/null
 fail=0
@@ -48,5 +50,7 @@ wait $HIRES || { fail=1; echo "hires: FAILED"; }
 cat build/hires/out.txt
 wait $MCARD || { fail=1; echo "memcard e2e: FAILED"; }
 cat build/memcard.out
+wait $MENU || { fail=1; echo "menu: FAILED"; }
+cat build/menu.out
 echo "tests: $(( $(date +%s) - START ))s wall clock, $([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail
