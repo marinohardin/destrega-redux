@@ -69,6 +69,25 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   fills, 3638 VRAM->VRAM copies (3547 with the source inside the framebuffer region), and
   29.6M CPU->VRAM upload pixels (29.26M inside the framebuffer region, i.e. mostly FMV).
 
+### What the render-quality modes see (runtime work, `--tex-filter` etc., AGENTS.md "Render quality")
+
+- The fight HUD (name lettering "GRADD"/"ANJIE", health-bar frames, round markers, "PUSH START")
+  is drawn with 2D primitives: rects or screen-aligned polygons whose u/v advance exactly one texel
+  per 1x pixel. With `--tex-filter xbr` it takes the 2D (edge-aware) rule and stays sharp, while
+  the stage and the characters around it come out bilinear. (verified: 4x6 dumps of fight frame
+  4200, every mode, compared by eye; the lettering is not blurred in xbr mode, it is in bilinear)
+- Count over the 7000-frame boot -> fight run (`tools/fight_script.py`, software 4x6, PGXP on;
+  `hires-filter:` summary line): 3,667,527 textured triangles, 352,532 of them (9.6 %) 2D by the
+  1:1 u/v test, plus 39,316 textured rects. (verified: counter in hires.c be_tri / be_rect)
+- Stage and character textures are noisy photographic 1x art with no flat-colour edges, so an
+  exact-colour edge rule finds nothing there; bilinear is what removes the 4x6 blockiness.
+  (verified: same dumps)
+- The floor/wall tile grout lines are part of the textures, not polygon seams: filtering keeps
+  them where nearest has them, with no lighter/darker seam at polygon boundaries thanks to the
+  footprint clamp. (verified: pixel columns across a tile boundary, base vs bilinear, frame 4200)
+- Gradients that gain most from full-precision colour: the additive hit glows (B+F) and gouraud
+  character shading; the stage has little fog. (likely: visual comparison only)
+
 ## Camera, projection and culling
 
 From the widescreen work (REA decompilation of the functions named in `symbols.txt`, a GTE

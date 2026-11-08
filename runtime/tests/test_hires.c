@@ -374,6 +374,301 @@ static void test_uv_1x_range(int Sx, int Sy)
     if (Sx > 1 || Sy > 1) CHECK(uv.tris_1x_range > 0, "%dx%d the 1x-sampled range was not used", Sx, Sy);
 }
 
+/* ---- render quality: texture filters, full-precision colour, SSAA ---------------------- */
+
+static void quality(int filter, bool full, int ssaa)
+{
+    hires_set_tex_filter(filter);
+    hires_set_colour(full);
+    hires_set_ssaa(ssaa);
+}
+
+static bool view_of(HiresView *v)
+{
+    GpuDisplay d = { 0, 0, 512, 480, false, true };
+    return hires_get_view(&d, v);
+}
+
+/* 8bpp page 10 (x 640), CLUT at (0,500); idx(u, v) picks the CLUT entry of every texel */
+static void upload_tex8(const u16 clut[16], int (*idx)(int u, int v))
+{
+    gp0(0xA0000000); gp0(xy(0, 500)); gp0(xy(16, 1));
+    for (int i = 0; i < 8; i++) gp0((u32)clut[2 * i] | ((u32)clut[2 * i + 1] << 16));
+    gp0(0xA0000000); gp0(xy(640, 0)); gp0(xy(128, 32));
+    for (int v = 0; v < 32; v++)
+        for (int hw = 0; hw < 128; hw += 2) {
+            u32 w[2];
+            for (int k = 0; k < 2; k++) {
+                int u = (hw + k) * 2;
+                w[k] = (u32)idx(u, v) | ((u32)idx(u + 1, v) << 8);
+            }
+            gp0(w[0] | (w[1] << 16));
+        }
+}
+#define CLUTW ((500u << 6) << 16)
+#define TPAGE8 (10u | (1u << 7))
+
+static int idx_far_white(int u, int v) { return (u < 16 && v < 16) ? ((u >= 14 || v >= 14) ? 2 : 1) : 3; }
+
+/* The whole filter footprint (both bilinear taps, xbr's neighbours) stays inside the 1x-sampled
+ * range: texels the 1x draw never reads (u/v >= 14, and everything outside 0..15) are white /
+ * red, everything else pure green, so any tap outside shows up as red or blue in a pixel. */
+static void test_filter_footprint(int filter, int Sx, int Sy)
+{
+    quality(filter, false, 1);
+    setup(Sx, Sy);
+    static const u16 clut[16] = { 0, 0x03E0, 0x7FFF, 0x001F };
+    upload_tex8(clut, idx_far_white);
+    gp0(0x2C808080);   /* 3D-ish quad (minified, not 1:1) */
+    gp0(xy(100, 100)); gp0(CLUTW | 0x0000);
+    gp0(xy(108, 100)); gp0((TPAGE8 << 16) | 0x000F);
+    gp0(xy(100, 108)); gp0(0x0F00);
+    gp0(xy(108, 108)); gp0(0x0F0F);
+    gp0(0x2C808080);   /* 1:1 sprite quad (2D path of xbr): drawn u/v 0..13 */
+    gp0(xy(200, 100)); gp0(CLUTW | 0x0000);
+    gp0(xy(214, 100)); gp0((TPAGE8 << 16) | 0x000E);
+    gp0(xy(200, 114)); gp0(0x0E00);
+    gp0(xy(214, 114)); gp0(0x0E0E);
+    gp0(0xE1000000 | TPAGE8);   /* textured rects: 14x14 from u/v 0, and x-flipped from u 13 */
+    gp0(0x64808080); gp0(xy(300, 100)); gp0(CLUTW | 0x0000); gp0(xy(14, 14));
+    gp0(0xE1000000 | TPAGE8 | 0x1000);
+    gp0(0x64808080); gp0(xy(400, 100)); gp0(CLUTW | 0x000D); gp0(xy(14, 14));
+    gp0(0xE1000000 | TPAGE8);
+    int st;
+    const u16 *t = tgt(&st);
+    long drawn = 0, bad = 0, mixed = 0;
+    for (int y = 90 * Sy; y < 130 * Sy; y++)
+        for (int x = 90 * Sx; x < 430 * Sx; x++) {
+            u16 px = t[y * st + x] & 0x7FFF;
+            if (!px) continue;
+            drawn++;
+            if ((px & 0x7C1F) != 0) bad++;
+            if ((px & 0x3E0) != 0x3E0) mixed++;
+        }
+    const char *fn = hires_tex_filter_name(filter);
+    CHECK(drawn > 0, "%s %dx%d nothing drawn", fn, Sx, Sy);
+    CHECK(bad == 0, "%s %dx%d %ld pixels sampled texels outside the 1x-sampled range", fn, Sx, Sy, bad);
+    CHECK(mixed == 0, "%s %dx%d %ld pixels darkened (uniform texels must stay exact)", fn, Sx, Sy, mixed);
+    HiresUvStats uv;
+    hires_get_uv_stats(&uv);
+    CHECK(uv.escaped == 0, "%s %dx%d %llu samples escaped", fn, Sx, Sy, (unsigned long long)uv.escaped);
+    quality(HIRES_TEX_NEAREST, false, 1);
+}
+
+/* Texel 0000 is transparent: filtered taps on it carry no weight (renormalised), so the edge
+ * between a sprite and its transparent surround is the sprite colour or the background, never
+ * darker (no black fringe); full precision keeps it exact too. */
+static int idx_checker(int u, int v) { return (((u >> 2) + (v >> 2)) & 1) ? 0 : 1; }
+static void test_transparent_texels(int filter, bool full, int Sx, int Sy)
+{
+    quality(filter, full, 1);
+    setup(Sx, Sy);
+    static const u16 clut[16] = { 0, 0x03E0 };
+    upload_tex8(clut, idx_checker);
+    gp0(0x02F80000); gp0(xy(0, 0)); gp0(xy(512, 300));   /* background: blue */
+    gp0(0xE1000000 | TPAGE8);
+    gp0(0x64808080); gp0(xy(100, 100)); gp0(CLUTW | 0x0101); gp0(xy(24, 24));   /* 2D */
+    gp0(0x2C808080);   /* 3D (magnified 2x, sheared) */
+    gp0(xy(200, 100)); gp0(CLUTW | 0x0000);
+    gp0(xy(248, 104)); gp0((TPAGE8 << 16) | 0x0018);
+    gp0(xy(198, 148)); gp0(0x1800);
+    gp0(xy(246, 152)); gp0(0x1818);
+    HiresView v;
+    CHECK(view_of(&v), "no view");
+    long fg = 0, other = 0;
+    for (int y = 95 * Sy; y < 160 * Sy; y++)
+        for (int x = 95 * Sx; x < 260 * Sx; x++) {
+            u32 r, g, b;
+            if (v.fmt == HIRES_FMT_RGBA8) {
+                u32 p = v.px32[(size_t)y * v.stride + x];
+                r = p & 255; g = (p >> 8) & 255; b = (p >> 16) & 255;
+            } else {
+                u16 p = v.pixels[(size_t)y * v.stride + x];
+                r = (p & 31u) << 3; g = ((p >> 5) & 31u) << 3; b = ((p >> 10) & 31u) << 3;
+            }
+            if (r == 0 && g == 0xF8 && b == 0) fg++;   /* sprite green, exact */
+            else if (!(r == 0 && g == 0 && b == 0xF8)) other++;
+        }
+    const char *fn = hires_tex_filter_name(filter);
+    CHECK(fg > 0, "%s %s %dx%d sprite not drawn", fn, full ? "full" : "15", Sx, Sy);
+    CHECK(other == 0, "%s %s %dx%d %ld fringe pixels (neither sprite nor background)", fn, full ? "full" : "15", Sx, Sy, other);
+    quality(HIRES_TEX_NEAREST, false, 1);
+}
+
+/* Full precision: 8-bit channels; the four semi-transparency modes clamp like the hardware;
+ * the mask bit is kept and honoured. */
+static void test_full_blend(int Sx, int Sy)
+{
+    quality(HIRES_TEX_NEAREST, true, 1);
+    setup(Sx, Sy);
+    static const u32 bg = 0x18C8F0, fgc[] = { 0x30E0FF, 0x0F1003, 0xC0C0C0 };   /* GP0 BGR */
+    for (int m = 0; m < 4; m++)
+        for (int k = 0; k < 3; k++) {
+            int x = 16 + 32 * (m * 3 + k);
+            gp0(0x02000000 | bg); gp0(xy(x, 100)); gp0(xy(32, 20));
+            gp0(0xE1000000 | ((u32)m << 5));
+            gp0(0x62000000 | fgc[k]); gp0(xy(x + 4, 104)); gp0(xy(10, 10));
+        }
+    HiresView v;
+    CHECK(view_of(&v) && v.fmt == HIRES_FMT_RGBA8, "full precision target missing");
+    if (v.fmt != HIRES_FMT_RGBA8) return;
+    int bad = 0;
+    for (int m = 0; m < 4; m++)
+        for (int k = 0; k < 3; k++) {
+            int x = 16 + 32 * (m * 3 + k) + 7;
+            u32 p = v.px32[(size_t)(106 * Sy) * v.stride + (size_t)x * Sx];
+            for (int c = 0; c < 3; c++) {
+                int B = (int)((bg >> (8 * c)) & 0xF8), F = (int)((fgc[k] >> (8 * c)) & 255), e;
+                switch (m) {
+                case 0: e = (B + F) >> 1; break;
+                case 1: e = B + F > 255 ? 255 : B + F; break;
+                case 2: e = B - F < 0 ? 0 : B - F; break;
+                default: e = B + F / 4 > 255 ? 255 : B + F / 4; break;
+                }
+                int got = (int)((p >> (8 * c)) & 255);
+                if (got != e) { bad++; printf("  mode %d fg %06x ch %d: got %d want %d\n", m, fgc[k], c, got, e); }
+            }
+            CHECK(!(p & 0xFF000000u), "mode %d: mask bit set", m);
+        }
+    CHECK(bad == 0, "full precision %dx%d: %d blended channels wrong", Sx, Sy, bad);
+    /* mask bit kept: set-mask on, then a check-mask draw must leave it alone */
+    gp0(0xE1000000);
+    gp0(0xE6000001); gp0(0x60FF0000); gp0(xy(20, 200)); gp0(xy(8, 8));
+    gp0(0xE6000002); gp0(0x6000FF00); gp0(xy(20, 200)); gp0(xy(8, 8));
+    gp0(0xE6000000);
+    CHECK(view_of(&v), "no view");
+    u32 p = v.px32[(size_t)(203 * Sy) * v.stride + (size_t)23 * Sx];
+    CHECK(p == 0xFFFF0000u, "mask bit: got %08x", p);   /* untextured: the 8-bit vertex colour */
+    quality(HIRES_TEX_NEAREST, false, 1);
+}
+
+/* Opaque primitives: full precision >> 3 is exactly the 15-bit result (only blending, gouraud
+ * and modulation keep the extra bits), dither being off in both above 1x1. */
+static void opaque_scene(void)
+{
+    static const u16 clut[16] = { 0, 0x03E0, 0x7FFF, 0x001F };
+    upload_tex8(clut, idx_far_white);
+    gp0(0x30FF0000); gp0(xy(10, 10)); gp0(0x0000FF00); gp0(xy(200, 30)); gp0(0x000000FF); gp0(xy(60, 220));
+    gp0(0x2C6040C0);
+    gp0(xy(250, 20)); gp0(CLUTW | 0x0000);
+    gp0(xy(400, 40)); gp0((TPAGE8 << 16) | 0x001F);
+    gp0(xy(260, 200)); gp0(0x1F00);
+    gp0(xy(420, 230)); gp0(0x1F1F);
+    gp0(0x3C102030);   /* gouraud textured */
+    gp0(xy(20, 250)); gp0(CLUTW | 0x0000); gp0(0x00A0FF40);
+    gp0(xy(200, 260)); gp0((TPAGE8 << 16) | 0x000F); gp0(0x00FFFFFF);
+    gp0(xy(30, 400)); gp0(0x0F00); gp0(0x00808080);
+    gp0(xy(210, 420)); gp0(0x0F0F);
+    gp0(0xE1000000 | TPAGE8);
+    gp0(0x64FF8020); gp0(xy(300, 300)); gp0(CLUTW | 0x0000); gp0(xy(30, 30));
+    gp0(0x50FF00FF); gp0(xy(5, 470)); gp0(0x0000FF00); gp0(xy(500, 300));
+}
+static void test_full_matches_15(int Sx, int Sy)
+{
+    quality(HIRES_TEX_NEAREST, false, 1);
+    setup(Sx, Sy);
+    opaque_scene();
+    HiresView a;
+    CHECK(view_of(&a) && a.fmt == HIRES_FMT_15, "15-bit target");
+    const size_t n = (size_t)a.stride * a.h;
+    u16 *c15 = malloc(n * 2);
+    memcpy(c15, a.pixels, n * 2);
+    const int st15 = a.stride;
+    quality(HIRES_TEX_NEAREST, true, 1);
+    setup(Sx, Sy);
+    opaque_scene();
+    HiresView b;
+    CHECK(view_of(&b) && b.fmt == HIRES_FMT_RGBA8, "full target");
+    long diff = 0, nonzero = 0;
+    for (int y = 0; y < 480 * Sy; y++)
+        for (int x = 0; x < 512 * Sx; x++) {
+            u32 p = b.px32[(size_t)y * b.stride + x];
+            u16 q = c15[(size_t)y * st15 + x];
+            u16 r = (u16)(((p & 255) >> 3) | ((((p >> 8) & 255) >> 3) << 5) | ((((p >> 16) & 255) >> 3) << 10) |
+                          ((p >> 24) ? 0x8000 : 0));
+            if (q) nonzero++;
+            if (r != q) diff++;
+        }
+    free(c15);
+    CHECK(nonzero > 1000, "scene not drawn");
+    CHECK(diff == 0, "full >> 3 vs 15-bit %dx%d: %ld pixels differ", Sx, Sy, diff);
+    quality(HIRES_TEX_NEAREST, false, 1);
+}
+
+/* SSAA multiplies the render scale; hires_get_scale keeps the base; the present conversion is
+ * an n x n box average; the factor shrinks to fit the per-axis and size limits. */
+static void test_ssaa(void)
+{
+    quality(HIRES_TEX_NEAREST, true, 2);
+    setup(2, 3);
+    int bx, by, rx, ry;
+    hires_get_scale(&bx, &by);
+    hires_get_render_scale(&rx, &ry);
+    CHECK(bx == 2 && by == 3 && rx == 4 && ry == 6 && hires_ssaa() == 2, "ssaa 2 at 2x3: base %dx%d render %dx%d n %d",
+          bx, by, rx, ry, hires_ssaa());
+    gp0(0x30FF0000); gp0(xy(10, 10)); gp0(0x0000FF00); gp0(xy(200, 30)); gp0(0x000000FF); gp0(xy(60, 220));
+    HiresView v;
+    CHECK(view_of(&v) && v.ssaa == 2, "view ssaa");
+    const int ow = v.w / 2, oh = v.h / 2;
+    u32 *out = malloc((size_t)ow * oh * 4);
+    hires_view_to_rgba(&v, out, (size_t)ow, 0, oh);
+    long bad = 0, edge = 0;
+    for (int y = 0; y < oh; y++)
+        for (int x = 0; x < ow; x++) {
+            u32 s[3] = { 0, 0, 0 };
+            for (int j = 0; j < 2; j++)
+                for (int i = 0; i < 2; i++) {
+                    u32 p = v.px32[(size_t)(2 * y + j) * v.stride + 2 * x + i];
+                    for (int c = 0; c < 3; c++) s[c] += (p >> (8 * c)) & 255;
+                }
+            const u32 o = out[(size_t)y * ow + x];
+            const u32 e = ((s[0] + 2) / 4) | (((s[1] + 2) / 4) << 8) | (((s[2] + 2) / 4) << 16);
+            if ((o & 0xFFFFFF) != e) bad++;
+            if (s[0] % 4) edge++;
+        }
+    free(out);
+    CHECK(bad == 0, "ssaa box average: %ld pixels differ", bad);
+    CHECK(edge > 0, "ssaa: no partially covered pixels (no anti-aliasing?)");
+    quality(HIRES_TEX_NEAREST, false, 4);
+    setup(4, 6);   /* 4x6 x 4 = 16x24 > 16 per axis: falls back to x2 (8x12, 4096 x 5760) */
+    hires_get_render_scale(&rx, &ry);
+    CHECK(hires_ssaa() == 2 && rx == 8 && ry == 12, "ssaa 4 at 4x6: n %d render %dx%d", hires_ssaa(), rx, ry);
+    hires_set_ssaa_cap(24);   /* the frontend's default: no more than a 4x6 target */
+    quality(HIRES_TEX_NEAREST, false, 2);
+    setup(2, 3);
+    CHECK(hires_ssaa() == 2, "cap 24: 2x3 x2 = 4x6 allowed, n %d", hires_ssaa());
+    setup(4, 6);
+    CHECK(hires_ssaa() == 1, "cap 24: 4x6 x2 refused, n %d", hires_ssaa());
+    hires_set_ssaa_cap(0);
+    setup(1, 1);
+    CHECK(!hires_verify_possible(), "verify must be refused with ssaa");
+    quality(HIRES_TEX_NEAREST, true, 1);
+    setup(1, 1);
+    CHECK(!hires_verify_possible(), "verify must be refused in full precision");
+    quality(HIRES_TEX_NEAREST, false, 1);
+    setup(1, 1);
+    CHECK(hires_verify_possible(), "verify at 1x1 15-bit");
+}
+
+static void test_2d_detection(void)
+{
+    HiresVtx s[3] = { { 10 << 16, 20 << 16, 0, 0, 0, 5, 7, 0 }, { 30 << 16, 20 << 16, 0, 0, 0, 25, 7, 0 },
+                      { 10 << 16, 50 << 16, 0, 0, 0, 5, 37, 0 } };
+    CHECK(hires_tri_is_2d(s), "1:1 sprite triangle not 2D");
+    HiresVtx f[3] = { s[0], s[1], s[2] };
+    f[0].u = 25; f[1].u = 5; f[2].u = 25;   /* mirrored: still 1:1 */
+    CHECK(hires_tri_is_2d(f), "mirrored sprite not 2D");
+    HiresVtx m[3] = { s[0], s[1], s[2] };
+    m[1].u = 45;   /* 2:1 magnified */
+    CHECK(!hires_tri_is_2d(m), "scaled triangle taken as 2D");
+    HiresVtx r[3] = { s[0], s[1], s[2] };
+    r[1].v = 8;    /* sheared */
+    CHECK(!hires_tri_is_2d(r), "sheared triangle taken as 2D");
+    HiresVtx w[3] = { s[0], s[1], s[2] };
+    w[0].w = w[1].w = w[2].w = 100.0f;   /* PGXP depth = 3D */
+    CHECK(!hires_tri_is_2d(w), "PGXP triangle taken as 2D");
+}
+
 static void check_pick(int pw, int ph, int dw, int dh, int mx, int my, int ex, int ey)
 {
     int sx, sy;
@@ -404,6 +699,18 @@ int main(void)
     test_uv_1x_range(3, 5);
     test_threads_identical(2, 3);
     test_threads_identical(4, 6);
+    static const int qs[][2] = { { 2, 2 }, { 4, 6 }, { 3, 5 }, { 1, 1 } };
+    for (unsigned i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        test_filter_footprint(HIRES_TEX_BILINEAR, qs[i][0], qs[i][1]);
+        test_filter_footprint(HIRES_TEX_XBR, qs[i][0], qs[i][1]);
+        test_transparent_texels(HIRES_TEX_BILINEAR, false, qs[i][0], qs[i][1]);
+        test_transparent_texels(HIRES_TEX_XBR, true, qs[i][0], qs[i][1]);
+        test_full_blend(qs[i][0], qs[i][1]);
+    }
+    test_full_matches_15(2, 2);
+    test_full_matches_15(4, 6);
+    test_ssaa();
+    test_2d_detection();
     check_pick(1920, 1440, 512, 240, 8, 8, 4, 6);     /* 1440p-ish window: 2048x1440 */
     check_pick(960, 720, 512, 240, 8, 8, 2, 3);
     check_pick(1920, 1080, 512, 240, 8, 8, 3, 5);     /* letterboxed 1440x1080 */

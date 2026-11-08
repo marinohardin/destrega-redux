@@ -78,6 +78,10 @@ static int seg_of(u64 frame) {
     return k;
 }
 static bool s_hires_dither;
+/* render quality (AGENTS.md "Render quality"); -1 = default: windowed play gets texture smoothing,
+ * full-precision colour and (GPU renderer) 2x SSAA, headless runs keep the PS1-exact output */
+static int s_opt_filter = -1, s_opt_full = -1, s_opt_ssaa = -1;
+static bool s_ssaa_chosen;                 /* --ssaa or View > Anti-aliasing: no renderer-based default */
 static int s_pgxp = 2;              /* --pgxp: 0 off, 1 precise positions only (affine), 2 on */
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
@@ -195,23 +199,18 @@ static void write_png(const char *path, const u32 *rgba, int w, int h) {
     free(raw); free(z);
 }
 
-/* Convert a hi-res view to RGBA8888 (R in the low byte, as ABGR8888 on little endian). */
+/* Convert a hi-res view to RGBA8888 (R in the low byte, as ABGR8888 on little endian), SSAA
+ * blocks box-averaged: view_w(v) x view_h(v) pixels. */
 typedef struct { const HiresView *v; u32 *dst; size_t pitch; } ConvJob;
 static void convert_rows(void *c, int y0, int y1) {
     const ConvJob *j = c;
-    if (y1 > j->v->h) y1 = j->v->h;
-    for (int y = y0; y < y1; y++) {
-        const u16 *src = j->v->pixels + (size_t)y * j->v->stride;
-        u32 *d = j->dst + y * j->pitch;
-        for (int x = 0; x < j->v->w; x++) {   /* plain arithmetic: auto-vectorizes */
-            u32 p = src[x];
-            d[x] = 0xff000000u | ((p & 0x7c00) << 9) | ((p & 0x03e0) << 6) | ((p & 0x001f) << 3);
-        }
-    }
+    hires_view_to_rgba(j->v, j->dst, j->pitch, y0, y1);
 }
+static int view_w(const HiresView *v) { return v->w / (v->ssaa > 1 ? v->ssaa : 1); }
+static int view_h(const HiresView *v) { return v->h / (v->ssaa > 1 ? v->ssaa : 1); }
 static void convert_view(const HiresView *v, u32 *dst, size_t dst_pitch_px) {
     ConvJob j = { v, dst, dst_pitch_px };
-    hires_parallel_rows(convert_rows, &j, v->h);
+    hires_parallel_rows(convert_rows, &j, view_h(v));
 }
 
 static int ws_present_extra(const GpuDisplay *d);
@@ -220,10 +219,10 @@ void frontend_screenshot(const char *path) {
     HiresView hv;
     gpu_get_display(&d);
     if (hires_read_view_wide(&d, ws_present_extra(&d), &hv)) {
-        u32 *buf = malloc((size_t)hv.w * hv.h * 4);
+        u32 *buf = malloc((size_t)view_w(&hv) * view_h(&hv) * 4);
         if (buf) {
-            convert_view(&hv, buf, (size_t)hv.w);
-            write_png(path, buf, hv.w, hv.h);
+            convert_view(&hv, buf, (size_t)view_w(&hv));
+            write_png(path, buf, view_w(&hv), view_h(&hv));
             free(buf);
             return;
         }
@@ -420,6 +419,7 @@ static void renderer_switch(int r) {
     if (r == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
     else if (r == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
     else hires_set_backend(NULL, NULL);
+    if (!s_ssaa_chosen && !s_headless) hires_set_ssaa(r == R_GPU ? 2 : 1);   /* default follows the renderer */
     int sx, sy;
     bool on = hires_get_scale(&sx, &sy);
     if (on && !hires_set_scale(sx, sy)) {
@@ -523,6 +523,14 @@ static void finish(void) {
                "integer, %llu table-full fallbacks",
                (unsigned long long)g_pgxp_stat_welded, (unsigned long long)g_pgxp_stat_weld_int,
                (unsigned long long)g_pgxp_stat_weld_full);
+    }
+    {
+        u64 ft, f2, fr;
+        hires_get_filter_stats(&ft, &f2, &fr);
+        if (ft || fr)
+            rt_log("hires-filter: %s: %llu textured triangles filtered, %llu of them as 2D (xbr rule), %llu textured rects",
+                   hires_tex_filter_name(hires_get_tex_filter()), (unsigned long long)ft, (unsigned long long)f2,
+                   (unsigned long long)fr);
     }
     if (g_pgxp_stat_vtx) {
         u64 tris, persp;
@@ -685,7 +693,7 @@ void frontend_vblank(void) {
     }
     {
         int cx, cy;
-        if (s_verify && hires_get_scale(&cx, &cy) && cx == 1 && cy == 1) {
+        if (s_verify && hires_get_scale(&cx, &cy) && hires_verify_possible()) {
         int fx = 0, fy = 0;
         u32 bad = hires_verify_1x(&fx, &fy);
         s_verify_frames++;
@@ -868,13 +876,13 @@ static void present_frame(void) {
     if (have && hv.gpu) {
         /* GPU backend: present straight from the GPU (target -> RGBA8 conversion pass), no readback */
         SDL_GPUTexture *t = hires_gpu_present(&hv);
-        if (t && (t != s_gputex_src || !s_gputex || s_gputex->w != hv.w || s_gputex->h != hv.h)) {
+        if (t && (t != s_gputex_src || !s_gputex || s_gputex->w != view_w(&hv) || s_gputex->h != view_h(&hv))) {
             if (s_gputex) SDL_DestroyTexture(s_gputex);
             SDL_PropertiesID pr = SDL_CreateProperties();
             SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, SDL_PIXELFORMAT_ABGR8888);
             SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STATIC);
-            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, hv.w);
-            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, hv.h);
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, view_w(&hv));
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, view_h(&hv));
             SDL_SetPointerProperty(pr, SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER, t);
             s_gputex = SDL_CreateTextureWithProperties(s_ren, pr);
             SDL_DestroyProperties(pr);
@@ -885,17 +893,18 @@ static void present_frame(void) {
         if (t && s_gputex) SDL_RenderTexture(s_ren, s_gputex, NULL, &dst);
     } else if (have) {
         /* true hi-res target: downsampled/filtered into the viewport, never an upsampled 1x image */
-        if (!s_hitex || s_hitex_w != hv.w || s_hitex_h != hv.h) {
+        const int ow = view_w(&hv), oh = view_h(&hv);   /* after the SSAA box filter */
+        if (!s_hitex || s_hitex_w != ow || s_hitex_h != oh) {
             if (s_hitex) SDL_DestroyTexture(s_hitex);
-            s_hitex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
-                                        hv.w, hv.h);
+            s_hitex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, ow, oh);
             if (s_hitex) SDL_SetTextureScaleMode(s_hitex, SDL_SCALEMODE_LINEAR);
-            s_hitex_w = hv.w; s_hitex_h = hv.h;
+            s_hitex_w = ow; s_hitex_h = oh;
         }
         /* Upload only if the displayed rows were drawn since the last upload (fights draw at
          * 30 fps but present at 60), or the view/target changed. */
-        static const u16 *up_pixels; static int up_stride, up_w, up_h; static u64 up_epoch; static bool up_ok;
-        bool same = up_ok && up_pixels == hv.pixels && up_stride == hv.stride && up_w == hv.w &&
+        static const void *up_pixels; static int up_stride, up_w, up_h; static u64 up_epoch; static bool up_ok;
+        const void *hpx = hv.pixels ? (const void *)hv.pixels : (const void *)hv.px32;
+        bool same = up_ok && up_pixels == hpx && up_stride == hv.stride && up_w == hv.w &&
                     up_h == hv.h && up_epoch == hires_epoch();
         if (!same || hires_dirty_rows(d.y, d.y + d.h - 1)) {
             void *px; int pitch;
@@ -903,7 +912,7 @@ static void present_frame(void) {
             if (s_hitex && SDL_LockTexture(s_hitex, NULL, &px, &pitch)) {
                 convert_view(&hv, px, (size_t)pitch / 4);
                 SDL_UnlockTexture(s_hitex);
-                up_pixels = hv.pixels; up_stride = hv.stride; up_w = hv.w; up_h = hv.h;
+                up_pixels = hpx; up_stride = hv.stride; up_w = hv.w; up_h = hv.h;
                 up_epoch = hires_epoch(); up_ok = true;
                 hires_clear_dirty();
             }
@@ -951,6 +960,9 @@ static void settings_apply(const char *dir) {
     if (s_ws_given) settings_lock("display", "widescreen");
     if (s_renderer_given) settings_lock("display", "renderer");
     if (s_win_set) settings_lock("display", "window");
+    if (s_opt_filter >= 0) settings_lock("display", "tex_filter");
+    if (s_opt_full >= 0) settings_lock("display", "smooth_colours");
+    if (s_ssaa_chosen) settings_lock("display", "ssaa");
     if (path[0] && settings_load() >= 0) rt_log("settings: %s", path);
     const char *v;
     int a, b;
@@ -969,6 +981,17 @@ static void settings_apply(const char *dir) {
     if (!s_win_set && (v = settings_get("display", "window"))) {
         if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
     }
+    if (s_opt_filter < 0 && (v = settings_get("display", "tex_filter"))) {
+        s_opt_filter = hires_tex_filter_from_name(v);
+        if (s_opt_filter < 0) rt_log("settings: display.tex_filter: nearest, bilinear or xbr");
+    }
+    if (s_opt_full < 0 && settings_get("display", "smooth_colours"))
+        s_opt_full = settings_get_bool("display", "smooth_colours", true) ? 1 : 0;
+    if (!s_ssaa_chosen && (v = settings_get("display", "ssaa"))) {   /* only written by an explicit choice */
+        int n = atoi(v);
+        if (n >= 1 && n <= HIRES_MAX_SSAA) { s_opt_ssaa = n; s_ssaa_chosen = true; }
+        else rt_log("settings: display.ssaa: 1 (off) to %d", HIRES_MAX_SSAA);
+    }
     s_fs_start = !s_headless && settings_get_bool("display", "fullscreen", false);
     input_init();
     atexit(settings_save_at_exit);
@@ -978,6 +1001,13 @@ static void settings_apply(const char *dir) {
 static void settings_note_view(const char *name) {
     if (!strcmp(name, "widescreen")) settings_set_bool("display", "widescreen", s_ws_req);
     else if (!strcmp(name, "renderer") && s_renderer != R_COMPARE) settings_set("display", "renderer", renderer_name(s_renderer));
+    else if (!strcmp(name, "tex-filter")) settings_set("display", "tex_filter", hires_tex_filter_name(hires_get_tex_filter()));
+    else if (!strcmp(name, "smooth-colours")) settings_set_bool("display", "smooth_colours", hires_get_colour());
+    else if (!strcmp(name, "ssaa") && s_ssaa_chosen) {
+        char n[8];
+        snprintf(n, sizeof n, "%d", hires_get_ssaa());
+        settings_set("display", "ssaa", n);
+    }
     else return;
     settings_save();
 }
@@ -1020,6 +1050,12 @@ static void usage(void) {
         "  --fight-from F        first frame counted as 'fight' in the hi-res frame stats (default 3700)\n"
         "  --hires-min-fight P   exit non-zero unless P%% of fight frames were shown from the hi-res target\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
+        "  --tex-filter F        hi-res texture filter: nearest, bilinear, xbr (2D edge-aware, 3D bilinear)\n"
+        "                        (default: xbr in a window, nearest headless)\n"
+        "  --hires-colour 15|full  hi-res target colour: 15-bit or full precision (8-bit channels)\n"
+        "                        (default: full in a window, 15 headless)\n"
+        "  --ssaa N              supersampling 1 (off) to 4: render at N x the scale, box-filter at present\n"
+        "                        (default: 2 with the GPU renderer in a window, else 1)\n"
         "  --pgxp on|off|affine  sub-pixel GTE vertices + perspective-correct textures in the hi-res\n"
         "                        target (default on; affine = precise positions, PS1 texture mapping)\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
@@ -1046,8 +1082,9 @@ static void usage(void) {
         "  --widescreen-at F:0|1,...  headless: switch widescreen off/on at the given frames\n"
         "  --menu-action F:NAME[=ARG]  (testing) run a menu action on frame F: load=IMAGE, reveal-game,\n"
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete,\n"
-        "                        widescreen[=on|off], renderer[=software|gpu|compare] (View menu;\n"
-        "                        no argument = toggle), netplay-host=PORT[,DELAY],\n"
+        "                        widescreen[=on|off], renderer[=software|gpu|compare],\n"
+        "                        tex-filter[=nearest|bilinear|xbr], smooth-colours[=on|off], ssaa[=1..4]\n"
+        "                        (View menu; no argument = toggle / next), netplay-host=PORT[,DELAY],\n"
         "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect (Netplay menu),\n"
         "                        controls, controls-bind=P1:cross=key:Z|pad:east, controls-device=P2:keyboard,\n"
         "                        controls-stick=P1:on|off, controls-deadzone=P1:40, controls-reset=P1|P2|all,\n"
@@ -1421,6 +1458,35 @@ bool frontend_menu_action_allowed(const char *name) {
 }
 bool frontend_netplay_busy(void) { return netplay_busy(); }
 
+/* View-menu render-quality items: reallocate the target (seeded from the 1x VRAM, like a resize).
+ * Runs between frames; presentation only. */
+static void log_render_quality(const char *when) {
+    int rx = 0, ry = 0;
+    hires_get_render_scale(&rx, &ry);
+    rt_log("hires: texture filter %s, %s colour, ssaa %d (in use %d, render scale %dx%d)%s",
+           hires_tex_filter_name(hires_get_tex_filter()), hires_get_colour() ? "full-precision" : "15-bit",
+           hires_get_ssaa(), hires_ssaa(), rx, ry, when);
+}
+static void view_changed(void) {
+    if (!hires_reconfigure()) {
+        rt_log("hires: cannot allocate the target with these settings; anti-aliasing off");
+        hires_set_ssaa(1);
+        hires_reconfigure();
+    }
+    char when[48];
+    snprintf(when, sizeof when, " at frame %llu", (unsigned long long)s_frame);
+    log_render_quality(when);
+}
+bool frontend_view_checked(const char *action, bool *checked) {
+    const char *eq = strchr(action, '=');
+    const size_t n = eq ? (size_t)(eq - action) : strlen(action);
+    const char *arg = eq ? eq + 1 : "";
+    if (n == 10 && !strncmp(action, "tex-filter", n) && *arg) { *checked = hires_tex_filter_from_name(arg) == hires_get_tex_filter(); return true; }
+    if (n == 14 && !strncmp(action, "smooth-colours", n)) { *checked = hires_get_colour(); return true; }
+    if (n == 4 && !strncmp(action, "ssaa", n) && *arg) { *checked = atoi(arg) == hires_get_ssaa(); return true; }
+    return false;
+}
+
 static void menu_run(const char *name, const char *arg) {
     rt_log("menu: action %s%s%s", name, *arg ? " " : "", arg);
     if (!frontend_menu_action_allowed(name)) {
@@ -1466,6 +1532,21 @@ static void menu_run(const char *name, const char *arg) {
         frontend_set_widescreen(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
                                 : !strcmp(arg, "off") || !strcmp(arg, "0") ? false
                                 : !frontend_widescreen());
+    else if (!strcmp(name, "tex-filter")) {   /* View > Texture Filtering; nearest|bilinear|xbr, none = next */
+        int m = *arg ? hires_tex_filter_from_name(arg) : (hires_get_tex_filter() + 1) % 3;
+        if (m < 0) rt_log("menu: tex-filter: nearest, bilinear or xbr");
+        else { hires_set_tex_filter(m); view_changed(); }
+    }
+    else if (!strcmp(name, "smooth-colours")) {   /* View > Smooth Colours; on/off, none = toggle */
+        hires_set_colour(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
+                         : !strcmp(arg, "off") || !strcmp(arg, "0") ? false : !hires_get_colour());
+        view_changed();
+    }
+    else if (!strcmp(name, "ssaa")) {   /* View > Anti-aliasing; 1 (off) .. 4, none = toggle off / 2x */
+        int n = *arg ? atoi(arg) : (hires_get_ssaa() > 1 ? 1 : 2);
+        if (n < 1 || n > HIRES_MAX_SSAA) rt_log("menu: ssaa: 1 (off) to %d", HIRES_MAX_SSAA);
+        else { hires_set_ssaa(n); hires_set_ssaa_cap(0); s_ssaa_chosen = true; view_changed(); }
+    }
     else if (!strcmp(name, "menu-test"))    /* Windows menu bar test hook (menu.h): dump | click=PATH */
         menu_test(arg);
     else if (!strcmp(name, "controls") || !strcmp(name, "settings")) {   /* Settings… / View > Controls… */
@@ -1576,6 +1657,21 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fight-from") && i + 1 < argc) s_fight_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--hires-min-fight") && i + 1 < argc) s_hires_min_fight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
+        else if (!strcmp(argv[i], "--tex-filter") && i + 1 < argc) {
+            s_opt_filter = hires_tex_filter_from_name(argv[++i]);
+            if (s_opt_filter < 0) { fprintf(stderr, "--tex-filter: nearest, bilinear or xbr\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--hires-colour") && i + 1 < argc) {
+            const char *c = argv[++i];
+            if (!strcmp(c, "15")) s_opt_full = 0;
+            else if (!strcmp(c, "full")) s_opt_full = 1;
+            else { fprintf(stderr, "--hires-colour: 15 or full\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--ssaa") && i + 1 < argc) {
+            s_opt_ssaa = atoi(argv[++i]);
+            if (s_opt_ssaa < 1 || s_opt_ssaa > HIRES_MAX_SSAA) { fprintf(stderr, "--ssaa: 1 (off) to %d\n", HIRES_MAX_SSAA); return 1; }
+            s_ssaa_chosen = true;
+        }
         else if (!strcmp(argv[i], "--pgxp-diag") && i + 1 < argc) g_pgxp_diag = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pgxp") && i + 1 < argc) {
             const char *m = argv[++i];
@@ -1751,11 +1847,18 @@ int main(int argc, char **argv) {
         hires_set_backend(NULL, NULL);
     }
     s_gpu_used = s_renderer != R_SOFTWARE;
+    hires_set_tex_filter(s_opt_filter >= 0 ? s_opt_filter : s_headless ? HIRES_TEX_NEAREST : HIRES_TEX_XBR);
+    hires_set_colour(s_opt_full >= 0 ? s_opt_full == 1 : !s_headless);
+    hires_set_ssaa(s_opt_ssaa >= 1 ? s_opt_ssaa : (!s_headless && s_renderer == R_GPU) ? 2 : 1);
+    /* default SSAA only while the render target costs no more than 4x6 (measured: 4x6 x2 = 8x12
+     * took ~4x the GPU time, far over a 60 Hz frame); an explicit choice is never capped */
+    hires_set_ssaa_cap(s_ssaa_chosen ? 0 : 24);
     rt_log("hires: renderer %s", s_renderer == R_GPU ? "gpu" : s_renderer == R_COMPARE ? "compare" : "software");
     if (s_renderer == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
     else if (s_renderer == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
     if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))
         rt_log("hires: cannot allocate scale %dx%d", s_opt_sx, s_opt_sy);
+    log_render_quality("");
     spu_init();
     mdec_init();
 

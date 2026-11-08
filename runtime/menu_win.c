@@ -114,6 +114,7 @@ static void update_items(void) {
         if (!strcmp(name, "fullscreen"))
             set_text(it->id, frontend_fullscreen() ? "Exit Full Screen\tAlt+Enter" : "Enter Full Screen\tAlt+Enter");
         if (!strcmp(name, "widescreen")) checked = frontend_widescreen();
+        frontend_view_checked(it->action, &checked);
         if (!strcmp(name, "renderer") && eq) {
             checked = !strcmp(eq + 1, frontend_renderer());
             if (!strcmp(eq + 1, "gpu") && !frontend_gpu_available()) enabled = false;
@@ -166,6 +167,18 @@ void menu_init(void) {
     add(ren, "Software", "renderer=software");
     add(ren, "GPU", "renderer=gpu");
     add_sub(view, "Renderer", ren);
+    HMENU tf = CreatePopupMenu();   /* render quality: presentation only, reseeds like a resize */
+    add(tf, "Off (Sharp Pixels)", "tex-filter=nearest");
+    add(tf, "Bilinear", "tex-filter=bilinear");
+    add(tf, "Smooth 2D Edges + Bilinear 3D", "tex-filter=xbr");
+    add_sub(view, "Texture Filtering", tf);
+    add(view, "Smooth Colours", "smooth-colours");
+    HMENU aa = CreatePopupMenu();
+    add(aa, "Off", "ssaa=1");
+    add(aa, "2x", "ssaa=2");
+    add(aa, "3x", "ssaa=3");
+    add(aa, "4x", "ssaa=4");
+    add_sub(view, "Anti-aliasing", aa);
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     add(view, "Enter Full Screen\tAlt+Enter", "fullscreen");
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);

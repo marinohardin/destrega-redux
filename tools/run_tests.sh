@@ -32,6 +32,10 @@ tools/test_hires_determinism.sh > build/hires/out.txt 2>&1 &
 HIRES=$!
 JOBS=4 tools/test_widescreen.sh > build/widescreen/out.txt 2>&1 &
 WIDE=$!
+# render-quality modes (texture filter, full colour, SSAA): state hash + software == GPU
+mkdir -p build/quality
+JOBS=4 tools/test_render_quality.sh > build/quality/out.txt 2>&1 &
+QUAL=$!
 # 3. scenario library: every mode / stage / character path, --no-interp (SCENARIOS=0 to skip), the
 #    hi-res determinism + 1x1 equivalence checks on the stage subset, and every scenario with
 #    periodic save-state rewinds
@@ -96,6 +100,8 @@ wait $HIRES || { fail=1; echo "hires: FAILED"; }
 cat build/hires/out.txt
 wait $WIDE || { fail=1; echo "widescreen: FAILED"; }
 cat build/widescreen/out.txt
+wait $QUAL || { fail=1; echo "render quality: FAILED"; }
+cat build/quality/out.txt
 if [ "${SCENARIOS:-1}" != 0 ]; then
   wait $SCN || { fail=1; echo "scenarios: FAILED"; }
   cat build/scenarios/out.txt

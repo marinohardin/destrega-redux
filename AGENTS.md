@@ -534,6 +534,10 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
   menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
 - **View > Renderer > Software / GPU**: action `renderer[=software|gpu]`, see "GPU renderer".
+- **View > Texture Filtering** (Off (Sharp Pixels) / Bilinear / Smooth 2D Edges + Bilinear 3D),
+  **View > Smooth Colours** (checkable) and **View > Anti-aliasing** (Off / 2x / 3x / 4x), Mac and
+  Windows: actions `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`;
+  see "Render quality".
 - **Netplay** menu (after View): Host Game…, Join Game…, Disconnect, status line; see "Rollback netplay".
 - **View > Controls…** (both platforms) and app menu **Settings… (Cmd+,)** on macOS: the Controls
   window, see "Input, controls and settings". View toggles are saved in `settings.ini`.
@@ -551,6 +555,7 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
   `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`,
+  `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`,
   `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`,
   `controls`, `settings`, `controls-*` (see "Input, controls and settings"),
   `menu-test=dump|click=PATH` (Windows, windowed). Headless: no dialogs (the file argument is
@@ -871,7 +876,8 @@ The header comment of `hires_gpu.c` has the details.
   `SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER`); readback only for `--dump`, `--hires-verify`
   and compare (`HiresBackend.read`).
 - Exactness: target B5G5R5A1 (shader writes PS1 red into `.b` = the low 5 bits, so the download
-  is raw PS1 u16, alpha = mask bit). Attributes are the 1x plane equations evaluated as exact
+  is raw PS1 u16, alpha = mask bit), or R8G8B8A8 in full-precision colour (see "Render quality";
+  both pipeline sets are created at init). Attributes are the 1x plane equations evaluated as exact
   rationals in 64-bit integers per pixel (Metal `long`; emulated with 32-bit pairs on Vulkan). Semi modes are fixed-function
   blends (B/2+F/2 via constant 0.5 and F/2-1/4; see the file comment for the one F=0 tie case).
   Triangles with a vertex outside the target are drawn as their clipped bbox with an exact
@@ -923,6 +929,109 @@ The header comment of `hires_gpu.c` has the details.
   and must pass the `pgxp-check`.
   `tools/test_widescreen.sh` adds `ws46g` (16:9 on the GPU) and `wsrender` (renderer and
   widescreen switched back and forth mid-fight, state hash = 4:3 software run).
+
+## Render quality (`--tex-filter`, `--hires-colour`, `--ssaa`; View menu)
+
+Three presentation-only improvements of the hi-res target, implemented the same way in the software
+backend (`hires.c`) and the GPU backend (`hires_gpu.c` MSL + `shaders/hires.glsl`). All integer
+math, so the two backends stay **bit-identical in every mode** (`--renderer compare` reports 0
+differing pixels with `--pgxp off`, 4:3 and 16:9). No emulated state changes (state hashes equal
+with every mode on). Options are plain global setters/getters in `hires.h`
+(`hires_set_tex_filter`, `hires_set_colour`, `hires_set_ssaa`), no persistence.
+
+- **Defaults**: windowed = `xbr` filter, full-precision colour, and 2x SSAA when the GPU renderer
+  is active (1 on software; switching the renderer moves the default along unless `--ssaa` or the
+  menu chose a value). The *default* SSAA is capped to a render target of at most 24 hi-res pixels
+  per 1x pixel (`hires_set_ssaa_cap(24)`: render Sx*Sy <= 24, i.e. never beyond 4x6), so it only
+  applies to small windows (base Sx*Sy <= 6 for 2x, e.g. 2x3) and is off at the usual 4x6; an explicit
+  `--ssaa N` or a menu choice is never capped (`hires_set_ssaa_cap(0)`). Reason: 2x SSAA on a 4x6
+  base (8x12, 23.6 M px) costs ~46 ms/frame on the GPU (below). Headless = nearest, 15-bit, no SSAA: every existing test and hash is
+  unchanged. `--hires-verify` only runs where it is meaningful (1x1, 15-bit, nearest, no SSAA:
+  `hires_verify_possible()`).
+- **Menus / actions** (Mac and Windows View menu; also `--menu-action`): Texture Filtering > Off
+  (Sharp Pixels) / Bilinear / Smooth 2D Edges + Bilinear 3D = `tex-filter=nearest|bilinear|xbr`
+  (no argument: next); Smooth Colours = `smooth-colours[=on|off]`; Anti-aliasing > Off / 2x / 3x /
+  4x = `ssaa=1..4` (no argument: off <-> 2x). Each switch runs `hires_reconfigure()` between frames:
+  a format or SSAA change reallocates the target and seeds it from the 1x VRAM, like a resize. The
+  log says `hires: texture filter F, C colour, ssaa N (in use N, render scale WxH) at frame F`.
+
+### Texture smoothing (`--tex-filter nearest|bilinear|xbr`)
+- Filtering happens **after the CLUT lookup**, on the 15-bit texels, with integer weights summing
+  to 65536 (`tex_combine` / `tcomb`), result in 5.8 fixed point; modulation, raw texture, dither and
+  semi-transparency then work as before (a single texel `t << 8` gives exactly the old result).
+- **Transparency**: texel 0000 contributes no weight; the opaque taps are renormalised, and the
+  pixel is transparent (discarded) when the opaque weight is below half. So a sprite edge is the
+  sprite colour or the background, never darkened towards black (no fringe). The STP bit
+  (semi-transparency / mask) is the weighted majority of the opaque taps.
+- **No bleed**: the whole footprint stays inside the 1x-sampled UV range (the `uv_track_span`
+  clamp of "High-resolution rendering", now always on when filtering): taps outside it are clamped
+  to its edge texel (clamp-to-edge inside the range). Rects use the u/v range of the columns/rows
+  they draw (`hires_rect_uv_range`). Texture windows are applied to every tap. Pages that overlap
+  the framebuffer are sampled from 1x VRAM like before (the game never does this).
+- **Bilinear**: sample point at the hi-res pixel centre without the PS1's +0.5 rounding bias,
+  `i = floor(u - 0.5)`, fraction in 1/256.
+- **xbr (default)**: a Scale2x/xBR corner rule for **2D** primitives, bilinear for **3D** ones.
+  2D = textured rects, and triangles without PGXP depth whose u/v advance exactly ±1 texel per 1x
+  pixel along x/y (`hires_tri_is_2d`: HUD, fonts, portraits, sprites). For the nearest texel E
+  and the quadrant the sample lies in, if the two neighbours H (horizontal) and V (vertical) are
+  equal, differ from E, and differ from their own outer neighbours, the corner beyond the diagonal
+  |dx|+|dy| > 1/2 texel takes H's colour, with a one-hi-res-pixel ramp; otherwise E (nearest).
+  Exact colour equality means noisy textures are left alone while fonts and HUD outlines get
+  smooth diagonals and keep sharp straight edges. Bilinear blurs pixel art, so it is the 3D-only
+  half. 3D textures (stage, characters) are photographic/noisy at 1x: bilinear removes the
+  blockiness at 4x6 without inventing edges.
+- No texture cache: every tap reads the 1x VRAM (software) / VRAM texture (GPU) directly, so
+  there is nothing to invalidate. The software rect path precomputes per-column taps.
+
+### Full-precision colour (`--hires-colour 15|full`)
+- Target RGBA8 (u32 R | G << 8 | B << 16 | mask << 24 in software, R8G8B8A8_UNORM on the GPU)
+  instead of 15-bit. Channels are on the PS1's 8-bit scale: a 15-bit value c is c << 3 (VRAM
+  uploads, fills, copies and textures stay 15-bit sources), an untextured colour is the 8-bit
+  vertex colour, a modulated texel `min((t5.8 * c) >> 12, 255)`, gouraud interpolation keeps all
+  8 bits. Never dithered (dither only exists to hide 15-bit banding).
+- Semi-transparency in 8-bit units, clamped like the hardware: B/2+F/2 = (B+F) >> 1,
+  B+F = min(B+F, 255), B-F = max(B-F, 0), B+F/4 = min(B + F/4, 255). The GPU uses the same
+  fixed-function blends on the UNORM8 target (exact for integers; the mode-0 F = 0 tie case of the
+  15-bit target applies here too; mode 0 is unused by the game).
+- The mask bit is kept in the alpha byte (set-mask, check-mask work as before).
+- For opaque primitives `full >> 3 == 15-bit` exactly (unit test), so full precision only adds the
+  bits gouraud shading, modulation and blending produce: smooth gradients and fog instead of
+  15-bit banding.
+- The 15-bit mode stays (default headless, `--hires-verify`, every bit-exact test).
+
+### Anti-aliasing (`--ssaa N`, 1..4)
+- Rendering at N x the scale and box-downsampling N x N blocks at present (rounded average of the
+  8-bit channels, identical in `hires_view_to_rgba` and the GPU present pass). It is ordinary
+  rasterization at a higher integer scale, so it is exact by construction (same rules, same
+  compare) and also smooths texture/edge aliasing; MSAA was not used because its coverage samples
+  cannot be reproduced bit-exactly in software.
+- The base scale (auto from the window, capped by `--max-scale`, default 4x6) is multiplied:
+  `hires_get_scale` returns the base, `hires_get_render_scale` the target's. N is lowered until each
+  axis <= `HIRES_MAX_RENDER_SCALE` (16), each side <= `HIRES_MAX_RENDER_DIM` (8192, the GPU texture
+  limit everywhere) and the target <= `HIRES_MAX_RENDER_PX` (34 M px, 136 MB in RGBA8); 4x6 with
+  `--ssaa 2` = 8x12 = 4096 x 5760 (+ guard band in widescreen). If the allocation still fails the
+  frontend logs it and turns SSAA off. Dumps (`--dump`) are written after the box filter.
+
+### Tests and measurements
+- `runtime/tests/test_hires.c`: filter footprint vs the 1x-sampled range (taps outside show up as
+  foreign colours; 3D quad, 1:1 sprite quad, rects, x-flipped rect), transparent texels (no fringe,
+  bilinear and xbr, 15-bit and full), the four blend modes' clamping in full precision and the mask
+  bit, full >> 3 == 15-bit for opaque primitives, SSAA scales / limits / box average, 2D detection.
+- `runtime/tests/test_hires_gpu.c`: every random command stream also in bilinear, xbr, full,
+  2x SSAA and combinations, 1x1 .. 4x6, with and without the guard band: 0 differing pixels on
+  Metal and on Vulkan (MoltenVK). It added a 2D sprite-quad generator (the xbr 2D path).
+- `tools/test_render_quality.sh` (in `run_tests.sh`): compare runs per mode and combined, 4:3 and
+  16:9, `--compare-max 0` and 0 differing pixels overall; state hashes with every mode on (software
+  and GPU) and with the modes switched live through the menu actions.
+- Measurements (Apple Silicon Mac, machine heavily loaded by other jobs: 1-min load 18-124, so
+  treat as rough; A/B runs back to back, fight frames 3700-4500, `tools/fight_script.py`).
+  Headless 4x6, ms/frame emulation + hi-res: GPU base 12.4, bilinear 13.1, xbr 13.1, full 12.4,
+  2x SSAA (8x12) 46.0, all three 48.4; software (3 threads) base 11.6-12.6, bilinear 47, xbr 46,
+  full 24. The GPU filter cost was ~4x higher before two fast paths (single opaque tap:
+  `(s + 128) >> 8` without the division; bilinear taps with weight 0 are not fetched).
+  Windowed GPU emu + present: 960x720 window (4x6) default 14.1 vs all off 12.4, `--ssaa 2`
+  49.1; 640x480 (3x4) default 10.3, `--ssaa 2` (6x8) 24.6; 1280x720 16:9 (4x6) default 17.6.
+  So explicit 2x SSAA does not hold 60 Hz on this machine at these window sizes, hence the cap.
 
 ## Widescreen (`--widescreen`, default off)
 
@@ -1017,4 +1126,9 @@ notarization steps) is in `docs/RELEASES.md`.
   handler runs, queued (not merged) repeat completions, and writes with the
   read-only bit 31 set are treated as RMW (no flag ack). Check with
   `--trace` (prints per-second MDEC frame/CD sector counts; intro = 15 fps).
+- Hi-res lines run Sa - 1 steps past their end (to cover whole 1x pixels); the gouraud colour
+  used to keep stepping there and wrapped below 0 (software wrote a garbage u32, the GPU `& 255`),
+  so the two backends disagreed on the last hi-res pixels of a fading line. Both now clamp the
+  colour to the end colours' range (a no-op at 1x1). Found by checking the random compare test
+  after every primitive (later primitives had hidden it); the game draws no lines.
 - Fights run at 30 updates/s by design (`f_80027218(1)` -> `VSync(2)`); not a bug.
