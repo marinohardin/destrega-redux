@@ -377,7 +377,7 @@ static void scene_and_bench(void)
     double best = 1e9;
     for (int rep = 0; rep < 8; rep++) {
         struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        timespec_get(&t0, TIME_UTC);   /* C11 (MinGW has no clock_gettime without winpthread) */
         unsigned seed = 1;
         for (int i = 0; i < N; i++) {
             seed = seed * 1103515245 + 12345;
@@ -386,7 +386,7 @@ static void scene_and_bench(void)
             gp0(0x00606060); gp0(xy(x + 20, y + 2)); gp0((tpage << 16) | 0x003F);
             gp0(0x00A0A0A0); gp0(xy(x + 1, y + 20)); gp0(0x3F00);
         }
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+        timespec_get(&t1, TIME_UTC);
         double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
         if (ms < best) best = ms;
     }

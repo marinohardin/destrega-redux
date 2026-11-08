@@ -282,6 +282,12 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
   frame is not black/flat. The fingerprints were recorded after looking at the key frames
   (`scenarios.py record`); if the game flow legitimately changes, re-record and re-look.
 
+- Vulkan renderer (Windows/Linux port; verified on MoltenVK with `tools/test_vulkan.sh`): the
+  7000-frame fight path gives the same Vulkan-vs-software results as Metal (0 differing pixels with
+  `--pgxp off` at 2x2 and 4x6, 4:3 and 16:9). So every fight-frame primitive kind the game sends
+  (list above) is covered by the GLSL port. The port learned nothing new about the game's own
+  code; no addresses were added to `symbols.txt`.
+
 ## Cleanup priority (readable C / overrides)
 
 Highest value first. Move items to "done" with the PR that did them.
