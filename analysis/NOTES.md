@@ -116,6 +116,14 @@ Round globals: `round_time` 800e379c, `round_wins` 800e3788/800e378c, `round_sta
 800e3780/800e3784, `time_limit_setting` 800e344c, `game_mode` 800e3794 (guess). RNG: Psy-Q
 `rand` (8008d198) with `rand_seed` at 800e7560 (verified: code); the round-end code calls it.
 Whether other RNG sources exist: unknown. `--gameplay-trace FILE` prints these per frame.
+Verified by trace over the recorded replays (`tools/replays.py`, 6 fights incl. a full best-of-3
+match): health is 200 at each round start and hits 0 exactly at the KO; the other fighter's
+`round_wins` goes +1 at that KO and both reset to 0 after a fighter reaches 2 wins (match over);
+`round_time` goes +2 per update and freezes from the KO to the next round; the gauge stays in
+0..1800 and drops sharply ~30 times per 3000 random fight frames (magic spends; likely). The rest of
+the fighter struct (0x1dc bytes) is covered by the replays' struct hashes but not mapped.
+Rollback-relevant: gameplay state reacts to pad input within one frame (an edited input at frame F
+changes the fighter struct at the start of F+1).
 ### GTE projection call sites (PGXP work)
 
 - 34 functions contain RTPS/RTPT (`symbols.txt`, evidence `code`): two families of small

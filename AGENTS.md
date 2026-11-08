@@ -223,6 +223,35 @@ Complete snapshots of the emulated machine, taken and restored only at the frame
   `scenarios.py savestate` (every scenario with rewinds every 41 frames + round trips every 13:
   `--state-hash` and complete state hash equal to a plain run). Both run in `tools/run_tests.sh`.
 
+## Replays: gameplay regression tests (`runtime/replay.c`, `tools/replays.py`)
+
+- `--record FILE`: both pads' input per frame (the pad state after the frontend's per-frame work,
+  whatever produced it: keyboard, gamepad, `--press`), disc identity (SLUS_007.32 CRC + sector
+  count), build identity (hash of the recompiled-function table, informational), a 16-bit hash of
+  each gameplay field at the start of every frame (both fighters' health, gauge, position, FNV of the
+  whole 0x1dc-byte fighter struct; round time, wins, RNG seed; addresses in analysis/symbols.txt) and
+  the complete emulated-state hash (`ss_hash_all`) every 60 frames. Works windowed and headless
+  (forces deterministic SPU rendering). Text format documented at the top of replay.c, may be gzipped.
+  **Recordings hold inputs and hashes only, never game values** (no game data in the repo).
+- `--replay FILE`: drives both pads from the file (other input is overridden), stops at its last
+  frame, compares every frame. First divergence: `replay: DIVERGED at frame F` with every field
+  marked DIFFERS / same, its live value, and its value at the last frame where everything matched;
+  exit status 7. A differing complete state hash with equal gameplay fields is a warning
+  (`--replay-strict` makes it fatal). Get the expected values by replaying with the old build and
+  `--gameplay-trace`.
+- Library (`tools/replays/*.dtr.gz`, `replays.py list`): a full best-of-3 VS match (Gradd vs Celia,
+  Hills), four VS fights with other characters / stages (Tieme-Rohzen Villa, Milena-Cougar
+  Fortress, Zauber-Doyle Throne, Anjie-Laon Canyon) and a 1P battle against the CPU (Reyus), all
+  with seeded random input on both pads (taps, chords, motions, charges, walks, jumps): KOs, round
+  wins, a decided match, ~30 gauge spends per fight. `replays.py run` also replays three of them
+  with `--savestate-rewind`, hi-res + widescreen and 4x4 / PGXP off (must still match) and checks
+  that an edited input is reported as a divergence. ~45 s on 10 cores; in `tools/run_tests.sh`.
+- **Re-recording (only for an intentional gameplay change)**: a failing replay means emulated
+  gameplay changed. Find out why first (`replays.py trace NAME OUT` with both builds and compare the
+  values). If the change is intended (e.g. an emulation fix), `python3 tools/replays.py record
+  [NAME...]`, check the summary it prints (KOs, rounds, matches) and commit the new `.dtr.gz` files
+  with the reason in the commit message. Adding one: append an `add_vs(...)` / `add_1p(...)` call.
+
 ## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
 
 macOS gets a native **File** menu inserted after the app menu (SDL3 keeps building the standard

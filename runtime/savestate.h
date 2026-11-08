@@ -131,6 +131,8 @@ void ss_set_frame_counter(u64 *frame);
 bool ss_resimulating(void);
 /* Exactly one spu_render(735) per vblank (record / replay / netplay / savestate tests). */
 bool ss_deterministic_audio(void);
+void ss_set_deterministic_audio(bool on);
+int ss_failed(void);           /* a save-state test, replay or netplay check failed (exit status 7) */
 
 /* Command-line options handled by the savestate / replay / netplay modules. Returns the
  * number of argv entries consumed (0 = not ours). */

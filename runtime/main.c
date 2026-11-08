@@ -501,7 +501,7 @@ static void finish(void) {
     if (s_state_hash) fclose(s_state_hash);
     if (s_gameplay) fclose(s_gameplay);
     int rc = 0;
-    { int ss_failed(void); if (ss_failed()) rc = 7; }
+    if (ss_failed()) rc = 7;
     if (s_ws_used)
         rt_log("widescreen-frames: %llu presented wider than 4:3 (%llu in fight window of %llu)",
                (unsigned long long)s_ws_wide[0], (unsigned long long)s_ws_wide[1],
@@ -613,6 +613,9 @@ static void finish(void) {
                s_f_emu / (double)s_f_n / 1e6, s_f_present / (double)s_f_n / 1e6);
     exit(rc);
 }
+
+/* Exit after frame n (headless and windowed), e.g. at the end of a --replay. */
+void frontend_set_max_frames(u64 n) { if (!s_max_frames || n < s_max_frames) s_max_frames = n; }
 
 /* --press / --press2 scripts for the current frame (taps held 6 frames). */
 static void script_pads(void) {

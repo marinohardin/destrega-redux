@@ -48,6 +48,9 @@ tools/test_menu.sh > build/menu.out 2>&1 &
 MENU=$!
 tools/test_savestate.sh > build/savestate.out 2>&1 &
 SAVST=$!
+# gameplay regression replays (tools/replays/*.dtr.gz): every frame's gameplay fields must match
+python3 tools/replays.py run -j 4 > build/replays.out 2>&1 &
+REPL=$!
 
 wait %1 %2 %3 %4 %5 %6 %7 2>/dev/null
 fail=0
@@ -83,5 +86,7 @@ wait $MENU || { fail=1; echo "menu: FAILED"; }
 cat build/menu.out
 wait $SAVST || { fail=1; echo "savestate: FAILED"; }
 cat build/savestate.out
+wait $REPL || { fail=1; echo "replays: FAILED (a gameplay change? see AGENTS.md \"Replays\")"; }
+cat build/replays.out
 echo "tests: $(( $(date +%s) - START ))s wall clock, $([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail

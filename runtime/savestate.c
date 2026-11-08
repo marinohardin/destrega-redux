@@ -454,4 +454,5 @@ void ss_finish(void) {
     }
 }
 
-int ss_failed(void) { return s_fail; }
+int replay_failed(void);
+int ss_failed(void) { return s_fail || replay_failed(); }
