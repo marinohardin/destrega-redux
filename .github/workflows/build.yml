@@ -74,7 +74,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build clang zlib1g-dev pkg-config \
-            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxtst-dev \
+            libdrm-dev libgbm-dev libdbus-1-dev libudev-dev \
             libxkbcommon-dev libwayland-dev libdecor-0-dev libegl-dev libgl-dev libasound2-dev libpulse-dev \
             libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb glslang-tools spirv-tools
       - name: Cache SDL3

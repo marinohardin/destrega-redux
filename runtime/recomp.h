@@ -4,6 +4,11 @@
 
 #include "psx.h"
 #include "pgxp.h"
+#ifdef _WIN32
+/* MinGW's setjmp.h (also pulled in by SDL.h via intrin.h) declares x64 jump-buffer fields
+ * named R12..R15; include it before the register macros below can rename them. */
+#include <setjmp.h>
+#endif
 
 #define R1 g_cpu.r[1]
 #define R2 g_cpu.r[2]

@@ -1188,7 +1188,7 @@ static bool card_slot_path(int slot, char *out, size_t n) {
 static void card_stamp(char *out, size_t n) {
     time_t t = time(NULL);
     struct tm tm;
-    localtime_r(&t, &tm);
+    plat_localtime(&t, &tm);
     strftime(out, n, "%Y%m%d-%H%M%S", &tm);
 }
 

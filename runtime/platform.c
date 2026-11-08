@@ -217,6 +217,15 @@ void plat_exec(const char *exe, char **argv)
 
 /* ---- timing and CPU topology --------------------------------------------------------------- */
 
+void plat_localtime(const time_t *t, struct tm *out)
+{
+#ifdef _WIN32
+    localtime_s(out, t);
+#else
+    localtime_r(t, out);
+#endif
+}
+
 uint64_t plat_thread_cpu_ns(void)
 {
 #ifdef _WIN32

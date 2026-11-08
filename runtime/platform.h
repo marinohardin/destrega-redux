@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
 /* Move src over dst, replacing dst if it exists (atomic on POSIX; MoveFileEx with
  * MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH on Windows, where rename() refuses to
@@ -32,6 +33,9 @@ bool plat_executable_path(char *out, size_t n);
  * Windows: start it with the same console/handles, wait for it and exit with its code (so a
  * caller waiting on this process sees the restarted one). Returns only on failure. */
 void plat_exec(const char *exe, char **argv);
+
+/* localtime_r / localtime_s */
+void plat_localtime(const time_t *t, struct tm *out);
 
 /* CPU time of the calling thread, nanoseconds. */
 uint64_t plat_thread_cpu_ns(void);
