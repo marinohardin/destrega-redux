@@ -342,7 +342,8 @@ static void write_state_hash(void) {
     h = hash_mix(h, g_scratch, sizeof g_scratch);
     h = hash_mix(h, gpu_vram(), 1024 * 512 * 2);
     size_t spu_n;
-    h = hash_mix(h, spu_ram_ptr(&spu_n), spu_n);
+    const u8 *spu = spu_ram_ptr(&spu_n);   /* separate statement: argument order is unspecified */
+    h = hash_mix(h, spu, spu_n);
     h = hash_mix(h, g_cpu.r, sizeof g_cpu.r);
     u64 misc[4 + 32 + 2] = { g_cpu.hi, g_cpu.lo, g_cpu.pc, g_cpu.cycles, 0 };
     for (int i = 0; i < 32; i++) misc[4 + i] = g_cpu.cop0[i];
@@ -1396,7 +1397,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--widescreen")) s_widescreen = true;
         else if (!strcmp(argv[i], "--ram-snap") && i + 1 < argc) s_ram_snap_dir = argv[++i];
         else if (!strcmp(argv[i], "--gameplay-trace") && i + 1 < argc) {
-            s_gameplay = fopen(argv[++i], "w");
+            s_gameplay = fopen(argv[++i], "wb");
             if (!s_gameplay) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
         }
         else if (!strcmp(argv[i], "--ram-snap-every") && i + 1 < argc) s_ram_snap_every = strtoull(argv[++i], 0, 0);
@@ -1414,7 +1415,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--compare-every") && i + 1 < argc) s_compare_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--compare-max") && i + 1 < argc) s_compare_max = atof(argv[++i]);
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
-            s_state_hash = fopen(argv[++i], "w");
+            s_state_hash = fopen(argv[++i], "wb");
             if (!s_state_hash) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
         }
         else if (!strcmp(argv[i], "--resize") && i + 1 < argc) {

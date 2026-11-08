@@ -78,6 +78,25 @@ SDL **3.4+** (`SDL_CreateGPURenderer(device, window)`), zlib, Python 3 and the d
   Mac-only (`menu_stub.c`); Alt+Enter/F11 full screen and F9 widescreen work everywhere.
 - GPU renderer: Vulkan (SPIR-V) on both, the windowed default when a device exists, else software
   (see "GPU renderer"). `--renderer` works everywhere; View > Renderer is Mac-only.
+- **Cross-compiling the Windows exe** (macOS or Linux, MinGW-w64 GCC: Homebrew `mingw-w64`):
+  `cmake -S . -B build/win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
+  -DCMAKE_PREFIX_PATH=<prefix>` where `<prefix>` holds SDL3 and zlib built for
+  `x86_64-w64-mingw32` (SDL's `SDL3-devel-*-mingw` release, or SDL/zlib from source configured
+  with the same toolchain file), then copy `<prefix>/bin/SDL3.dll` next to `build/win/destrega.exe`.
+  With MinGW GCC the exe links `-static` (GCC's `_Thread_local` uses emutls on libwinpthread),
+  so it needs only SDL3.dll plus the system UCRT. GCC builds the generated code fine (`__int128`
+  included); it evaluates function arguments in a different order than clang, which once broke
+  `--state-hash` (`f(p(&n), n)`: keep such calls in separate statements).
+- **Wine / CrossOver**: `tools/test_wine.sh` runs the same headless boot-to-fight (`--no-interp
+  --verify-overrides`) natively and under Wine and requires identical per-frame state hashes
+  and dumped frames (`WINE=` the wine command, `WINE_ARGS=` its options; CrossOver:
+  `WINE=".../CrossOver-Hosted Application/wine" WINE_ARGS="--bottle destrega-test --no-gui"`, a
+  dedicated bottle made with `cxbottle --bottle destrega-test --create --template win10_64`).
+  Passes with CrossOver 26 (x86-64 under Rosetta): 4000/4000 frames identical at 1x and at 4x6 widescreen
+  with `--hires-threads 6` (Win32 worker pool), frames dumped at 4x6 byte-identical too. Windowed under CrossOver works with the software renderer; its SDL_GPU
+  Vulkan device (MoltenVK 1.2.10 via winevulkan) reports conformance version 0.0.0.0, and SDL
+  rejects non-conformant Vulkan drivers, so the GPU renderer falls back to software there.
+  `--state-hash`/`--gameplay-trace` files are written in binary mode (LF) on every platform.
 - Not verified on a real Windows/Linux machine with the game: there is no disc in CI. CI
   (`.github/workflows/build.yml`) builds everything except the generated code: configure with
   `-DDESTREGA_STUB_GEN=ON` to link the runtime against `tools/ci/stub_gen` (empty function table,

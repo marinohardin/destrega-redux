@@ -9,6 +9,12 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
+if(MINGW AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  # MinGW GCC implements _Thread_local with emutls on top of libwinpthread-1.dll; link
+  # libgcc and winpthread statically so the .exe needs only SDL3.dll and the system UCRT.
+  add_link_options(-static)
+endif()
+
 find_package(SDL3 REQUIRED CONFIG)
 find_package(ZLIB REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)

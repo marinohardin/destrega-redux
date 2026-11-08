@@ -287,6 +287,12 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
   `--pgxp off` at 2x2 and 4x6, 4:3 and 16:9). So every fight-frame primitive kind the game sends
   (list above) is covered by the GLSL port. The port learned nothing new about the game's own
   code; no addresses were added to `symbols.txt`.
+- Windows build under Wine (`tools/test_wine.sh`, MinGW GCC cross build, CrossOver 26):
+  `verified` that the boot-to-fight state hash matches macOS for every frame (4000/4000, at 1x and
+  at 4x6 widescreen) with `--no-interp`. So the IRQ path (libetc `setjmp` at 0x8009b8bc resumed at
+  0x8009b924 on every interrupt, `ReturnFromException` = C `longjmp` through recompiled frames)
+  works with MinGW's setjmp/longjmp on Win64. It also shows that GCC-compiled generated code
+  behaves the same as clang-compiled code.
 
 ## Cleanup priority (readable C / overrides)
 
