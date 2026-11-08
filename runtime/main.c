@@ -329,11 +329,17 @@ static void finish(void) {
                (unsigned long long)s_verify_bad_frames);
         if (s_verify_bad_frames || !s_verify_fight) rc = 3;
     }
-    if (g_pgxp_stat_tris)
-        rt_log("pgxp-check: %llu triangles with precise vertices; %llu with a vertex > 1.5 px from its integer, "
-               "%llu with depth ratio > 2, %llu using a value older than 2 frames",
+    if (g_pgxp_stat_tris) {
+        rt_log("pgxp-check: %llu triangles with precise vertices; %llu with an on-screen vertex > 1.5 px from its integer, "
+               "%llu with depth ratio > 2, %llu using a value older than 2 frames, %llu split vertices",
                (unsigned long long)g_pgxp_stat_tris, (unsigned long long)g_pgxp_stat_bad_d,
-               (unsigned long long)g_pgxp_stat_bad_w, (unsigned long long)g_pgxp_stat_old);
+               (unsigned long long)g_pgxp_stat_bad_w, (unsigned long long)g_pgxp_stat_old,
+               (unsigned long long)g_pgxp_stat_split);
+        rt_log("pgxp-weld: %llu vertex uses snapped to another precise value of the same word, %llu to the "
+               "integer, %llu table-full fallbacks",
+               (unsigned long long)g_pgxp_stat_welded, (unsigned long long)g_pgxp_stat_weld_int,
+               (unsigned long long)g_pgxp_stat_weld_full);
+    }
     if (g_pgxp_stat_vtx) {
         u64 tris, persp;
         hires_get_persp_stats(&tris, &persp);

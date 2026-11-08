@@ -65,6 +65,7 @@ static void mfc2_sw(int sxy_reg, int rt, u32 a)
 /* GP0 from RAM the way a DMA does it: each word with the tag of its RAM word */
 static void gp0_from_ram(u32 a, int words)
 {
+    pgxp_new_batch();   /* one DMA = one welding batch */
     for (int i = 0; i < words; i++) {
         u32 w = a + 4u * (u32)i;
         gpu_write_gp0_tag(mem_r32(w), g_pgxp_mem[pgxp_slot(w)]);
@@ -199,6 +200,7 @@ static void test_perspective(void)
     CHECK(tris1 - tris0 == 1 && p1 - p0 == 1, "perspective triangle not counted (%llu, %llu)",
           (unsigned long long)(tris1 - tris0), (unsigned long long)(p1 - p0));
     tags[5] = 0;
+    pgxp_new_batch();
     for (int i = 0; i < 7; i++) gpu_write_gp0_tag(pkt[i], tags[i]);
     hires_get_persp_stats(&tris0, &p0);
     CHECK(tris0 - tris1 == 1 && p0 - p1 == 0, "mixed triangle textured perspective-correctly");
@@ -209,11 +211,51 @@ static void test_perspective(void)
     g_pgxp = false;
 }
 
+static void test_weld(void)
+{
+    /* two primitives in one batch share an SXY word but carry different precise values (distinct
+     * GTE results that round to the same pixel): both must be drawn at one position (the first
+     * value), or the mesh cracks; a new batch starts over */
+    g_pgxp = true;
+    gpu_init();
+    hires_set_region(0, 0, 512, 480);
+    hires_set_scale(0, 0);
+    hires_set_scale(2, 2);
+    gpu_write_gp0(0xE3000000);
+    gpu_write_gp0(0xE4000000 | (479u << 10) | 511u);
+    const u32 shared = (40u << 16) | 30u;
+    u32 a = pgxp_new(shared, 0.2f, 0.3f, 500.0f), b = pgxp_new(shared, 0.8f, 0.7f, 510.0f);
+    u32 o1 = pgxp_new((10u << 16) | 10u, 0.5f, 0.5f, 500.0f), o2 = pgxp_new((60u << 16) | 12u, 0.5f, 0.5f, 500.0f);
+    u32 o3 = pgxp_new((70u << 16) | 50u, 0.5f, 0.5f, 500.0f);
+    pgxp_new_batch();
+    u64 w0 = g_pgxp_stat_welded, s0 = g_pgxp_stat_split;
+    u32 t1[4] = { 0x20808080u, (10u << 16) | 10u, shared, (60u << 16) | 12u };
+    u32 g1[4] = { 0, o1, a, o2 };
+    u32 t2[4] = { 0x20808080u, shared, (70u << 16) | 50u, (60u << 16) | 12u };
+    u32 g2[4] = { 0, b, o3, o2 };
+    for (int i = 0; i < 4; i++) gpu_write_gp0_tag(t1[i], g1[i]);
+    for (int i = 0; i < 4; i++) gpu_write_gp0_tag(t2[i], g2[i]);
+    CHECK(g_pgxp_stat_welded - w0 == 1, "shared word not welded (%llu)", (unsigned long long)(g_pgxp_stat_welded - w0));
+    CHECK(g_pgxp_stat_split == s0, "shared word sent at two positions");
+    const PgxpVert *q = pgxp_weld(shared, pgxp_lookup(b, shared));
+    CHECK(q && q->dx == 0.2f && q->dy == 0.3f, "weld did not keep the first value");
+    pgxp_new_batch();
+    q = pgxp_weld(shared, pgxp_lookup(b, shared));
+    CHECK(q && q->dx == 0.8f, "weld leaked across batches");
+    /* a word first sent as an integer vertex stays integer for the rest of the batch */
+    pgxp_new_batch();
+    CHECK(pgxp_weld(shared, NULL) == NULL && pgxp_weld(shared, pgxp_lookup(a, shared)) == NULL,
+          "integer-first word got a precise value");
+    hires_set_scale(0, 0);
+    g_pgxp = false;
+}
+
 int main(void)
 {
     test_guest_identical();
     test_precision_path();
     test_perspective();
+    test_weld();
     printf("test_pgxp: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

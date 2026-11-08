@@ -108,11 +108,26 @@ extern u64 g_pgxp_stat_vtx, g_pgxp_stat_hit, g_pgxp_stat_new;
 extern u32 g_pgxp_frame;                     /* bumped every vblank (diagnostics) */
 extern const u32 *g_pgxp_callstack;          /* optional: rt.c call stack, for pgxp_new's site */
 extern const u32 *g_pgxp_depth;
-/* Diagnostics: check a triangle about to be drawn with precise vertices. */
-typedef struct { const PgxpVert *v; } PgxpTriCheck;
+/* Welding. The game's meshes rely on integer snapping: vertices of different primitives that
+ * are meant to meet (character limb/hair/face pieces, duplicated per-primitive vertex copies)
+ * are distinct GTE results that only coincide after rounding to the same SXY word. Drawn at
+ * their individual precise positions they separate by up to 1 px, which shows as cracks, torn
+ * limbs and back geometry poking through. So within one batch (one GPU linked-list DMA or one
+ * vblank, whichever ends first) every primitive vertex with the same SXY word gets the same
+ * position: the precise value seen first for that word, or the integer one if the word was first
+ * sent without a precise value. Returns the value to use (NULL = integer). */
+extern u32 g_pgxp_batch;
+static inline void pgxp_new_batch(void) { g_pgxp_batch++; }
+const PgxpVert *pgxp_weld(u32 sxy, const PgxpVert *q);
+extern u64 g_pgxp_stat_welded, g_pgxp_stat_weld_int, g_pgxp_stat_weld_full;
+
+/* Diagnostics / regression check on the vertices actually sent to the hi-res target (after
+ * welding): per triangle, a vertex > 1.5 px from its integer, a depth ratio > 2 within the
+ * triangle, a value older than 2 vblanks; per batch, an SXY word sent at two different
+ * positions ("split": the crack/tear bug; must be 0). q[i] = NULL for integer vertices. */
 void pgxp_check_tri(const PgxpVert *const q[3], const u32 sxy[3]);
 extern int g_pgxp_diag;                      /* --pgxp-diag N: log up to N suspicious triangles */
-extern u64 g_pgxp_stat_bad_d, g_pgxp_stat_bad_w, g_pgxp_stat_old, g_pgxp_stat_tris;
+extern u64 g_pgxp_stat_bad_d, g_pgxp_stat_bad_w, g_pgxp_stat_old, g_pgxp_stat_tris, g_pgxp_stat_split;
 /* Misses whose integer word equals a recent GTE result (a hash set of the last ~64K produced
  * words): an estimate of GTE vertices whose association was lost on the way (the rest are
  * mostly 2D primitives computed by the CPU), and misses that carried a stale tag. */

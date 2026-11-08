@@ -11,7 +11,10 @@
 #  4. PGXP (sub-pixel GTE vertices, perspective-correct textures) is presentation only: the runs
 #     with --pgxp on/affine must hash the same as the reference run (hi-res off, --pgxp off) and
 #     must report precise vertices; 1x1 equivalence is checked with --pgxp off (with it on the
-#     target intentionally differs from 1x: vertices are no longer on the 1x integer grid).
+#     target intentionally differs from 1x: vertices are no longer on the 1x integer grid), and the
+#     vertices actually drawn must be consistent: no SXY word drawn at two positions within one
+#     batch (cracks/torn limbs), no depth ratio > 2 in a triangle, no stale values, and no on-screen
+#     vertex > 1.5 px from its integer position (a false association).
 #  5. In every hi-res run >= 95% of the fight-window frames (frame >= 3700) must be presentable
 #     from the hi-res target rather than the 1x fallback.
 # The runs are independent processes and run concurrently (JOBS at a time, default: performance
@@ -72,6 +75,10 @@ done
 for n in s8x8 resize s4x6 s4x4 s2x3; do
   grep -h "pgxp:" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -q "pgxp: [1-9][0-9]* of" $OUT/$n.log || { echo "hires: $n: no precise PGXP vertices"; fail=1; }
+  grep -h "pgxp-check\|pgxp-weld" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
+  # cracks: an SXY word drawn at two positions within one batch (unwelded shared vertices), and
+  # precise vertices far from their integer one (false associations)
+  grep -q "pgxp-check: [0-9]* triangles with precise vertices; 0 with an on-screen vertex > 1.5 px from its integer, 0 with depth ratio > 2, 0 using a value older than 2 frames, 0 split vertices" $OUT/$n.log || { echo "hires: $n: PGXP consistency check failed"; fail=1; }
 done
 if grep -q "pgxp:" $OUT/s2x2.log; then echo "hires: s2x2: --pgxp off still tracked vertices"; fail=1; fi
 grep -q "hires-uv: [0-9]* textured samples, 0 clamped to the 1x-sampled" $OUT/verify1.log || { echo "hires: verify1: UV clamp is not a no-op at 1x1"; fail=1; }

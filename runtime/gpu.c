@@ -545,7 +545,7 @@ static void gp0_polygon(const u32 *w)
         if (k == 0 || gour) i++;
         pv[k].ok = false;
         if (want_pv) {
-            const PgxpVert *q = pgxp_lookup(s_cmd_tag[i], w[i]);
+            const PgxpVert *q = pgxp_weld(w[i], pgxp_lookup(s_cmd_tag[i], w[i]));
             g_pgxp_stat_vtx++;
             pq[k] = q; pxy[k] = w[i];
             if (q) {
@@ -585,7 +585,7 @@ static void gp0_polygon(const u32 *w)
     if (tex && raw) {
         for (int k = 0; k < n; k++) v[k].r = v[k].g = v[k].b = 0x80;
     }
-    if (any_pv) {
+    if (want_pv) {
         pgxp_check_tri(pq, pxy);
         if (quad) pgxp_check_tri(pq + 1, pxy + 1);
     }
@@ -1079,6 +1079,7 @@ u32 gpu_read_stat(void)
 void gpu_vblank(void)
 {
     g_pgxp_frame++;
+    pgxp_new_batch();
     if (interlaced()) s_field = !s_field;
 }
 

@@ -238,6 +238,7 @@ static void dma_run(int ch) {
         break;
     case 2: /* GPU */
         if (sync == 2) {
+            pgxp_new_batch();   /* PGXP welding scope: one ordering-table DMA */
             u32 a = madr, guard = 0;
             cost = 0;
             for (;;) {

@@ -282,7 +282,8 @@ static void pgxp_project(const s64 acc[3], int shift, int lm)
     u32 w = d[D_SXY2];
     double isx = (double)sx16(w), isy = (double)sx16(w >> 16);
     double ddx = fx - isx, ddy = fy - isy;
-    if (fabs(ddx) >= 4.0 || fabs(ddy) >= 4.0) return;            /* clamped SX/SY or way off */
+    if (isx <= -0x400 || isx >= 0x3FF || isy <= -0x400 || isy >= 0x3FF) return;   /* SX/SY clamped */
+    if (fabs(ddx) >= 4.0 || fabs(ddy) >= 4.0) return;            /* way off: keep the integer */
     g_pgxp_gte[2] = pgxp_new(w, (float)ddx, (float)ddy, (float)z);
 }
 
