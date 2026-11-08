@@ -582,7 +582,10 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   follows the state, Ctrl+Cmd+F; replaces SDL's own "Toggle Full Screen" item, which called
   `-[NSWindow toggleFullScreen:]` behind SDL's back). `SDL_SetWindowFullscreen` uses the desktop
   mode (a native full-screen Space on macOS); SDL keeps and restores the windowed size and
-  position. The hi-res auto scale follows the new pixel size in `present_frame` like any resize
+  position. In full screen the mouse pointer hides after 2 s without movement and **Esc** leaves
+  full screen (windowed, Esc still quits). macOS: `SDL_HINT_VIDEO_MAC_FULLSCREEN_MENU_VISIBILITY=1`
+  keeps the menu bar reachable by moving the mouse to the top (SDL's default hides it entirely
+  when full screen is entered through `SDL_SetWindowFullscreen`, i.e. every path here). The hi-res auto scale follows the new pixel size in `present_frame` like any resize
   (widescreen and both renderers included); the log shows `fullscreen: entered/left, window WxH
   px` and the new `render scale`. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
