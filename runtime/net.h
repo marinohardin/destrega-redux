@@ -21,5 +21,8 @@ int net_recv(NetSock *s, void *buf, int cap);           /* > 0 bytes, 0 nothing,
 void net_poll(NetSock *s);                              /* send due simulated packets */
 void net_flush(NetSock *s, int max_ms);                 /* send everything still queued */
 const char *net_peer_name(NetSock *s);
+void net_lock_peer(NetSock *s);                         /* host: only the current peer from now on */
+/* This machine's IPv4 addresses (no loopback), comma-separated; returns how many. */
+int net_local_addresses(char *out, size_t n);
 void net_sleep_us(u64 us);
 #endif

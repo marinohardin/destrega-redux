@@ -17,6 +17,8 @@ typedef SOCKET sock_t;
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 typedef int sock_t;
 #define SOCK_BAD (-1)
 #define sock_close close
@@ -30,6 +32,7 @@ struct NetSock {
     struct sockaddr_storage peer;
     socklen_t peer_len;
     bool have_peer;
+    bool locked;           /* host: peer fixed (after a valid hello); before, the last sender */
     NetSim sim;
     bool simulate;
     QPkt *q;
@@ -99,6 +102,7 @@ NetSock *net_open(const char *host, int port, int bind_port, const NetSim *sim) 
         s->peer_len = (socklen_t)res->ai_addrlen;
         family = res->ai_family;
         s->have_peer = true;
+        s->locked = true;
         freeaddrinfo(res);
         set_name(s);
     }
@@ -119,6 +123,7 @@ NetSock *net_open(const char *host, int port, int bind_port, const NetSim *sim) 
     ioctlsocket(s->fd, FIONBIO, &nb);
 #else
     fcntl(s->fd, F_SETFL, fcntl(s->fd, F_GETFL) | O_NONBLOCK);
+    fcntl(s->fd, F_SETFD, FD_CLOEXEC);   /* a re-exec (menu netplay start) must free the port */
 #endif
     if (sim) s->sim = *sim;
     s->simulate = s->sim.latency_ms > 0 || s->sim.jitter_ms > 0 || s->sim.loss_pct > 0 || s->sim.reorder_pct > 0;
@@ -186,7 +191,7 @@ int net_recv(NetSock *s, void *buf, int cap) {
         socklen_t fl = sizeof from;
         long n = (long)recvfrom(s->fd, buf, (size_t)cap, 0, (struct sockaddr *)&from, &fl);
         if (n <= 0) return 0;
-        if (!s->have_peer) {   /* host: the first sender becomes the peer */
+        if (!s->locked) {      /* host: answer the last sender until a valid hello locks the peer */
             memcpy(&s->peer, &from, fl);
             s->peer_len = fl;
             s->have_peer = true;
@@ -199,3 +204,26 @@ int net_recv(NetSock *s, void *buf, int cap) {
 }
 
 const char *net_peer_name(NetSock *s) { return s->have_peer ? s->name : "(none)"; }
+void net_lock_peer(NetSock *s) { if (s->have_peer) s->locked = true; }
+
+int net_local_addresses(char *out, size_t n) {
+    int k = 0;
+    if (n) out[0] = 0;
+#if !defined(_WIN32)
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs)) return 0;
+    size_t len = 0;
+    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || (i->ifa_flags & IFF_LOOPBACK) || !(i->ifa_flags & IFF_UP))
+            continue;
+        char h[64];
+        inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, h, sizeof h);
+        int w = snprintf(out + len, n > len ? n - len : 0, "%s%s", k ? ", " : "", h);
+        if (w > 0) len += (size_t)w;
+        if (len >= n) { if (n) out[n - 1] = 0; break; }
+        k++;
+    }
+    freeifaddrs(ifs);
+#endif
+    return k;
+}

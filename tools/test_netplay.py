@@ -158,6 +158,86 @@ def run_case(name, port, pace):
     return not problems, '; '.join(problems) if problems else msg, dt, sh, sj
 
 
+def run_menu_session(name, port, pace):
+    """Both processes start offline; one hosts and the other joins through the menu actions mid-run
+    (Netplay > Host Game / Join Game); both restart from a fresh boot, play synced, then the joiner
+    disconnects and both keep playing offline until --frames."""
+    rp = R.REPLAYS['vs_tieme_rohzen_villa']
+    d = os.path.join(OUT, name)
+    os.makedirs(d, exist_ok=True)
+    t0 = time.time()
+    frames, disc_at = 6000, 4500           # frames of the new boot; disconnect around frame disc_at
+    common = [BIN, '--headless', '--no-interp', '--frames', str(frames), '--net-pace', str(pace),
+              '--net-desync-dir', d]
+    host = common + ['--press', R.fmt(rp.p1), '--net-sim', '3:2:0:0:21', '--net-hash-log', os.path.join(d, 'host.hash'),
+                     '--menu-action', f'300:netplay-host={port},2']
+    join = common + ['--press', R.fmt(rp.p2), '--net-sim', '3:2:0:0:22', '--net-hash-log', os.path.join(d, 'join.hash'),
+                     '--menu-action', f'400:netplay-join=127.0.0.1:{port},3',
+                     '--menu-action', f'{400 + disc_at}:netplay-disconnect']
+    with open(os.path.join(d, 'host.log'), 'w') as hl, open(os.path.join(d, 'join.log'), 'w') as jl:
+        ph = subprocess.Popen(host, stdout=hl, stderr=subprocess.STDOUT, cwd=ROOT)
+        pj = subprocess.Popen(join, stdout=jl, stderr=subprocess.STDOUT, cwd=ROOT)
+        rc_j = pj.wait(timeout=900)
+        rc_h = ph.wait(timeout=300)
+    hlog = open(os.path.join(d, 'host.log')).read()
+    jlog = open(os.path.join(d, 'join.log')).read()
+    delay = 3                              # the larger of the two delays is agreed
+    ref = os.path.join(d, 'offline.hash')
+    r = subprocess.run([BIN, '--headless', '--no-interp', '--frames', str(disc_at), '--net-hash-log', ref,
+                        '--press', R.fmt(shifted(rp.p1, delay)), '--press2', R.fmt(shifted(rp.p2, delay))],
+                       capture_output=True, text=True, cwd=ROOT)
+    open(os.path.join(d, 'offline.log'), 'w').write(r.stdout + r.stderr)
+    H, J, O = read_log(os.path.join(d, 'host.hash')), read_log(os.path.join(d, 'join.hash')), read_log(ref)
+    both = sorted(set(H) & set(J))
+    problems = []
+    if rc_h or rc_j: problems.append(f'exit codes host {rc_h} join {rc_j}')
+    for who, log in (('host', hlog), ('join', jlog)):
+        if 'netplay: restarting for the session' not in log: problems.append(f'{who}: no synced restart')
+        if 'input delay 3' not in log: problems.append(f'{who}: delay 3 not agreed')
+        if 'netplay: session ended' not in log: problems.append(f'{who}: session did not end')
+        if f'headless: reached {frames} frames' not in log: problems.append(f'{who}: did not keep playing offline to the end')
+    if 'alert: Your opponent left' not in hlog: problems.append('host: no "opponent left" alert')
+    bad = [f for f in both if H[f] != J[f]]
+    if bad: problems.append(f'peers differ at {len(bad)} final frames, first {bad[0]}')
+    badref = [f for f in both if f in O and O[f] != H[f]]
+    if badref: problems.append(f'differs from the offline run at {len(badref)} frames, first {badref[0]}')
+    if len(both) < 0.9 * disc_at: problems.append(f'only {len(both)} final frames on both (disconnect near {disc_at})')
+    dt = time.time() - t0
+    msg = (f'started from the menu (both rebooted, delay 3 agreed), {len(both)} final frames equal on both peers and '
+           f'offline, disconnected near frame {disc_at}, both continued offline to {frames}')
+    return not problems, '; '.join(problems) if problems else msg, dt, None, None
+
+
+def run_menu_fail(name, port, pace):
+    """Menu sessions that cannot start must alert and keep playing offline: a host with other
+    settings refuses the joiner (plain-language reason), and joining a port nobody hosts times out."""
+    d = os.path.join(OUT, name)
+    os.makedirs(d, exist_ok=True)
+    t0 = time.time()
+    common = [BIN, '--headless', '--no-interp', '--net-pace', str(pace)]
+    host = common + ['--frames', '9000', '--net-window', '6', '--menu-action', f'100:netplay-host={port}']
+    join = common + ['--frames', '600', '--menu-action', f'300:netplay-join=127.0.0.1:{port}']
+    # the join attempt gives up after --net-timeout + 5 s (20 s by default): 0.5 s here
+    lone = common + ['--frames', '3000', '--net-timeout', '-4.5', '--menu-action', f'100:netplay-join=127.0.0.1:{port + 1}']
+    logs = {}
+    procs = {}
+    for who, cmd in (('host', host), ('join', join), ('lone', lone)):
+        logs[who] = os.path.join(d, who + '.log')
+        procs[who] = subprocess.Popen(cmd, stdout=open(logs[who], 'w'), stderr=subprocess.STDOUT, cwd=ROOT)
+    rcs = {w: p.wait(timeout=300) for w, p in procs.items()}
+    L = {w: open(f).read() for w, f in logs.items()}
+    problems = [f'{w} exit code {rc}' for w, rc in rcs.items() if rc]
+    if 'alert: The host could not accept you: the two players chose different netplay settings' not in L['join']:
+        problems.append('join: no "different settings" refusal alert')
+    if 'refused a player' not in L['host']: problems.append('host: did not refuse')
+    if 'alert: No answer from 127.0.0.1' not in L['lone']: problems.append('lone joiner: no timeout alert')
+    for w, n in (('host', 9000), ('join', 600), ('lone', 3000)):
+        if f'headless: reached {n} frames' not in L[w]: problems.append(f'{w}: did not keep playing offline')
+        if 'restarting for the session' in L[w]: problems.append(f'{w}: restarted although nothing was agreed')
+    msg = 'settings mismatch refused with an alert, unanswered join timed out with an alert, all kept playing offline'
+    return not problems, '; '.join(problems) if problems else msg, time.time() - t0, None, None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cases', nargs='*')
@@ -167,13 +247,16 @@ def main():
     a = ap.parse_args()
     if a.list:
         for n, c in CASES.items(): print(f'{n:8s} {c[0]} delay {c[1]} sim {c[2]} / {c[3]}')
+        print('menu_session  host / join / disconnect through --menu-action mid-run')
         return 0
-    names = a.cases or list(CASES)
+    names = a.cases or list(CASES) + ['menu_session', 'menu_fail']
     base = 47100 + (os.getpid() % 50) * 20
     t0 = time.time()
     fail = 0
     with cf.ThreadPoolExecutor(a.j) as ex:
-        futs = [ex.submit(run_case, n, base + i, a.pace) for i, n in enumerate(names)]
+        fn = {'menu_session': run_menu_session, 'menu_fail': run_menu_fail}
+        futs = [ex.submit(fn.get(n, run_case), n, base + 2 * i, a.pace)
+                for i, n in enumerate(names)]
         for n, fu in zip(names, futs):
             ok, msg, dt, sh, sj = fu.result()
             print(f'{"ok  " if ok else "FAIL"} {n:8s} {dt:5.1f}s {msg}')

@@ -971,7 +971,8 @@ static void usage(void) {
         "  --menu-action F:NAME[=ARG]  (testing) run a menu action on frame F: load=IMAGE, reveal-game,\n"
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete,\n"
         "                        widescreen[=on|off], renderer[=software|gpu|compare] (View menu;\n"
-        "                        no argument = toggle)\n"
+        "                        no argument = toggle), netplay-host=PORT[,DELAY],\n"
+        "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect (Netplay menu)\n"
         "                        (save actions use card slot 1; headless needs --data-dir or --memcard1)\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
@@ -1140,19 +1141,38 @@ static void import_progress(void *ud, float frac) {
     if (!s_headless) draw_progress(NULL, frac);
 }
 
-/* After a new data pack is in place: re-exec the process (a clean machine, never a half-reset one). */
-static void restart_process(void) {
+/* Re-exec the process: a clean machine, never a half-reset one.
+ *   load:    after a new data pack is in place (drops the positional image and every --menu-action)
+ *   netplay: a synced fresh boot for a menu-started session (frontend_restart_with): drops earlier
+ *            netplay options, appends `extra`, and keeps the --menu-action steps that are still in
+ *            the future, re-based to the new boot's frame numbers (so tests can script past it). */
+static void restart_exec(bool netplay, const char *const *extra, int nextra) {
     char exe[PATH_MAX];
     if (!menu_executable_path(exe, sizeof exe)) snprintf(exe, sizeof exe, "%s", s_argv[0]);
-    char **av = calloc((size_t)s_argc + 2, sizeof *av);
+    char **av = calloc((size_t)s_argc + (size_t)nextra + 2 * 16 + 2, sizeof *av);
     int n = 0;
     av[n++] = exe;
     for (int i = 1; i < s_argc; i++) {
         if (!strcmp(s_argv[i], "--menu-action") && i + 1 < s_argc) { i++; continue; }
-        if (s_disc_path && s_argv[i] == s_disc_path) continue;   /* run from the new pack instead */
+        if (netplay) {
+            if ((!strcmp(s_argv[i], "--host") || !strcmp(s_argv[i], "--join") || !strcmp(s_argv[i], "--net-delay"))
+                && i + 1 < s_argc) { i++; continue; }
+            if (!strcmp(s_argv[i], "--net-from-menu")) continue;
+        } else if (s_disc_path && s_argv[i] == s_disc_path) continue;   /* run from the new pack instead */
         av[n++] = s_argv[i];
     }
-    rt_log("menu: restarting on the new data pack");
+    if (netplay) {
+        for (int i = 0; i < s_menu_script_n; i++) {
+            const MenuStep *m = &s_menu_script[i];
+            if (m->frame <= s_frame) continue;
+            char *a = malloc(2100);
+            snprintf(a, 2100, "%llu:%s%s%s", (unsigned long long)(m->frame - s_frame), m->name, *m->arg ? "=" : "", m->arg);
+            av[n++] = "--menu-action";
+            av[n++] = a;
+        }
+        for (int i = 0; i < nextra; i++) av[n++] = (char *)extra[i];
+    }
+    rt_log(netplay ? "netplay: restarting for the session (fresh boot on both sides)" : "menu: restarting on the new data pack");
     memcard_flush();
     if (s_state_hash) fflush(s_state_hash);
     fflush(NULL);
@@ -1162,6 +1182,15 @@ static void restart_process(void) {
     fprintf(stderr, "menu: ERROR: cannot restart (%s)\n", exe);
     exit(1);
 }
+static void restart_process(void) { restart_exec(false, NULL, 0); }
+void frontend_restart_with(const char *const *args, int n) { restart_exec(true, args, n); }
+
+/* Netplay (netplay.c): alerts and keeping the window alive while it waits. */
+void frontend_alert(const char *msg) {
+    rt_log("netplay: alert: %s", msg);
+    if (!s_headless) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Destrega Netplay", msg, s_win);
+}
+void frontend_pump_events(void) { if (!s_headless) SDL_PumpEvents(); }
 
 static void action_load(const char *arg) {
     char path[2048];
@@ -1297,17 +1326,26 @@ static void action_card_delete(const char *arg) {
  * state (a new game image, the memory card) are refused; presentation-only ones stay allowed.
  * Export only reads the card but flushes it first, so it is blocked too (netplay detaches cards). */
 bool netplay_active(void);   /* netplay.c */
+bool netplay_busy(void);
+void netplay_menu_host(int port, int delay);
+void netplay_menu_join(const char *addr, int port, int delay);
+void netplay_menu_disconnect(void);
 bool frontend_menu_action_allowed(const char *name) {
     static const char *const blocked[] = { "load", "save-import", "save-export", "save-delete" };
+    if (!strcmp(name, "netplay-host") || !strcmp(name, "netplay-join")) return !netplay_busy();
+    if (!strcmp(name, "netplay-disconnect")) return netplay_busy();
     if (!netplay_active()) return true;
     for (size_t i = 0; i < sizeof blocked / sizeof *blocked; i++) if (!strcmp(name, blocked[i])) return false;
     return true;
 }
+bool frontend_netplay_busy(void) { return netplay_busy(); }
 
 static void menu_run(const char *name, const char *arg) {
     rt_log("menu: action %s%s%s", name, *arg ? " " : "", arg);
     if (!frontend_menu_action_allowed(name)) {
-        rt_log("menu: REFUSED %s: not available during a netplay session (it would desync the peers)", name);
+        if (!strncmp(name, "netplay-", 8))
+            rt_log("menu: REFUSED %s: %s", name, netplay_busy() ? "a netplay session is already running" : "no netplay session");
+        else rt_log("menu: REFUSED %s: not available during a netplay session (it would desync the peers)", name);
         return;
     }
     if (!strcmp(name, "load")) action_load(arg);
@@ -1316,6 +1354,22 @@ static void menu_run(const char *name, const char *arg) {
     else if (!strcmp(name, "save-import")) action_card_import(arg);
     else if (!strcmp(name, "save-export")) action_card_export(arg);
     else if (!strcmp(name, "save-delete")) action_card_delete(arg);
+    else if (!strcmp(name, "netplay-host")) {   /* PORT[,DELAY] */
+        int port = 7000, delay = 2;
+        if (*arg) sscanf(arg, "%d,%d", &port, &delay);
+        netplay_menu_host(port, delay);
+    }
+    else if (!strcmp(name, "netplay-join")) {   /* HOST:PORT[,DELAY] */
+        char host[256] = "";
+        int port = 0, delay = 2;
+        const char *c = strrchr(arg, ':');
+        if (c) {
+            snprintf(host, sizeof host, "%.*s", (int)(c - arg), arg);
+            sscanf(c + 1, "%d,%d", &port, &delay);
+        }
+        netplay_menu_join(host, port, delay);
+    }
+    else if (!strcmp(name, "netplay-disconnect")) netplay_menu_disconnect();
     else if (!strcmp(name, "renderer")) {   /* View > Renderer; arg software|gpu|compare, none = toggle */
         if (!strcmp(arg, "gpu")) renderer_switch(R_GPU);
         else if (!strcmp(arg, "software")) renderer_switch(R_SOFTWARE);

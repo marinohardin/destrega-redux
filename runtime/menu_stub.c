@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 void menu_init(void) {}
+void menu_netplay_progress(const char *text) { (void)text; }
 void menu_reveal(const char *path) { (void)path; }
 bool menu_executable_path(char *out, size_t n) {
     ssize_t k = readlink("/proc/self/exe", out, n - 1);

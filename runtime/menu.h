@@ -14,6 +14,16 @@ void menu_reveal(const char *path);
 /* Absolute path of the running executable (for the clean re-exec after loading a game image). */
 bool menu_executable_path(char *out, size_t n);
 
+/* Netplay progress panel ("Waiting for an opponent..." with Cancel); NULL hides it. No-op
+ * without menus (headless, other platforms). */
+void menu_netplay_progress(const char *text);
+
+/* ---- provided by netplay.c / net.c (Netplay menu) ---- */
+const char *netplay_status_text(void);
+bool netplay_busy(void);          /* a session or a host / join attempt is running */
+bool netplay_active(void);        /* a session is running */
+int net_local_addresses(char *out, size_t n);
+
 /* ---- provided by main.c ---- */
 /* Queue action NAME[, ARG] (copied). Safe to call from menu callbacks. Names: see main.c. */
 void frontend_menu_action(const char *name, const char *arg);

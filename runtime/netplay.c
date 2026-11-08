@@ -41,6 +41,10 @@ void ss_set_resim(bool on);
 bool ss_restore_ex(const Snapshot *s, bool reseed_hires);
 u64 ss_now_ns(void);
 void frontend_set_max_frames(u64 n);       /* main.c */
+void frontend_alert(const char *msg);      /* main.c: native alert (logged; headless: log only) */
+void frontend_pump_events(void);           /* main.c: keep the window responsive while waiting */
+void frontend_restart_with(const char *const *args, int n);   /* main.c: clean re-exec + args */
+void menu_netplay_progress(const char *text);                  /* menu_mac.m / menu_stub.c */
 void replay_record_in_memory(void);        /* replay.c: desync reports are replay files */
 bool replay_write(const char *path, u64 last);
 int replay_field_count(void);
@@ -52,7 +56,8 @@ void replay_field_str(int k, u32 v, char *b, size_t n);
 #define RING 256                            /* frames of input / hash history (power of two) */
 #define SNAPS 24                            /* snapshot ring */
 
-enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_BYE = 4 };
+enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_BYE = 4,
+       PKT_LOBBY_HELLO = 5, PKT_LOBBY_WELCOME = 6, PKT_LOBBY_REFUSE = 7 };   /* menu sessions (below) */
 #define NET_MAGIC 0x504e5344u               /* "DSNP" */
 #define NET_VERSION 1
 
@@ -69,6 +74,7 @@ typedef struct {
     u64 inject_frame;                        /* test: corrupt p1 hp at the start of this frame */
     bool desync_stop;
     bool lockstep;                           /* never predict (debugging / comparison) */
+    bool from_menu;                          /* started from the Netplay menu: alerts instead of exits */
     int hash_every;
     double timeout_s;
 } Opts;
@@ -91,6 +97,14 @@ static u64 s_local_through;                 /* our inputs are known up to this f
 static u64 s_first_bad;                     /* earliest mispredicted frame (0 = none) */
 static u16 s_last_remote;                   /* prediction source */
 static bool s_peer_left, s_pred_prev;
+static char s_end_msg[512];                 /* session end requested (peer left, desync, timeout) */
+static bool s_end_pending;
+static void end_later(const char *msg) {
+    if (s_end_pending) return;
+    s_end_pending = true;
+    snprintf(s_end_msg, sizeof s_end_msg, "%s", msg ? msg : "");
+}
+static char s_card_path[2][2048];          /* cards detached for the session, re-attached after */
 static u64 s_cur_frame, s_peer_frame;       /* time sync (GGPO-style frame advantage) */
 static double s_adv_avg, s_peer_adv;
 static u32 s_echo_ts;                       /* round-trip time */
@@ -151,31 +165,44 @@ static int pkt_ident(u8 *b, int type, const Ident *id) {
     return 28;
 }
 
-static const char *ident_check(const u8 *b, int n, int want_type) {
+/* NULL: compatible; "": not a packet of that type; else a plain-language reason. */
+static const char *ident_check_ex(const u8 *b, int n, int want_type, bool check_delay) {
     static char err[256];
     if (n < 28 || get_u32(b) != NET_MAGIC || b[4] != want_type) return "";
     Ident me, peer = { get_u32(b + 8), get_u32(b + 12), get_u32(b + 16), get_u32(b + 20), get_u32(b + 24) };
     ident_local(&me);
-    if (b[5] != NET_VERSION) snprintf(err, sizeof err, "peer speaks protocol %d, this build %d", b[5], NET_VERSION);
+    if (b[5] != NET_VERSION)
+        snprintf(err, sizeof err, "the two copies of Destrega use different netplay versions (%d and %d)", b[5], NET_VERSION);
     else if (peer.disc_crc != me.disc_crc || peer.sectors != me.sectors)
-        snprintf(err, sizeof err, "peer has a different disc (%08x/%u, here %08x/%u)", peer.disc_crc, peer.sectors, me.disc_crc, me.sectors);
+        snprintf(err, sizeof err, "the two players imported different game discs (%08x/%u and %08x/%u); both need the "
+                 "North American release", peer.disc_crc, peer.sectors, me.disc_crc, me.sectors);
     else if (peer.build != me.build)
-        snprintf(err, sizeof err, "peer runs a different build (recompiled code %08x, here %08x)", peer.build, me.build);
-    else if (peer.delay != me.delay || peer.window != me.window)
-        snprintf(err, sizeof err, "peer uses --net-delay %u --net-window %u, here %u / %u", peer.delay, peer.window, me.delay, me.window);
+        snprintf(err, sizeof err, "the two players run different versions of Destrega (%08x and %08x); both need the same "
+                 "version", peer.build, me.build);
+    else if (peer.window != me.window || (check_delay && peer.delay != me.delay))
+        snprintf(err, sizeof err, "the two players chose different netplay settings (input delay %u / %u, rollback window "
+                 "%u / %u)", peer.delay, me.delay, peer.window, me.window);
     else return NULL;
     return err;
 }
+static const char *ident_check(const u8 *b, int n, int want_type) { return ident_check_ex(b, n, want_type, true); }
 
-static void handshake(void) {
+/* Returns NULL when connected, else a message for the player. */
+static const char *handshake(void) {
+    static char err[320];
     u8 b[1500];
     Ident me;
     ident_local(&me);
     u64 t0 = ss_now_ns(), last = 0;
+    double limit = o.from_menu ? 30 : o.timeout_s * 4;
     fprintf(stderr, "netplay: %s, waiting for the peer...\n", o.host ? "hosting" : "joining");
     for (;;) {
         u64 now = ss_now_ns();
-        if ((double)(now - t0) / 1e9 > o.timeout_s * 4) fatal("no peer (handshake timeout)");
+        if ((double)(now - t0) / 1e9 > limit) {
+            snprintf(err, sizeof err, "%s", o.host ? "Your opponent did not connect in time." :
+                     "No answer from the host. Check the address and that your opponent is hosting.");
+            return err;
+        }
         if (!o.host && now - last > 100000000ull) {     /* join: hello every 100 ms */
             int n = pkt_ident(b, PKT_HELLO, &me);
             net_send(s_sock, b, n);
@@ -187,19 +214,21 @@ static void handshake(void) {
                 const char *e = ident_check(b, n, PKT_HELLO);
                 if (e && !*e) continue;
                 if (e) { fprintf(stderr, "netplay: refusing peer: %s\n", e); continue; }
+                net_lock_peer(s_sock);
                 int m = pkt_ident(b, PKT_WELCOME, &me);
                 for (int k = 0; k < 5; k++) net_send(s_sock, b, m);   /* the first input packets re-ack anyway */
                 fprintf(stderr, "netplay: peer %s joined\n", net_peer_name(s_sock));
-                return;
+                return NULL;
             } else {
                 const char *e = ident_check(b, n, PKT_WELCOME);
                 if (e && !*e) continue;
-                if (e) fatal(e);
+                if (e) { snprintf(err, sizeof err, "The host refused the connection: %s.", e); return err; }
                 fprintf(stderr, "netplay: joined %s\n", net_peer_name(s_sock));
-                return;
+                return NULL;
             }
         }
         net_poll(s_sock);
+        frontend_pump_events();
         net_sleep_us(1000);
     }
 }
@@ -255,14 +284,14 @@ static void receive(void) {
     int n;
     net_poll(s_sock);
     while ((n = net_recv(s_sock, b, sizeof b)) > 0) {
-        if (n < 17 || get_u32(b) != NET_MAGIC) continue;
-        if (b[4] == PKT_BYE) {
+        if (n < 8 || get_u32(b) != NET_MAGIC) continue;
+        if (b[4] == PKT_BYE) {   /* ends the session at the next safe moment (end_pending) */
             if (!s_peer_left) fprintf(stderr, "netplay: peer left at our frame %llu\n", (unsigned long long)s_applied);
             s_peer_left = true;
-            frontend_set_max_frames(s_applied + 1);
+            end_later("Your opponent left the game. Continuing offline.");
             continue;
         }
-        if (b[4] != PKT_INPUT) continue;
+        if (b[4] != PKT_INPUT || n < 17) continue;
         st.pkts_in++;
         u64 ack = get_u32(b + 8), first = get_u32(b + 12);
         int cnt = b[16];
@@ -399,19 +428,42 @@ static void emit_final(u64 upto) {
 
 bool netplay_active(void) { return o.on; }
 
-static void start(void) {
+static void print_stats(void);
+static void session_end(const char *msg);
+static void lobby_poll(void);
+
+static bool start(void) {
     s_started = true;
     s_sock = net_open(o.host ? NULL : o.addr, o.port, o.host ? o.port : o.local_port, &o.sim);
-    if (!s_sock) fatal("cannot open the UDP socket");
-    /* both peers must emulate the same machine: no memory cards, and nothing is ever written */
-    memcard_flush();
-    memcard_attach(0, NULL);
-    memcard_attach(1, NULL);
-    memcard_set_write_protect(true);
-    ss_set_deterministic_audio(true);   /* the SPU must advance the same on both peers */
+    if (!s_sock) {
+        if (!o.from_menu) fatal("cannot open the UDP socket");
+        char m[160];
+        snprintf(m, sizeof m, "Could not use network port %d (another program may be using it).", o.port);
+        frontend_alert(m);
+        o.on = false;
+        return false;
+    }
     s_local_idx = o.host ? 0 : 1;
     s_remote_idx = 1 - s_local_idx;
-    handshake();
+    const char *err = handshake();
+    if (err) {
+        if (!o.from_menu) fatal(err);
+        net_close(s_sock); s_sock = NULL;
+        o.on = false; s_started = false;
+        char m[400];
+        snprintf(m, sizeof m, "Netplay could not start. %s The game continues offline.", err);
+        frontend_alert(m);
+        return false;
+    }
+    /* both peers must emulate the same machine: no memory cards, and nothing is ever written */
+    memcard_flush();
+    for (int p = 0; p < 2; p++) {
+        const char *cp = memcard_path(p);
+        snprintf(s_card_path[p], sizeof s_card_path[p], "%s", cp ? cp : "");
+        memcard_attach(p, NULL);
+    }
+    memcard_set_write_protect(true);
+    ss_set_deterministic_audio(true);   /* the SPU must advance the same on both peers */
     if (o.hash_log) s_hash_log = fopen(o.hash_log, "w");
     for (int k = 0; k <= o.delay; k++) { s_local_in[slot((u64)k)] = 0; }
     s_local_through = (u64)o.delay;    /* frames 1..delay: no input */
@@ -420,6 +472,35 @@ static void start(void) {
     }
     s_remote_conf = (u64)o.delay;
     s_t0_ns = ss_now_ns();
+    return true;
+}
+
+/* End the session and keep playing offline from the current state: pads go back to local input,
+ * cards come back, nothing more is logged. Only between frames (never while re-simulating). */
+static void session_end(const char *msg) {
+    if (!o.on) return;
+    fprintf(stderr, "netplay: session ended at frame %llu%s%s\n", (unsigned long long)s_cur_frame,
+            msg && *msg ? ": " : "", msg ? msg : "");
+    if (s_sock) {
+        u8 b[8]; put_u32(b, NET_MAGIC); b[4] = PKT_BYE; b[5] = 0; b[6] = b[7] = 0;
+        for (int k = 0; k < 3; k++) net_send(s_sock, b, 8);
+        net_flush(s_sock, 200);
+        net_close(s_sock);
+        s_sock = NULL;
+    }
+    print_stats();
+    if (s_hash_log) { fclose(s_hash_log); s_hash_log = NULL; }
+    o.hash_log = NULL;
+    if (s_hires_off) { g_hires = s_hires_saved; s_hires_off = false; }
+    s_resim_until = 0;
+    ss_set_resim(false);
+    memcard_set_write_protect(false);
+    for (int p = 0; p < 2; p++) if (s_card_path[p][0]) memcard_attach(p, s_card_path[p]);
+    g_pad_buttons[0] = g_pad_buttons[1] = 0xffff;   /* released; the frontend's own input takes over */
+    o.on = false;
+    s_started = false;
+    menu_netplay_progress(NULL);
+    if (msg && *msg) frontend_alert(msg);
 }
 
 static void hires_for_resim(u64 f) {
@@ -431,6 +512,7 @@ static void hires_for_resim(u64 f) {
 
 void netplay_vblank_begin(u64 f) {
     if (!o.on) {   /* --net-hash-log without netplay: the same log for an offline run (tests) */
+        lobby_poll();
         if (!o.hash_log) return;
         if (!s_hash_log && !(s_hash_log = fopen(o.hash_log, "w"))) { o.hash_log = NULL; return; }
         if (o.hash_every > 0 && f % (u64)o.hash_every == 0)
@@ -439,7 +521,7 @@ void netplay_vblank_begin(u64 f) {
         else fprintf(s_hash_log, "%llu %016llx\n", (unsigned long long)f, (unsigned long long)gameplay_hash());
         return;
     }
-    if (!s_started) start();
+    if (!s_started && !start()) return;
     bool resim = s_resim_until && f < s_resim_until;
     if (s_resim_until && f >= s_resim_until) {          /* caught up */
         u64 dt = ss_now_ns() - s_resim_from;
@@ -473,6 +555,7 @@ void netplay_vblank_begin(u64 f) {
             if (due > now && due - now < 1000000000ull) net_sleep_us((due - now) / 1000);
         }
         receive();
+        if (s_end_pending) { s_end_pending = false; session_end(s_end_msg); return; }
         /* stall while the remote input of frame f is unknown and may not be predicted */
         bool round = in_round(f);
         u64 t0 = 0;
@@ -484,7 +567,11 @@ void netplay_vblank_begin(u64 f) {
             bool now_ok = prediction_ok(s_remote_conf + 1);
             if (ahead_ok && round && (now_ok || s_pred_prev)) { s_pred_prev = now_ok; break; }
             if (!t0) { t0 = ss_now_ns(); st.stalls++; }
-            if ((double)(ss_now_ns() - t0) / 1e9 > o.timeout_s) fatal("peer timed out");
+            if ((double)(ss_now_ns() - t0) / 1e9 > o.timeout_s) {
+                end_later("Lost the connection to your opponent. Continuing offline.");
+                break;
+            }
+            frontend_pump_events();
             static u64 last_send;
             if (ss_now_ns() - last_send > 4000000ull) {    /* keep acks / resends flowing (lost packets) */
                 send_inputs();
@@ -494,6 +581,7 @@ void netplay_vblank_begin(u64 f) {
             receive();
         }
         if (t0) st.stall_ns += ss_now_ns() - t0;
+        if (s_end_pending) { s_end_pending = false; session_end(s_end_msg); return; }
         if (remote_known(f)) s_pred_prev = prediction_ok(s_remote_conf + 1);
         /* rollback */
         if (s_first_bad) {
@@ -658,6 +746,181 @@ static void desync_report(u64 frame) {
     fclose(f);
     fprintf(stderr, "netplay: desync report written to %s%s%s\n", txt, rec ? " and " : "", rec ? dtr : "");
     if (o.desync_stop) { fprintf(stderr, "netplay: stopping (--net-desync-stop)\n"); frontend_set_max_frames(s_applied + 1); }
+    if (o.from_menu) {
+        char m[512];
+        snprintf(m, sizeof m, "Netplay stopped: the two games went out of sync at frame %llu. Continuing offline. "
+                 "A report was saved as %s.", (unsigned long long)frame, txt);
+        end_later(m);
+    }
+}
+
+
+/* ---- menu sessions: Netplay > Host Game / Join Game ------------------------------------------
+ * The game is already running when a player picks Host or Join, and the two machines are in
+ * different states. Starting from a common point is done the simplest correct way: a fresh boot
+ * on both sides. A short "lobby" exchange runs between frames while the game keeps playing
+ * offline (the host waits for a hello, the joiner sends one every 200 ms); it checks the same
+ * identity as the session handshake and agrees on the input delay (the larger of the two). When
+ * both agree, each process re-executes itself (main.c frontend_restart_with, the same clean
+ * restart as after loading a game image) with --host / --join, the agreed --net-delay and
+ * --net-from-menu, and the normal session handshake runs at frame 1 of the new boot. Sending a
+ * running state instead would need the host's host-side call chain on the joiner (savestate.c),
+ * which another process cannot reproduce at an arbitrary moment.
+ * --net-from-menu turns every failure into an alert and offline play instead of an exit. */
+enum { LOBBY_OFF, LOBBY_HOSTING, LOBBY_JOINING };
+static int s_lobby;
+static NetSock *s_lsock;
+static int s_lport, s_ldelay;
+static char s_laddr[256];
+static u64 s_lt0, s_llast;
+
+bool netplay_busy(void) { return o.on || s_lobby != LOBBY_OFF; }
+
+static void lobby_stop(void) {
+    if (s_lsock) net_close(s_lsock);
+    s_lsock = NULL;
+    s_lobby = LOBBY_OFF;
+    menu_netplay_progress(NULL);
+}
+
+static void lobby_restart(bool host, int delay) {
+    static char a1[300], d[16];
+    snprintf(d, sizeof d, "%d", delay);
+    if (host) snprintf(a1, sizeof a1, "%d", s_lport);
+    else snprintf(a1, sizeof a1, "%s:%d", s_laddr, s_lport);
+    const char *args[] = { host ? "--host" : "--join", a1, "--net-delay", d, "--net-from-menu" };
+    fprintf(stderr, "netplay: opponent found; restarting both games from a fresh boot (%s %s, input delay %d)\n",
+            args[0], a1, delay);
+    net_flush(s_lsock, 100);
+    lobby_stop();
+    frontend_restart_with(args, 5);
+}
+
+void netplay_menu_host(int port, int delay) {
+    if (netplay_busy()) { frontend_alert("A netplay session is already running. Disconnect first."); return; }
+    if (port <= 0 || port > 65535) port = 7000;
+    if (delay < 1 || delay > 30) delay = 2;
+    s_lsock = net_open(NULL, port, port, NULL);
+    if (!s_lsock) {
+        char m[200];
+        snprintf(m, sizeof m, "Could not host on port %d: it may be in use by another program. Try another port.", port);
+        frontend_alert(m);
+        return;
+    }
+    s_lobby = LOBBY_HOSTING; s_lport = port; s_ldelay = delay; s_lt0 = ss_now_ns();
+    char ip[256], m[512];
+    net_local_addresses(ip, sizeof ip);
+    snprintf(m, sizeof m, "Waiting for an opponent on port %d...\nYour opponent joins with: %s:%d", port,
+             *ip ? ip : "(your IP address)", port);
+    fprintf(stderr, "netplay: hosting a game on port %d (addresses: %s), waiting for an opponent\n", port, *ip ? ip : "none");
+    menu_netplay_progress(m);
+}
+
+void netplay_menu_join(const char *addr, int port, int delay) {
+    if (netplay_busy()) { frontend_alert("A netplay session is already running. Disconnect first."); return; }
+    if (delay < 1 || delay > 30) delay = 2;
+    if (port <= 0 || port > 65535 || !addr || !*addr) { frontend_alert("Enter the host's address as address:port, for example 192.168.1.20:7000."); return; }
+    s_lsock = net_open(addr, port, 0, NULL);
+    if (!s_lsock) {
+        char m[400];
+        snprintf(m, sizeof m, "Could not find \"%s\". Check the address your opponent gave you.", addr);
+        frontend_alert(m);
+        return;
+    }
+    s_lobby = LOBBY_JOINING; s_lport = port; s_ldelay = delay; s_lt0 = ss_now_ns(); s_llast = 0;
+    snprintf(s_laddr, sizeof s_laddr, "%s", addr);
+    char m[400];
+    snprintf(m, sizeof m, "Connecting to %s:%d...", addr, port);
+    fprintf(stderr, "netplay: joining %s:%d\n", addr, port);
+    menu_netplay_progress(m);
+}
+
+void netplay_menu_disconnect(void) {
+    if (s_lobby != LOBBY_OFF) { fprintf(stderr, "netplay: cancelled\n"); lobby_stop(); return; }
+    if (o.on && s_started) session_end(NULL);
+}
+
+static void lobby_poll(void) {
+    if (s_lobby == LOBBY_OFF) return;
+    u8 b[1500];
+    Ident me;
+    int saved = o.delay;
+    o.delay = s_ldelay;
+    ident_local(&me);
+    o.delay = saved;
+    u64 now = ss_now_ns();
+    int n;
+    if (s_lobby == LOBBY_JOINING) {
+        if ((double)(now - s_lt0) / 1e9 > o.timeout_s + 5) {   /* 20 s by default */
+            char m[512];
+            snprintf(m, sizeof m, "No answer from %s:%d. Check the address, that your opponent chose Host Game, and that "
+                     "their network lets UDP port %d through. The game continues offline.", s_laddr, s_lport, s_lport);
+            lobby_stop();
+            frontend_alert(m);
+            return;
+        }
+        if (now - s_llast > 200000000ull) { net_send(s_lsock, b, pkt_ident(b, PKT_LOBBY_HELLO, &me)); s_llast = now; }
+    }
+    while (s_lsock && (n = net_recv(s_lsock, b, sizeof b)) > 0) {
+        if (n < 8 || get_u32(b) != NET_MAGIC) continue;
+        if (s_lobby == LOBBY_HOSTING && b[4] == PKT_LOBBY_HELLO) {
+            const char *e = ident_check_ex(b, n, PKT_LOBBY_HELLO, false);
+            if (e && !*e) continue;
+            if (e) {   /* tell the joiner why, keep waiting */
+                u8 r[300];
+                put_u32(r, NET_MAGIC); r[4] = PKT_LOBBY_REFUSE; r[5] = NET_VERSION;
+                int k = snprintf((char *)r + 8, sizeof r - 8, "%s", e);
+                for (int i = 0; i < 3; i++) net_send(s_lsock, r, 8 + k + 1);
+                fprintf(stderr, "netplay: refused a player: %s\n", e);
+                continue;
+            }
+            int pd = (int)get_u32(b + 20), d = pd > s_ldelay ? pd : s_ldelay;
+            net_lock_peer(s_lsock);
+            int saved2 = o.delay;
+            o.delay = d;
+            Ident w;
+            ident_local(&w);
+            o.delay = saved2;
+            int m = pkt_ident(b, PKT_LOBBY_WELCOME, &w);
+            for (int i = 0; i < 5; i++) net_send(s_lsock, b, m);
+            fprintf(stderr, "netplay: %s wants to play\n", net_peer_name(s_lsock));
+            lobby_restart(true, d);
+            return;
+        }
+        if (s_lobby == LOBBY_JOINING && b[4] == PKT_LOBBY_REFUSE && n > 8) {
+            char m[512];
+            b[n < (int)sizeof b ? n : (int)sizeof b - 1] = 0;
+            snprintf(m, sizeof m, "The host could not accept you: %s. The game continues offline.", (char *)b + 8);
+            lobby_stop();
+            frontend_alert(m);
+            return;
+        }
+        if (s_lobby == LOBBY_JOINING && b[4] == PKT_LOBBY_WELCOME) {
+            const char *e = ident_check_ex(b, n, PKT_LOBBY_WELCOME, false);
+            if (e && !*e) continue;
+            if (e) {
+                char m[512];
+                snprintf(m, sizeof m, "Could not join: %s. The game continues offline.", e);
+                lobby_stop();
+                frontend_alert(m);
+                return;
+            }
+            lobby_restart(false, (int)get_u32(b + 20));
+            return;
+        }
+    }
+}
+
+/* One line for the Netplay menu's status item. */
+const char *netplay_status_text(void) {
+    static char t[300];
+    if (s_lobby == LOBBY_HOSTING) snprintf(t, sizeof t, "Waiting for an opponent on port %d", s_lport);
+    else if (s_lobby == LOBBY_JOINING) snprintf(t, sizeof t, "Connecting to %s:%d", s_laddr, s_lport);
+    else if (o.on && s_first_desync) snprintf(t, sizeof t, "Desync at frame %llu", (unsigned long long)s_first_desync);
+    else if (o.on && s_started && s_sock) snprintf(t, sizeof t, "Connected to %s, ping %.0f ms", net_peer_name(s_sock), s_rtt);
+    else if (o.on) snprintf(t, sizeof t, "Connecting...");
+    else snprintf(t, sizeof t, "Not connected");
+    return t;
 }
 
 /* ---- options / report ---------------------------------------------------------------------- */
@@ -700,6 +963,7 @@ int netplay_parse_arg(int argc, char **argv, int i) {
     if (!strcmp(a, "--net-hash-log") && has) { o.hash_log = argv[i + 1]; return 2; }
     if (!strcmp(a, "--net-hash-every") && has) { o.hash_every = atoi(argv[i + 1]); return 2; }
     if (!strcmp(a, "--net-desync-dir") && has) { o.desync_dir = argv[i + 1]; return 2; }
+    if (!strcmp(a, "--net-from-menu")) { o.from_menu = true; return 1; }
     if (!strcmp(a, "--net-lockstep")) { o.lockstep = true; return 1; }
     if (!strcmp(a, "--net-desync-stop")) { o.desync_stop = true; return 1; }
     if (!strcmp(a, "--net-inject-desync") && has) { o.inject_frame = strtoull(argv[i + 1], NULL, 0); return 2; }
@@ -731,6 +995,10 @@ void netplay_finish(void) {
         net_flush(s_sock, 200);
     }
     if (s_hash_log) fclose(s_hash_log);
+    print_stats();
+}
+
+static void print_stats(void) {
     double n = st.rollbacks ? (double)st.rollbacks : 1;
     fprintf(stderr, "netplay: %llu frames, %llu predicted remote inputs, %llu mispredicted; %llu rollbacks "
             "(max depth %llu vblanks, %llu deferred one vblank, %llu impossible), %llu frames re-simulated, "
@@ -748,4 +1016,4 @@ void netplay_finish(void) {
                 st.resim_ns / 1e6 / (double)st.resim_frames);
 }
 
-int netplay_failed(void) { return s_desyncs != 0; }
+int netplay_failed(void) { return s_desyncs != 0 && !o.from_menu; }

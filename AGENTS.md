@@ -255,7 +255,40 @@ Complete snapshots of the emulated machine, taken and restored only at the frame
 
 ## Rollback netplay (`runtime/netplay.c`, `runtime/net.[ch]`)
 
-GGPO-style rollback on top of save states, two peers, UDP. Command-line only so far.
+GGPO-style rollback on top of save states, two peers, UDP. Started from the **Netplay** menu
+(below) or the command line.
+
+- **Netplay menu** (macOS, `menu_mac.m`; top level, after View): Host Game… (port, default 7000,
+  and input delay, default 2, both remembered in NSUserDefaults; the dialog lists this computer's
+  IPv4 addresses, `net_local_addresses`), Join Game… (address:port, remembered, and delay),
+  Disconnect (enabled while a session or an attempt runs), and a disabled status line
+  (`netplay_status_text`: Not connected / Waiting for an opponent on port N / Connecting to X /
+  Connected to X, ping N ms / Desync at frame F). While hosting or connecting a small non-modal
+  panel says so with Cancel; the game keeps running offline. UI words: Netplay, Host Game, Join
+  Game, opponent (no console jargon). Menu actions (also `--menu-action`, every platform):
+  `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`.
+- **Synchronised start = fresh boot on both sides.** The game is already running when someone
+  picks Host / Join, so the two machines differ. A short lobby exchange runs between frames
+  (`lobby_poll`, packet types 5-7): the joiner sends a hello every 200 ms, the host checks the
+  same identity as the session handshake (protocol, disc, build, rollback window) and either
+  refuses with a plain-language reason (the joiner gets an alert; the host keeps waiting) or
+  welcomes with the agreed delay (the larger of the two). Then both re-execute themselves
+  (`frontend_restart_with` in main.c, the same clean restart as Load Game Image) with `--host` /
+  `--join`, `--net-delay D` and `--net-from-menu`; the normal handshake runs at frame 1 of the new
+  boot. Sending a running snapshot instead is not possible in general: a snapshot only restores
+  under the same host call chain (savestate.c), which the other process does not have at an
+  arbitrary moment. A restart keeps the future `--menu-action` steps, re-based to the new boot's
+  frames, and drops earlier netplay options. Sockets are close-on-exec so the port is free again.
+- `--net-from-menu` (set by that restart): every failure is a native alert and offline play, never
+  an exit: no answer (join gives up after `--net-timeout` + 5 s = 20 s), refused settings / disc /
+  version, port in use, the opponent not reconnecting after the restart (30 s), losing the
+  connection (no data for `--net-timeout`, 15 s), the opponent leaving, and a desync (report
+  written, then the session ends). A desync does not change the exit status in that mode.
+- **Ending a session** (`session_end`: Disconnect, the opponent's BYE, lost connection, desync from
+  the menu): sends BYE, prints the statistics, stops the hash log, re-attaches the cards the session
+  detached and lifts the write protection, releases both pads (the frontend's own input, incl. a
+  local pad 2, takes over next frame) and keeps playing offline from the current state. Command-line
+  sessions end the same way when the opponent leaves or the link is lost (they used to exit).
 
 - `--host PORT` (player 1) / `--join HOST:PORT` (player 2). Each peer's own input is whatever its
   frontend puts into pad 1 (keyboard, gamepad, `--press`); netplay writes both pads at the end of
@@ -305,11 +338,11 @@ GGPO-style rollback on top of save states, two peers, UDP. Command-line only so 
   drops / reorders this peer's sends (deterministic per seed) for tests. `--net-pace HZ` paces
   headless runs; `--net-hash-log FILE` writes every final frame's hashes (also without netplay, for
   an offline reference run); `--net-lockstep` never predicts.
-- Tests: `tools/test_netplay.py` (in `run_tests.sh`): seven cases, each two headless processes over
+- Tests: `tools/test_netplay.py` (in `run_tests.sh`): nine cases, each two headless processes over
   loopback with seeded VS menu + random fight input (`replays.py` scripts), paced at 240 Hz (4x real
   time, so the simulated latencies cover 4x as many frames): lan, wan (20 ms + 8 jitter, 1% loss, 2%
   reorder), lossy (15+15 ms, 10% loss, 10% reorder), asym (35 / 5 ms), a full best-of-3 match with
-  delay 3, an injected desync, and refused menu actions. Pass: both peers' final-frame hashes equal each other **and an
+  delay 3, an injected desync, refused menu actions, and the two menu-session cases below. Pass: both peers' final-frame hashes equal each other **and an
   offline run of the same inputs shifted by the delay**, >= 95% of frames final, no desync, no
   impossible rollback; the desync case must be detected and its two report replays must behave
   (clean peer replays cleanly, faulty one diverges at the injected frame naming `p1.hp`).
@@ -319,9 +352,17 @@ GGPO-style rollback on top of save states, two peers, UDP. Command-line only so 
   `save-delete`. The Mac menu greys them out (`validateMenuItem`), `--menu-action` logs
   `menu: REFUSED NAME: ...`. Presentation-only actions (renderer, widescreen, full screen, reveal
   in Finder) still run. Test: the `menu` case of `test_netplay.py`.
-- Not done / not verified: a lobby or NAT traversal (direct UDP only), the UI beyond the title bar,
-  spectators, Windows (`net.c` has Winsock code, untested), the greyed-out Mac menu items (compiled,
-  not clicked), windowed-vs-windowed play by two people (tested: windowed host + headless joiner).
+- Tests for the menu path (`test_netplay.py`): `menu_session` (two processes start offline, host
+  and join by `--menu-action` mid-run, both reboot, play synced: final-frame hashes equal on both
+  and equal to an offline run with the agreed delay; the joiner disconnects, the host gets the
+  "opponent left" alert, both keep playing offline to `--frames`) and `menu_fail` (a host with a
+  different rollback window refuses with a reason, an unanswered join times out with an alert, all
+  three keep playing offline, nobody restarts).
+- Not done / not verified: NAT traversal or a server-assisted lobby (direct UDP only: the host
+  forwards the port over the internet), spectators, Windows / Linux menus (the actions work there),
+  Windows (`net.c` has Winsock code, untested; `net_local_addresses` returns nothing there), the
+  Mac dialogs, panel and greyed-out items by hand (compiled; two windowed processes were driven
+  through the same actions with `--menu-action`), windowed-vs-windowed play by two people (tested: windowed host + headless joiner).
 
 ## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
 
@@ -350,6 +391,7 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
   menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
 - **View > Renderer > Software / GPU**: action `renderer[=software|gpu]`, see "GPU renderer".
+- **Netplay** menu (after View): Host Game…, Join Game…, Disconnect, status line; see "Rollback netplay".
 - **Full screen** on every platform from the SDL event loop in `main.c` (so not a Cocoa-only
   feature): **Alt+Enter** and **F11**, plus **Ctrl+Cmd+F** on macOS, queue the action
   `fullscreen` (`=on|off`, none = toggle; one toggle per frame, because Ctrl+Cmd+F can arrive both
@@ -363,7 +405,8 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   px` and the new `render scale`. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
-  `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`. Headless: no dialogs (the file argument is
+  `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`,
+  `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`. Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
   unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
   Log lines start with `menu:`; errors with `menu: ERROR:`.
