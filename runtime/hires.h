@@ -66,10 +66,21 @@ typedef struct HiresBackend {
     void (*put)(int x, int y, u16 v, bool mask_check, bool mask_set);   /* CPU->VRAM pixel */
     bool (*view)(int x, int y, int w, int h, HiresView *out);          /* 1x rect -> target */
     void (*destroy)(void);
+    /* Optional (NULL = unsupported; widescreen then stays 4:3). Guard band: gx virtual 1x
+     * columns on each side of the region, taking effect at the next configure(). They are
+     * not VRAM: only tri/rect/line draw there, never fill/copy/put, except that a fill row
+     * covering the whole region width also fills them (screen clears). A primitive whose draw
+     * area starts at the region's left edge (ends at its right edge) is clipped gx columns
+     * further out on that side, and an untextured rect covering the whole draw-area width is
+     * widened across the guard band (fades). view() then accepts x in [rx - gx, rx + rw + gx).
+     * The 1x VRAM, and so all emulated state, never sees any of it. */
+    void (*set_guard)(int gx);
 } HiresBackend;
 
 /* Active backend; NULL = hi-res off. Defined in gpu.c, set by hires_set_scale(). */
 extern const HiresBackend *g_hires;
+/* Guard band columns of the active target (0 = none). Defined in gpu.c, set by hires.c. */
+extern int g_hires_guard;
 
 /* ---- control (runtime/hires.c) ------------------------------------------- */
 
@@ -82,13 +93,23 @@ bool hires_get_scale(int *sx, int *sy);   /* false when off */
  * next hires_set_scale(). */
 void hires_set_region(int rx, int ry, int rw, int rh);
 void hires_set_dither(bool enable);           /* dither at scale > 1 (default off) */
+/* Widescreen guard band (see HiresBackend.set_guard): gx 1x columns left and right of the
+ * region (0 = off, the default; max HIRES_MAX_GUARD). Takes effect on the next
+ * hires_set_scale() (forces a reallocation). hires_guard() = the guard band in use. */
+#define HIRES_MAX_GUARD 256
+void hires_set_guard(int gx);
+int hires_guard(void);
 /* Presentable view of the current display area, or false (24-bit display, display
  * not inside the target, hi-res off): present from 1x VRAM then. */
 bool hires_get_view(const GpuDisplay *d, HiresView *v);
+/* Same, widened by `extra` guard-band columns on each side (clamped to the guard band). */
+bool hires_get_view_wide(const GpuDisplay *d, int extra, HiresView *v);
 /* Scales for a window of pw x ph physical pixels showing a dw x dh display: the 4:3 letterbox
  * viewport (vw x vh) is covered without ever upsampling on either axis,
  * sx = ceil(vw/dw), sy = ceil(vh/dh), each capped to 1..max_x / 1..max_y. */
 void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int *sx, int *sy);
+/* Same for content of aspect ar (width / height as presented, 4:3 = 1.333...). */
+void hires_pick_scale_ar(int pw, int ph, int dw, int dh, double ar, int max_x, int max_y, int *sx, int *sy);
 /* Worker pool (hi-res path only; 1x GPU and emulated state stay single-threaded). Large
  * primitives are split into row chunks and rasterized fork-join, so command order is kept.
  * n = worker threads besides the calling one; -1 = auto (performance cores - 1); 0 = serial. */

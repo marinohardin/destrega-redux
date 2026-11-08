@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from image import Image                    # noqa: E402
 from analyze import Analyzer               # noqa: E402
 from codegen import FuncEmitter            # noqa: E402
+import codegen                             # noqa: E402
 from overlays import overlay_list          # noqa: E402
 
 MAIN_CODE = (0x80026000, 0x800aa000)
@@ -77,6 +78,24 @@ def overrides():
             line = line.split('#')[0].split()
             if line:
                 res.add(int(line[0], 16))
+    return res
+
+
+def widescreen_patches(img):
+    """analysis/widescreen_cull.txt: `<hex addr> <orig imm> <wide imm>` per main-exe `slti`
+    whose immediate is a screen-space culling bound; checked against the instruction."""
+    path = 'analysis/widescreen_cull.txt'
+    res = {}
+    if os.path.exists(path):
+        for n, line in enumerate(open(path), 1):
+            f = line.split('#')[0].split()
+            if not f:
+                continue
+            a, orig, wide = int(f[0], 16), int(f[1], 0), int(f[2], 0)
+            i = img.ins(a)
+            if i.op != 'slti' or i.imm != orig:
+                raise SystemExit(f'{path}:{n}: {a:08x} is {i.op} imm {i.imm}, expected slti {orig}')
+            res[a] = wide
     return res
 
 
@@ -169,6 +188,7 @@ def main():
     seeds += sorted(ps)
     an = Analyzer(main_img, *MAIN_CODE, seeds)
     main_funcs = an.run()
+    codegen.WS_PATCHES = widescreen_patches(main_img)
     main_names = {e: f'f_{e:08x}' for e in main_funcs}
     report.append(f'main: {len(main_funcs)} functions, '
                   f'{sum(len(f.insns) for f in main_funcs.values())} instructions')
@@ -201,6 +221,11 @@ def main():
             raise SystemExit(f'override {a:08x}: cannot locate generated body')
         chunks[idx[0]] = f'void {main_names[a]}_orig(void) {{' + chunks[idx[0]][len(head):]
         protos.append(f'void {main_names[a]}_orig(void);')
+    missing = set(codegen.WS_PATCHES) - codegen.WS_EMITTED
+    if missing:
+        raise SystemExit('analysis/widescreen_cull.txt: not in recompiled code: ' +
+                         ' '.join(f'{a:08x}' for a in sorted(missing)))
+    report.append(f'main: {len(codegen.WS_EMITTED)} widescreen culling patch points')
     for n in range(0, len(chunks), FUNCS_PER_FILE):
         write_file(f'{args.out}/main_{n // FUNCS_PER_FILE:02d}.c', chunks[n:n + FUNCS_PER_FILE])
     for e, f in sorted(main_funcs.items()):

@@ -11,6 +11,9 @@ int g_trace;
 u32 g_callstack[1024];
 u32 g_depth;
 
+int g_widescreen_cull;   /* --widescreen: widened stage culling bounds (WS_IMM, recomp.h) */
+u32 g_ws_cull_hits;
+
 void rt_dump_stack(void) {
     fprintf(stderr, "guest call stack (depth %u):\n", g_depth);
     for (u32 i = g_depth > 40 ? g_depth - 40 : 0; i < g_depth; i++)

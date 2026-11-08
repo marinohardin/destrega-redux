@@ -11,6 +11,7 @@
  * unsigned 16-bit regs stored zero-extended) so reads are mostly direct.
  */
 #include "psx.h"
+#include <string.h>
 
 static u32 d[32]; /* cop2 data registers */
 static u32 c[32]; /* cop2 control registers (c[31] unused; see g_flag) */
@@ -589,4 +590,19 @@ void gte_write_ctrl(int reg, u32 v)
         c[reg] = v;
         break;
     }
+}
+
+/* Whole-GTE snapshot (widescreen shadow pass, runtime/overrides/widescreen.c). */
+void gte_save(GteState *s)
+{
+    memcpy(s->d, d, sizeof d);
+    memcpy(s->c, c, sizeof c);
+    s->flag = g_flag;
+}
+
+void gte_restore(const GteState *s)
+{
+    memcpy(d, s->d, sizeof d);
+    memcpy(c, s->c, sizeof c);
+    g_flag = s->flag;
 }

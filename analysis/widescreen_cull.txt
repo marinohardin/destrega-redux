@@ -1,0 +1,62 @@
+# Widescreen culling patch points (read by recomp/recomp.py; see AGENTS.md "Widescreen").
+#
+#   <hex addr>  <original slti immediate>  <widened immediate>   # function
+#
+# Each line is a main-exe `slti` whose immediate is the horizontal screen-space culling bound
+# of the stage renderer (screen x is centred: OFX = 0, the GPU drawing offset adds 256). The
+# original bound is +-255 (per polygon) / +-257 (per stage object). The generated code uses
+# the widened bound only while g_widescreen_cull is set, i.e. only inside the sandboxed shadow
+# pass of runtime/overrides/widescreen.c (never in the run the game sees), so polygons up to 88
+# 1x pixels beyond the 4:3 screen edge (the hi-res guard band, 16:9 = 85.3) are found.
+# Vertical bounds (+-119 / +-121) are unchanged. recomp.py fails if a line does not match
+# the instruction at that address. Without --widescreen WS_IMM() yields the original value.
+8003fd78   -254   -342   # 8003fcb8
+8003fd80   -254   -342   # 8003fcb8
+8003fd88    255    343   # 8003fcb8
+8004001c   -254   -342   # 8003fcb8
+80040024   -254   -342   # 8003fcb8
+8004002c    255    343   # 8003fcb8
+80040308   -254   -342   # 800401f8
+80040310   -254   -342   # 800401f8
+80040318    255    343   # 800401f8
+80040600   -254   -342   # 800401f8
+80040608   -254   -342   # 800401f8
+80040610    255    343   # 800401f8
+80040928   -254   -342   # 80040820
+80040930   -254   -342   # 80040820
+80040938    255    343   # 80040820
+80040c38   -254   -342   # 80040820
+80040c40   -254   -342   # 80040820
+80040c48    255    343   # 80040820
+80040fe0   -254   -342   # 80040e98
+80040fe8   -254   -342   # 80040e98
+80040ff0    255    343   # 80040e98
+8004137c   -254   -342   # 80040e98
+80041384   -254   -342   # 80040e98
+8004138c    255    343   # 80040e98
+80041708   -254   -342   # 8004163c
+80041710   -254   -342   # 8004163c
+80041718    255    343   # 8004163c
+800419ec   -254   -342   # 8004163c
+800419f4   -254   -342   # 8004163c
+800419fc    255    343   # 8004163c
+80041d2c   -254   -342   # 80041c14
+80041d34   -254   -342   # 80041c14
+80041d3c    255    343   # 80041c14
+80042084   -254   -342   # 80041c14
+8004208c   -254   -342   # 80041c14
+80042094    255    343   # 80041c14
+80042498   -254   -342   # 800423e0
+800424a0   -254   -342   # 800423e0
+800424ac    255    343   # 800423e0
+800427f4   -254   -342   # 800426c4
+800427fc   -254   -342   # 800426c4
+80042804    255    343   # 800426c4
+8004312c   -254   -342   # 80042fec
+80043140    255    343   # 80042fec
+80043524   -254   -342   # 800433c4
+8004352c   -254   -342   # 800433c4
+80043534    255    343   # 800433c4
+80044100   -256   -344   # 80043fd4
+80044108   -256   -344   # 80043fd4
+80044110    257    345   # 80043fd4

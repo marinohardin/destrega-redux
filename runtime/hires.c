@@ -44,6 +44,9 @@ static int s_rx = 0, s_ry = 0, s_rw = 512, s_rh = 480;   /* tracked 1x region (i
 static int s_cfg_rx = 0, s_cfg_ry = 0, s_cfg_rw = 512, s_cfg_rh = 480;   /* requested */
 static int s_tw, s_th;                 /* target size in pixels */
 static int s_ox, s_oy;                 /* hi-res coordinates of target pixel (0,0) */
+static int s_gx;                       /* guard band in use: virtual 1x columns each side */
+static int s_pend_gx;                  /* guard band for the next configure() */
+static int s_cfg_gx;                   /* requested via hires_set_guard() */
 static bool s_dither_hi;
 
 static const s8 s_dither[4][4] = {
@@ -608,6 +611,15 @@ static const BandFn s_tri_tex[3][10] = {
     TRI_TEX_TABLE(0), TRI_TEX_TABLE(1), TRI_TEX_TABLE(2),
 };
 
+/* Guard band: a draw area that reaches the region's left / right edge is extended gx columns
+ * further out on that side (see HiresBackend.set_guard). No-op without a guard band. */
+static inline void guard_clip(HiresPrim *p)
+{
+    if (!s_gx || p->clip_x2 < p->clip_x1) return;
+    if (p->clip_x1 == s_rx) p->clip_x1 = s_rx - s_gx;
+    if (p->clip_x2 == s_rx + s_rw - 1) p->clip_x2 = s_rx + s_rw - 1 + s_gx;
+}
+
 static inline bool dither_on(const HiresPrim *p) { return p->dither && ((s_Sx == 1 && s_Sy == 1) || s_dither_hi); }
 
 static void be_tri(const HiresPrim *p, const HiresVtx v[3])
@@ -615,6 +627,7 @@ static void be_tri(const HiresPrim *p, const HiresVtx v[3])
     if (!s_t) return;
     TriArgs ta;
     ta.p = *p;
+    guard_clip(&ta.p);
     ta.p.dither = dither_on(p);
     memcpy(ta.v, v, sizeof ta.v);
     BandFn fn;
@@ -639,10 +652,11 @@ static void be_tri(const HiresPrim *p, const HiresVtx v[3])
         if (v[i].x < minx) minx = v[i].x;
         if (v[i].x > maxx) maxx = v[i].x;
     }
-    int ylo = imax(imax((int)(((s64)miny * s_Sy) >> 16), p->clip_y1 * s_Sy), s_oy);
-    int yhi = imin(imin((int)((((s64)maxy * s_Sy) >> 16) + 1), (p->clip_y2 + 1) * s_Sy), s_oy + s_th);
-    int xlo = imax(imax((int)(((s64)minx * s_Sx) >> 16), p->clip_x1 * s_Sx), s_ox);
-    int xhi = imin(imin((int)((((s64)maxx * s_Sx) >> 16) + 1), (p->clip_x2 + 1) * s_Sx), s_ox + s_tw);
+    const HiresPrim *cp = &ta.p;
+    int ylo = imax(imax((int)(((s64)miny * s_Sy) >> 16), cp->clip_y1 * s_Sy), s_oy);
+    int yhi = imin(imin((int)((((s64)maxy * s_Sy) >> 16) + 1), (cp->clip_y2 + 1) * s_Sy), s_oy + s_th);
+    int xlo = imax(imax((int)(((s64)minx * s_Sx) >> 16), cp->clip_x1 * s_Sx), s_ox);
+    int xhi = imin(imin((int)((((s64)maxx * s_Sx) >> 16) + 1), (cp->clip_x2 + 1) * s_Sx), s_ox + s_tw);
     if (yhi <= ylo || xhi <= xlo) return;
     mark_dirty(ylo / s_Sy, (yhi - 1) / s_Sy);
     s64 area = (s64)(yhi - ylo) * (xhi - xlo);
@@ -671,7 +685,7 @@ rect_impl(const RectArgs *ra, int by0, int by1,
     if (xe > p->clip_x2 + 1) xe = p->clip_x2 + 1;
     if (ys < p->clip_y1) ys = p->clip_y1;
     if (ye > p->clip_y2 + 1) ye = p->clip_y2 + 1;
-    xs = imax(xs, s_rx); xe = imin(xe, s_rx + s_rw);
+    xs = imax(xs, s_rx - s_gx); xe = imin(xe, s_rx + s_rw + s_gx);
     ys = imax(ys, s_ry); ye = imin(ye, s_ry + s_rh);
     /* restrict to the band (hi-res rows [by0, by1)) */
     ys = imax(ys, by0 / Sy); ye = imin(ye, (by1 + Sy - 1) / Sy);
@@ -730,11 +744,18 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
 {
     if (!s_t) return;
     RectArgs ra = { *p, x, y, w, h, r, g, b, u0, v0, fx, fy };
+    if (s_gx) {
+        /* an untextured rect over the whole draw-area width (fade, flash) spans the guard band */
+        bool full = !p->tex && x <= p->clip_x1 && x + w >= p->clip_x2 + 1;
+        guard_clip(&ra.p);
+        if (full) { ra.x0 = x = ra.p.clip_x1; ra.w = w = ra.p.clip_x2 + 1 - x; }
+    }
+    p = &ra.p;
     BandFn fn;
     if (!p->tex) fn = p->semi ? rect_u1 : rect_u0;
     else { note_tex_page(p); fn = s_rect_tex[p->depth][(p->raw ? 2 : 0) | (p->semi ? 1 : 0)]; }
     int ys = imax(imax(y, p->clip_y1), s_ry), ye = imin(imin(y + h, p->clip_y2 + 1), s_ry + s_rh);
-    int xs = imax(imax(x, p->clip_x1), s_rx), xe = imin(imin(x + w, p->clip_x2 + 1), s_rx + s_rw);
+    int xs = imax(imax(x, p->clip_x1), s_rx - s_gx), xe = imin(imin(x + w, p->clip_x2 + 1), s_rx + s_rw + s_gx);
     if (ys >= ye || xs >= xe) return;
     mark_dirty(ys, ye - 1);
     int ylo = ys * s_Sy, yhi = ye * s_Sy;
@@ -744,9 +765,12 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
 
 /* ---- lines ----------------------------------------------------------------- */
 
-static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, u32 c1)
+static void be_line(const HiresPrim *p0, int x0, int y0, u32 c0, int x1, int y1, u32 c1)
 {
     if (!s_t) return;
+    HiresPrim pl = *p0;
+    guard_clip(&pl);
+    const HiresPrim *p = &pl;
     const int Sx = s_Sx, Sy = s_Sy;
     int dx = x1 - x0, dy = y1 - y0;
     int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
@@ -835,6 +859,8 @@ static void be_fill(int x, int y, int w, int h, u16 c)
         int xa = x, xb = x + w;
         if (xb <= VRAM_W) {
             int a = imax(xa, s_rx), b = imin(xb, s_rx + s_rw);
+            /* a row cleared across the whole region also clears the guard band */
+            if (s_gx && xa <= s_rx && xb >= s_rx + s_rw) { a -= s_gx; b += s_gx; }
             if (a < b) fill_span(a, b, row, c);
         } else {
             int a = imax(xa, s_rx), b = imin(VRAM_W, s_rx + s_rw);
@@ -911,8 +937,10 @@ static void seed(void)
     for (int y = 0; y < s_rh; y++) {
         u16 *row0 = s_t + (size_t)y * s_Sy * s_tw;
         const u16 *src = &s_vram[(s_ry + y) * VRAM_W + s_rx];
+        memset(row0, 0, (size_t)s_tw * sizeof(u16));   /* the guard band starts black */
+        u16 *real = row0 + (size_t)s_gx * s_Sx;
         for (int x = 0; x < s_rw; x++)
-            for (int i = 0; i < s_Sx; i++) row0[x * s_Sx + i] = src[x];
+            for (int i = 0; i < s_Sx; i++) real[x * s_Sx + i] = src[x];
         for (int j = 1; j < s_Sy; j++) memcpy(row0 + (size_t)j * s_tw, row0, (size_t)s_tw * sizeof(u16));
     }
 }
@@ -922,6 +950,7 @@ static void be_destroy(void)
     free(s_t);
     s_t = NULL;
     s_Sx = s_Sy = 0;
+    s_gx = 0; g_hires_guard = 0;
 }
 
 static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int rw, int rh)
@@ -929,15 +958,18 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     if (sx < 1 || sx > HIRES_MAX_SCALE || sy < 1 || sy > HIRES_MAX_SCALE || rw <= 0 || rh <= 0 ||
         rx < 0 || ry < 0 || rx + rw > VRAM_W || ry + rh > VRAM_H)
         return false;
-    u16 *nt = malloc((size_t)rw * sx * rh * sy * sizeof(u16));
+    const int gx = s_pend_gx;
+    u16 *nt = malloc((size_t)(rw + 2 * gx) * sx * rh * sy * sizeof(u16));
     if (!nt) return false;
     free(s_t);
     s_t = nt;
     s_vram = vram1x;
     s_Sx = sx; s_Sy = sy;
     s_rx = rx; s_ry = ry; s_rw = rw; s_rh = rh;
-    s_tw = rw * sx; s_th = rh * sy;
-    s_ox = rx * sx; s_oy = ry * sy;
+    s_gx = gx;
+    g_hires_guard = gx;
+    s_tw = (rw + 2 * gx) * sx; s_th = rh * sy;
+    s_ox = (rx - gx) * sx; s_oy = ry * sy;
     memset(s_fb_tex_seen, 0, sizeof s_fb_tex_seen);
     seed();
     s_epoch++;
@@ -948,7 +980,7 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
 static bool be_view(int x, int y, int w, int h, HiresView *out)
 {
     if (!s_t || w <= 0 || h <= 0) return false;
-    if (x < s_rx || y < s_ry || x + w > s_rx + s_rw || y + h > s_ry + s_rh) return false;
+    if (x < s_rx - s_gx || y < s_ry || x + w > s_rx + s_rw + s_gx || y + h > s_ry + s_rh) return false;
     out->pixels = s_t + (size_t)(y * s_Sy - s_oy) * s_tw + (x * s_Sx - s_ox);
     out->stride = s_tw;
     out->w = w * s_Sx;
@@ -958,8 +990,11 @@ static bool be_view(int x, int y, int w, int h, HiresView *out)
     return true;
 }
 
+static void be_set_guard(int gx) { s_pend_gx = gx < 0 ? 0 : (gx > HIRES_MAX_GUARD ? HIRES_MAX_GUARD : gx); }
+
 static const HiresBackend s_soft = {
     "software", be_configure, be_tri, be_rect, be_line, be_fill, be_copy, be_put, be_view, be_destroy,
+    be_set_guard,
 };
 
 /* ---- control --------------------------------------------------------------------- */
@@ -975,8 +1010,9 @@ bool hires_set_scale(int sx, int sy)
         return true;
     }
     if (g_hires && s_Sx == sx && s_Sy == sy && s_rx == s_cfg_rx && s_ry == s_cfg_ry &&
-        s_rw == s_cfg_rw && s_rh == s_cfg_rh)
+        s_rw == s_cfg_rw && s_rh == s_cfg_rh && s_gx == s_cfg_gx)
         return true;
+    if (s_soft.set_guard) s_soft.set_guard(s_cfg_gx);
     if (!s_soft.configure(gpu_vram(), sx, sy, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh)) {
         g_hires = NULL;
         return false;
@@ -999,13 +1035,28 @@ void hires_set_region(int rx, int ry, int rw, int rh)
 
 void hires_set_dither(bool enable) { s_dither_hi = enable; }
 
+void hires_set_guard(int gx) { s_cfg_gx = gx < 0 ? 0 : (gx > HIRES_MAX_GUARD ? HIRES_MAX_GUARD : gx); }
+int hires_guard(void) { return g_hires ? s_gx : 0; }
+
 bool hires_get_view(const GpuDisplay *d, HiresView *v)
 {
     if (!g_hires || !d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) return false;
     return g_hires->view(d->x, d->y, d->w, d->h, v);
 }
 
+bool hires_get_view_wide(const GpuDisplay *d, int extra, HiresView *v)
+{
+    if (!g_hires || !d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) return false;
+    extra = imax(0, imin(extra, s_gx));
+    return g_hires->view(d->x - extra, d->y, d->w + 2 * extra, d->h, v);
+}
+
 void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int *sx, int *sy)
+{
+    hires_pick_scale_ar(pw, ph, dw, dh, 4.0 / 3.0, max_x, max_y, sx, sy);
+}
+
+void hires_pick_scale_ar(int pw, int ph, int dw, int dh, double ar, int max_x, int max_y, int *sx, int *sy)
 {
     if (max_x < 1) max_x = 1;
     if (max_x > HIRES_MAX_SCALE) max_x = HIRES_MAX_SCALE;
@@ -1014,9 +1065,11 @@ void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int 
     if (dw < 1) dw = 512;
     if (dh < 1) dh = 240;
     int vw = 1, vh = 1;
-    if (pw >= 1 && ph >= 1) {                    /* 4:3 letterbox viewport */
-        if ((s64)pw * 3 > (s64)ph * 4) { vh = ph; vw = ph * 4 / 3; }
-        else { vw = pw; vh = pw * 3 / 4; }
+    if (pw >= 1 && ph >= 1) {                    /* letterbox viewport of aspect ar */
+        if ((s64)pw * 3 > (s64)ph * 4 && ar == 4.0 / 3.0) { vh = ph; vw = ph * 4 / 3; }
+        else if (ar == 4.0 / 3.0) { vw = pw; vh = pw * 3 / 4; }
+        else if ((double)pw > (double)ph * ar) { vh = ph; vw = (int)(ph * ar); }
+        else { vw = pw; vh = (int)(pw / ar); }
     }
     /* never upsample at present: at least one target pixel per viewport pixel on each axis */
     *sx = imin(imax((vw + dw - 1) / dw, 1), max_x);
@@ -1029,7 +1082,7 @@ u32 hires_verify_1x(int *first_x, int *first_y)
     u32 bad = 0;
     for (int y = 0; y < s_rh; y++)
         for (int x = 0; x < s_rw; x++)
-            if (s_t[y * s_tw + x] != s_vram[(s_ry + y) * VRAM_W + s_rx + x]) {
+            if (s_t[y * s_tw + s_gx + x] != s_vram[(s_ry + y) * VRAM_W + s_rx + x]) {
                 if (!bad) { if (first_x) *first_x = s_rx + x; if (first_y) *first_y = s_ry + y; }
                 bad++;
             }

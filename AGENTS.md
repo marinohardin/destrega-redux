@@ -217,6 +217,42 @@ hashing all emulated state per frame).
   state hashes equal, >=95% of fight frames hi-res, 0 UV fetches outside the 1x-sampled range, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
   tests, `tools/smoke_test.sh` and the determinism script concurrently (~1.7 min).
 
+## Widescreen (`--widescreen`, default off)
+
+16:9 fights with **zero** change to emulated state (proved per frame by
+`tools/test_widescreen.sh`). Menus, FMV, character select and other non-stage screens stay 4:3.
+
+- Guard band (hi-res only): `hires_set_guard(88)` gives the hi-res target 88 virtual 1x columns
+  left and right of the 512-wide region (`HiresBackend.set_guard`, optional). Primitives whose
+  draw area touches the region edge are clipped against the widened area there; fills that span
+  the whole region and untextured rects across the whole draw area (fades) extend into it;
+  uploads/copies never do. A triangle crossing the edge uses its vertex UV/colour range for the
+  clamp (the 1x-sampled range would smear it outside). 1x VRAM is unchanged: the 512-wide part of
+  the target still equals it at 1x1 (`--hires-verify` in the test).
+- The game culls stage polygons at screen x +-255 and stage objects at +-257 (see NOTES.md
+  "Camera, projection and culling"). Those 50 `slti` immediates are listed in
+  `analysis/widescreen_cull.txt`; `recomp.py` emits them as `WS_IMM(orig, wide)` (`recomp.h`),
+  which is the original value unless `g_widescreen_cull` is set.
+- **Why a shadow pass**: running the widened culling for real changes RAM (packets, OT, per-object
+  animation counters) and emulated time (more instructions, longer GPU DMA), and that measurably
+  changed the fight (different positions within ~2000 frames). So `stage_render` (80044210) is an
+  override (`runtime/overrides/widescreen.c`): snapshot RAM/scratchpad/CPU/GTE, run the renderer
+  with `g_widescreen_cull` on, interrupts held off (`next_event = ~0`) and hardware access
+  blocked (`g_bus_sandbox` in bus.c; any access rejects the pass), record the 2048 OT slots,
+  restore, run it again normally (the run the game sees), record again; per slot the packets the
+  wide pass has and the real one lacks (compared by payload) are the extras. The GPU linked-list
+  DMA calls `g_gpu_ll_hook` per node; on reaching a slot the extras are drawn into the hi-res
+  target only (`gpu_shadow_packet`: no 1x drawing, no IRQ, GPU state restored).
+- Presentation: 16:9 (or the window's aspect, clamped to 4:3 .. 4:3 * 688/512) while the stage
+  is being drawn (a `WS_IMM` evaluated within the last 6 vblanks), 4:3 otherwise; the HUD keeps
+  its 4:3 layout in the centre. The render scale is picked for the widest presentation the window
+  allows (`hires_pick_scale_ar`), so switching never reallocates. Default window 1280x720.
+  Headless dumps use `--window`/`--resize` as the window.
+- Options/diagnostics: `--widescreen`, `--gameplay-trace FILE` (per frame: health, gauge,
+  position of both fighters, round time, wins, RNG seed, fighter-struct hash), `--ram-snap DIR`
+  / `--ram-snap-every N` (raw RAM dumps for diffing). The run summary prints
+  `widescreen: N shadow passes, M extra stage packets, R rejected` and `widescreen-frames: ...`.
+
 ## Pitfalls
 
 - Branches may target another branch's delay slot (e.g. 0x800951c0); the tracer

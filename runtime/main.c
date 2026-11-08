@@ -32,6 +32,16 @@ static u32 s_wav_bytes;
 static int s_opt_sx = -1, s_opt_sy = -1;   /* --scale N|NxM: -1 = auto from the window, 0 = off */
 static int s_max_sx = 4, s_max_sy = 6;     /* auto-scale caps per axis (see AGENTS.md) */
 static int s_win_w = 960, s_win_h = 720;   /* --window WxH (logical points) */
+static bool s_win_set;                     /* --window given */
+/* --widescreen (see AGENTS.md "Widescreen"): the hi-res target gets a guard band of WS_GUARD
+ * 1x columns per side and the stage renderer's horizontal culling bounds are widened by the
+ * same amount (analysis/widescreen_cull.txt). Presented 16:9 (or the window aspect, if
+ * narrower) while the stage is being drawn, 4:3 otherwise. */
+#define WS_GUARD 88
+static bool s_widescreen;
+static u64 s_ws_stage_frame;               /* last frame a widened culling bound was evaluated */
+static bool s_ws_stage;                    /* stage drawn within the last few frames */
+static int s_pres_w, s_pres_h;             /* window (physical pixels) presentation is laid out for */
 static u64 s_fight_from = 3700;            /* frames >= this count as "fight" in the hi-res stats */
 static int s_hires_min_fight = -1;         /* --hires-min-fight PCT: fail unless this % of fight frames used hi-res */
 static u64 s_hr_used[2], s_hr_fallback[2]; /* [0] all frames, [1] frames >= s_fight_from */
@@ -53,6 +63,10 @@ static bool s_hires_dither;
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
 static FILE *s_state_hash;         /* --state-hash FILE */
+static FILE *s_gameplay;           /* --gameplay-trace FILE */
+static u64 s_ws_wide[2];           /* widescreen: frames presented wider than 4:3 (all, fight window) */
+static const char *s_ram_snap_dir; /* --ram-snap DIR: raw RAM + scratchpad every --ram-snap-every frames */
+static u64 s_ram_snap_every = 100;
 typedef struct { u64 frame; int w, h; } ResizeStep;
 static ResizeStep s_resizes[256];
 static int s_resize_n;
@@ -155,11 +169,12 @@ static void convert_view(const HiresView *v, u32 *dst, size_t dst_pitch_px) {
     hires_parallel_rows(convert_rows, &j, v->h);
 }
 
+static int ws_present_extra(const GpuDisplay *d);
 void frontend_screenshot(const char *path) {
     GpuDisplay d;
     HiresView hv;
     gpu_get_display(&d);
-    if (hires_get_view(&d, &hv)) {
+    if (hires_get_view_wide(&d, ws_present_extra(&d), &hv)) {
         u32 *buf = malloc((size_t)hv.w * hv.h * 4);
         if (buf) {
             convert_view(&hv, buf, (size_t)hv.w);
@@ -279,6 +294,41 @@ static void write_state_hash(void) {
 }
 
 static void present_frame(void);
+extern u32 g_ws_cull_hits;
+
+/* ---- gameplay trace: the fight state a player can observe (see analysis/symbols.txt) ---- */
+
+#define FIGHTER_P1   0x800c9938u   /* fighter structs, 0x1dc bytes each */
+#define FIGHTER_P2   0x800c9b14u
+#define FIGHTER_SIZE 0x1dcu
+static void write_gameplay_trace(void) {
+    u32 fh = 0x811c9dc5u;           /* FNV-1a over both fighter structs */
+    for (u32 a = FIGHTER_P1; a < FIGHTER_P1 + 2 * FIGHTER_SIZE; a++) fh = (fh ^ mem_r8(a)) * 0x01000193u;
+    fprintf(s_gameplay, "%llu", (unsigned long long)s_frame);
+    const u32 f[2] = { FIGHTER_P1, FIGHTER_P2 };
+    for (int i = 0; i < 2; i++)
+        fprintf(s_gameplay, " p%d hp=%d gauge=%d pos=%d,%d,%d", i + 1, (s16)mem_r16(f[i] + 0xc),
+                (s16)mem_r16(f[i] + 0xe), (s32)mem_r32(f[i] + 0xa0), (s32)mem_r32(f[i] + 0xa4),
+                (s32)mem_r32(f[i] + 0xa8));
+    fprintf(s_gameplay, " time=%u wins=%u,%u rng=%08x fighters=%08x\n", mem_r32(0x800e379c),
+            mem_r32(0x800e3788), mem_r32(0x800e378c), mem_r32(0x800e7560), fh);
+}
+
+/* Widescreen: guard-band columns per side to present for a pw x ph window showing a dw-wide
+ * display: the window aspect clamped to [4:3, 4:3 * (dw + 2 * guard) / dw]. 0 when off. */
+static int ws_extra_for(int pw, int ph, int dw, int guard) {
+    if (!s_widescreen || guard <= 0 || pw <= 0 || ph <= 0 || dw <= 0) return 0;
+    double ar = (double)pw / ph;
+    double cols = ar * 0.75 * dw;              /* 1x columns that fill the window at 4:3 pixels */
+    int e = (int)((cols - dw) / 2 + 0.5);
+    return e < 0 ? 0 : (e > guard ? guard : e);
+}
+
+/* Columns per side the current frame is presented with (0 = plain 4:3). */
+static int ws_present_extra(const GpuDisplay *d) {
+    if (!s_widescreen || !s_ws_stage) return 0;
+    return ws_extra_for(s_pres_w, s_pres_h, d->w, hires_guard());
+}
 
 /* Pick the render scales for a window of pw x ph physical pixels, from the display mode
  * currently shown (24-bit / disabled displays keep the 512x240 reference). */
@@ -289,7 +339,15 @@ static void apply_window_size(int pw, int ph, bool simulated) {
     int dw = 512, dh = 240;
     if (d.enabled && !d.rgb24 && d.w > 0 && d.h > 0) { dw = d.w; dh = d.h; }
     int sx, sy, cx, cy;
-    hires_pick_scale(pw, ph, dw, dh, s_max_sx, s_max_sy, &sx, &sy);
+    s_pres_w = pw; s_pres_h = ph;
+    if (s_widescreen) {
+        /* sized for the widest presentation this window allows, so switching between 4:3
+         * screens and 16:9 fights never reallocates the target */
+        int e = ws_extra_for(pw, ph, dw, WS_GUARD);
+        hires_pick_scale_ar(pw, ph, dw + 2 * e, dh, 4.0 / 3.0 * (dw + 2 * e) / dw,
+                            s_max_sx, s_max_sy, &sx, &sy);
+    } else
+        hires_pick_scale(pw, ph, dw, dh, s_max_sx, s_max_sy, &sx, &sy);
     hires_get_scale(&cx, &cy);
     if (sx != cx || sy != cy) {
         rt_log("hires: window %dx%d, display %dx%d -> render scale %dx%d", pw, ph, dw, dh, sx, sy);
@@ -299,9 +357,15 @@ static void apply_window_size(int pw, int ph, bool simulated) {
 
 extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g_hires_stat_inline_jobs;
 static void finish(void) {
+    void widescreen_report(void); widescreen_report();
     if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
     if (s_state_hash) fclose(s_state_hash);
+    if (s_gameplay) fclose(s_gameplay);
     int rc = 0;
+    if (s_widescreen)
+        rt_log("widescreen-frames: %llu presented wider than 4:3 (%llu in fight window of %llu)",
+               (unsigned long long)s_ws_wide[0], (unsigned long long)s_ws_wide[1],
+               (unsigned long long)(s_hr_used[1] + s_hr_fallback[1]));
     int sx, sy;
     if (hires_get_scale(&sx, &sy) || s_hr_used[0] + s_hr_fallback[0]) {
         u64 ft = s_hr_used[1] + s_hr_fallback[1];
@@ -357,6 +421,15 @@ static void finish(void) {
 
 void frontend_vblank(void) {
     s_frame++;
+    if (s_widescreen) {
+        static u32 last_hits;
+        if (g_ws_cull_hits != last_hits) s_ws_stage_frame = s_frame;
+        last_hits = g_ws_cull_hits;
+        /* fights draw every second vblank; allow a few frames of slack before going 4:3 */
+        bool stage = s_ws_stage_frame && s_frame - s_ws_stage_frame <= 6;
+        if (stage != s_ws_stage && g_trace) rt_log("widescreen: %s", stage ? "16:9 (stage drawn)" : "4:3");
+        s_ws_stage = stage;
+    }
     if (s_headless) {
         u64 now = SDL_GetTicksNS();
         if (s_last_vb_ns) {
@@ -382,6 +455,7 @@ void frontend_vblank(void) {
             int f = s_frame >= s_fight_from;
             (used ? s_hr_used : s_hr_fallback)[0]++;
             if (f) (used ? s_hr_used : s_hr_fallback)[1]++;
+            if (used && ws_present_extra(&d) > 0) { s_ws_wide[0]++; if (f) s_ws_wide[1]++; }
         }
     }
     {
@@ -400,6 +474,13 @@ void frontend_vblank(void) {
         }
     }
     if (s_state_hash) write_state_hash();
+    if (s_gameplay) write_gameplay_trace();
+    if (s_ram_snap_dir && s_frame % s_ram_snap_every == 0) {
+        char p[512];
+        snprintf(p, sizeof p, "%s/ram_%06llu.bin", s_ram_snap_dir, (unsigned long long)s_frame);
+        FILE *f = fopen(p, "wb");
+        if (f) { fwrite(g_ram, 1, RAM_SIZE, f); fwrite(g_scratch, 1, sizeof g_scratch, f); fclose(f); }
+    }
     if (g_trace && s_frame % 60 == 0) {
         extern u32 g_mdec_in_dmas, g_cd_dma_words;
         static u32 lm, lc;
@@ -513,24 +594,30 @@ void frontend_vblank(void) {
 
 /* ---- presentation ------------------------------------------------------------------- */
 
-/* 4:3 letterbox viewport inside a pw x ph window. */
-static SDL_FRect letterbox(int pw, int ph) {
+/* Letterbox viewport of aspect ar inside a pw x ph window (4:3 = the original path). */
+static SDL_FRect letterbox_ar(int pw, int ph, double ar) {
     float w, h;
-    if ((s64)pw * 3 > (s64)ph * 4) { h = (float)ph; w = h * 4.0f / 3.0f; }
-    else { w = (float)pw; h = w * 3.0f / 4.0f; }
+    if (ar == 4.0 / 3.0) {
+        if ((s64)pw * 3 > (s64)ph * 4) { h = (float)ph; w = h * 4.0f / 3.0f; }
+        else { w = (float)pw; h = w * 3.0f / 4.0f; }
+    } else if ((double)pw > (double)ph * ar) { h = (float)ph; w = (float)(h * ar); }
+    else { w = (float)pw; h = (float)(w / ar); }
     return (SDL_FRect){ ((float)pw - w) / 2, ((float)ph - h) / 2, w, h };
 }
 
 static void present_frame(void) {
     int pw = 0, ph = 0;
     SDL_GetWindowSizeInPixels(s_win, &pw, &ph);
+    s_pres_w = pw; s_pres_h = ph;
     apply_window_size(pw, ph, false);
-    SDL_FRect dst = letterbox(pw, ph);
     GpuDisplay d;
     HiresView hv;
     gpu_get_display(&d);
+    int extra = ws_present_extra(&d);
+    SDL_FRect dst = letterbox_ar(pw, ph, 4.0 / 3.0);
     SDL_RenderClear(s_ren);
-    if (hires_get_view(&d, &hv)) {
+    if (hires_get_view_wide(&d, extra, &hv)) {
+        if (extra) dst = letterbox_ar(pw, ph, 4.0 / 3.0 * (d.w + 2 * extra) / d.w);
         /* true hi-res target: downsampled/filtered into the viewport, never an upsampled 1x image */
         if (!s_hitex || s_hitex_w != hv.w || s_hitex_h != hv.h) {
             if (s_hitex) SDL_DestroyTexture(s_hitex);
@@ -591,7 +678,11 @@ static void usage(void) {
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
+        "  --gameplay-trace FILE per frame: fighters' health/gauge/position, round time, wins, RNG seed\n"
+        "  --ram-snap DIR        write raw guest RAM + scratchpad to DIR every --ram-snap-every N frames (100)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
+        "  --widescreen          16:9 fights: wider stage culling + hi-res guard band (menus/FMV stay 4:3;\n"
+        "                        needs hi-res; the window aspect picks 4:3..16:9; default window 1280x720)\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
@@ -698,7 +789,7 @@ int main(int argc, char **argv) {
             s_max_sy = (*e == 'x' || *e == 'X') ? (int)strtol(e + 1, NULL, 10) : s_max_sx;
         }
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) {
-            char *e; s_win_w = (int)strtol(argv[++i], &e, 10);
+            char *e; s_win_w = (int)strtol(argv[++i], &e, 10); s_win_set = true;
             if (*e == 'x' || *e == 'X') s_win_h = (int)strtol(e + 1, NULL, 10);
         }
         else if (!strcmp(argv[i], "--hires-threads") && i + 1 < argc) s_hires_threads = atoi(argv[++i]);
@@ -712,6 +803,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--hires-min-fight") && i + 1 < argc) s_hires_min_fight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
         else if (!strcmp(argv[i], "--hires-verify")) s_verify = true;
+        else if (!strcmp(argv[i], "--widescreen")) s_widescreen = true;
+        else if (!strcmp(argv[i], "--ram-snap") && i + 1 < argc) s_ram_snap_dir = argv[++i];
+        else if (!strcmp(argv[i], "--gameplay-trace") && i + 1 < argc) {
+            s_gameplay = fopen(argv[++i], "w");
+            if (!s_gameplay) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
+        }
+        else if (!strcmp(argv[i], "--ram-snap-every") && i + 1 < argc) s_ram_snap_every = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
             s_state_hash = fopen(argv[++i], "w");
             if (!s_state_hash) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
@@ -747,6 +845,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "data pack written to %s\n", pak);
         return 0;
     }
+    if (s_widescreen && !s_win_set) { s_win_w = 1280; s_win_h = 720; }
     if (!s_headless) create_window();
     const char *src = disc_path ? disc_path : pak;
     if (!disc_path) {
@@ -765,6 +864,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (s_widescreen) {
+        extern int g_widescreen;
+        g_widescreen = 1;
+        hires_set_guard(WS_GUARD);
+        if (s_opt_sx == 0 || (s_headless && s_opt_sx < 0 && !s_resize_n))
+            rt_log("widescreen: hi-res is off, so nothing beyond 4:3 can be shown");
+    }
+    s_pres_w = s_win_w; s_pres_h = s_win_h;   /* headless: --window (or --resize) is the window */
     bus_init();
     gte_init();
     gpu_init();

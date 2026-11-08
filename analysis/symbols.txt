@@ -15,24 +15,48 @@
 # slot addresses are shared by many files. Keep the file sorted by address.
 # Never edit a line to raise its confidence without new evidence; correct or delete wrong lines.
 
+1f800000  data   scr_buffer_index           likely    rea        scratchpad u32: current double-buffer index (0/1); selects ot_pointer_table entry
+1f800008  data   scr_ot_depth_bounds        likely    rea        scratchpad u32 x3 (1f800008 far, 1f80000c near, 1f800010 mid): 3-segment SZ -> OT index mapping (0x155 / 0x400 / 0x2ab slots)
 80010000  data   overlay_slot_p1            verified  agents-md  P1 overlay load address (Mxxx.BIN, EVENT_SP.BIN, OPTOVL.BIN); file copied verbatim, code at file+4
 8001a268  data   overlay_slot_p2            verified  agents-md  P2 overlay load address (Mxxx2.BIN, EVENTOVL.BIN)
 800244d0-80026618  range  text_leading_data  verified  agents-md  data inside .text before the code; never linear-sweep
 80027218  func   frame_sync                 likely    agents-md  f_80027218(1) -> VSync(2); why fights update at 30/s
+80028c70  func   sound_pan_from_screen_x    likely    rea        projects a 3D point (GTE RTPS) and derives left/right volumes from screen x (|x| <= 256, |y| <= 120); audio, not culling - not widened
 8002b80c  func   main                       verified  code       game main(), called from crt0
-8002beb0  func   -                          verified  trace      on the guest call stack during a fight (main > 8006b35c > 8006acc4 > 8002c820 > 8002beb0 > 80037280 ...)
-8002c820  func   -                          verified  trace      on the fight call stack, see 8002beb0
-800363c8  func   -                          verified  trace      innermost frame of the fight call stack seen at the end of headless runs
-80036b0c  func   -                          verified  trace      on the fight call stack, see 8002beb0
-80037144  func   -                          verified  trace      on the fight call stack, see 8002beb0
-80037280  func   -                          verified  trace      on the fight call stack, see 8002beb0
+8002bb68  func   round_end_sequence         guess     rea        runs while a round is decided (KO/time); counter 0x3c/0x3d/0xb4 milestones, calls rand (8008d198) for a voice pick
+8002beb0  func   fight_round_loop           likely    rea        per-round loop: fighter updates, camera, stage_render (80044210), fighters, effects, HUD; args a0/a1 = fighter_p1/p2; on the fight call stack (trace)
+8002c820  func   fight_match_loop           likely    rea        sets up fighter_p1/p2 (800c9938/800c9b14), loops fight_round_loop until the match ends; on the fight call stack (trace)
+80035594  func   fighter_ot_depth_range     likely    rea        projects both fighters; sets the OT depth mapping bounds 1f80000c/1f800010 (x culling +-257, y +-121 vs screen); render state only, not widened
+80036138  func   char_mesh_tris_to_ot       likely    rea        character mesh: NCLIP backface test, depth -> OT index (3-segment mapping), links 0x34 packets; no screen-bounds culling
+800363c8  func   char_mesh_quads_to_ot      likely    rea        quad version of 80036138 (0x3c packets); innermost frame of the fight call stack (trace)
+800367d8  func   char_mesh_chains           guess     rea        transforms jointed vertex chains (length-constrained, e.g. hair/cloth) into the mesh buffer
+80036b0c  func   char_mesh_render           likely    rea        transforms a character mesh (RTPT into 800c9d38/800cb7c8), then 80036138/800363c8 per part; on the fight call stack (trace)
+80037144  func   fighter_render             likely    rea        per fighter: bone matrices (800338d8), char_mesh_render for the body and an optional attachment (+0x1a0); on the fight call stack (trace)
+80037280  func   fighters_render            guess     trace      calls fighter_render for both fighters (fight call stack); not decompiled
 8003e36c  func   overlay_loader_b           likely    rea        one of the three overlay loaders (memcpy file into P1/P2 slot); which files it loads: unconfirmed
+8003fcb8  func   stage_prims_0x20           likely    rea        stage polygon builder (flat tri); per-polygon x culling +-255 (widened by WS_IMM), y +-119, near SZ > 0x18f
+800401f8  func   stage_prims_0x28           likely    rea        stage polygon builder (flat quad); culling as 8003fcb8
+80040820  func   stage_prims_0x34           likely    rea        stage polygon builder (gouraud textured tri); culling as 8003fcb8
+80040e98  func   stage_prims_0x3c           likely    rea        stage polygon builder (gouraud textured quad); culling as 8003fcb8
+8004163c  func   stage_prims_0x35           likely    rea        stage polygon builder (textured tri, depth-cued DPCT colours); culling as 8003fcb8
+80041c14  func   stage_prims_0x3d           likely    rea        stage polygon builder (textured quad, depth-cued); culling as 8003fcb8
+800423e0  func   stage_prims_sub_tri        guess     rea        called by 800426c4 only (object flag 0x2000 path); x culling +-255
+800426c4  func   stage_prims_alt_tri        guess     rea        alternative tri builder for stage objects with flag 0x2000 (cleared every frame)
+80042fec  func   stage_prims_sub_quad       guess     rea        called by 800433c4 only; x culling +-255
+800433c4  func   stage_prims_alt_quad       guess     rea        alternative quad builder for stage objects with flag 0x2000
+80043fd4  func   stage_object_visible       likely    rea        per stage object: 4 bounding points projected, x +-257 / y +-121 test (widened by WS_IMM); flags 0x4000/0x8 hide it
+80044210  func   stage_render               verified  test       draws the stage: per object stage_object_visible, then the polygon builders by packet type; only caller of all stage builders; overridden for widescreen (runtime/overrides/widescreen.c)
 800465a4  func   sphere_vs_poly             verified  override   moving sphere vs stage collision polygons; readable version runtime/overrides/collision.c, checked by --verify-overrides
 80049e90  label  str_wait_loop              verified  trace      libpress STR playback wait loop; stuck here when MDEC/CD DMA completions race
 8004c1e8  func   overlay_loader_a           likely    rea        one of the three overlay loaders; see 8003e36c
 8006acc4  func   -                          verified  trace      on the fight call stack, see 8002beb0
 8006b35c  func   overlay_loader_c           likely    rea        one of the three overlay loaders, and on the fight call stack right under main
+8007d6f4  func   round_timer_and_judge      likely    rea        advances round_time by 2 per update, ends the round on time limit (30/60/99 s by time_limit_setting) or KO, counts round wins
+8008d198  func   rand                       verified  code       Psy-Q rand(): seed = seed * 0x41c64e6d + 12345, returns (seed >> 16) & 0x7fff
+8008d1c8  func   srand                      verified  code       Psy-Q srand(): stores a0 into rand_seed
+80093d08  func   -                          verified  probe      only calls 80095f98; the caller that changes GTE H during fights (camera zoom)
 800951c0  label  -                          verified  agents-md  branch target that is another branch's delay slot (tracer pitfall)
+80095f98  func   SetGeomScreen              verified  probe      libgte: ctc2 H (GTE reg 26); H changes during fights between ~0x38a and 0x3bb (camera zoom); OFX/OFY stay 0
 8009b8bc  func   ResetCallback              verified  code       libetc; setjmps into 800be224 and passes it to HookEntryInt
 8009b924  label  resetcallback_irq_resume   verified  test       setjmp return point resumed on every IRQ; seeded as its own native entry (extra_seeds.txt)
 8009b994  func   irq_dispatcher             verified  code       libetc interrupt dispatcher; ends in ReturnFromException (C longjmp in rt.c)
@@ -41,3 +65,13 @@
 800a9528  func   -                          verified  agents-md  extra seed from the original port; role not recorded
 800aa000-  range  text_trailing_data        verified  agents-md  data inside .text from here on; never linear-sweep
 800be224  data   resetcallback_jmpbuf       verified  code       setjmp buffer used for IRQ hook (HookEntryInt)
+800c0724  data   ot_pointer_table           verified  test       per double-buffer (index = scratch 1f800000, stride 0x14) u32 pointer to the stage/scene ordering table, 2048 slots (index 0..0x7ff); widescreen.c walks it
+800c9938  data   fighter_p1                 verified  probe      player 1 fighter struct, 0x1dc bytes (P2 follows at 800c9b14); +0xc s16 health (200 max, falls on hits), +0xe s16 gauge, +0xa0/+0xa4/+0xa8 s32 position, +0xc8 model/camera block
+800c9b14  data   fighter_p2                 verified  probe      player 2 fighter struct; layout as fighter_p1
+800e344c  data   time_limit_setting         likely    rea        0..3; selects the round time limit in round_timer_and_judge (0 = 30 s, 1 = 60 s, 2 = 99 s, 3 = none in some modes)
+800e3780  data   round_start_hp             likely    rea        s32 x2 (P1, P2): health carried into the next round; fight_match_loop copies them to fighter +0xc
+800e3788  data   round_wins                 likely    rea        s32 x2 (P1 at 800e3788, P2 at 800e378c): rounds won, incremented by round_timer_and_judge
+800e3794  data   game_mode                  guess     rea        compared with 1, 4, 5, 6, 10 by the round code; 1 seems to disable the time limit (practice?)
+800e379c  data   round_time                 likely    rea        u32 elapsed round time, +2 per 30 Hz update (= vblanks); compared with limit * 60
+800e7560  data   rand_seed                  verified  code       rand()/srand() seed
+800ed4c8  data   camera_matrix              likely    rea        camera rotation + translation (MATRIX) loaded into the GTE by stage_render and the character renderers

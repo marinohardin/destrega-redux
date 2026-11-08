@@ -115,12 +115,16 @@ void gte_command(u32 instr);           /* COP2 imm25 operation */
 u32 gte_read_data(int reg);           /* mfc2 / swc2 */
 void gte_write_data(int reg, u32 v);  /* mtc2 / lwc2 */
 u32 gte_read_ctrl(int reg);           /* cfc2 */
+typedef struct { u32 d[32], c[32], flag; } GteState;
+void gte_save(GteState *s);              /* snapshot of all GTE registers */
+void gte_restore(const GteState *s);
 void gte_write_ctrl(int reg, u32 v);  /* ctc2 */
 
 /* ---- GPU (runtime/gpu.c) ------------------------------------------------- */
 
 void gpu_init(void);
 void gpu_write_gp0(u32 v);
+void gpu_shadow_packet(const u32 *w, int n);   /* presentation-only packet (hi-res target only) */
 void gpu_write_gp1(u32 v);
 u32 gpu_read_data(void);              /* GPUREAD 0x1f801810 */
 u32 gpu_read_stat(void);              /* GPUSTAT 0x1f801814 */

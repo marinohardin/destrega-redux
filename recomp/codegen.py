@@ -9,6 +9,13 @@ branch condition / jump target captured first.
 from mips import REG
 
 
+# Widescreen culling patch points (analysis/widescreen_cull.txt, loaded by recomp.py):
+# main-exe `slti` address -> widened immediate. The instruction is emitted as
+# `rs < WS_IMM(orig, wide)`, which is the original comparison unless --widescreen is on.
+WS_PATCHES = {}
+WS_EMITTED = set()
+
+
 def fname(addr, ovl_tag=''):
     return f'f_{addr:08x}{ovl_tag}'
 
@@ -93,6 +100,9 @@ class FuncEmitter:
         if o in ('addi', 'addiu'):
             return setr(i.rt, f'{rs} + {imm}')
         if o == 'slti':
+            if self.ovl_tag == '' and i.addr in WS_PATCHES:
+                WS_EMITTED.add(i.addr)
+                return setr(i.rt, f'(s32){rs} < WS_IMM({imm}, {WS_PATCHES[i.addr]})')
             return setr(i.rt, f'(s32){rs} < {imm}')
         if o == 'sltiu':
             return setr(i.rt, f'{rs} < (u32){imm}')
