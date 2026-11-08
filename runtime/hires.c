@@ -238,9 +238,13 @@ static inline bool tex_combine(const u16 *t, const u32 *w, int n, Tex8 *o)
         if (t[k] & 0x8000) ss += w[k];
     }
     if (cov < 32768) return false;
-    o->r = (int)((sr * 256 + (cov >> 1)) / cov);
-    o->g = (int)((sg * 256 + (cov >> 1)) / cov);
-    o->b = (int)((sb * 256 + (cov >> 1)) / cov);
+    if (cov == 65536) {   /* all taps opaque (the common case): the same rounding as a shift */
+        o->r = (int)((sr + 128) >> 8); o->g = (int)((sg + 128) >> 8); o->b = (int)((sb + 128) >> 8);
+    } else {
+        o->r = (int)((sr * 256 + (cov >> 1)) / cov);
+        o->g = (int)((sg * 256 + (cov >> 1)) / cov);
+        o->b = (int)((sb * 256 + (cov >> 1)) / cov);
+    }
     o->stp = ss * 2 >= cov;
     return true;
 }
@@ -1508,6 +1512,7 @@ static int s_cur_sx, s_cur_sy;               /* render scale (base x ssaa) of th
 static int s_cur_gx;                         /* guard band of the allocated target(s) */
 static int s_cur_fmt, s_cur_ssaa = 1;        /* format / supersampling of the allocated target(s) */
 static int s_cfg_ssaa = 1;                   /* hires_set_ssaa() */
+static int s_cfg_ssaa_cap;                   /* hires_set_ssaa_cap(): max render Sx*Sy, 0 = none */
 static bool s_cfg_full;                      /* hires_set_colour() */
 static int s_pend_fmt;                       /* format for the configure() in progress */
 
@@ -1560,6 +1565,7 @@ void hires_set_colour(bool full) { s_cfg_full = full; }
 bool hires_get_colour(void) { return s_cfg_full; }
 void hires_set_ssaa(int n) { s_cfg_ssaa = n < 1 ? 1 : (n > HIRES_MAX_SSAA ? HIRES_MAX_SSAA : n); }
 int hires_get_ssaa(void) { return s_cfg_ssaa; }
+void hires_set_ssaa_cap(int cap) { s_cfg_ssaa_cap = cap > 0 ? cap : 0; }
 int hires_ssaa(void) { return g_hires ? s_cur_ssaa : 1; }
 int hires_target_fmt(void) { return s_pend_fmt; }
 bool hires_get_render_scale(int *sx, int *sy)
@@ -1577,7 +1583,8 @@ static int ssaa_for(int sx, int sy, int gx)
     for (; n > 1; n--) {
         const s64 w = (s64)(s_cfg_rw + 2 * gx) * sx * n, h = (s64)s_cfg_rh * sy * n;
         if (sx * n <= HIRES_MAX_RENDER_SCALE && sy * n <= HIRES_MAX_RENDER_SCALE && w <= HIRES_MAX_RENDER_DIM &&
-            h <= HIRES_MAX_RENDER_DIM && w * h <= HIRES_MAX_RENDER_PX)
+            h <= HIRES_MAX_RENDER_DIM && w * h <= HIRES_MAX_RENDER_PX &&
+            (!s_cfg_ssaa_cap || sx * n * sy * n <= s_cfg_ssaa_cap))
             break;
     }
     return n;

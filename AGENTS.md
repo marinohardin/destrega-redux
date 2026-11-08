@@ -814,7 +814,11 @@ with every mode on). Options are plain global setters/getters in `hires.h`
 
 - **Defaults**: windowed = `xbr` filter, full-precision colour, and 2x SSAA when the GPU renderer
   is active (1 on software; switching the renderer moves the default along unless `--ssaa` or the
-  menu chose a value). Headless = nearest, 15-bit, no SSAA: every existing test and hash is
+  menu chose a value). The *default* SSAA is capped to a render target of at most 24 hi-res pixels
+  per 1x pixel (`hires_set_ssaa_cap(24)`: render Sx*Sy <= 24, i.e. never beyond 4x6), so it only
+  applies to small windows (base Sx*Sy <= 6 for 2x, e.g. 2x3) and is off at the usual 4x6; an explicit
+  `--ssaa N` or a menu choice is never capped (`hires_set_ssaa_cap(0)`). Reason: 2x SSAA on a 4x6
+  base (8x12, 23.6 M px) costs ~46 ms/frame on the GPU (below). Headless = nearest, 15-bit, no SSAA: every existing test and hash is
   unchanged. `--hires-verify` only runs where it is meaningful (1x1, 15-bit, nearest, no SSAA:
   `hires_verify_possible()`).
 - **Menus / actions** (Mac and Windows View menu; also `--menu-action`): Texture Filtering > Off
@@ -892,7 +896,15 @@ with every mode on). Options are plain global setters/getters in `hires.h`
 - `tools/test_render_quality.sh` (in `run_tests.sh`): compare runs per mode and combined, 4:3 and
   16:9, `--compare-max 0` and 0 differing pixels overall; state hashes with every mode on (software
   and GPU) and with the modes switched live through the menu actions.
-- Measurements: see "Render quality" in the PR and NOTES.md.
+- Measurements (Apple Silicon Mac, machine heavily loaded by other jobs: 1-min load 18-124, so
+  treat as rough; A/B runs back to back, fight frames 3700-4500, `tools/fight_script.py`).
+  Headless 4x6, ms/frame emulation + hi-res: GPU base 12.4, bilinear 13.1, xbr 13.1, full 12.4,
+  2x SSAA (8x12) 46.0, all three 48.4; software (3 threads) base 11.6-12.6, bilinear 47, xbr 46,
+  full 24. The GPU filter cost was ~4x higher before two fast paths (single opaque tap:
+  `(s + 128) >> 8` without the division; bilinear taps with weight 0 are not fetched).
+  Windowed GPU emu + present: 960x720 window (4x6) default 14.1 vs all off 12.4, `--ssaa 2`
+  49.1; 640x480 (3x4) default 10.3, `--ssaa 2` (6x8) 24.6; 1280x720 16:9 (4x6) default 17.6.
+  So explicit 2x SSAA does not hold 60 Hz on this machine at these window sizes, hence the cap.
 
 ## Widescreen (`--widescreen`, default off)
 

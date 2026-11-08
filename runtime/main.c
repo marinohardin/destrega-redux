@@ -1441,7 +1441,7 @@ static void menu_run(const char *name, const char *arg) {
     else if (!strcmp(name, "ssaa")) {   /* View > Anti-aliasing; 1 (off) .. 4, none = toggle off / 2x */
         int n = *arg ? atoi(arg) : (hires_get_ssaa() > 1 ? 1 : 2);
         if (n < 1 || n > HIRES_MAX_SSAA) rt_log("menu: ssaa: 1 (off) to %d", HIRES_MAX_SSAA);
-        else { hires_set_ssaa(n); s_ssaa_chosen = true; view_changed(); }
+        else { hires_set_ssaa(n); hires_set_ssaa_cap(0); s_ssaa_chosen = true; view_changed(); }
     }
     else if (!strcmp(name, "menu-test"))    /* Windows menu bar test hook (menu.h): dump | click=PATH */
         menu_test(arg);
@@ -1720,6 +1720,9 @@ int main(int argc, char **argv) {
     hires_set_tex_filter(s_opt_filter >= 0 ? s_opt_filter : s_headless ? HIRES_TEX_NEAREST : HIRES_TEX_XBR);
     hires_set_colour(s_opt_full >= 0 ? s_opt_full == 1 : !s_headless);
     hires_set_ssaa(s_opt_ssaa >= 1 ? s_opt_ssaa : (!s_headless && s_renderer == R_GPU) ? 2 : 1);
+    /* default SSAA only while the render target costs no more than 4x6 (measured: 4x6 x2 = 8x12
+     * took ~4x the GPU time, far over a 60 Hz frame); an explicit choice is never capped */
+    hires_set_ssaa_cap(s_ssaa_chosen ? 0 : 24);
     rt_log("hires: renderer %s", s_renderer == R_GPU ? "gpu" : s_renderer == R_COMPARE ? "compare" : "software");
     if (s_renderer == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
     else if (s_renderer == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());

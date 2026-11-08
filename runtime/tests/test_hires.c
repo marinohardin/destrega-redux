@@ -633,7 +633,13 @@ static void test_ssaa(void)
     setup(4, 6);   /* 4x6 x 4 = 16x24 > 16 per axis: falls back to x2 (8x12, 4096 x 5760) */
     hires_get_render_scale(&rx, &ry);
     CHECK(hires_ssaa() == 2 && rx == 8 && ry == 12, "ssaa 4 at 4x6: n %d render %dx%d", hires_ssaa(), rx, ry);
+    hires_set_ssaa_cap(24);   /* the frontend's default: no more than a 4x6 target */
     quality(HIRES_TEX_NEAREST, false, 2);
+    setup(2, 3);
+    CHECK(hires_ssaa() == 2, "cap 24: 2x3 x2 = 4x6 allowed, n %d", hires_ssaa());
+    setup(4, 6);
+    CHECK(hires_ssaa() == 1, "cap 24: 4x6 x2 refused, n %d", hires_ssaa());
+    hires_set_ssaa_cap(0);
     setup(1, 1);
     CHECK(!hires_verify_possible(), "verify must be refused with ssaa");
     quality(HIRES_TEX_NEAREST, true, 1);

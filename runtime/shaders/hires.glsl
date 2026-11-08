@@ -191,6 +191,10 @@ bool tcomb(uint t[5], uint w[5], int n, out ivec4 o)
     }
     o = ivec4(0);
     if (cov < 32768u) return false;
+    if (cov == 65536u) {   /* all taps opaque: the same rounding as a shift */
+        o = ivec4(int((sr + 128u) >> 8), int((sg + 128u) >> 8), int((sb + 128u) >> 8), ss * 2u >= cov ? 1 : 0);
+        return true;
+    }
     o = ivec4(int((sr * 256u + (cov >> 1)) / cov), int((sg * 256u + (cov >> 1)) / cov), int((sb * 256u + (cov >> 1)) / cov),
               ss * 2u >= cov ? 1 : 0);
     return true;
@@ -203,8 +207,10 @@ bool samp_filt(uint pi, uint depth, bool xbr, int iu, int fu, int iv, int fv, in
     int n;
     if (!xbr) {
         int iu1 = iu < uhi ? iu + 1 : uhi, iv1 = iv < vhi ? iv + 1 : vhi;
-        t[0] = tex_fetch(pi, depth, uint(iu), uint(iv)); t[1] = tex_fetch(pi, depth, uint(iu1), uint(iv));
-        t[2] = tex_fetch(pi, depth, uint(iu), uint(iv1)); t[3] = tex_fetch(pi, depth, uint(iu1), uint(iv1));
+        t[0] = tex_fetch(pi, depth, uint(iu), uint(iv));   /* taps with weight 0 are not fetched */
+        if (fu != 0) t[1] = tex_fetch(pi, depth, uint(iu1), uint(iv));
+        if (fv != 0) t[2] = tex_fetch(pi, depth, uint(iu), uint(iv1));
+        if (fu != 0 && fv != 0) t[3] = tex_fetch(pi, depth, uint(iu1), uint(iv1));
         w[0] = uint((256 - fu) * (256 - fv)); w[1] = uint(fu * (256 - fv)); w[2] = uint((256 - fu) * fv); w[3] = uint(fu * fv);
         n = 4;
     } else {

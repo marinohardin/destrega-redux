@@ -209,6 +209,10 @@ bool hires_get_colour(void);
 #define HIRES_MAX_RENDER_PX (34 * 1024 * 1024)
 void hires_set_ssaa(int n);
 int hires_get_ssaa(void);
+/* Optional cost cap (0 = none): the factor is also lowered until render Sx * render Sy <= cap.
+ * The frontend's default SSAA uses 24 (= 4x6, the cost of the default 4x6 target), so the
+ * default only supersamples small targets; an explicit --ssaa / menu choice sets 0. */
+void hires_set_ssaa_cap(int cap);
 int hires_ssaa(void);
 /* Reallocate the target now at the same base scale (after a setting above changed). */
 bool hires_reconfigure(void);
