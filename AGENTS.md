@@ -53,6 +53,66 @@ Pillow, NumPy and macOS's Herculanum font). Never put game-derived art in the
 repo. Launching the bundle's binary from a non-GUI shell can stall in macOS's
 first-launch check; test it from Finder/`open`, or use the plain binary.
 
+### Windows and Linux
+
+Same CMake project; the compiler must be **clang or GCC** (the runtime uses `__int128`,
+`__builtin_*`, `always_inline`, inline `asm` hints; MSVC/clang-cl are not supported). Needs
+SDL **3.4+** (`SDL_CreateGPURenderer(device, window)`), zlib, Python 3 and the disc as on macOS.
+
+- **Windows**: MSYS2, environment **CLANG64** (`pacman -S mingw-w64-clang-x86_64-{clang,cmake,ninja,
+  pkgconf,python,sdl3,zlib}`), then the same `cmake -S . -B build/cmake -G Ninja && cmake --build
+  build/cmake` from the CLANG64 shell; run `build/cmake/destrega.exe` with `clang64/bin` (SDL3.dll,
+  zlib1.dll) on `PATH` or the DLLs copied next to it. Console-subsystem executable (logs on
+  stdout/stderr). `runtime/win/destrega.rc` embeds a manifest with the UTF-8 code page (fopen/rename
+  take the UTF-8 paths SDL gives, e.g. a non-ASCII user folder), and the main thread gets a 16 MiB
+  stack (`--stack`; Windows' default is 1 MiB, macOS/Linux give 8). Data pack and cards live in
+  `%APPDATA%\Destrega\` (SDL's pref path). Load Game Image restarts by `CreateProcess` + wait +
+  exit with the child's code (`plat_exec`), so a waiting caller sees the restarted run.
+- **Linux**: any distribution with SDL 3.4 (or build SDL from source, as CI does); data in
+  `~/.local/share/Destrega/`. GCC and clang both build the runtime; clang is the one tested on
+  the generated code.
+- Platform differences live in `runtime/platform.[ch]` (file replace via `MoveFileEx`, `fsync`/
+  `_commit`, `realpath`/`_fullpath`, `setenv`/`_putenv_s`, exec, executable path, thread CPU time,
+  performance-core count, the hi-res worker pool's threads: pthreads or Win32 SRW locks +
+  condition variables, the monotonic clock / sleep, the host call chain for save states:
+  `backtrace` / `CaptureStackBackTrace`) and `runtime/platform_net.c` (this machine's IPv4
+  addresses for Host Game: `getifaddrs` / `GetAdaptersAddresses`; separate so the unit tests that
+  link platform.c need no socket libraries). Sockets stay in `net.c` (BSD sockets / Winsock; on
+  Windows created with `WSA_FLAG_NO_HANDLE_INHERIT`: `SetHandleInformation` on a bound socket
+  made it receive nothing under Wine). `\` is a path separator on Windows (cue -> bin, folders).
+  Native menus on macOS (`menu_mac.m`) and Windows (`menu_win.c`, see "Application menus"); Linux
+  has none (`menu_stub.c`). Alt+Enter/F11 full screen and F9 widescreen work everywhere.
+- GPU renderer: Vulkan (SPIR-V) on both, the windowed default when a device exists, else software
+  (see "GPU renderer"). `--renderer` works everywhere; View > Renderer on macOS and Windows.
+- **Cross-compiling the Windows exe** (macOS or Linux, MinGW-w64 GCC: Homebrew `mingw-w64`):
+  `cmake -S . -B build/win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
+  -DCMAKE_PREFIX_PATH=<prefix>` where `<prefix>` holds SDL3 and zlib built for
+  `x86_64-w64-mingw32` (SDL's `SDL3-devel-*-mingw` release, or SDL/zlib from source configured
+  with the same toolchain file), then copy `<prefix>/bin/SDL3.dll` next to `build/win/destrega.exe`.
+  With MinGW GCC the exe links `-static` (GCC's `_Thread_local` uses emutls on libwinpthread),
+  so it needs only SDL3.dll plus the system UCRT. (A minimal zlib without the `gz*` file API is
+  enough: replays are read with `inflate`, `replay.c read_maybe_gz`.) GCC builds the generated code fine (`__int128`
+  included); it evaluates function arguments in a different order than clang, which once broke
+  `--state-hash` (`f(p(&n), n)`: keep such calls in separate statements).
+- **Wine / CrossOver**: `tools/test_netplay_wine.py` plays netplay between the native and the Windows build
+  (see "Rollback netplay"); `tools/test_wine.sh` runs the same headless boot-to-fight (`--no-interp
+  --verify-overrides`) natively and under Wine and requires identical per-frame state hashes
+  and dumped frames (`WINE=` the wine command, `WINE_ARGS=` its options; CrossOver:
+  `WINE=".../CrossOver-Hosted Application/wine" WINE_ARGS="--bottle destrega-test --no-gui"`, a
+  dedicated bottle made with `cxbottle --bottle destrega-test --create --template win10_64`).
+  Passes with CrossOver 26 (x86-64 under Rosetta): 4000/4000 frames identical at 1x and at 4x6 widescreen
+  with `--hires-threads 6` (Win32 worker pool), frames dumped at 4x6 byte-identical too. Windowed under CrossOver works with the software renderer; its SDL_GPU
+  Vulkan device (MoltenVK 1.2.10 via winevulkan) reports conformance version 0.0.0.0, and SDL
+  rejects non-conformant Vulkan drivers, so the GPU renderer falls back to software there.
+  `--state-hash`/`--gameplay-trace` files are written in binary mode (LF) on every platform.
+- Not verified on a real Windows/Linux machine with the game: there is no disc in CI. CI
+  (`.github/workflows/build.yml`) builds everything except the generated code: configure with
+  `-DDESTREGA_STUB_GEN=ON` to link the runtime against `tools/ci/stub_gen` (empty function table,
+  stubs that exit) and `-DDESTREGA_TESTS=ON` for the CTest unit tests; the executable then starts,
+  parses options and fails with "no data pack". Windows CI: MSYS2 CLANG64, no Vulkan driver (the
+  GPU test checks it is refused cleanly). Linux CI: gcc and clang, the GPU test on Mesa lavapipe
+  under Xvfb, and `tools/gen_spirv.py --check`.
+
 The main-exe REA export is `analysis/rea_list_procedures_main.json` (MCP
 `list_procedures`); a reusable REA snapshot is `analysis/SLUS_007.32.rea-snapshot`
 (`open_binary` with `snapshot_path`). REA's Ghidra MIPS lane only admits
@@ -141,6 +201,13 @@ Right 0x20, Down 0x40, Left 0x80, L2 0x100, R2 0x200, L1 0x400, R1 0x800,
 Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
 `--press2 F:MASK,...` is the same for pad 2 (VS mode waits for it). Presses are taps (held 6 frames).
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
+
+GPU backend checks: `run_tests.sh` also builds `runtime/tests/test_hires_gpu.c` (GPU vs software
+on random command streams, no disc needed) and runs it on the default driver (`gpu-auto`, Metal
+on macOS) and on Vulkan (`gpu-vulkan`: MoltenVK; "skipped" when there is no Vulkan loader). The
+full-game Vulkan compare matrix is `tools/test_vulkan.sh` (a few minutes; not in run_tests.sh).
+CI (`.github/workflows/build.yml`, Windows + Linux, no disc) runs the module unit tests and
+`test_hires_gpu` through CTest; see "Windows and Linux".
 
 ### Scenario library (`tools/scenarios.py`)
 
@@ -258,9 +325,10 @@ Complete snapshots of the emulated machine, taken and restored only at the frame
 GGPO-style rollback on top of save states, two peers, UDP. Started from the **Netplay** menu
 (below) or the command line.
 
-- **Netplay menu** (macOS, `menu_mac.m`; top level, after View): Host Game… (port, default 7000,
-  and input delay, default 2, both remembered in NSUserDefaults; the dialog lists this computer's
-  IPv4 addresses, `net_local_addresses`), Join Game… (address:port, remembered, and delay),
+- **Netplay menu** (macOS `menu_mac.m` and Windows `menu_win.c`; top level, after View): Host
+  Game… (port, default 7000, and input delay, default 2, both remembered: NSUserDefaults on the
+  Mac, `HKCU\Software\Destrega\Netplay` on Windows; the dialog lists this computer's IPv4
+  addresses, `plat_local_ipv4`), Join Game… (address:port, remembered, and delay),
   Disconnect (enabled while a session or an attempt runs), and a disabled status line
   (`netplay_status_text`: Not connected / Waiting for an opponent on port N / Connecting to X /
   Connected to X, ping N ms / Desync at frame F). While hosting or connecting a small non-modal
@@ -270,7 +338,8 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
 - **Synchronised start = fresh boot on both sides.** The game is already running when someone
   picks Host / Join, so the two machines differ. A short lobby exchange runs between frames
   (`lobby_poll`, packet types 5-7): the joiner sends a hello every 200 ms, the host checks the
-  same identity as the session handshake (protocol, disc, build, rollback window) and either
+  same identity as the session handshake (protocol, disc, game code, emulation sources, rollback
+  window) and either
   refuses with a plain-language reason (the joiner gets an alert; the host keeps waiting) or
   welcomes with the agreed delay (the larger of the two). Then both re-execute themselves
   (`frontend_restart_with` in main.c, the same clean restart as Load Game Image) with `--host` /
@@ -294,8 +363,22 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   frontend puts into pad 1 (keyboard, gamepad, `--press`); netplay writes both pads at the end of
   every vblank (`netplay_vblank_end`, from `ss_vblank_end`). Handshake: the joiner sends hello until
   the host answers; both check protocol version, disc identity (SLUS_007.32 CRC + sector count),
-  build identity (recompiled-function table hash) and equal `--net-delay` / `--net-window`, and
-  refuse otherwise. `--net-port` picks the joiner's local port.
+  build identity and equal `--net-delay` / `--net-window`, and refuse otherwise. `--net-port`
+  picks the joiner's local port.
+- **Build identity = game code + emulation sources, never the platform** (protocol 2). Two hashes:
+  the recompiled-code table (`replay_build_id`: each recompiled function's address, overlay, bounds
+  and the hash of its original MIPS bytes, so "which game code runs natively") and
+  `DESTREGA_SOURCE_IDENT` (`tools/source_ident.py`, generated into the build directory by CMake):
+  a hash of the emulation runtime (`runtime/*.c|h`, `runtime/overrides/`), the recompiler
+  (`recomp/*.py`) and its analysis inputs (seeds, overrides, procedure / overlay lists), line
+  endings normalised. Left out: what only one platform compiles or what is presentation-only and
+  proven not to reach emulated state (menus, `platform*.c|h`, `hires*.c|h`, shaders, Windows
+  resources), plus tools / tests / docs. No compiler, OS or build type: the Mac (clang) and Windows
+  (MinGW GCC) builds of the same commit have identical per-frame state hashes (`test_wine.sh`), so
+  they emulate the same machine and must be allowed to play; any source change that could alter
+  emulation is refused even if it looks harmless (both players update). The refusal is the
+  plain-language "the two players run different versions of Destrega" with both ids.
+  `--net-test-ident build=HEX|source=HEX` fakes a difference for tests.
 - **Frames are vblanks (60 Hz)**, not game updates: inputs, packets, delay and window are counted
   in vblanks (the game polls the pad per vblank in menus, and fights only run every second one, so
   60 Hz is the only clock that covers both). Local input sampled at the end of frame F is used for
@@ -358,13 +441,32 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   "opponent left" alert, both keep playing offline to `--frames`) and `menu_fail` (a host with a
   different rollback window refuses with a reason, an unanswered join times out with an alert, all
   three keep playing offline, nobody restarts).
+- **Mac <-> Windows** (`tools/test_netplay_wine.py`, in `run_tests.sh`; skipped with a message
+  when Wine, `build/win/destrega.exe` + `SDL3.dll` or the data pack is missing): the native build
+  and the Windows build under Wine (`WINE`, `WINE_ARGS`, `WIN_EXE`, `PAK`; default CrossOver's wine
+  with `--bottle destrega-test --no-gui`) over loopback, started with the menu actions
+  (`netplay-host` / `netplay-join`) in both directions: `mac_hosts`, `win_hosts`, and both again
+  with a lossy link (`--net-sim 15:10:5:5`: 15 ms + 10 jitter, 5% loss, 5% reorder each way). Each
+  plays the VS fight of a replay script, disconnects and continues offline; every confirmed
+  frame's hash must match on both peers **and** an offline native run. `ident`: a Windows host
+  claiming other emulation sources refuses the Mac joiner with the alert. Pace 120 Hz (2x real
+  time; headless Wine runs ~1.3 ms/frame, so Wine is not the bottleneck there). Offline frames are
+  not paced, so the script starts the Wine peer first and the native one once Wine is hosting /
+  joining (Wine needs 2-3 s to start). ~3.5 min. `--windowed` runs both peers windowed at 60 Hz
+  with real audio output (slow under Wine, not in `run_tests.sh`; alerts are logged instead of
+  shown with `DESTREGA_TEST_NO_ALERTS=1`): the check that the windowed audio top-up stays off in a
+  session (`ss_deterministic_audio()`, set by `netplay.c start()` on every platform, which a
+  menu-started session also runs after its restart).
+- Windows specifics: the menu restart is `plat_exec` = `CreateProcess` + wait + exit with the
+  child's code, so the parent process stays alive meanwhile; its socket is closed before (and not
+  inheritable), so the child can bind the same port.
 - Not done / not verified: NAT traversal or a server-assisted lobby (direct UDP only: the host
-  forwards the port over the internet), spectators, Windows / Linux menus (the actions work there),
-  Windows (`net.c` has Winsock code, untested; `net_local_addresses` returns nothing there), the
-  Mac dialogs, panel and greyed-out items by hand (compiled; two windowed processes were driven
-  through the same actions with `--menu-action`), windowed-vs-windowed play by two people (tested: windowed host + headless joiner).
+  forwards the port over the internet), spectators, Linux menus (the actions work there), a real
+  Windows machine (only Wine), the Mac dialogs, panel and greyed-out items by hand (compiled; two
+  windowed processes were driven through the same actions with `--menu-action`),
+  windowed-vs-windowed play by two people.
 
-## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
+## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_win.c`, `menu_stub.c`, `main.c`)
 
 macOS gets a native **File** menu inserted after the app menu (SDL3 keeps building the standard
 app/Window menus; Quit still works). `menu_mac.m` (Cocoa, ARC, Apple only; `menu_stub.c` no-ops
@@ -406,7 +508,8 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
   `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`,
-  `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`. Headless: no dialogs (the file argument is
+  `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`,
+  `menu-test=dump|click=PATH` (Windows, windowed). Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
   unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
   Log lines start with `menu:`; errors with `menu: ERROR:`.
@@ -414,7 +517,30 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   with state hash equal to a plain run on that pack, 9 rejection cases, save import with backup (the game
   really loads the imported save: ROUND COUNT byte), export, delete, invalid files. It rebuilds
   a disc image from the pack with `tools/pak_to_bin.py` when `Destrega/Destrega.cue` is absent.
-- Not done: saves other than the game's own file, Windows/Linux menus.
+- **Windows** (`menu_win.c`): a Win32 menu bar on SDL's window (`SDL_PROP_WINDOW_WIN32_HWND_POINTER`),
+  same items and rules: **File** (Load Game Image…, Show Game Files in Explorer, Save Games > Show
+  Save Games in Explorer / Import / Export / Delete, Exit), **View** (Widescreen (16:9) with check
+  mark, Renderer > Software / GPU, Enter / Exit Full Screen), **Netplay** (Host Game…, Join Game…,
+  Disconnect, status line). The window procedure is subclassed: `WM_COMMAND` queues the action,
+  `WM_INITMENUPOPUP` updates check marks, titles, the status line and greys out refused items
+  (`frontend_menu_action_allowed`, as `validateMenuItem` on the Mac). SDL sizes the window by its
+  client area and accounts for the menu bar, so the picture keeps its size; full screen covers the
+  bar. Host / Join are a small modal form built in code (no resource script; values in
+  `HKCU\Software\Destrega\Netplay`), the waiting panel a modeless window with Cancel (queues
+  `netplay-disconnect`); file dialogs and alerts are SDL's (native). Explorer: `ShellExecuteW`
+  (folder) / `explorer /select,`. No keyboard shortcuts besides Alt+Enter / F11 / F9 (SDL keeps
+  Alt from opening the menu bar). The UI text never says "memory card" or console names, as on the
+  Mac.
+- Test hook `menu-test` (Windows): `--menu-action F:menu-test=dump` logs every item with
+  `[greyed]` / `[checked]` after the same update a menu opening does; `menu-test=click=Netplay/Host
+  Game…` posts that item's `WM_COMMAND` like a click. `DESTREGA_MENU_AUTOTEST=1` accepts the Host /
+  Join form after 0.7 s with the remembered values, `=2` cancels it after 3 s. Verified under
+  CrossOver (windowed): the dump before / during hosting / after Disconnect (Host and Join greyed
+  and Disconnect enabled while waiting, status "Waiting for an opponent on port N"), widescreen
+  check mark, full screen in and out (title follows), Exit, both forms (screenshots), the panel.
+  On macOS and Linux `menu-test` logs that it is not available.
+- Not done: saves other than the game's own file, Linux menus, the Windows menus clicked by a
+  person (only driven through `menu-test` under Wine), a real Windows machine.
 
 ## High-resolution rendering (`runtime/hires.[ch]`)
 
@@ -557,15 +683,52 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   15.2 with `on`. Tracking alone costs nothing measurable.
 ## GPU renderer (`runtime/hires_gpu.[ch]`, `--renderer gpu`)
 
-A second `HiresBackend` on SDL3's SDL_GPU (Metal, MSL shaders embedded in the C file). Same
+A second `HiresBackend` on SDL3's SDL_GPU: **Metal** (MSL source embedded in the C file) or
+**Vulkan** (SPIR-V, Windows/Linux, and macOS through MoltenVK). Same
 contract as the software backend: commands in, target out, presentation only. It is
 **bit-identical to the software backend** at every scale tested (1x1, 2x3, 4x6, 8x8 over a
 7000-frame fight run) and to the 1x VRAM at 1x1 (with `--pgxp off`; for `on` see the PGXP
 section). Keep it that way: a rule change in `hires.c`
-needs the same change in the shader. The header comment of `hires_gpu.c` has the details.
+needs the same change in **both** shaders (MSL in `hires_gpu.c`, GLSL in `runtime/shaders/hires.glsl`).
+The header comment of `hires_gpu.c` has the details.
 
-- `--renderer software|gpu|compare`. Default: **gpu in a macOS window** (if the SDL GPU renderer
-  or the backend cannot be created: `hires-gpu: GPU renderer unavailable ...` and software),
+- **Shaders / drivers.** One backend, two shader sources selected by `SDL_GetGPUShaderFormats`:
+  MSL (Metal) as before, and `runtime/shaders/hires.glsl` (Vulkan GLSL 450, the same functions
+  line for line) compiled by `python3 tools/gen_spirv.py` (glslangValidator, `spirv-val`) into
+  the checked-in `runtime/shaders/hires_spirv.h` (generated bytecode, regenerate after editing
+  the GLSL; `--check` only compiles and validates, as CI does). No shader compiler is needed to
+  build. Not done: DXIL/D3D12 (the device is created with MSL|SPIR-V only, so SDL never picks
+  D3D12; a Windows machine without a Vulkan driver gets software).
+- **64-bit integers on Vulkan**: `shaderInt64` is an optional Vulkan feature and SDL_GPU does not
+  enable it, so the GLSL keeps every 64-bit value as a `uvec2` (lo, hi) with exact wrapping
+  add/sub/multiply (`uaddCarry`, `usubBorrow`, `umulExtended`, `imulExtended`: core SPIR-V). The
+  three 64-bit divisions of the MSL are exact without a divide: the plane-equation fraction is split
+  off into a 0/1 carry test, span edges and the perspective division use a float estimate corrected
+  by integer multiplies, `(U1-U0)/n` (n <= 8) is a 16-bit long division. Signed 32-bit `/` and `%`
+  on negative values are avoided too (GLSL leaves them loose): `floordiv`/`tdiv` work on magnitudes.
+- **Edge rule on Vulkan**: Vulkan does not fix the rasterizer's tie-break for pixel centres exactly
+  on an edge (Metal/D3D use top-left, which the integer path relies on), so with SPIR-V every
+  triangle takes the exact shader edge test (F_EDGE: the triangle grown by 1 px, or its bbox for
+  slivers). `DESTREGA_GPU_EDGE=0|1` overrides it (experiments; on MoltenVK both give 0 diffs).
+- `--gpu-driver auto|metal|vulkan` (also for headless/compare): auto = Metal on macOS, Vulkan
+  elsewhere. On macOS `vulkan` loads MoltenVK through the Vulkan loader; SDL only searches the
+  default library paths, so `hires_gpu.c` sets `SDL_VULKAN_LIBRARY` to Homebrew's
+  `libvulkan.1.dylib` (`brew install vulkan-loader molten-vk`) unless already set. The windowed
+  GPU renderer is created on the backend's own device (`hires_gpu_create_device` +
+  `SDL_CreateGPURenderer(dev, win)`), so its driver is the one the shaders exist for.
+- Vulkan results (MoltenVK on Apple Silicon, 7000-frame fight, every 10th frame compared,
+  `tools/test_vulkan.sh`): `--pgxp off` 0 differing pixels at 2x2 and 4x6, 4:3 and 16:9; `affine`
+  0 at 4x6; `on` 24 (4:3) and 31 (16:9) pixels over 331 fight frames at 4x6 (Metal: 24 / 28; limit
+  `CMP_MAX_PGXP`). `runtime/tests/test_hires_gpu.c` (random GP0 streams through gpu.c in compare
+  mode: all polygon/rect/line kinds, semi modes 1-3, texture windows, dither, fills, uploads,
+  copies, plus PGXP packets; 1x1/2x2/3x2/4x6, with and without the guard band): 0 differing pixels
+  on Metal and on MoltenVK; it found a deliberately broken edge rule at every scale. Not run on a
+  native Vulkan driver (NVIDIA/AMD/Intel) or D3D12: that, and the semi-transparency blend rounding
+  on other hardware (UNORM5 blending precision is implementation-defined), are unverified.
+
+- `--renderer software|gpu|compare`. Default: **gpu in a window** on every platform (if no device
+  with MSL or SPIR-V shaders and a B5G5R5A1 render target exists, or the SDL GPU renderer or the
+  backend cannot be created: `hires-gpu: GPU renderer unavailable ...` and software),
   software headless (the tests' reference). `--renderer software` forces software and the
   plain SDL renderer (no live switch to GPU then). **View > Renderer > Software / GPU**
   (radio check marks; menu action `renderer[=software|gpu|compare]`, no argument toggles)
@@ -576,13 +739,13 @@ needs the same change in the shader. The header comment of `hires_gpu.c` has the
   both back: `hires-compare:` lines at exit (all / fight frames, pixels differing, by >1 step,
   mask-bit only, worst frame); `--compare-max PCT` exits 6 if a fight frame differs more.
   Headless works (own device, needs `SDL_InitSubSystem(VIDEO)` with the default driver; the
-  `offscreen` driver has no GPU backend). Without Metal it logs `GPU renderer unavailable` and
-  uses software. Windowed it presents straight from the GPU texture (SDL GPU renderer +
+  `offscreen` driver has no GPU backend). Without a usable device it logs `GPU renderer
+  unavailable` and uses software. Windowed it presents straight from the GPU texture (SDL GPU renderer +
   `SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER`); readback only for `--dump`, `--hires-verify`
   and compare (`HiresBackend.read`).
 - Exactness: target B5G5R5A1 (shader writes PS1 red into `.b` = the low 5 bits, so the download
   is raw PS1 u16, alpha = mask bit). Attributes are the 1x plane equations evaluated as exact
-  rationals in 64-bit integers per pixel (Metal supports `long`). Semi modes are fixed-function
+  rationals in 64-bit integers per pixel (Metal `long`; emulated with 32-bit pairs on Vulkan). Semi modes are fixed-function
   blends (B/2+F/2 via constant 0.5 and F/2-1/4; see the file comment for the one F=0 tie case).
   Triangles with a vertex outside the target are drawn as their clipped bbox with an exact
   edge test in the shader: GPU clipping produces inexact vertices that flip shared-edge
@@ -600,8 +763,8 @@ needs the same change in the shader. The header comment of `hires_gpu.c` has the
   emu 1.3 ms + present 6.6 ms per frame.
 - Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
   mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
-  chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), MSL only
-  (no SPIR-V/DXIL), no `--hires-threads` (n/a).
+  chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), no DXIL
+  (D3D12), no `--hires-threads` (n/a).
 - Widescreen guard band: supported (`set_guard`): `s_ox` is negative with the default region
   at x = 0, so the clip rectangle's x is packed signed, the shader's 1x column uses floor
   division and the 32x32 tile masks are shifted by the guard width. Guard-band-only packets

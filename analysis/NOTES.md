@@ -290,6 +290,18 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
   frame is not black/flat. The fingerprints were recorded after looking at the key frames
   (`scenarios.py record`); if the game flow legitimately changes, re-record and re-look.
 
+- Vulkan renderer (Windows/Linux port; verified on MoltenVK with `tools/test_vulkan.sh`): the
+  7000-frame fight path gives the same Vulkan-vs-software results as Metal (0 differing pixels with
+  `--pgxp off` at 2x2 and 4x6, 4:3 and 16:9). So every fight-frame primitive kind the game sends
+  (list above) is covered by the GLSL port. The port learned nothing new about the game's own
+  code; no addresses were added to `symbols.txt`.
+- Windows build under Wine (`tools/test_wine.sh`, MinGW GCC cross build, CrossOver 26):
+  `verified` that the boot-to-fight state hash matches macOS for every frame (4000/4000, at 1x and
+  at 4x6 widescreen) with `--no-interp`. So the IRQ path (libetc `setjmp` at 0x8009b8bc resumed at
+  0x8009b924 on every interrupt, `ReturnFromException` = C `longjmp` through recompiled frames)
+  works with MinGW's setjmp/longjmp on Win64. It also shows that GCC-compiled generated code
+  behaves the same as clang-compiled code.
+
 ## Save states and the snapshot-safe point (runtime/savestate.c)
 
 - **Where emulated state lives** (verified: `--savestate-rewind` over every scenario, every re-run
@@ -350,6 +362,13 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
   (fight emulation ~0.9 ms/vblank + a snapshot ~0.1 ms + restore once per rollback ~0.2 ms); avg
   2.5-8 ms per rollback, max ~12 ms at 20 ms one-way latency with jitter. At 60 Hz that fits in a
   frame with the default window of 8 vblanks.
+
+- Netplay between the macOS build and the Windows build under Wine (`tools/test_netplay_wine.py`,
+  CrossOver 26): `verified` that every confirmed frame's gameplay hash (and the full state hash every
+  30 frames) is identical on a clang/arm64 peer and a MinGW-GCC/x86-64 peer and equal to an offline
+  run, through a VS fight with rollbacks over a lossy simulated link, in both host directions. So
+  rollback (snapshot restore at a matching host call chain) works the same on both hosts. Nothing new
+  about the game's own code; no addresses added to `symbols.txt`.
 
 ## Cleanup priority (readable C / overrides)
 

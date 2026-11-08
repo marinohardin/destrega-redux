@@ -28,12 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#if defined(_WIN32)
-#include <windows.h>
-#elif defined(__APPLE__) || defined(__GLIBC__)
-#include <execinfo.h>
-#define HAVE_BACKTRACE 1
-#endif
+#include "platform.h"
 
 int g_ss_unsafe;
 bool rt_in_exception(void);
@@ -80,18 +75,7 @@ static void hash_ram_chunks(u64 out[RAM_CHUNKS]) {
     for (int i = 0; i < RAM_CHUNKS; i++) out[i] = ss_hash_bytes(0, g_ram + (size_t)i * 65536, 65536);
 }
 
-static u64 now_ns(void) {
-#if defined(_WIN32)
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (u64)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
-#endif
-}
+static u64 now_ns(void) { return plat_mono_ns(); }
 
 /* ---- host context ------------------------------------------------------------------- */
 
@@ -105,13 +89,7 @@ static u32 callstack_hash(void) {
 }
 
 __attribute__((noinline)) static void capture_ctx(HostCtx *c) {
-#if defined(_WIN32)
-    c->n = CaptureStackBackTrace(1, 64, c->pc, NULL);
-#elif defined(HAVE_BACKTRACE)
-    c->n = (u32)backtrace(c->pc, 64);
-#else
-    c->n = 0;
-#endif
+    c->n = (u32)plat_backtrace(c->pc, 64);
     c->sp = __builtin_frame_address(0);
     c->depth = g_depth;
     c->cs_hash = callstack_hash();

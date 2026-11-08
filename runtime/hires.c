@@ -25,14 +25,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdatomic.h>
-#ifndef _WIN32
-#include <pthread.h>
-#include <unistd.h>
-#ifdef __APPLE__
-#include <pthread/qos.h>
-#include <sys/sysctl.h>
-#endif
-#endif
+#include "platform.h"
 
 #define VRAM_W 1024
 #define VRAM_H 512
@@ -235,7 +228,6 @@ u64 hires_epoch(void) { return s_epoch; }
 bool hires_dirty_rows(int y0, int y1) { return s_dirty_y1 >= y0 && s_dirty_y0 < y1; }
 void hires_clear_dirty(void) { s_dirty_y0 = 1 << 30; s_dirty_y1 = -1; }
 
-#ifndef _WIN32
 #define HIRES_MAX_THREADS 15
 #define RING 64
 #define SPIN_ITERS 40000
@@ -249,23 +241,16 @@ typedef struct {
 } PoolJob;
 
 static struct {
-    pthread_t th[HIRES_MAX_THREADS];
+    plat_thread th[HIRES_MAX_THREADS];
     int nth;
     PoolJob ring[RING];
     atomic_uint gen;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    plat_mutex mu;
+    plat_cond cv;
     atomic_bool quit;
-} P = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+} P = { .mu = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT };
 
-static inline void cpu_relax(void)
-{
-#if defined(__aarch64__)
-    __asm__ volatile("yield");
-#elif defined(__x86_64__)
-    __asm__ volatile("pause");
-#endif
-}
+static inline void cpu_relax(void) { plat_cpu_relax(); }
 
 /* Claim and run chunks of job `g`. Safe against stale workers: a chunk can only be claimed
  * while the slot still holds job g (tag in the counter), and a claimed chunk keeps the
@@ -292,22 +277,20 @@ static void run_chunks(unsigned g)
     }
 }
 
-static void *worker_main(void *arg)
+static void worker_main(void *arg)
 {
     (void)arg;
-#ifdef __APPLE__
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
+    plat_thread_boost();
     unsigned seen = atomic_load(&P.gen);
     for (;;) {
         unsigned g;
         long spins = 0;
         while ((g = atomic_load_explicit(&P.gen, memory_order_acquire)) == seen) {
-            if (atomic_load_explicit(&P.quit, memory_order_relaxed)) return NULL;
+            if (atomic_load_explicit(&P.quit, memory_order_relaxed)) return;
             if (++spins < SPIN_ITERS) { cpu_relax(); continue; }
-            pthread_mutex_lock(&P.mu);
-            while (atomic_load(&P.gen) == seen && !atomic_load(&P.quit)) pthread_cond_wait(&P.cv, &P.mu);
-            pthread_mutex_unlock(&P.mu);
+            plat_mutex_lock(&P.mu);
+            while (atomic_load(&P.gen) == seen && !atomic_load(&P.quit)) plat_cond_wait(&P.cv, &P.mu);
+            plat_mutex_unlock(&P.mu);
             spins = 0;
         }
         /* process every job published since we last looked (the latest is normally the only
@@ -320,32 +303,24 @@ static void *worker_main(void *arg)
 static void stop_workers(void)
 {
     if (!P.nth) return;
-    pthread_mutex_lock(&P.mu);
+    plat_mutex_lock(&P.mu);
     atomic_store(&P.quit, true);
-    pthread_cond_broadcast(&P.cv);
-    pthread_mutex_unlock(&P.mu);
-    for (int i = 0; i < P.nth; i++) pthread_join(P.th[i], NULL);
+    plat_cond_broadcast(&P.cv);
+    plat_mutex_unlock(&P.mu);
+    for (int i = 0; i < P.nth; i++) plat_thread_join(P.th[i]);
     P.nth = 0;
     atomic_store(&P.quit, false);
 }
 
 void hires_set_threads(int n)
 {
-    if (n < 0) {   /* auto: performance cores - 1 */
-        long cores = 0;
-#ifdef __APPLE__
-        int v = 0; size_t sz = sizeof v;
-        if (sysctlbyname("hw.perflevel0.logicalcpu", &v, &sz, NULL, 0) == 0) cores = v;
-#endif
-        if (cores <= 0) cores = sysconf(_SC_NPROCESSORS_ONLN);
-        n = (int)cores - 1;
-    }
+    if (n < 0) n = plat_perf_cpus() - 1;   /* auto: performance cores - 1 */
     if (n > HIRES_MAX_THREADS) n = HIRES_MAX_THREADS;
     if (n < 0) n = 0;
     if (n == P.nth) return;
     stop_workers();
     for (int i = 0; i < n; i++)
-        if (pthread_create(&P.th[i], NULL, worker_main, NULL) != 0) break;
+        if (!plat_thread_start(&P.th[i], worker_main, NULL)) break;
         else P.nth++;
 }
 
@@ -366,18 +341,13 @@ static void par_rows(BandFn fn, const void *ctx, int ylo, int yhi)
     /* the last chunk may extend past yhi: BandFn implementations clip to their own bounds */
     atomic_store_explicit(&j->done, 0, memory_order_relaxed);
     atomic_store_explicit(&j->ctr, (u64)g << 32, memory_order_release);
-    pthread_mutex_lock(&P.mu);
+    plat_mutex_lock(&P.mu);
     atomic_store_explicit(&P.gen, g, memory_order_release);
-    pthread_cond_broadcast(&P.cv);
-    pthread_mutex_unlock(&P.mu);
+    plat_cond_broadcast(&P.cv);
+    plat_mutex_unlock(&P.mu);
     run_chunks(g);
     while (atomic_load_explicit(&j->done, memory_order_acquire) != nchunks) cpu_relax();
 }
-#else
-void hires_set_threads(int n) { (void)n; }
-int hires_threads(void) { return 0; }
-static void par_rows(BandFn fn, const void *ctx, int ylo, int yhi) { fn(ctx, ylo, yhi); flush_counters(); }
-#endif
 
 typedef struct { void (*fn)(void *, int, int); void *ctx; } UserJob;
 static void user_band(const void *c, int y0, int y1)

@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "source_ident.h"   /* DESTREGA_SOURCE_IDENT (tools/source_ident.py, generated) */
 
 u64 gameplay_hash(void);                    /* replay.c */
 u32 replay_build_id(void);
@@ -59,7 +60,7 @@ void replay_field_str(int k, u32 v, char *b, size_t n);
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_BYE = 4,
        PKT_LOBBY_HELLO = 5, PKT_LOBBY_WELCOME = 6, PKT_LOBBY_REFUSE = 7 };   /* menu sessions (below) */
 #define NET_MAGIC 0x504e5344u               /* "DSNP" */
-#define NET_VERSION 1
+#define NET_VERSION 2                       /* 2: the hello carries the emulation source identity */
 
 typedef struct {
     bool on, host;
@@ -72,6 +73,7 @@ typedef struct {
     const char *hash_log;
     const char *desync_dir;
     u64 inject_frame;                        /* test: corrupt p1 hp at the start of this frame */
+    u32 fake_build, fake_source;             /* test: pretend to be different game code / sources */
     bool desync_stop;
     bool lockstep;                           /* never predict (debugging / comparison) */
     bool from_menu;                          /* started from the Netplay menu: alerts instead of exits */
@@ -149,36 +151,50 @@ static void fatal(const char *msg) {
 
 /* ---- handshake ---------------------------------------------------------------------------- */
 
-typedef struct { u32 disc_crc, sectors, build, delay, window; } Ident;
+/* What both peers must share (the rule is explained in tools/source_ident.py):
+ *   disc_crc, sectors: the same game disc;
+ *   build: the recompiled-code table (replay_build_id: every recompiled function's address,
+ *          overlay, bounds and the hash of its original MIPS bytes), i.e. the same game code;
+ *   source: the emulation sources (runtime + recompiler + its analysis inputs), line endings
+ *           normalised, platform-only and presentation-only files left out; no compiler or OS;
+ *   window (and delay for the session handshake): the same netplay settings. */
+typedef struct { u32 disc_crc, sectors, build, delay, window, source; } Ident;
 
 static void ident_local(Ident *id) {
     replay_disc_id(&id->disc_crc, &id->sectors);
     id->build = replay_build_id();
     id->delay = (u32)o.delay;
     id->window = (u32)o.window;
+    id->source = DESTREGA_SOURCE_IDENT;
+    if (o.fake_build) id->build = o.fake_build;
+    if (o.fake_source) id->source = o.fake_source;
 }
 
 static int pkt_ident(u8 *b, int type, const Ident *id) {
     put_u32(b, NET_MAGIC); b[4] = (u8)type; b[5] = NET_VERSION;
     put_u32(b + 8, id->disc_crc); put_u32(b + 12, id->sectors); put_u32(b + 16, id->build);
-    put_u32(b + 20, id->delay); put_u32(b + 24, id->window);
-    return 28;
+    put_u32(b + 20, id->delay); put_u32(b + 24, id->window); put_u32(b + 28, id->source);
+    return 32;
 }
 
 /* NULL: compatible; "": not a packet of that type; else a plain-language reason. */
 static const char *ident_check_ex(const u8 *b, int n, int want_type, bool check_delay) {
     static char err[256];
     if (n < 28 || get_u32(b) != NET_MAGIC || b[4] != want_type) return "";
-    Ident me, peer = { get_u32(b + 8), get_u32(b + 12), get_u32(b + 16), get_u32(b + 20), get_u32(b + 24) };
+    if (b[5] != NET_VERSION) {   /* checked before the length: older versions send shorter hellos */
+        snprintf(err, sizeof err, "the two players run different versions of Destrega (netplay version %d and %d); "
+                 "both need the same version", b[5], NET_VERSION);
+        return err;
+    }
+    if (n < 32) return "";
+    Ident me, peer = { get_u32(b + 8), get_u32(b + 12), get_u32(b + 16), get_u32(b + 20), get_u32(b + 24), get_u32(b + 28) };
     ident_local(&me);
-    if (b[5] != NET_VERSION)
-        snprintf(err, sizeof err, "the two copies of Destrega use different netplay versions (%d and %d)", b[5], NET_VERSION);
-    else if (peer.disc_crc != me.disc_crc || peer.sectors != me.sectors)
+    if (peer.disc_crc != me.disc_crc || peer.sectors != me.sectors)
         snprintf(err, sizeof err, "the two players imported different game discs (%08x/%u and %08x/%u); both need the "
                  "North American release", peer.disc_crc, peer.sectors, me.disc_crc, me.sectors);
-    else if (peer.build != me.build)
-        snprintf(err, sizeof err, "the two players run different versions of Destrega (%08x and %08x); both need the same "
-                 "version", peer.build, me.build);
+    else if (peer.build != me.build || peer.source != me.source)
+        snprintf(err, sizeof err, "the two players run different versions of Destrega (%08x-%08x and %08x-%08x); both "
+                 "need the same version", peer.build, peer.source, me.build, me.source);
     else if (peer.window != me.window || (check_delay && peer.delay != me.delay))
         snprintf(err, sizeof err, "the two players chose different netplay settings (input delay %u / %u, rollback window "
                  "%u / %u)", peer.delay, me.delay, peer.window, me.window);
@@ -967,6 +983,12 @@ int netplay_parse_arg(int argc, char **argv, int i) {
     if (!strcmp(a, "--net-lockstep")) { o.lockstep = true; return 1; }
     if (!strcmp(a, "--net-desync-stop")) { o.desync_stop = true; return 1; }
     if (!strcmp(a, "--net-inject-desync") && has) { o.inject_frame = strtoull(argv[i + 1], NULL, 0); return 2; }
+    if (!strcmp(a, "--net-test-ident") && has) {   /* build=HEX or source=HEX */
+        const char *v = argv[i + 1];
+        if (!strncmp(v, "build=", 6)) o.fake_build = (u32)strtoul(v + 6, NULL, 16);
+        else if (!strncmp(v, "source=", 7)) o.fake_source = (u32)strtoul(v + 7, NULL, 16);
+        return 2;
+    }
     if (!strcmp(a, "--net-timeout") && has) { o.timeout_s = atof(argv[i + 1]); return 2; }
     return 0;
 }
@@ -983,7 +1005,8 @@ void netplay_usage(void) {
         "  --net-desync-dir DIR  where a desync report + replay file goes (default: current directory)\n"
         "  --net-lockstep        never predict remote input (no rollback; wait for every input)\n"
         "  --net-desync-stop     stop at the first desync (default: report it and keep playing)\n"
-        "  --net-inject-desync F test: corrupt p1.hp at frame F on this peer\n");
+        "  --net-inject-desync F test: corrupt p1.hp at frame F on this peer\n"
+        "  --net-test-ident build=HEX|source=HEX  test: claim other game code / emulation sources\n");
 }
 
 void netplay_finish(void) {

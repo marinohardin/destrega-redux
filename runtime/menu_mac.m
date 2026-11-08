@@ -266,3 +266,8 @@ bool menu_executable_path(char *out, size_t n) {
     free(real);
     return true;
 }
+
+bool menu_test(const char *cmd) {   /* the Windows menus' test hook (menu.h); not on the Mac */
+    fprintf(stderr, "menu: test %s: only the Windows menus have this hook\n", cmd);
+    return false;
+}

@@ -17,6 +17,10 @@ bool menu_executable_path(char *out, size_t n);
 /* Netplay progress panel ("Waiting for an opponent..." with Cancel); NULL hides it. No-op
  * without menus (headless, other platforms). */
 void menu_netplay_progress(const char *text);
+/* Test hook (--menu-action F:menu-test=CMD, windowed): "dump" logs every menu item with its
+ * greyed / checked state; "click=Menu/Submenu/Item" chooses that item as a click would.
+ * Windows only (menu_win.c); elsewhere it logs and returns false. */
+bool menu_test(const char *cmd);
 
 /* ---- provided by netplay.c / net.c (Netplay menu) ---- */
 const char *netplay_status_text(void);

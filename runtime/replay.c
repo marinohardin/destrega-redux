@@ -155,9 +155,70 @@ bool replay_active(void) { return s_play_path != NULL; }
 
 /* ---- loading ----------------------------------------------------------------------------- */
 
+/* Whole file, gunzipped if it starts with the gzip magic (inflate only: the gz* file API is not
+ * in every zlib build, e.g. minimal cross-compiled ones). NUL-terminated, malloc'd. */
+static char *read_maybe_gz(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    size_t cap = 1 << 16, n = 0;
+    unsigned char *raw = malloc(cap);
+    for (size_t k; raw && (k = fread(raw + n, 1, cap - n, fp)) > 0;) {
+        n += k;
+        if (n == cap) {
+            unsigned char *r = realloc(raw, cap *= 2);
+            if (!r) { free(raw); raw = NULL; } else raw = r;
+        }
+    }
+    fclose(fp);
+    if (!raw) return NULL;
+    if (n < 2 || raw[0] != 0x1f || raw[1] != 0x8b) {
+        char *t = realloc(raw, n + 1);
+        if (!t) { free(raw); return NULL; }
+        t[n] = 0;
+        return t;
+    }
+    z_stream z;
+    memset(&z, 0, sizeof z);
+    if (inflateInit2(&z, 15 + 16) != Z_OK) { free(raw); return NULL; }
+    size_t ocap = n * 8 + 4096, on = 0;
+    char *out = malloc(ocap + 1);
+    z.next_in = raw;
+    z.avail_in = (uInt)n;
+    int r = Z_OK;
+    while (out && r == Z_OK) {
+        if (on == ocap) {
+            char *o = realloc(out, (ocap *= 2) + 1);
+            if (!o) { free(out); out = NULL; break; }
+            out = o;
+        }
+        z.next_out = (Bytef *)out + on;
+        z.avail_out = (uInt)(ocap - on);
+        r = inflate(&z, Z_NO_FLUSH);
+        on = ocap - z.avail_out;
+    }
+    inflateEnd(&z);
+    free(raw);
+    if (out && r != Z_STREAM_END) { free(out); out = NULL; }
+    if (out) out[on] = 0;
+    return out;
+}
+
+/* next line of the in-memory file (like fgets); false at the end */
+static bool next_line(const char **pos, char *line, size_t cap) {
+    const char *p = *pos;
+    if (!*p) return false;
+    size_t k = 0;
+    while (*p && *p != '\n') { if (k + 2 < cap) line[k++] = *p; p++; }
+    if (*p == '\n') { line[k++] = '\n'; p++; }
+    line[k] = 0;
+    *pos = p;
+    return true;
+}
+
 static bool load(const char *path) {
-    gzFile f = gzopen(path, "rb");
-    if (!f) { fprintf(stderr, "replay: cannot open %s\n", path); return false; }
+    char *buf = read_maybe_gz(path);
+    if (!buf) { fprintf(stderr, "replay: cannot open %s\n", path); return false; }
+    const char *pos = buf;
     char line[4096];
     int ver = 0;
     u32 crc = 0, sec = 0, build = 0;
@@ -165,7 +226,7 @@ static bool load(const char *path) {
     u32 cur_in = 0;
     Gp cur = {{0}};
     bool have_build = false;
-    while (gzgets(f, line, sizeof line)) {
+    while (next_line(&pos, line, sizeof line)) {
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || !*p) continue;
@@ -203,7 +264,7 @@ static bool load(const char *path) {
             s_sh[fr] = h;
         } else goto bad;
     }
-    gzclose(f);
+    free(buf);
     if (ver != 1 || !frames) { fprintf(stderr, "replay: %s is not a version 1 replay\n", path); return false; }
     grow(frames + 1);
     for (u64 k = last_in; k <= frames; k++) s_in[k] = cur_in;
@@ -226,7 +287,7 @@ static bool load(const char *path) {
     return true;
 bad:
     fprintf(stderr, "replay: %s: bad line: %s", path, line);
-    gzclose(f);
+    free(buf);
     return false;
 }
 

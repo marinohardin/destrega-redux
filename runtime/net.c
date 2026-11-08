@@ -1,5 +1,6 @@
 /* UDP transport for netplay (see net.h). */
 #include "net.h"
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +18,6 @@ typedef SOCKET sock_t;
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <ifaddrs.h>
-#include <net/if.h>
 typedef int sock_t;
 #define SOCK_BAD (-1)
 #define sock_close close
@@ -41,27 +40,8 @@ struct NetSock {
     char name[128];
 };
 
-static u64 mono_ns(void) {
-#if defined(_WIN32)
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (u64)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
-#endif
-}
-
-void net_sleep_us(u64 us) {
-#if defined(_WIN32)
-    Sleep((DWORD)((us + 999) / 1000));
-#else
-    struct timespec ts = { (time_t)(us / 1000000), (long)(us % 1000000) * 1000 };
-    nanosleep(&ts, NULL);
-#endif
-}
+static u64 mono_ns(void) { return plat_mono_ns(); }
+void net_sleep_us(u64 us) { plat_sleep_us(us); }
 
 static double rnd01(NetSock *s) {   /* xorshift64*: the simulated network is reproducible per seed */
     s->rng ^= s->rng >> 12; s->rng ^= s->rng << 25; s->rng ^= s->rng >> 27;
@@ -106,7 +86,14 @@ NetSock *net_open(const char *host, int port, int bind_port, const NetSim *sim) 
         freeaddrinfo(res);
         set_name(s);
     }
+#if defined(_WIN32)
+    /* not inheritable: a menu-started session restarts by CreateProcess with inherited handles
+     * (plat_exec), and the child binds the same port. (SetHandleInformation on the socket instead
+     * stopped a bound socket from receiving anything under Wine.) */
+    s->fd = WSASocketW(family, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+#else
     s->fd = socket(family, SOCK_DGRAM, IPPROTO_UDP);
+#endif
     if (s->fd == SOCK_BAD) { free(s); return NULL; }
     int bp = host ? bind_port : port;
     if (family == AF_INET6) {
@@ -206,24 +193,4 @@ int net_recv(NetSock *s, void *buf, int cap) {
 const char *net_peer_name(NetSock *s) { return s->have_peer ? s->name : "(none)"; }
 void net_lock_peer(NetSock *s) { if (s->have_peer) s->locked = true; }
 
-int net_local_addresses(char *out, size_t n) {
-    int k = 0;
-    if (n) out[0] = 0;
-#if !defined(_WIN32)
-    struct ifaddrs *ifs = NULL;
-    if (getifaddrs(&ifs)) return 0;
-    size_t len = 0;
-    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
-        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || (i->ifa_flags & IFF_LOOPBACK) || !(i->ifa_flags & IFF_UP))
-            continue;
-        char h[64];
-        inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, h, sizeof h);
-        int w = snprintf(out + len, n > len ? n - len : 0, "%s%s", k ? ", " : "", h);
-        if (w > 0) len += (size_t)w;
-        if (len >= n) { if (n) out[n - 1] = 0; break; }
-        k++;
-    }
-    freeifaddrs(ifs);
-#endif
-    return k;
-}
+int net_local_addresses(char *out, size_t n) { return plat_local_ipv4(out, n); }
