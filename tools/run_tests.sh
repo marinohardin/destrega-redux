@@ -22,6 +22,7 @@ cc_job spu $CC runtime/spu.c runtime/xa.c runtime/tests/test_spu.c -o build/test
 cc_job mdec $CC runtime/mdec.c runtime/tests/test_mdec.c -o build/tests/test_mdec -lm &
 cc_job memcard $CC runtime/memcard.c runtime/platform.c runtime/tests/test_memcard.c -o build/tests/test_memcard &
 SDLF=$(pkg-config --cflags --libs sdl3 2>/dev/null || echo "-I/opt/homebrew/include -L/opt/homebrew/lib -lSDL3")
+cc_job input $CC runtime/input.c runtime/settings.c runtime/platform.c runtime/tests/test_input.c -o build/tests/test_input $SDLF -lm &
 cc_job hgpu $CC runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c runtime/platform.c runtime/tests/test_hires_gpu.c -o build/tests/test_hires_gpu $SDLF -lm &
 
 # 2. the long runs start right away (the binary is already built): smoke + hi-res matrix
@@ -54,6 +55,9 @@ tools/test_menu.sh > build/menu.out 2>&1 &
 MENU=$!
 tools/test_savestate.sh > build/savestate.out 2>&1 &
 SAVST=$!
+# input layer + settings file: custom bindings and synthetic host events == the --press run
+python3 tools/test_input.py > build/input.out 2>&1 &
+INPT=$!
 # gameplay regression replays (tools/replays/*.dtr.gz): every frame's gameplay fields must match
 python3 tools/replays.py run -j 4 > build/replays.out 2>&1 &
 REPL=$!
@@ -65,15 +69,15 @@ NETP=$!
 python3 tools/test_netplay_wine.py > build/netplay_wine.out 2>&1 &
 NETW=$!
 
-wait %1 %2 %3 %4 %5 %6 %7 %8 2>/dev/null
+wait %1 %2 %3 %4 %5 %6 %7 %8 %9 2>/dev/null
 fail=0
 # 3. run the unit tests concurrently, report in order
-for t in gte gpu hires pgxp spu mdec memcard; do
+for t in gte gpu hires pgxp spu mdec memcard input; do
   if [ "$(cat build/tests/$t.cc.rc)" != 0 ]; then echo "$t: COMPILE FAIL"; cat build/tests/$t.cc.log; fail=1; continue; fi
   ./build/tests/test_$t > build/tests/test_$t.log 2>&1 &
   eval "UT_$t=$!"
 done
-for t in gte gpu hires pgxp spu mdec memcard; do
+for t in gte gpu hires pgxp spu mdec memcard input; do
   eval "pid=\$UT_$t"
   [ -n "$pid" ] || continue
   printf '%-6s ' "$t"
@@ -112,6 +116,8 @@ wait $MENU || { fail=1; echo "menu: FAILED"; }
 cat build/menu.out
 wait $SAVST || { fail=1; echo "savestate: FAILED"; }
 cat build/savestate.out
+wait $INPT || { fail=1; echo "input: FAILED"; }
+cat build/input.out
 wait $REPL || { fail=1; echo "replays: FAILED (a gameplay change? see AGENTS.md \"Replays\")"; }
 cat build/replays.out
 wait $NETP || { fail=1; echo "netplay: FAILED"; }

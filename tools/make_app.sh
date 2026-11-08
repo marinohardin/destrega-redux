@@ -11,7 +11,9 @@
 #   --bin      built executable           (default: build/cmake/destrega)
 #   --out      bundle to create           (default: next to --bin, Destrega.app)
 #   --icon     app icon, PNG >= 512px or .icns (default: assets/icon/destrega.png)
-#   --version  CFBundle version string    (default: 1.0)
+#   --version  CFBundleShortVersionString (default: tools/version.py short = the VERSION file;
+#              CFBundleVersion is the git commit count, and the full "describe" string is
+#              also stored under the DestregaBuild key)
 #   --sign     codesign identity          (default: "-" = ad-hoc, runs on this Mac;
 #              use a "Developer ID Application: ..." identity to distribute)
 #   --dmg      also write a compressed disk image
@@ -27,7 +29,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/build/cmake/destrega"
 APP=""
 ICON="$ROOT/assets/icon/destrega.png"
-VERSION="1.0"
+VERSION=""
 SIGN="-"
 DMG=""
 BUNDLE_ID="io.github.destrega-recomp"
@@ -40,13 +42,17 @@ while [ $# -gt 0 ]; do
         --version) VERSION="$2"; shift 2 ;;
         --sign)    SIGN="$2"; shift 2 ;;
         --dmg)     DMG="$2"; shift 2 ;;
-        -h|--help) sed -n 2,23p "$0"; exit 0 ;;
+        -h|--help) sed -n 2,26p "$0"; exit 0 ;;
         *) echo "make_app: unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
 [ "$(uname -s)" = Darwin ] || { echo "make_app: macOS only" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "make_app: no executable at $BIN (build first: cmake --build build/cmake)" >&2; exit 1; }
+[ -n "$VERSION" ] || VERSION="$(python3 "$ROOT/tools/version.py" short)"
+BUILD_NUM="$(python3 "$ROOT/tools/version.py" build)"
+BUILD_DESC="$(python3 "$ROOT/tools/version.py" describe)"
+YEAR="$(date +%Y)"
 [ -n "$APP" ] || APP="$(dirname "$BIN")/Destrega.app"
 
 # 1. Bundle skeleton. Build in a temp dir and swap in at the end so a failed run
@@ -87,7 +93,9 @@ cat > "$TMPAPP/Contents/Info.plist" <<EOF
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>CFBundleVersion</key><string>$BUILD_NUM</string>
+    <key>DestregaBuild</key><string>$BUILD_DESC</string>
+    <key>NSHumanReadableCopyright</key><string>Runtime (c) $YEAR the Destrega Redux contributors. Destrega is (c) 1998 KOEI Co., Ltd. No game data is included; you supply your own disc image.</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>LSMinimumSystemVersion</key><string>${MINOS:-11.0}</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
@@ -98,6 +106,8 @@ cat > "$TMPAPP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 plutil -lint -s "$TMPAPP/Contents/Info.plist"
+
+cp "$ROOT/THIRD_PARTY_LICENSES.txt" "$TMPAPP/Contents/Resources/"
 
 # 2. Copy every non-system dylib (recursively) into Frameworks; relink via @rpath.
 is_external() { case "$1" in /usr/lib/*|/System/*|@*) return 1 ;; *) return 0 ;; esac; }

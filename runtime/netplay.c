@@ -30,6 +30,7 @@
 #include "net.h"
 #include "hires.h"
 #include "memcard.h"
+#include "smooth.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +78,9 @@ typedef struct {
     bool desync_stop;
     bool lockstep;                           /* never predict (debugging / comparison) */
     bool from_menu;                          /* started from the Netplay menu: alerts instead of exits */
+    bool full_boot;                          /* --net-full-boot: the session boots through the intro */
+    bool sync_hard;                          /* --net-sync-hard: time sync by stopping (old, comparisons) */
+    bool boot_to_vs_offline;                 /* --boot-to-vs: the same shortcut without netplay (tests) */
     int hash_every;
     double timeout_s;
 } Opts;
@@ -109,6 +113,10 @@ static void end_later(const char *msg) {
 static char s_card_path[2][2048];          /* cards detached for the session, re-attached after */
 static u64 s_cur_frame, s_peer_frame;       /* time sync (GGPO-style frame advantage) */
 static double s_adv_avg, s_peer_adv;
+static double s_sync_debt_ns;               /* time-sync slowdown still to spread over the next frames */
+static u64 s_sync_next;                     /* first frame the next slowdown may be decided */
+static u64 s_fe_extra_ns;                   /* windowed: slowdown for the frontend's pacing to add */
+static int s_peer_load = -1;                /* peer's share of its frame budget in use (%), -1 = unknown */
 static u32 s_echo_ts;                       /* round-trip time */
 static u64 s_echo_at;
 static double s_rtt;
@@ -116,6 +124,7 @@ static double s_rtt;
 static Snapshot s_snap[SNAPS];
 static u64 s_resim_until;                   /* re-simulating until begin(this frame) */
 static u64 s_resim_from;
+static u64 s_rb_depth, s_rb_shown;          /* current rollback: depth, frames shown before the fix */
 static const HiresBackend *s_hires_saved;
 static bool s_hires_off;
 
@@ -164,7 +173,7 @@ static void ident_local(Ident *id) {
     replay_disc_id(&id->disc_crc, &id->sectors);
     id->build = replay_build_id();
     id->delay = (u32)o.delay;
-    id->window = (u32)o.window;
+    id->window = (u32)o.window | (o.full_boot ? 0x80000000u : 0);   /* the boot shortcut must match too */
     id->source = DESTREGA_SOURCE_IDENT;
     if (o.fake_build) id->build = o.fake_build;
     if (o.fake_source) id->source = o.fake_source;
@@ -197,7 +206,8 @@ static const char *ident_check_ex(const u8 *b, int n, int want_type, bool check_
                  "need the same version", peer.build, peer.source, me.build, me.source);
     else if (peer.window != me.window || (check_delay && peer.delay != me.delay))
         snprintf(err, sizeof err, "the two players chose different netplay settings (input delay %u / %u, rollback window "
-                 "%u / %u)", peer.delay, me.delay, peer.window, me.window);
+                 "%u / %u, intro skip %s / %s)", peer.delay, me.delay, peer.window & 0xffff, me.window & 0xffff,
+                 peer.window >> 31 ? "off" : "on", me.window >> 31 ? "off" : "on");
     else return NULL;
     return err;
 }
@@ -288,6 +298,9 @@ static void send_inputs(void) {
     u64 hold = s_echo_at ? (now - s_echo_at) / 1000000 : 0;
     b[n + 8] = (u8)(hold > 65535 ? 65535 : hold); b[n + 9] = (u8)((hold > 65535 ? 65535 : hold) >> 8);
     n += 10;
+    /* our load: % of the frame budget used by our own work (255 = unknown, e.g. headless) */
+    double ld = smooth_load();
+    b[n++] = ld <= 0 ? 255 : ld * 100 > 250 ? 250 : (u8)(ld * 100);
     net_send(s_sock, b, n);
     st.pkts_out++;
 }
@@ -346,6 +359,7 @@ static void receive(void) {
                 double rtt = (double)((u32)(now / 1000000) - echo) - hold;
                 if (rtt >= 0 && rtt < 5000) s_rtt = s_rtt ? s_rtt + (rtt - s_rtt) / 8 : rtt;
             }
+            if (n >= r + 11) s_peer_load = b[r + 10] == 255 ? -1 : b[r + 10];
         }
         if (n >= h + 26) {
             u64 pf = get_u32(b + h + 20);
@@ -488,6 +502,8 @@ static bool start(void) {
     }
     s_remote_conf = (u64)o.delay;
     s_t0_ns = ss_now_ns();
+    s_sync_debt_ns = 0; s_sync_next = 0; s_fe_extra_ns = 0; s_peer_load = -1;
+    smooth_governor(true);
     return true;
 }
 
@@ -508,6 +524,8 @@ static void session_end(const char *msg) {
     if (s_hash_log) { fclose(s_hash_log); s_hash_log = NULL; }
     o.hash_log = NULL;
     if (s_hires_off) { g_hires = s_hires_saved; s_hires_off = false; }
+    smooth_governor(false);
+    s_sync_debt_ns = 0; s_fe_extra_ns = 0;
     s_resim_until = 0;
     ss_set_resim(false);
     memcard_set_write_protect(false);
@@ -543,25 +561,45 @@ void netplay_vblank_begin(u64 f) {
         u64 dt = ss_now_ns() - s_resim_from;
         st.resim_ns += dt;
         if (dt > st.max_resim_ns) st.max_resim_ns = dt;
+        smooth_rollback(s_rb_depth, dt, s_rb_shown);
         s_resim_until = 0;
         ss_set_resim(false);
         hires_for_resim(f);
     }
     if (!resim) {
         s_cur_frame = f;
-        /* time sync: a peer that runs ahead of the other (it started first, or its clock is faster)
-         * predicts more and makes the other side roll back more. Both sides measure their frame
-         * advantage over the last frame reported by the peer (latency cancels out in the difference);
-         * the one ahead by >= 1 frame on average waits that long, at most once a second. */
+        /* time sync: a peer that runs ahead of the other (it started first, its clock is faster, or
+         * the other one lost time on a slow frame) predicts more and makes the other side roll back
+         * more. Both sides measure their frame advantage over the last frame reported by the peer
+         * (latency cancels out in the difference). The one ahead by >= 1 frame on average slows down
+         * by that much, spread over the next frames (1 ms per frame, 2 ms when far ahead: ~6-12%
+         * slower for a moment) instead of stopping, so nothing visibly halts; then it waits ~0.75 s
+         * for both averages to show the result before deciding again. */
         if (s_peer_frame) {
             double adv = (double)f - (double)s_peer_frame;
             s_adv_avg += (adv - s_adv_avg) / 32;
             double d = (s_adv_avg - s_peer_adv) / 2;
-            if (f % 60 == 0 && d >= 1.0) {
-                int k = d > 8 ? 8 : (int)d;
+            if (o.sync_hard) {             /* the old way, for comparisons: stop for the whole amount */
+                if (f % 60 == 0 && d >= 1.0) {
+                    int k = d > 8 ? 8 : (int)d;
+                    st.sync_waits++; st.sync_frames += (u64)k;
+                    smooth_sync((u64)k * 16666667ull);
+                    if (o.pace_hz > 0) s_t0_ns += (u64)(k * 1e9 / o.pace_hz);
+                    else if (!o.unpaced) net_sleep_us((u64)k * 16667);
+                }
+            } else if (s_sync_debt_ns <= 0 && f >= s_sync_next && d >= 1.0) {
+                double k = d > 8 ? 8 : d;
                 st.sync_waits++; st.sync_frames += (u64)k;
-                if (o.pace_hz > 0) s_t0_ns += (u64)(k * 1e9 / o.pace_hz);
-                else if (!o.unpaced) net_sleep_us((u64)k * 16667);
+                s_sync_debt_ns = k * 1e9 / 60;
+            }
+            if (s_sync_debt_ns > 0) {
+                double pay = s_sync_debt_ns > 2.5e9 / 60 ? 2e6 : 1e6;
+                if (pay > s_sync_debt_ns) pay = s_sync_debt_ns;
+                s_sync_debt_ns -= pay;
+                if (s_sync_debt_ns <= 0) s_sync_next = f + 45;
+                smooth_sync((u64)pay);
+                if (o.pace_hz > 0) s_t0_ns += (u64)pay;
+                else if (!o.unpaced) s_fe_extra_ns += (u64)pay;
             }
         }
         /* pacing (headless; windowed runs are paced by the frontend) */
@@ -596,7 +634,7 @@ void netplay_vblank_begin(u64 f) {
             net_sleep_us(500);
             receive();
         }
-        if (t0) st.stall_ns += ss_now_ns() - t0;
+        if (t0) { st.stall_ns += ss_now_ns() - t0; smooth_stall(ss_now_ns() - t0); }
         if (s_end_pending) { s_end_pending = false; session_end(s_end_msg); return; }
         if (remote_known(f)) s_pred_prev = prediction_ok(s_remote_conf + 1);
         /* rollback */
@@ -616,6 +654,8 @@ void netplay_vblank_begin(u64 f) {
                             (unsigned long long)s_remote_conf);
                 if (depth > st.max_depth) st.max_depth = depth;
                 st.rollbacks++;
+                s_rb_depth = depth;
+                s_rb_shown = f - s_first_bad;   /* frames f-1 .. first_bad + 1 were presented wrong */
                 s_first_bad = 0;
                 s_resim_from = ss_now_ns();
                 s_resim_until = f;
@@ -662,7 +702,34 @@ void netplay_vblank_begin(u64 f) {
     }
 }
 
+/* Straight to VS mode's character select (P1 = host, P2 = joiner): the inputs a player would give
+ * from power-on (Start skips the KOEI logo and the intro FMV into the title menu, Down Down moves its
+ * cursor from 1P BATTLE to VS, Start), played on pad 1 on both peers at the same frames of the
+ * session's fresh boot, whatever the players press meanwhile. Pure emulation of the real path: both
+ * machines stay identical and nothing is loaded from outside the disc. The character select is up at
+ * about frame 380 instead of ~1560, and its cursors start on Gradd (P1) and Celia (P2) as usual.
+ * Each press is held 6 vblanks like --press. Found by stepping through dumps (analysis/NOTES.md). */
+static const struct { u16 frame, mask; } k_boot_vs[] = {
+    { 210, 0x0008 },   /* Start: KOEI logo -> title (the intro FMV never starts) */
+    { 240, 0x0040 },   /* Down: 1P BATTLE -> STORY */
+    { 270, 0x0040 },   /* Down: STORY -> VS */
+    { 300, 0x0008 },   /* Start: VS -> character select (up by frame ~380) */
+};
+#define BOOT_VS_END 306u   /* frames 1 .. this are driven by the script */
+static bool boot_vs_pads(u64 f) {
+    if (f < 1 || f > BOOT_VS_END) return false;
+    u16 m = 0;
+    for (size_t k = 0; k < sizeof k_boot_vs / sizeof k_boot_vs[0]; k++)
+        if (f >= k_boot_vs[k].frame && f < k_boot_vs[k].frame + 6u) m |= k_boot_vs[k].mask;
+    g_pad_buttons[0] = (u16)~m;
+    g_pad_buttons[1] = 0xffff;
+    if (f == BOOT_VS_END) fprintf(stderr, "netplay: boot shortcut done at frame %llu (VS character select next)\n",
+                                  (unsigned long long)f);
+    return true;
+}
+
 void netplay_vblank_end(u64 f) {
+    if (!o.on && o.boot_to_vs_offline) { boot_vs_pads(f); return; }
     if (!o.on || !s_started) return;
     bool resim = s_resim_until && f < s_resim_until;
     if (!resim) {
@@ -681,6 +748,7 @@ void netplay_vblank_end(u64 f) {
     u16 local_now = s_local_in[s];
     g_pad_buttons[s_local_idx] = (u16)~local_now;
     g_pad_buttons[s_remote_idx] = (u16)~rem;
+    if (!o.full_boot) boot_vs_pads(f);
     if (!resim) { send_inputs(); status(f); }
 }
 
@@ -698,7 +766,9 @@ static void status(u64 f) {
              (double)(st.rollbacks - last_rb) / sec,
              f > last_f ? 100.0 * (double)(st.predicted - last_pred) / (double)(f - last_f) : 0.0,
              100.0 * (double)(st.stall_ns - last_stall_ns) / (double)(now - last_ns),
-             s_desyncs ? " | DESYNC" : s_peer_left ? " | peer left" : "");
+             s_desyncs ? " | DESYNC" : s_peer_left ? " | peer left" :
+             s_peer_load >= 95 ? " | Opponent's computer is running slowly" :
+             smooth_load() >= 0.95 ? " | This computer is running slowly" : "");
     frontend_set_status(b);
     static int n;
     if (++n % 10 == 0) fprintf(stderr, "%s\n", b);
@@ -979,8 +1049,12 @@ int netplay_parse_arg(int argc, char **argv, int i) {
     if (!strcmp(a, "--net-hash-log") && has) { o.hash_log = argv[i + 1]; return 2; }
     if (!strcmp(a, "--net-hash-every") && has) { o.hash_every = atoi(argv[i + 1]); return 2; }
     if (!strcmp(a, "--net-desync-dir") && has) { o.desync_dir = argv[i + 1]; return 2; }
+    { int k = smooth_parse_arg(argc, argv, i); if (k) return k; }
     if (!strcmp(a, "--net-from-menu")) { o.from_menu = true; return 1; }
     if (!strcmp(a, "--net-lockstep")) { o.lockstep = true; return 1; }
+    if (!strcmp(a, "--net-full-boot")) { o.full_boot = true; return 1; }
+    if (!strcmp(a, "--net-sync-hard")) { o.sync_hard = true; return 1; }
+    if (!strcmp(a, "--boot-to-vs")) { o.boot_to_vs_offline = true; return 1; }
     if (!strcmp(a, "--net-desync-stop")) { o.desync_stop = true; return 1; }
     if (!strcmp(a, "--net-inject-desync") && has) { o.inject_frame = strtoull(argv[i + 1], NULL, 0); return 2; }
     if (!strcmp(a, "--net-test-ident") && has) {   /* build=HEX or source=HEX */
@@ -1009,7 +1083,15 @@ void netplay_usage(void) {
         "  --net-test-ident build=HEX|source=HEX  test: claim other game code / emulation sources\n");
 }
 
+/* windowed pacing (main.c): extra time to add to this frame (gradual time sync) */
+u64 netplay_pace_extra_ns(void) {
+    u64 x = s_fe_extra_ns;
+    s_fe_extra_ns = 0;
+    return x;
+}
+
 void netplay_finish(void) {
+    smooth_report();
     if (!o.on && s_hash_log) { fclose(s_hash_log); s_hash_log = NULL; }
     if (!o.on || !s_started) return;
     if (s_sock) {
