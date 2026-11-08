@@ -401,7 +401,45 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   impossible rollbacks and desyncs at the end of each match (NOTES.md). An impossible rollback is
   still counted and logged as a last resort; desync detection then reports what it caused.
 - **Time sync**: each packet carries the sender's frame and its frame advantage; the peer that is
-  ahead by >= 1 frame on average waits (at most 8 frames, once a second), like GGPO.
+  ahead by >= 1 frame on average slows down by that much (at most 8 frames), **spread over the next
+  frames**: 1 ms per frame (2 ms while more than 2.5 frames are owed), i.e. 6-12% slower for a
+  moment instead of a visible halt; then ~45 frames for both averages to show it before deciding
+  again. Windowed, `netplay_pace_extra_ns()` is added to main.c's pacing tick; headless paced
+  runs shift their pace origin. (It used to sleep the whole amount once a second: the picture froze
+  for up to 133 ms, and windowed the frontend's pacing then caught up by running fast.)
+- **Boot shortcut** (default; `--net-full-boot` turns it off, and both peers must agree: it is part
+  of the handshake's settings check): a session's fresh boot goes straight to VS mode's character
+  select, P1 = host, P2 = joiner. Frames 1-306 of the session play a fixed pad-1 script on both
+  peers (`k_boot_vs`: Start at 210 skips the KOEI logo and the intro FMV into the title menu,
+  Down, Down, Start at 300 on VS), whatever the players press meanwhile; the select screen is up by
+  frame ~380 instead of ~1560 on the scripted normal path: 19.7 s sooner. It is ordinary emulated
+  input, so both machines stay identical (no state comes from outside). After a match the game
+  itself returns to the VS character select with a win counter (NOTES.md), so rematches never need
+  the title. `--boot-to-vs` applies the same script offline (reference runs of the tests).
+- **Smoothness instrumentation** (`runtime/smooth.[ch]`, presentation-only): windowed runs record
+  every presented frame's interval and the host work behind it, stalls (waiting for the peer),
+  time-sync slowdowns, rollbacks (depth histogram, re-simulation time, frames shown before the
+  correction) and the audio queue (underrun = empty, low = < 1 frame, repeat = the deterministic
+  top-up re-queued samples). At exit (`netplay_finish`, also offline) a `smooth:` line and a
+  `smooth-json: {...}` line: interval p50/p95/p99/max/sd, frames held > 1.5 vblank and what held
+  each (the largest of rollback / stall / sync wait since the last present if it explains at least
+  half the overrun, else "slow host"), host busy % of the 16.7 ms budget, stalls, rollbacks, audio.
+  `--smooth-from F` starts counting at frame F. Headless runs present nothing (only the netplay
+  part is counted). `tools/netplay_smooth.py [solo|solo_win|mm_lan|mm_wan|mw_lan|mw_wide]` runs
+  windowed peers at 60 Hz on a VS replay (Mac<->Mac clean or 20 ms + 10 jitter + 2% loss each way,
+  Mac<->Wine with the software renderer there, optionally widescreen; `solo` = one offline window)
+  and prints one row per peer with the load average. Results depend heavily on machine load:
+  compare runs made back-to-back.
+- **Scale governor** (`smooth.c`, presentation-only): during a session, a host whose average frame
+  work stays above 90% of the budget lowers its hi-res render scale one step (4x6 -> 4x4 -> 3x4 ->
+  3x3 -> 2x3 -> 2x2 -> 1x2 -> 1x1) every 2.5 s until it keeps up, logging `smooth: this computer is
+  too slow for render scale ...`; the caps are lifted when the session ends. Otherwise a slow peer
+  drags the fast one (which waits for every late input). Never touches a forced `--scale`;
+  `--no-scale-governor` turns it off. Each input packet also carries the sender's load (% of its
+  frame budget, one byte at the end; older peers ignore it), and the status line says "Opponent's
+  computer is running slowly" (peer >= 95%) or "This computer is running slowly".
+- Windows: `plat_sleep_us` uses a high-resolution waitable timer; `Sleep()` rounds to the 15.6 ms
+  system tick, which turned every 0.5 ms netplay wait into a 16 ms one.
 - **Final frames and desync detection**: the state at the start of frame F is final once every
   input before F is confirmed and was used. Each packet carries the newest final frame's gameplay
   hash, its 16 field hashes (replay.c fields) and every 30 frames the complete state hash
@@ -436,8 +474,11 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   `menu: REFUSED NAME: ...`. Presentation-only actions (renderer, widescreen, full screen, reveal
   in Finder) still run. Test: the `menu` case of `test_netplay.py`.
 - Tests for the menu path (`test_netplay.py`): `menu_session` (two processes start offline, host
-  and join by `--menu-action` mid-run, both reboot, play synced: final-frame hashes equal on both
-  and equal to an offline run with the agreed delay; the joiner disconnects, the host gets the
+  and join by `--menu-action` mid-run, both reboot through the boot shortcut (both log it, both are
+  on the VS character select at frame 400: frame dump of the `--boot-to-vs` reference run, equal
+  hashes), play synced with the replay's picks moved 1180 frames earlier: final-frame hashes equal
+  on both and equal to an offline run with the agreed delay; the other cases pass
+  `--net-full-boot` so their replay scripts still start from power-on; the joiner disconnects, the host gets the
   "opponent left" alert, both keep playing offline to `--frames`) and `menu_fail` (a host with a
   different rollback window refuses with a reason, an unanswered join times out with an alert, all
   three keep playing offline, nobody restarts).
@@ -447,7 +488,7 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   with `--bottle destrega-test --no-gui`) over loopback, started with the menu actions
   (`netplay-host` / `netplay-join`) in both directions: `mac_hosts`, `win_hosts`, and both again
   with a lossy link (`--net-sim 15:10:5:5`: 15 ms + 10 jitter, 5% loss, 5% reorder each way). Each
-  plays the VS fight of a replay script, disconnects and continues offline; every confirmed
+  boots through the boot shortcut (both peers log it), plays the VS fight of a replay script, disconnects and continues offline; every confirmed
   frame's hash must match on both peers **and** an offline native run. `ident`: a Windows host
   claiming other emulation sources refuses the Mac joiner with the alert. Pace 120 Hz (2x real
   time; headless Wine runs ~1.3 ms/frame, so Wine is not the bottleneck there). Offline frames are
