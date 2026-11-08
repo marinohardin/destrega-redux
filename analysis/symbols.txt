@@ -17,6 +17,7 @@
 
 80010000  data   overlay_slot_p1            verified  agents-md  P1 overlay load address (Mxxx.BIN, EVENT_SP.BIN, OPTOVL.BIN); file copied verbatim, code at file+4
 8001a268  data   overlay_slot_p2            verified  agents-md  P2 overlay load address (Mxxx2.BIN, EVENTOVL.BIN)
+8001a284  func   -                          verified  test       [MROSEN2] first function of P2 Rohzen (4 entries a284/a2b4/a2e4/a314 vs a26c/a29c/a2cc/a2fc of the others); was not recompiled until main-data slot pointers became seeds; scenario vs_villa
 800244d0-80026618  range  text_leading_data  verified  agents-md  data inside .text before the code; never linear-sweep
 80027218  func   frame_sync                 likely    agents-md  f_80027218(1) -> VSync(2); why fights update at 30/s
 8002b80c  func   main                       verified  code       game main(), called from crt0
@@ -29,7 +30,7 @@
 8003e36c  func   overlay_loader_b           likely    rea        one of the three overlay loaders (memcpy file into P1/P2 slot); which files it loads: unconfirmed
 800465a4  func   sphere_vs_poly             verified  override   moving sphere vs stage collision polygons; readable version runtime/overrides/collision.c, checked by --verify-overrides
 80049e90  label  str_wait_loop              verified  trace      libpress STR playback wait loop; stuck here when MDEC/CD DMA completions race
-8004c1e8  func   overlay_loader_a           likely    rea        one of the three overlay loaders; see 8003e36c
+8004c1e8  func   overlay_loader_a           likely    rea        one of the three overlay loaders; see 8003e36c. Also on the guest call stack (8004be10 > 8004c1e8 > 80039cd8 > 8002c51c > 8002c820) when a VS fight overlay is loaded (verified: trace of the 8001a284 miss)
 8006acc4  func   -                          verified  trace      on the fight call stack, see 8002beb0
 8006b35c  func   overlay_loader_c           likely    rea        one of the three overlay loaders, and on the fight call stack right under main
 800951c0  label  -                          verified  agents-md  branch target that is another branch's delay slot (tracer pitfall)
@@ -40,6 +41,7 @@
 800a8e28  func   -                          verified  agents-md  extra seed from the original port; role not recorded
 800a9528  func   -                          verified  agents-md  extra seed from the original port; role not recorded
 800aa000-  range  text_trailing_data        verified  agents-md  data inside .text from here on; never linear-sweep
+800b310c  data   char_overlay_fn_table       likely    code       main-exe table of overlay function pointers, 4 per character per slot; 8004c1e8 jalr's them (Rohzen P2 pointers at 800b318c..)
 800be224  data   resetcallback_jmpbuf       verified  code       setjmp buffer used for IRQ hook (HookEntryInt)
 # --- memory card (libmcrd-style library at 0x800a4xxx-0x800a7xxx, game wrappers in main_05) ---
 800a47bc  func   mcrd_exist_step              likely    rea        per-frame state machine: _card_info, retries 5x on ERROR/TIMEOUT, maps event to McErr via 800a5f2c
