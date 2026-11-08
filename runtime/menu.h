@@ -36,6 +36,9 @@ bool frontend_menu_action_allowed(const char *name);
 /* Current hi-res renderer ("software", "gpu", "compare") and whether "gpu" can be chosen. */
 const char *frontend_renderer(void);
 bool frontend_gpu_available(void);
+/* Check mark of a View-menu render-quality item ("tex-filter=bilinear", "smooth-colours",
+ * "ssaa=2"): true and *checked set if `action` is one of them. */
+bool frontend_view_checked(const char *action, bool *checked);
 /* Whether the window is full screen (View > Enter/Exit Full Screen follows it). */
 bool frontend_fullscreen(void);
 #endif

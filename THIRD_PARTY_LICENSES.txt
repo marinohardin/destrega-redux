@@ -1,0 +1,82 @@
+Destrega (static recompilation) - third-party software notices
+================================================================
+
+This file ships next to every packaged build (inside Destrega.app on macOS, beside
+destrega.exe on Windows). The runtime links the components below. No game data is included
+in this package: you supply your own disc image.
+
+Destrega itself is (c) 1998 KOEI Co., Ltd. This project is not affiliated with or endorsed by
+KOEI; the name is used only to say which game the runtime runs.
+
+
+SDL3 (Simple DirectMedia Layer 3)            zlib license
+----------------------------------------------------------
+Linked dynamically: libSDL3.dylib (macOS, inside the app bundle) or SDL3.dll (Windows).
+https://libsdl.org/
+
+Copyright (C) 1997-2026 Sam Lantinga
+
+This software is provided 'as-is', without any express or implied
+warranty.  In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+
+SDL3 contains a few small components under their own permissive terms (for example HIDAPI
+for game controllers, offered under a BSD-style licence); they are described in the SDL
+source distribution (https://github.com/libsdl-org/SDL, files under src/ and the licence
+notes there). The SDL3 binary used for a given build is the one named in the release notes.
+
+
+zlib                                          zlib license
+----------------------------------------------------------
+Linked statically (Windows) or from the system (macOS, Linux).
+https://zlib.net/
+
+Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler
+
+This software is provided 'as-is', without any express or implied
+warranty.  In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+
+
+Compiler runtime (Windows build only)
+----------------------------------------------------------
+The Windows executable cross-built with MinGW-w64 GCC links the GCC runtime library (libgcc)
+and the winpthreads library statically.
+
+- libgcc: GPL-3.0-or-later WITH the GCC Runtime Library Exception 3.1, which permits linking
+  it into programs under any licence. https://gcc.gnu.org/onlinedocs/libstdc++/manual/license.html
+- winpthreads / mingw-w64 runtime: MIT-style licence of the mingw-w64 project
+  (Copyright (c) 2011 mingw-w64 project). https://www.mingw-w64.org/
+
+Builds made with MSYS2 CLANG64 instead link LLVM's compiler runtime (Apache-2.0 WITH
+LLVM-exception) and the Universal C Runtime of Windows.
+
+
+Not bundled
+----------------------------------------------------------
+A Vulkan loader / driver (including MoltenVK on macOS, Mesa on Linux) is used only if the
+computer already has one; it is not part of this package.

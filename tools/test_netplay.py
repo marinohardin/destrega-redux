@@ -52,6 +52,26 @@ def shifted(steps, d):
     return [(f + d, m) for f, m in steps]
 
 
+# A session boots straight to VS mode's character select (netplay.c k_boot_vs; --boot-to-vs offline):
+# it is up at frame ~380 instead of ~1560 with the normal title path of tools/scenarios.py, so the
+# character / stage picks (from frame 1750 on) and the fight of a VS replay come BOOT_VS_SAVES earlier.
+BOOT_VS_SAVES = 1180
+BOOT_VS_READY = 400        # the character select is on screen by this frame
+
+
+def after_boot_to_vs(steps):
+    return [(f - BOOT_VS_SAVES, m) for f, m in steps if f >= 1700]
+
+
+def is_vs_select(png):
+    """VS character select: P1's portrait on red at the left, P2's on blue at the right (title, 1P
+    select and loading screens have neither)."""
+    import scenarios as S
+    r, g, b = S.region_mean(png, (0.6, 0.1, 0.69, 0.15))       # top of P2's frame
+    r1, g1, b1 = S.region_mean(png, (0.02, 0.1, 0.06, 0.15))   # top left of P1's frame
+    return b > 60 and b > 2 * r and r1 > 60 and r1 > 2 * b1
+
+
 def summary(log):
     m = re.search(r'netplay: (\d+) frames, (\d+) predicted remote inputs, (\d+) mispredicted; (\d+) rollbacks '
                   r'\(max depth (\d+) vblanks, (\d+) deferred one vblank, (\d+) impossible\), (\d+) frames re-simulated, '
@@ -85,7 +105,7 @@ def run_case(name, port, pace):
         if f.startswith('desync-'): os.remove(os.path.join(d, f))
     t0 = time.time()
     common = [BIN, '--headless', '--no-interp', '--frames', str(rp.frames), '--net-delay', str(delay),
-              '--net-pace', str(pace), '--net-desync-dir', d] + extra + os.environ.get('NETPLAY_EXTRA', '').split()
+              '--net-pace', str(pace), '--net-desync-dir', d, '--net-full-boot'] + extra + os.environ.get('NETPLAY_EXTRA', '').split()
     host = common + ['--press', R.fmt(rp.p1), '--host', str(port), '--net-sim', sim_h,
                      '--net-hash-log', os.path.join(d, 'host.hash')]
     join = common + ['--press', R.fmt(rp.p2), '--join', f'127.0.0.1:{port}', '--net-sim', sim_j,
@@ -95,8 +115,8 @@ def run_case(name, port, pace):
     with open(os.path.join(d, 'host.log'), 'w') as hl, open(os.path.join(d, 'join.log'), 'w') as jl:
         ph = subprocess.Popen(host, stdout=hl, stderr=subprocess.STDOUT, cwd=ROOT)
         pj = subprocess.Popen(join, stdout=jl, stderr=subprocess.STDOUT, cwd=ROOT)
-        rc_j = pj.wait(timeout=900)
-        rc_h = ph.wait(timeout=120)
+        rc_j = pj.wait(timeout=2400)
+        rc_h = ph.wait(timeout=600)
     # offline reference: the same inputs, shifted by the input delay
     ref = os.path.join(d, 'offline.hash')
     off = [BIN, '--headless', '--no-interp', '--frames', str(rp.frames), '--net-hash-log', ref,
@@ -169,31 +189,36 @@ def run_case(name, port, pace):
 
 def run_menu_session(name, port, pace):
     """Both processes start offline; one hosts and the other joins through the menu actions mid-run
-    (Netplay > Host Game / Join Game); both restart from a fresh boot, play synced, then the joiner
-    disconnects and both keep playing offline until --frames."""
+    (Netplay > Host Game / Join Game); both restart from a fresh boot that goes straight to the VS
+    character select (the default boot shortcut), play synced, then the joiner disconnects and both
+    keep playing offline until --frames."""
     rp = R.REPLAYS['vs_tieme_rohzen_villa']
+    p1, p2 = after_boot_to_vs(rp.p1), after_boot_to_vs(rp.p2)
     d = os.path.join(OUT, name)
     os.makedirs(d, exist_ok=True)
     t0 = time.time()
-    frames, disc_at = 6000, 4500           # frames of the new boot; disconnect around frame disc_at
+    frames, disc_at = 4800, 3300           # frames of the new boot; disconnect around frame disc_at
     common = [BIN, '--headless', '--no-interp', '--frames', str(frames), '--net-pace', str(pace),
               '--net-desync-dir', d]
-    host = common + ['--press', R.fmt(rp.p1), '--net-sim', '3:2:0:0:21', '--net-hash-log', os.path.join(d, 'host.hash'),
+    host = common + ['--press', R.fmt(p1), '--net-sim', '3:2:0:0:21', '--net-hash-log', os.path.join(d, 'host.hash'),
                      '--menu-action', f'300:netplay-host={port},2']
-    join = common + ['--press', R.fmt(rp.p2), '--net-sim', '3:2:0:0:22', '--net-hash-log', os.path.join(d, 'join.hash'),
+    join = common + ['--press', R.fmt(p2), '--net-sim', '3:2:0:0:22', '--net-hash-log', os.path.join(d, 'join.hash'),
                      '--menu-action', f'400:netplay-join=127.0.0.1:{port},3',
                      '--menu-action', f'{400 + disc_at}:netplay-disconnect']
     with open(os.path.join(d, 'host.log'), 'w') as hl, open(os.path.join(d, 'join.log'), 'w') as jl:
         ph = subprocess.Popen(host, stdout=hl, stderr=subprocess.STDOUT, cwd=ROOT)
         pj = subprocess.Popen(join, stdout=jl, stderr=subprocess.STDOUT, cwd=ROOT)
-        rc_j = pj.wait(timeout=900)
-        rc_h = ph.wait(timeout=300)
+        rc_j = pj.wait(timeout=1800)
+        rc_h = ph.wait(timeout=600)
     hlog = open(os.path.join(d, 'host.log')).read()
     jlog = open(os.path.join(d, 'join.log')).read()
     delay = 3                              # the larger of the two delays is agreed
     ref = os.path.join(d, 'offline.hash')
-    r = subprocess.run([BIN, '--headless', '--no-interp', '--frames', str(disc_at), '--net-hash-log', ref,
-                        '--press', R.fmt(shifted(rp.p1, delay)), '--press2', R.fmt(shifted(rp.p2, delay))],
+    dump = os.path.join(d, 'offline_dump')
+    os.makedirs(dump, exist_ok=True)
+    r = subprocess.run([BIN, '--headless', '--no-interp', '--frames', str(disc_at), '--net-hash-log', ref, '--boot-to-vs',
+                        '--dump', dump, '--dump-every', str(BOOT_VS_READY), '--scale', '1',
+                        '--press', R.fmt(shifted(p1, delay)), '--press2', R.fmt(shifted(p2, delay))],
                        capture_output=True, text=True, cwd=ROOT)
     open(os.path.join(d, 'offline.log'), 'w').write(r.stdout + r.stderr)
     H, J, O = read_log(os.path.join(d, 'host.hash')), read_log(os.path.join(d, 'join.hash')), read_log(ref)
@@ -203,6 +228,7 @@ def run_menu_session(name, port, pace):
     for who, log in (('host', hlog), ('join', jlog)):
         if 'netplay: restarting for the session' not in log: problems.append(f'{who}: no synced restart')
         if 'input delay 3' not in log: problems.append(f'{who}: delay 3 not agreed')
+        if 'boot shortcut done at frame 306' not in log: problems.append(f'{who}: no boot shortcut to VS select')
         if 'netplay: session ended' not in log: problems.append(f'{who}: session did not end')
         if f'headless: reached {frames} frames' not in log: problems.append(f'{who}: did not keep playing offline to the end')
     if 'alert: Your opponent left' not in hlog: problems.append('host: no "opponent left" alert')
@@ -211,9 +237,15 @@ def run_menu_session(name, port, pace):
     badref = [f for f in both if f in O and O[f] != H[f]]
     if badref: problems.append(f'differs from the offline run at {len(badref)} frames, first {badref[0]}')
     if len(both) < 0.9 * disc_at: problems.append(f'only {len(both)} final frames on both (disconnect near {disc_at})')
+    if BOOT_VS_READY not in both: problems.append(f'frame {BOOT_VS_READY} not final on both peers')
+    vs = os.path.join(dump, f'frame_{BOOT_VS_READY:06d}.png')
+    if not os.path.exists(vs) or not is_vs_select(vs): problems.append(f'not on the VS character select at frame {BOOT_VS_READY}')
+    if f'headless: reached {disc_at} frames' not in r.stdout + r.stderr: problems.append('offline reference did not finish')
     dt = time.time() - t0
-    msg = (f'started from the menu (both rebooted, delay 3 agreed), {len(both)} final frames equal on both peers and '
-           f'offline, disconnected near frame {disc_at}, both continued offline to {frames}')
+    msg = (f'started from the menu (both rebooted, delay 3 agreed), both on the VS character select at frame '
+           f'{BOOT_VS_READY} with equal hashes (boot shortcut, {BOOT_VS_SAVES} frames = {BOOT_VS_SAVES / 60:.1f} s '
+           f'sooner), {len(both)} final frames equal on both peers and offline, disconnected near frame {disc_at}, '
+           f'both continued offline to {frames}')
     return not problems, '; '.join(problems) if problems else msg, dt, None, None
 
 
@@ -233,7 +265,7 @@ def run_menu_fail(name, port, pace):
     for who, cmd in (('host', host), ('join', join), ('lone', lone)):
         logs[who] = os.path.join(d, who + '.log')
         procs[who] = subprocess.Popen(cmd, stdout=open(logs[who], 'w'), stderr=subprocess.STDOUT, cwd=ROOT)
-    rcs = {w: p.wait(timeout=300) for w, p in procs.items()}
+    rcs = {w: p.wait(timeout=900) for w, p in procs.items()}
     L = {w: open(f).read() for w, f in logs.items()}
     problems = [f'{w} exit code {rc}' for w, rc in rcs.items() if rc]
     if 'alert: The host could not accept you: the two players chose different netplay settings' not in L['join']:

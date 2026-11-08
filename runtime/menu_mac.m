@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include "menu.h"
 #include "widescreen.h"
+#include "settings.h"
+#include "input.h"
 
 static void netplay_dialog(bool host);
 
@@ -54,6 +56,9 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
         item.title = frontend_fullscreen() ? @"Exit Full Screen" : @"Enter Full Screen";
     if ([a isEqual:@"widescreen"])
         item.state = frontend_widescreen() ? NSControlStateValueOn : NSControlStateValueOff;
+    bool vchk;
+    if (a && frontend_view_checked(a.UTF8String, &vchk))
+        item.state = vchk ? NSControlStateValueOn : NSControlStateValueOff;
     if ([a hasPrefix:@"renderer="]) {
         NSString *r = [a substringFromIndex:9];
         item.state = [r isEqualToString:@(frontend_renderer())] ? NSControlStateValueOn : NSControlStateValueOff;
@@ -65,7 +70,8 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
 
 /* ---- Netplay dialogs ------------------------------------------------------------------------
  * Host Game / Join Game ask for the settings in a modal alert (the game pauses while it is open),
- * then queue netplay-host / netplay-join. The values are remembered (NSUserDefaults). While the
+ * then queue netplay-host / netplay-join. The values are remembered in settings.ini ([netplay] port,
+ * delay, join_address; read once from the old NSUserDefaults keys if the file has none). While the
  * host waits or the joiner connects, a small non-modal panel says so and offers Cancel; the game
  * keeps running offline meanwhile. */
 static NSPanel *s_np_panel;
@@ -109,10 +115,20 @@ static NSTextField *field(NSView *v, NSString *label, NSString *value, CGFloat y
 
 static void netplay_dialog(bool host) {
     @autoreleasepool {
+        /* migration: earlier versions kept these in NSUserDefaults */
         NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-        NSString *port = [d stringForKey:@"NetplayPort"] ?: @"7000";
-        NSString *addr = [d stringForKey:@"NetplayJoinAddress"] ?: @"";
-        NSString *delay = [d stringForKey:@"NetplayDelay"] ?: @"2";
+        static const char *const keys[3][2] = { { "port", "NetplayPort" }, { "join_address", "NetplayJoinAddress" },
+                                                { "delay", "NetplayDelay" } };
+        bool migrated = false;
+        for (int i = 0; i < 3; i++) {
+            NSString *old = [d stringForKey:@(keys[i][1])];
+            if (!settings_get("netplay", keys[i][0]) && old.length) migrated |= settings_set("netplay", keys[i][0], old.UTF8String);
+        }
+        if (migrated) settings_save();
+        const char *sv;
+        NSString *port = (sv = settings_get("netplay", "port")) ? @(sv) : @"7000";
+        NSString *addr = (sv = settings_get("netplay", "join_address")) ? @(sv) : @"";
+        NSString *delay = (sv = settings_get("netplay", "delay")) ? @(sv) : @"2";
         NSAlert *a = [NSAlert new];
         a.messageText = host ? @"Host Game" : @"Join Game";
         if (host) {
@@ -136,18 +152,20 @@ static void netplay_dialog(bool host) {
         if ([a runModal] != NSAlertFirstButtonReturn) return;
         int dl = f2.intValue;
         if (dl < 1 || dl > 30) dl = 2;
-        [d setObject:[NSString stringWithFormat:@"%d", dl] forKey:@"NetplayDelay"];
+        settings_set_int("netplay", "delay", dl);
         char arg[400];
         if (host) {
             int p = f1.intValue;
             if (p <= 0 || p > 65535) p = 7000;
-            [d setObject:[NSString stringWithFormat:@"%d", p] forKey:@"NetplayPort"];
+            settings_set_int("netplay", "port", p);
+            settings_save();
             snprintf(arg, sizeof arg, "%d,%d", p, dl);
             frontend_menu_action("netplay-host", arg);
         } else {
             NSString *s = [f1.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
             if (![s containsString:@":"]) s = [s stringByAppendingFormat:@":%@", port];
-            [d setObject:s forKey:@"NetplayJoinAddress"];
+            settings_set("netplay", "join_address", s.UTF8String);
+            settings_save();
             snprintf(arg, sizeof arg, "%s,%d", s.UTF8String, dl);
             frontend_menu_action("netplay-join", arg);
         }
@@ -221,15 +239,58 @@ void menu_init(void) {
         renItem.submenu = ren;
         [view insertItem:renItem atIndex:1];
 
+        /* render quality (presentation only; each switch reseeds the hi-res target like a resize) */
+        NSMenu *tf = [[NSMenu alloc] initWithTitle:@"Texture Filtering"];
+        add(tf, @"Off (Sharp Pixels)", @"tex-filter=nearest", nil, 0);
+        add(tf, @"Bilinear", @"tex-filter=bilinear", nil, 0);
+        add(tf, @"Smooth 2D Edges + Bilinear 3D", @"tex-filter=xbr", nil, 0);
+        NSMenuItem *tfItem = [[NSMenuItem alloc] initWithTitle:@"Texture Filtering" action:nil keyEquivalent:@""];
+        tfItem.submenu = tf;
+        [view insertItem:tfItem atIndex:2];
+        NSMenuItem *sc = [[NSMenuItem alloc] initWithTitle:@"Smooth Colours" action:@selector(fire:) keyEquivalent:@""];
+        sc.target = s_target;
+        sc.representedObject = @"smooth-colours";
+        [view insertItem:sc atIndex:3];
+        NSMenu *aa = [[NSMenu alloc] initWithTitle:@"Anti-aliasing"];
+        add(aa, @"Off", @"ssaa=1", nil, 0);
+        add(aa, @"2x", @"ssaa=2", nil, 0);
+        add(aa, @"3x", @"ssaa=3", nil, 0);
+        add(aa, @"4x", @"ssaa=4", nil, 0);
+        NSMenuItem *aaItem = [[NSMenuItem alloc] initWithTitle:@"Anti-aliasing" action:nil keyEquivalent:@""];
+        aaItem.submenu = aa;
+        [view insertItem:aaItem atIndex:4];
+
         /* Enter / Exit Full Screen (title follows the state; also Alt+Enter and F11, handled in
          * main.c's event loop so they work on every platform) */
-        [view insertItem:NSMenuItem.separatorItem atIndex:2];
+        [view insertItem:NSMenuItem.separatorItem atIndex:5];
         NSMenuItem *fs = [[NSMenuItem alloc] initWithTitle:@"Enter Full Screen" action:@selector(fire:)
                                               keyEquivalent:@"f"];
         fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         fs.target = s_target;
         fs.representedObject = @"fullscreen";
-        [view insertItem:fs atIndex:3];
+        [view insertItem:fs atIndex:6];
+
+        /* View > Controls… (also Settings… in the application menu, Cmd+,) */
+        [view insertItem:NSMenuItem.separatorItem atIndex:4];
+        NSMenuItem *ctl = [[NSMenuItem alloc] initWithTitle:@"Controls…" action:@selector(fire:) keyEquivalent:@""];
+        ctl.target = s_target;
+        ctl.representedObject = @"controls";
+        [view insertItem:ctl atIndex:5];
+        NSMenu *app = bar.numberOfItems > 0 ? bar.itemArray[0].submenu : nil;
+        if (app && app != file) {
+            NSInteger at = app.numberOfItems > 0 ? 1 : 0;   /* after About */
+            for (NSMenuItem *it in app.itemArray)
+                if (it.action == @selector(orderFrontPreferencesPanel:) || [it.title hasPrefix:@"Preferences"] ||
+                    [it.title hasPrefix:@"Settings"]) { at = -1; break; }
+            if (at >= 0) {
+                NSMenuItem *st = [[NSMenuItem alloc] initWithTitle:@"Settings…" action:@selector(fire:) keyEquivalent:@","];
+                st.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+                st.target = s_target;
+                st.representedObject = @"settings";
+                [app insertItem:NSMenuItem.separatorItem atIndex:at];
+                [app insertItem:st atIndex:at + 1];
+            }
+        }
 
         /* Netplay: play against someone on another computer (rollback netplay, netplay.c) */
         NSMenu *np = [[NSMenu alloc] initWithTitle:@"Netplay"];

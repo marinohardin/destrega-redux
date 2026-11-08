@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include "platform.h"
 
@@ -31,7 +32,10 @@
 #define VRAM_H 512
 
 static const u16 *s_vram;              /* 1x VRAM (texture/CLUT source) */
-static u16 *s_t;                       /* target pixels */
+static u16 *s_t;                       /* target pixels (HIRES_FMT_15), else NULL */
+static u32 *s_t32;                     /* target pixels (HIRES_FMT_RGBA8), else NULL */
+#define HAVE_T (s_t || s_t32)
+static int s_tex_filter;               /* HIRES_TEX_* (hires_set_tex_filter) */
 static int s_Sx, s_Sy;                 /* current horizontal / vertical scale; 0 = none */
 static int s_rx = 0, s_ry = 0, s_rw = 512, s_rh = 480;   /* tracked 1x region (in use) */
 static int s_cfg_rx = 0, s_cfg_ry = 0, s_cfg_rw = 512, s_cfg_rh = 480;   /* requested */
@@ -182,6 +186,165 @@ static inline void store_px(const HiresPrim *p, u16 *dst, u16 out, bool blend)
     if (p->mask_check && (*dst & 0x8000)) return;
     if (blend) out = blend_px(p->blend, *dst, out);
     *dst = out | p->mask_or;
+}
+
+/* ---- full-precision pixels (HIRES_FMT_RGBA8) -------------------------------------------------
+ * R | G << 8 | B << 16, channels on the PS1's 8-bit scale (15-bit c = c << 3), A = 0xFF << 24 for
+ * the mask bit. Semi-transparency clamps like the hardware, in 8-bit units. */
+#define A32 0xFF000000u
+static inline u32 c15to32(u32 c)
+{
+    return ((c & 0x1F) << 3) | (((c >> 5) & 0x1F) << 11) | (((c >> 10) & 0x1F) << 19) | ((c & 0x8000) ? A32 : 0);
+}
+
+static inline u32 blend32(int mode, u32 b, u32 f)
+{
+    int br = b & 255, bg = (b >> 8) & 255, bb = (b >> 16) & 255;
+    int fr = f & 255, fg = (f >> 8) & 255, fb = (f >> 16) & 255;
+    int r, g, bl;
+    switch (mode) {
+    case 0: r = (br + fr) >> 1; g = (bg + fg) >> 1; bl = (bb + fb) >> 1; break;
+    case 1: r = imin(br + fr, 255); g = imin(bg + fg, 255); bl = imin(bb + fb, 255); break;
+    case 2: r = imax(br - fr, 0); g = imax(bg - fg, 0); bl = imax(bb - fb, 0); break;
+    default: r = imin(br + (fr >> 2), 255); g = imin(bg + (fg >> 2), 255); bl = imin(bb + (fb >> 2), 255); break;
+    }
+    return (u32)r | ((u32)g << 8) | ((u32)bl << 16) | (f & A32);
+}
+
+/* ---- filtered texels ---------------------------------------------------------------------------
+ * A texel sample is a weighted combination of CLUT-looked-up texels: channels in 5.8 fixed point
+ * (a single texel t gives (t & 31) << 8), the semi-transparency bit by weighted majority. Colour
+ * 0000 is transparent: it contributes no colour (the rest is renormalised, so no black fringes)
+ * and the sample is transparent when the opaque texels weigh less than half. Integer only, the
+ * same as both shaders. */
+typedef struct { int r, g, b; bool stp; } Tex8;
+
+static inline Tex8 tex8(u16 t)
+{
+    Tex8 o = { (t & 31) << 8, ((t >> 5) & 31) << 8, ((t >> 10) & 31) << 8, (t & 0x8000) != 0 };
+    return o;
+}
+
+/* weights w[] sum to 65536 */
+static inline bool tex_combine(const u16 *t, const u32 *w, int n, Tex8 *o)
+{
+    u32 cov = 0, sr = 0, sg = 0, sb = 0, ss = 0;
+    for (int k = 0; k < n; k++) {
+        if (!t[k] || !w[k]) continue;
+        cov += w[k];
+        sr += w[k] * (t[k] & 31u);
+        sg += w[k] * ((t[k] >> 5) & 31u);
+        sb += w[k] * ((t[k] >> 10) & 31u);
+        if (t[k] & 0x8000) ss += w[k];
+    }
+    if (cov < 32768) return false;
+    if (cov == 65536) {   /* all taps opaque (the common case): the same rounding as a shift */
+        o->r = (int)((sr + 128) >> 8); o->g = (int)((sg + 128) >> 8); o->b = (int)((sb + 128) >> 8);
+    } else {
+        o->r = (int)((sr * 256 + (cov >> 1)) / cov);
+        o->g = (int)((sg * 256 + (cov >> 1)) / cov);
+        o->b = (int)((sb * 256 + (cov >> 1)) / cov);
+    }
+    o->stp = ss * 2 >= cov;
+    return true;
+}
+
+/* sampled texel modulated by the vertex colour (r, g, b 0..255; 128 = 1.0), 15-bit output.
+ * For a single texel this is exactly shade_tex(). */
+static inline u16 tex8_out15(Tex8 t, int r, int g, int b, const int RAW, const int DITHER, int d)
+{
+    int tr, tg, tb;
+    if (RAW) { tr = t.r >> 8; tg = t.g >> 8; tb = t.b >> 8; }
+    else if (DITHER) {
+        tr = clamp255(((t.r * r) >> 12) + d) >> 3;
+        tg = clamp255(((t.g * g) >> 12) + d) >> 3;
+        tb = clamp255(((t.b * b) >> 12) + d) >> 3;
+    } else {
+        tr = imin((t.r * r) >> 15, 31); tg = imin((t.g * g) >> 15, 31); tb = imin((t.b * b) >> 15, 31);
+    }
+    return (u16)(tr | (tg << 5) | (tb << 10) | (t.stp ? 0x8000 : 0));
+}
+
+/* the same in full precision: the 8-bit value the PS1 truncates to 5 bits (>> 3 of it = tex8_out15) */
+static inline u32 tex8_out32(Tex8 t, int r, int g, int b, const int RAW)
+{
+    int tr, tg, tb;
+    if (RAW) { tr = t.r >> 5; tg = t.g >> 5; tb = t.b >> 5; }
+    else { tr = imin((t.r * r) >> 12, 255); tg = imin((t.g * g) >> 12, 255); tb = imin((t.b * b) >> 12, 255); }
+    return (u32)tr | ((u32)tg << 8) | ((u32)tb << 16) | (t.stp ? A32 : 0);
+}
+
+/* One axis of a filtered sample: texel index i (texel centres at integers) and fraction f (1/256
+ * texel) towards i + 1, clamped so the footprint stays inside [lo, hi], the range the 1x draw
+ * sampled: the sample point is clamped to [lo, hi] and i + 1 to hi. */
+static inline void clamp_axis(int *i, int *f, int lo, int hi)
+{
+    if (*i < lo) { *i = lo; *f = 0; }
+    else if (*i >= hi) { *i = hi; *f = 0; }
+}
+
+typedef struct { int ku, kv, kq; u16 t[5]; bool cond; } TCache;   /* last footprint fetched */
+#define TCACHE_INIT { INT_MIN, INT_MIN, -1, { 0 }, false }
+
+static inline bool samp_bilinear(const HiresPrim *p, int depth, int iu, int fu, int iv, int fv,
+                                 int uhi, int vhi, TCache *c, Tex8 *o)
+{
+    if (iu != c->ku || iv != c->kv) {
+        c->ku = iu; c->kv = iv;
+        int iu1 = iu < uhi ? iu + 1 : uhi, iv1 = iv < vhi ? iv + 1 : vhi;
+        c->t[0] = tex_fetch(p, depth, (u32)iu, (u32)iv);
+        c->t[1] = tex_fetch(p, depth, (u32)iu1, (u32)iv);
+        c->t[2] = tex_fetch(p, depth, (u32)iu, (u32)iv1);
+        c->t[3] = tex_fetch(p, depth, (u32)iu1, (u32)iv1);
+    }
+    const u32 w[4] = { (u32)((256 - fu) * (256 - fv)), (u32)(fu * (256 - fv)), (u32)((256 - fu) * fv), (u32)(fu * fv) };
+    return tex_combine(c->t, w, 4, o);
+}
+
+/* Edge-aware 2D filter (xBR-style, for pixel art at 1:1): the nearest texel E, except in the corner
+ * of E the sample lies towards, cut off by the line through the midpoints of E's two edges there
+ * (|dx| + |dy| > 1/2 texel), which takes the colour of the horizontal neighbour H when H equals the
+ * vertical neighbour V and the pattern is a real diagonal edge, Scale2x's rule: H == V, H != E,
+ * H != the opposite horizontal neighbour, V != the opposite vertical one. The cut is anti-aliased
+ * over about one hi-res pixel. Neighbours are clamped to the 1x-sampled range like bilinear. */
+static inline bool samp_xbr(const HiresPrim *p, int depth, int iu, int fu, int iv, int fv,
+                            int ulo, int uhi, int vlo, int vhi, int Sx, int Sy, TCache *c, Tex8 *o)
+{
+    int ie = iu, dx = fu, je = iv, dy = fv;
+    if (fu >= 128) { ie = iu + 1; dx = fu - 256; }
+    if (fv >= 128) { je = iv + 1; dy = fv - 256; }
+    const int hx = dx >= 0 ? 1 : -1, hy = dy >= 0 ? 1 : -1;
+    const int q = (hx > 0) | ((hy > 0) << 1);
+    if (ie != c->ku || je != c->kv || q != c->kq) {
+        c->ku = ie; c->kv = je; c->kq = q;
+        const int ih = imin(imax(ie + hx, ulo), uhi), iho = imin(imax(ie - hx, ulo), uhi);
+        const int jv = imin(imax(je + hy, vlo), vhi), jvo = imin(imax(je - hy, vlo), vhi);
+        c->t[0] = tex_fetch(p, depth, (u32)ie, (u32)je);
+        c->t[1] = tex_fetch(p, depth, (u32)ih, (u32)je);
+        c->t[2] = tex_fetch(p, depth, (u32)ie, (u32)jv);
+        c->t[3] = tex_fetch(p, depth, (u32)iho, (u32)je);
+        c->t[4] = tex_fetch(p, depth, (u32)ie, (u32)jvo);
+        c->cond = c->t[1] == c->t[2] && c->t[1] != c->t[0] && c->t[1] != c->t[3] && c->t[2] != c->t[4];
+    }
+    u32 w[2] = { 65536, 0 };
+    if (c->cond) {
+        const int d8 = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) - 128;
+        const int a = imin(imax(((d8 * (Sx + Sy)) >> 1) + 128, 0), 256);
+        w[0] = (u32)(256 - a) * 256; w[1] = (u32)a * 256;
+    }
+    return tex_combine(c->t, w, 2, o);
+}
+
+/* Rect texel coordinate on one axis at hi-res pixel X (scale S): texel t0 + d*(k - k0) is centred
+ * on 1x pixel k (d = +-1), so the sample point (X + 0.5)/S - 0.5 maps to
+ * num / (2S) with num = 2S*t0 + d*(2X + 1 - S - 2S*k0). */
+static inline void rect_axis(int t0, int d, int k0, int X, int S, int *i, int *f)
+{
+    const int D = 2 * S, num = D * t0 + d * (2 * X + 1 - S - D * k0);
+    int q = num / D;
+    if (num % D != 0 && num < 0) q--;
+    *i = q;
+    *f = ((num - q * D) * 256) / D;
 }
 
 /* ---- worker pool, counters, dirty tracking ----------------------------------------- */
@@ -372,11 +535,18 @@ typedef struct {
     const HiresVtx *v;
 } HV;
 
-typedef struct { HiresPrim p; HiresVtx v[3]; bool persp, precise; } TriArgs;
+typedef struct { HiresPrim p; HiresVtx v[3]; bool persp, precise, xbr; } TriArgs;
 
 /* PGXP perspective-correct texturing (see be_tri) */
 static bool s_persp = true;
 static atomic_ullong s_tris_all, s_tris_persp;
+static atomic_ullong s_filt_tris, s_filt_2d, s_filt_rects;   /* --tex-filter: textured tris / of them 2D / rects */
+void hires_get_filter_stats(u64 *tris, u64 *tris_2d, u64 *rects)
+{
+    *tris = atomic_load(&s_filt_tris);
+    *tris_2d = atomic_load(&s_filt_2d);
+    *rects = atomic_load(&s_filt_rects);
+}
 void hires_set_perspective(bool enable) { s_persp = enable; }
 bool hires_get_perspective(void) { return s_persp; }
 void hires_get_persp_stats(u64 *tris, u64 *persp)
@@ -390,7 +560,7 @@ static inline int ccol_clamp(s64 c, int lo, int hi) { return c < lo ? lo : (c > 
 static inline __attribute__((always_inline)) void
 tri_impl(const TriArgs *ta, int by0, int by1,
          const int TEX, const int DEPTH, const int RAW, const int SEMI,
-         const int GOUR, const int DITHER)
+         const int GOUR, const int DITHER, const int FILT, const int HP)
 {
     const HiresPrim *p = &ta->p;
     const HiresVtx *v0 = &ta->v[0], *v1 = &ta->v[1], *v2 = &ta->v[2];
@@ -517,8 +687,10 @@ tri_impl(const TriArgs *ta, int by0, int by1,
     /* at 1x1 the sample positions equal the 1x GPU's (which wraps rather than clamps), so the
      * clamp is skipped to stay bit-identical; it only matters for sub-pixel sample offsets */
     const bool do_clamp = Sx > 1 || Sy > 1 || ta->precise;   /* PGXP moves samples off 1x's too */
+    const bool XBR = FILT && ta->xbr;
     const bool mc = p->mask_check;
     const u16 mo = p->mask_or;
+    const u32 mo32 = p->mask_or ? A32 : 0;
     const int blendm = p->blend;
 
     for (int part = 0; part < 2; part++) {
@@ -558,14 +730,18 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                     pu = pq[1] + pdx[1] * (P - ax) + pdy[1] * (Q - ay);
                     pv = pq[2] + pdx[2] * (P - ax) + pdy[2] * (Q - ay);
                 }
-                u16 *dst = s_t + (size_t)(y - s_oy) * s_tw + (xs - s_ox);
+                const size_t row_off = (size_t)(y - s_oy) * s_tw + (xs - s_ox);
+                u16 *dst = HP ? NULL : s_t + row_off;
+                u32 *dst32 = HP ? s_t32 + row_off : NULL;
                 const int y1 = y / Sy;
                 int lu = -1, lv = -1;
                 u16 lt = 0;
+                TCache tc = TCACHE_INIT;
                 u32 n_clamped = 0, n_escaped = 0;
                 s64 pus = 0, pvs = 0;   /* PERSP: affine step inside the current 8-pixel run */
-                for (int x = xs; x < xe; x++, dst++) {
-                    u16 out; bool blend, ok;
+                for (int x = xs; x < xe; x++) {
+                    u16 out = 0; u32 out32 = 0; bool blend = false, ok;
+                    const int px = x - xs;
                     if (PERSP && !((x - xs) & 7)) {
                         /* exact u/v every 8 hi-res pixels (2 1x pixels at 4x), linear in between;
                          * +0.5 texel: same rounding as the affine base */
@@ -579,8 +755,30 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                         pus = (U1 - U) / n; pvs = (V1 - V) / n;
                         pq0 = q1; pu = u1; pv = v1;
                     }
-                    if (!(mc && (*dst & 0x8000))) {
-                        if (TEX) {
+                    if (!(mc && (HP ? (dst32[px] & 0x80000000u) : (dst[px] & 0x8000)))) {
+                        if (TEX && FILT) {
+                            /* filtered: sample point without the +0.5 rounding bias, footprint
+                             * clamped to the 1x-sampled range (clamp_axis) */
+                            const s64 su = U - (1 << (FRAC - 1)), sv = V - (1 << (FRAC - 1));
+                            int iu = (int)(su >> FRAC), fu = (int)((su >> 16) & 255);
+                            int iv = (int)(sv >> FRAC), fv = (int)((sv >> 16) & 255);
+                            n_clamped += (iu < umin) | (iu > umax) | (iv < vmin) | (iv > vmax) |
+                                         (iu == umax && fu) | (iv == vmax && fv);
+                            clamp_axis(&iu, &fu, umin, umax);
+                            clamp_axis(&iv, &fv, vmin, vmax);
+                            __asm__ volatile("" : "+r"(iu), "+r"(iv), "+r"(fu), "+r"(fv));
+                            n_escaped += (iu < umin) | (iu > umax) | (iv < vmin) | (iv > vmax) |
+                                         (iu == umax && fu) | (iv == vmax && fv);
+                            Tex8 tx;
+                            ok = XBR ? samp_xbr(p, DEPTH, iu, fu, iv, fv, umin, umax, vmin, vmax, Sx, Sy, &tc, &tx)
+                                     : samp_bilinear(p, DEPTH, iu, fu, iv, fv, umax, vmax, &tc, &tx);
+                            if (ok) {
+                                if (HP) out32 = tex8_out32(tx, (int)CCOL(r, 0), (int)CCOL(g, 1), (int)CCOL(bb, 2), RAW);
+                                else out = tex8_out15(tx, (int)CCOL(r, 0), (int)CCOL(g, 1), (int)CCOL(bb, 2), RAW, DITHER,
+                                                      DITHER ? s_dither[y1 & 3][(x / Sx) & 3] : 0);
+                                blend = SEMI && tx.stp;
+                            }
+                        } else if (TEX) {
                             int ui = (int)(U >> FRAC), vi = (int)(V >> FRAC);
                             if (do_clamp) {
                                 n_clamped += (ui < umin) | (ui > umax) | (vi < vmin) | (vi > vmax);
@@ -590,15 +788,31 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                                 n_escaped += (ui < umin) | (ui > umax) | (vi < vmin) | (vi > vmax);
                             }
                             if (ui != lu || vi != lv) { lu = ui; lv = vi; lt = tex_fetch(p, DEPTH, (u32)ui, (u32)vi); }
-                            ok = shade_tex(p, lt, DITHER ? x / Sx : 0, y1, CCOL(r, 0), CCOL(g, 1), CCOL(bb, 2),
-                                           RAW, SEMI, DITHER, &out, &blend);
+                            if (HP) {
+                                ok = lt != 0;
+                                if (ok) {
+                                    out32 = tex8_out32(tex8(lt), (int)CCOL(r, 0), (int)CCOL(g, 1), (int)CCOL(bb, 2), RAW);
+                                    blend = SEMI && (lt & 0x8000);
+                                }
+                            } else
+                                ok = shade_tex(p, lt, DITHER ? x / Sx : 0, y1, CCOL(r, 0), CCOL(g, 1), CCOL(bb, 2),
+                                               RAW, SEMI, DITHER, &out, &blend);
+                        } else if (HP) {
+                            ok = true;
+                            out32 = CCOL(r, 0) | (CCOL(g, 1) << 8) | (CCOL(bb, 2) << 16);
+                            blend = SEMI;
                         } else {
                             ok = shade(p, DITHER ? x / Sx : 0, y1, CCOL(r, 0), CCOL(g, 1), CCOL(bb, 2), 0, 0,
                                        0, DEPTH, RAW, SEMI, DITHER, &out, &blend);
                         }
                         if (ok) {
-                            if (blend) out = blend_px(blendm, *dst, out);
-                            *dst = out | mo;
+                            if (HP) {
+                                if (blend) out32 = blend32(blendm, dst32[px], out32);
+                                dst32[px] = out32 | mo32;
+                            } else {
+                                if (blend) out = blend_px(blendm, dst[px], out);
+                                dst[px] = out | mo;
+                            }
                         }
                     }
                     if (GOUR) { r += gs[0]; g += gs[1]; bb += gs[2]; }
@@ -613,9 +827,14 @@ tri_impl(const TriArgs *ta, int by0, int by1,
     }
 }
 
+/* Instantiations: H0 = 15-bit target, H1 = full precision (never dithered). Nearest texturing is
+ * specialised on every flag; filtered texturing (one generic variant per format) is heavier per
+ * pixel anyway. */
 #define TRI_FN(name, TEX, DEPTH, RAW, SEMI, GOUR, DITHER)                                  \
-    static void name(const void *ctx, int y0, int y1)                                      \
-    { tri_impl((const TriArgs *)ctx, y0, y1, TEX, DEPTH, RAW, SEMI, GOUR, DITHER); }
+    static void name##_h0(const void *ctx, int y0, int y1)                                 \
+    { tri_impl((const TriArgs *)ctx, y0, y1, TEX, DEPTH, RAW, SEMI, GOUR, DITHER, 0, 0); } \
+    static void name##_h1(const void *ctx, int y0, int y1)                                 \
+    { tri_impl((const TriArgs *)ctx, y0, y1, TEX, DEPTH, RAW, SEMI, GOUR, 0, 0, 1); }
 
 TRI_FN(tri_u000, 0, 0, 0, 0, 0, 0)
 TRI_FN(tri_u001, 0, 0, 0, 0, 0, 1)
@@ -625,9 +844,10 @@ TRI_FN(tri_u100, 0, 0, 0, 1, 0, 0)
 TRI_FN(tri_u101, 0, 0, 0, 1, 0, 1)
 TRI_FN(tri_u110, 0, 0, 0, 1, 1, 0)
 TRI_FN(tri_u111, 0, 0, 0, 1, 1, 1)
-static const BandFn s_tri_untex[8] = {
-    tri_u000, tri_u001, tri_u010, tri_u011, tri_u100, tri_u101, tri_u110, tri_u111,
-};
+#define TRI_UNTEX_TABLE(H)                                                                 \
+    { tri_u000_##H, tri_u001_##H, tri_u010_##H, tri_u011_##H, tri_u100_##H, tri_u101_##H,  \
+      tri_u110_##H, tri_u111_##H }
+static const BandFn s_tri_untex[2][8] = { TRI_UNTEX_TABLE(h0), TRI_UNTEX_TABLE(h1) };
 
 #define TRI_TEX_DEPTH(D)                                   \
     TRI_FN(tri_t##D##_raw0, 1, D, 1, 0, 0, 0)              \
@@ -643,13 +863,24 @@ static const BandFn s_tri_untex[8] = {
 TRI_TEX_DEPTH(0)
 TRI_TEX_DEPTH(1)
 TRI_TEX_DEPTH(2)
-#define TRI_TEX_TABLE(D)                                                          \
-    { tri_t##D##_raw0, tri_t##D##_raw1, tri_t##D##_m000, tri_t##D##_m001,         \
-      tri_t##D##_m010, tri_t##D##_m011, tri_t##D##_m100, tri_t##D##_m101,         \
-      tri_t##D##_m110, tri_t##D##_m111 }
-static const BandFn s_tri_tex[3][10] = {
-    TRI_TEX_TABLE(0), TRI_TEX_TABLE(1), TRI_TEX_TABLE(2),
+#define TRI_TEX_TABLE(D, H)                                                                \
+    { tri_t##D##_raw0_##H, tri_t##D##_raw1_##H, tri_t##D##_m000_##H, tri_t##D##_m001_##H,  \
+      tri_t##D##_m010_##H, tri_t##D##_m011_##H, tri_t##D##_m100_##H, tri_t##D##_m101_##H,  \
+      tri_t##D##_m110_##H, tri_t##D##_m111_##H }
+static const BandFn s_tri_tex[2][3][10] = {
+    { TRI_TEX_TABLE(0, h0), TRI_TEX_TABLE(1, h0), TRI_TEX_TABLE(2, h0) },
+    { TRI_TEX_TABLE(0, h1), TRI_TEX_TABLE(1, h1), TRI_TEX_TABLE(2, h1) },
 };
+static void tri_filt_h0(const void *ctx, int y0, int y1)
+{
+    const TriArgs *ta = ctx;
+    tri_impl(ta, y0, y1, 1, ta->p.depth, ta->p.raw, ta->p.semi, ta->p.gour, ta->p.dither, 1, 0);
+}
+static void tri_filt_h1(const void *ctx, int y0, int y1)
+{
+    const TriArgs *ta = ctx;
+    tri_impl(ta, y0, y1, 1, ta->p.depth, ta->p.raw, ta->p.semi, ta->p.gour, 0, 1, 1);
+}
 
 /* Guard band: a draw area that reaches the region's left / right edge is extended gx columns
  * further out on that side (see HiresBackend.set_guard). No-op without a guard band. */
@@ -660,17 +891,51 @@ static inline void guard_clip(HiresPrim *p)
     if (p->clip_x2 == s_rx + s_rw - 1) p->clip_x2 = s_rx + s_rw - 1 + s_gx;
 }
 
-static inline bool dither_on(const HiresPrim *p) { return p->dither && ((s_Sx == 1 && s_Sy == 1) || s_dither_hi); }
+/* full-precision targets are never dithered (dither only exists to hide the 15-bit truncation) */
+static inline bool dither_on(const HiresPrim *p)
+{
+    return p->dither && !s_t32 && ((s_Sx == 1 && s_Sy == 1) || s_dither_hi);
+}
+
+/* A 2D triangle for the texture filter (HIRES_TEX_XBR): no PGXP depth (so integer vertices) and
+ * u/v mapped 1:1 to x/y, axis-aligned (flips allowed): the 1x GPU's u/v gradients are exactly
+ * +-1 and 0. Sprites, HUD and text drawn as polygons. Shared by both backends. */
+bool hires_tri_is_2d(const HiresVtx v[3])
+{
+    if (v[0].w > 0 || v[1].w > 0 || v[2].w > 0) return false;
+    const HiresVtx *a = &v[0], *b = &v[1], *c = &v[2], *t;
+    if (b->y < a->y) { t = a; a = b; b = t; }
+    if (c->y < b->y) { t = b; b = c; c = t; }
+    if (b->y < a->y) { t = a; a = b; b = t; }
+    const s64 denom = ((s64)b->x - a->x) * ((s64)c->y - a->y) - ((s64)c->x - a->x) * ((s64)b->y - a->y);
+    if (denom == 0) return false;
+    s64 q[2][2];   /* [u/v][d/dx, d/dy], 12-bit fixed point like the 1x GPU */
+    for (int i = 0; i < 2; i++) {
+        const s32 av = (s32)(i ? a->v : a->u), bv = (s32)(i ? b->v : b->u), cv = (s32)(i ? c->v : c->u);
+        s64 n_x = (s64)(bv - av) * ((s64)c->y - a->y) - (s64)(cv - av) * ((s64)b->y - a->y);
+        s64 n_y = (s64)(cv - av) * ((s64)b->x - a->x) - (s64)(bv - av) * ((s64)c->x - a->x);
+        q[i][0] = (s64)(((__int128)n_x << 28) / denom);
+        q[i][1] = (s64)(((__int128)n_y << 28) / denom);
+    }
+    const s64 one = (s64)1 << 12;
+    return (q[0][0] == one || q[0][0] == -one) && q[0][1] == 0 && q[1][0] == 0 && (q[1][1] == one || q[1][1] == -one);
+}
 
 static void be_tri(const HiresPrim *p, const HiresVtx v[3])
 {
-    if (!s_t) return;
+    if (!HAVE_T) return;
+    const int H = s_t32 ? 1 : 0;
     TriArgs ta;
     ta.p = *p;
     guard_clip(&ta.p);
     ta.p.dither = dither_on(p);
     memcpy(ta.v, v, sizeof ta.v);
     ta.precise = v[0].w > 0 || v[1].w > 0 || v[2].w > 0;
+    ta.xbr = p->tex && s_tex_filter == HIRES_TEX_XBR && hires_tri_is_2d(v);
+    if (p->tex && s_tex_filter != HIRES_TEX_NEAREST) {
+        atomic_fetch_add_explicit(&s_filt_tris, 1, memory_order_relaxed);
+        if (ta.xbr) atomic_fetch_add_explicit(&s_filt_2d, 1, memory_order_relaxed);
+    }
     /* equal depth on all three vertices: perspective-correct = affine, so take the affine path
      * (exact rationals, the same in hires_gpu.c). The perspective path's double/fixed-point
      * planes made exact texel-boundary ties (constant q, e.g. walls facing the camera) round
@@ -686,12 +951,13 @@ static void be_tri(const HiresPrim *p, const HiresVtx v[3])
     }
     if (!p->tex) {
         int idx = (p->semi ? 4 : 0) | (p->gour ? 2 : 0) | (ta.p.dither ? 1 : 0);
-        fn = s_tri_untex[idx];
+        fn = s_tri_untex[H][idx];
     } else {
         note_tex_page(p);
         int d = p->depth;
-        if (p->raw) fn = s_tri_tex[d][p->semi ? 1 : 0];
-        else fn = s_tri_tex[d][2 + ((p->semi ? 4 : 0) | (p->gour ? 2 : 0) | (ta.p.dither ? 1 : 0))];
+        if (s_tex_filter != HIRES_TEX_NEAREST) fn = H ? tri_filt_h1 : tri_filt_h0;
+        else if (p->raw) fn = s_tri_tex[H][d][p->semi ? 1 : 0];
+        else fn = s_tri_tex[H][d][2 + ((p->semi ? 4 : 0) | (p->gour ? 2 : 0) | (ta.p.dither ? 1 : 0))];
     }
     /* hi-res row / column extent of the triangle, intersected with clip and target */
     s32 miny = v[0].y, maxy = v[0].y, minx = v[0].x, maxx = v[0].x;
@@ -720,16 +986,17 @@ typedef struct {
     int x0, y0, w, h;
     u32 r, g, b, u0, v0;
     bool flipx, flipy;
+    /* filtered: unwrapped u/v range of the columns / rows drawn (the 1x-sampled range) */
+    int ulo, uhi, vlo, vhi;
+    bool xbr;
 } RectArgs;
 
-static inline __attribute__((always_inline)) void
-rect_impl(const RectArgs *ra, int by0, int by1,
-          const int TEX, const int DEPTH, const int RAW, const int SEMI)
+/* clip a rect to the draw area, region and band (1x rows / columns); false if nothing is left */
+static inline bool rect_span(const RectArgs *ra, int by0, int by1, int *xs_, int *xe_, int *ys_, int *ye_)
 {
     const HiresPrim *p = &ra->p;
-    const int Sx = s_Sx, Sy = s_Sy;
-    const int x0 = ra->x0, y0 = ra->y0;
-    int xs = x0, xe = x0 + ra->w, ys = y0, ye = y0 + ra->h;
+    const int Sy = s_Sy;
+    int xs = ra->x0, xe = ra->x0 + ra->w, ys = ra->y0, ye = ra->y0 + ra->h;
     if (xs < p->clip_x1) xs = p->clip_x1;
     if (xe > p->clip_x2 + 1) xe = p->clip_x2 + 1;
     if (ys < p->clip_y1) ys = p->clip_y1;
@@ -738,7 +1005,19 @@ rect_impl(const RectArgs *ra, int by0, int by1,
     ys = imax(ys, s_ry); ye = imin(ye, s_ry + s_rh);
     /* restrict to the band (hi-res rows [by0, by1)) */
     ys = imax(ys, by0 / Sy); ye = imin(ye, (by1 + Sy - 1) / Sy);
-    if (xs >= xe || ys >= ye) return;
+    *xs_ = xs; *xe_ = xe; *ys_ = ys; *ye_ = ye;
+    return xs < xe && ys < ye;
+}
+
+static inline __attribute__((always_inline)) void
+rect_impl(const RectArgs *ra, int by0, int by1,
+          const int TEX, const int DEPTH, const int RAW, const int SEMI, const int HP)
+{
+    const HiresPrim *p = &ra->p;
+    const int Sx = s_Sx, Sy = s_Sy;
+    const int x0 = ra->x0, y0 = ra->y0;
+    int xs, xe, ys, ye;
+    if (!rect_span(ra, by0, by1, &xs, &xe, &ys, &ye)) return;
     const u32 r = ra->r, g = ra->g, b = ra->b;
     u32 u0 = ra->u0;
     const u32 v0 = ra->v0;
@@ -747,31 +1026,117 @@ rect_impl(const RectArgs *ra, int by0, int by1,
     u8 ucol[VRAM_W];
     for (int x = xs; x < xe; x++) ucol[x - xs] = (u8)((u0 + (u32)(du * (x - x0))) & 0xFF);
     u16 outs[VRAM_W];
+    u32 outs32[HP ? VRAM_W : 1];
     u8 vis[VRAM_W];
     const int cnt = xe - xs;
+    const u32 mo32 = p->mask_or ? A32 : 0;
     for (int y = ys; y < ye; y++) {
         u32 v = (v0 + (u32)(dv * (y - y0))) & 0xFF;
         for (int i = 0; i < cnt; i++) {
-            bool blend;
-            u16 o = 0;
-            bool ok = shade(p, 0, 0, r, g, b, ucol[i], v, TEX, DEPTH, RAW, SEMI, 0, &o, &blend);
-            outs[i] = o;
+            bool blend = false, ok;
+            if (HP) {
+                u32 o = 0;
+                if (TEX) {
+                    u16 t = tex_fetch(p, DEPTH, ucol[i], v);
+                    ok = t != 0;
+                    if (ok) { o = tex8_out32(tex8(t), (int)r, (int)g, (int)b, RAW); blend = SEMI && (t & 0x8000); }
+                } else { ok = true; o = r | (g << 8) | (b << 16); blend = SEMI; }
+                outs32[i] = o;
+            } else {
+                u16 o = 0;
+                ok = shade(p, 0, 0, r, g, b, ucol[i], v, TEX, DEPTH, RAW, SEMI, 0, &o, &blend);
+                outs[i] = o;
+            }
             vis[i] = ok ? (blend ? 2 : 1) : 0;
         }
         int sy0 = imax(0, by0 - y * Sy), sy1 = imin(Sy, by1 - y * Sy);
         for (int sy = sy0; sy < sy1; sy++) {
-            u16 *dst = s_t + (size_t)(y * Sy + sy - s_oy) * s_tw + (xs * Sx - s_ox);
-            for (int i = 0; i < cnt; i++) {
-                if (!vis[i]) { dst += Sx; continue; }
-                for (int sx = 0; sx < Sx; sx++, dst++) store_px(p, dst, outs[i], vis[i] == 2);
+            const size_t off = (size_t)(y * Sy + sy - s_oy) * s_tw + (xs * Sx - s_ox);
+            if (HP) {
+                u32 *dst = s_t32 + off;
+                for (int i = 0; i < cnt; i++) {
+                    if (!vis[i]) { dst += Sx; continue; }
+                    for (int sx = 0; sx < Sx; sx++, dst++) {
+                        if (p->mask_check && (*dst & A32)) continue;
+                        *dst = (vis[i] == 2 ? blend32(p->blend, *dst, outs32[i]) : outs32[i]) | mo32;
+                    }
+                }
+            } else {
+                u16 *dst = s_t + off;
+                for (int i = 0; i < cnt; i++) {
+                    if (!vis[i]) { dst += Sx; continue; }
+                    for (int sx = 0; sx < Sx; sx++, dst++) store_px(p, dst, outs[i], vis[i] == 2);
+                }
             }
         }
     }
 }
 
+/* Filtered textured rect: per hi-res pixel, texel coordinates from rect_axis (the sample point
+ * relative to the 1x texel centres), footprint clamped to the u/v range of the drawn columns/rows. */
+static inline __attribute__((always_inline)) void
+rect_filt_impl(const RectArgs *ra, int by0, int by1, const int HP)
+{
+    const HiresPrim *p = &ra->p;
+    const int Sx = s_Sx, Sy = s_Sy;
+    int xs, xe, ys, ye;
+    if (!rect_span(ra, by0, by1, &xs, &xe, &ys, &ye)) return;
+    const int u0 = (int)(ra->u0 | (ra->flipx ? 1u : 0u)), v0 = (int)ra->v0;
+    const int du = ra->flipx ? -1 : 1, dv = ra->flipy ? -1 : 1;
+    const int depth = p->depth;
+    const bool RAW = p->raw, SEMI = p->semi;
+    const int r = (int)ra->r, g = (int)ra->g, b = (int)ra->b;
+    const u32 mo32 = p->mask_or ? A32 : 0;
+    const int X0 = xs * Sx, X1 = xe * Sx;
+    const int Y0 = imax(ys * Sy, by0), Y1 = imin(ye * Sy, by1);
+    static _Thread_local int iu_col[(VRAM_W + 2 * HIRES_MAX_GUARD) * HIRES_MAX_RENDER_SCALE];
+    static _Thread_local u8 fu_col[(VRAM_W + 2 * HIRES_MAX_GUARD) * HIRES_MAX_RENDER_SCALE];
+    if (Y0 >= Y1) return;
+    u32 n_clamped = 0, n_escaped = 0;
+    for (int X = X0; X < X1; X++) {
+        int iu, fu;
+        rect_axis(u0, du, ra->x0, X, Sx, &iu, &fu);
+        n_clamped += (iu < ra->ulo) | (iu > ra->uhi) | (iu == ra->uhi && fu);
+        clamp_axis(&iu, &fu, ra->ulo, ra->uhi);
+        __asm__ volatile("" : "+r"(iu), "+r"(fu));
+        n_escaped += (iu < ra->ulo) | (iu > ra->uhi) | (iu == ra->uhi && fu);
+        iu_col[X - X0] = iu; fu_col[X - X0] = (u8)fu;
+    }
+    for (int Y = Y0; Y < Y1; Y++) {
+        int iv, fv;
+        rect_axis(v0, dv, ra->y0, Y, Sy, &iv, &fv);
+        clamp_axis(&iv, &fv, ra->vlo, ra->vhi);
+        TCache tc = TCACHE_INIT;
+        const size_t off = (size_t)(Y - s_oy) * s_tw + (X0 - s_ox);
+        for (int X = X0; X < X1; X++) {
+            const int k = X - X0;
+            if (p->mask_check && (HP ? (s_t32[off + k] & A32) : (s_t[off + k] & 0x8000))) continue;
+            Tex8 tx;
+            bool ok = ra->xbr ? samp_xbr(p, depth, iu_col[k], fu_col[k], iv, fv, ra->ulo, ra->uhi, ra->vlo, ra->vhi, Sx, Sy, &tc, &tx)
+                              : samp_bilinear(p, depth, iu_col[k], fu_col[k], iv, fv, ra->uhi, ra->vhi, &tc, &tx);
+            if (!ok) continue;
+            const bool blend = SEMI && tx.stp;
+            if (HP) {
+                u32 o = RAW ? tex8_out32(tx, r, g, b, 1) : tex8_out32(tx, r, g, b, 0);
+                u32 *d = &s_t32[off + k];
+                *d = (blend ? blend32(p->blend, *d, o) : o) | mo32;
+            } else {
+                u16 o = RAW ? tex8_out15(tx, r, g, b, 1, 0, 0) : tex8_out15(tx, r, g, b, 0, 0, 0);
+                u16 *d = &s_t[off + k];
+                *d = (blend ? blend_px(p->blend, *d, o) : o) | p->mask_or;
+            }
+        }
+    }
+    tl_samples += (u64)(X1 - X0) * (u64)(Y1 - Y0);
+    tl_clamped += n_clamped;
+    tl_escaped += n_escaped;
+}
+
 #define RECT_FN(name, TEX, DEPTH, RAW, SEMI)                                                   \
-    static void name(const void *ctx, int y0, int y1)                                          \
-    { rect_impl((const RectArgs *)ctx, y0, y1, TEX, DEPTH, RAW, SEMI); }
+    static void name##_h0(const void *ctx, int y0, int y1)                                     \
+    { rect_impl((const RectArgs *)ctx, y0, y1, TEX, DEPTH, RAW, SEMI, 0); }                    \
+    static void name##_h1(const void *ctx, int y0, int y1)                                     \
+    { rect_impl((const RectArgs *)ctx, y0, y1, TEX, DEPTH, RAW, SEMI, 1); }
 RECT_FN(rect_u0, 0, 0, 0, 0)
 RECT_FN(rect_u1, 0, 0, 0, 1)
 #define RECT_DEPTH(D)                          \
@@ -782,17 +1147,36 @@ RECT_FN(rect_u1, 0, 0, 0, 1)
 RECT_DEPTH(0)
 RECT_DEPTH(1)
 RECT_DEPTH(2)
-static const BandFn s_rect_tex[3][4] = {
-    { rect_t0_00, rect_t0_01, rect_t0_10, rect_t0_11 },
-    { rect_t1_00, rect_t1_01, rect_t1_10, rect_t1_11 },
-    { rect_t2_00, rect_t2_01, rect_t2_10, rect_t2_11 },
-};
+#define RECT_TABLE(H)                                                                     \
+    { { rect_t0_00_##H, rect_t0_01_##H, rect_t0_10_##H, rect_t0_11_##H },                 \
+      { rect_t1_00_##H, rect_t1_01_##H, rect_t1_10_##H, rect_t1_11_##H },                 \
+      { rect_t2_00_##H, rect_t2_01_##H, rect_t2_10_##H, rect_t2_11_##H } }
+static const BandFn s_rect_tex[2][3][4] = { RECT_TABLE(h0), RECT_TABLE(h1) };
+static void rect_filt_h0(const void *ctx, int y0, int y1) { rect_filt_impl(ctx, y0, y1, 0); }
+static void rect_filt_h1(const void *ctx, int y0, int y1) { rect_filt_impl(ctx, y0, y1, 1); }
+
+/* Filtered rects: the unwrapped u/v range of the columns/rows drawn (rect within the draw area),
+ * which is what the 1x rect samples there. Shared with hires_gpu.c. */
+void hires_rect_uv_range(const HiresPrim *p, int x, int y, int w, int h, u32 u0, u32 v0, bool fx, bool fy,
+                         int *ulo, int *uhi, int *vlo, int *vhi)
+{
+    int xs = imax(x, p->clip_x1), xe = imin(x + w, p->clip_x2 + 1);
+    int ys = imax(y, p->clip_y1), ye = imin(y + h, p->clip_y2 + 1);
+    if (xe <= xs) xe = xs + 1;
+    if (ye <= ys) ye = ys + 1;
+    const int uu0 = (int)(u0 | (fx ? 1u : 0u)), du = fx ? -1 : 1, dv = fy ? -1 : 1;
+    const int ua = uu0 + du * (xs - x), ub = uu0 + du * (xe - 1 - x);
+    const int va = (int)v0 + dv * (ys - y), vb = (int)v0 + dv * (ye - 1 - y);
+    *ulo = imin(ua, ub); *uhi = imax(ua, ub);
+    *vlo = imin(va, vb); *vhi = imax(va, vb);
+}
 
 static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g, u32 b,
                     u32 u0, u32 v0, bool fx, bool fy)
 {
-    if (!s_t) return;
-    RectArgs ra = { *p, x, y, w, h, r, g, b, u0, v0, fx, fy };
+    if (!HAVE_T) return;
+    const int H = s_t32 ? 1 : 0;
+    RectArgs ra = { *p, x, y, w, h, r, g, b, u0, v0, fx, fy, 0, 0, 0, 0, false };
     if (s_gx) {
         /* an untextured rect over the whole draw-area width (fade, flash) spans the guard band */
         bool full = !p->tex && x <= p->clip_x1 && x + w >= p->clip_x2 + 1;
@@ -801,22 +1185,40 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
     }
     p = &ra.p;
     BandFn fn;
-    if (!p->tex) fn = p->semi ? rect_u1 : rect_u0;
-    else { note_tex_page(p); fn = s_rect_tex[p->depth][(p->raw ? 2 : 0) | (p->semi ? 1 : 0)]; }
+    if (!p->tex) {
+        if (H) fn = p->semi ? rect_u1_h1 : rect_u0_h1;
+        else fn = p->semi ? rect_u1_h0 : rect_u0_h0;
+    } else if (s_tex_filter != HIRES_TEX_NEAREST) {
+        note_tex_page(p);
+        hires_rect_uv_range(p, x, y, w, h, u0, v0, fx, fy, &ra.ulo, &ra.uhi, &ra.vlo, &ra.vhi);
+        ra.xbr = s_tex_filter == HIRES_TEX_XBR;
+        atomic_fetch_add_explicit(&s_filt_rects, 1, memory_order_relaxed);
+        fn = H ? rect_filt_h1 : rect_filt_h0;
+    } else {
+        note_tex_page(p);
+        fn = s_rect_tex[H][p->depth][(p->raw ? 2 : 0) | (p->semi ? 1 : 0)];
+    }
     int ys = imax(imax(y, p->clip_y1), s_ry), ye = imin(imin(y + h, p->clip_y2 + 1), s_ry + s_rh);
     int xs = imax(imax(x, p->clip_x1), s_rx - s_gx), xe = imin(imin(x + w, p->clip_x2 + 1), s_rx + s_rw + s_gx);
     if (ys >= ye || xs >= xe) return;
     mark_dirty(ys, ye - 1);
     int ylo = ys * s_Sy, yhi = ye * s_Sy;
     if ((s64)(yhi - ylo) * (xe - xs) * s_Sx >= s_par_threshold) par_rows(fn, &ra, ylo, yhi);
-    else fn(&ra, ylo, yhi);
+    else { fn(&ra, ylo, yhi); flush_counters(); }
+}
+
+static inline u32 lclamp(s32 v, u32 c0, u32 c1, int sh)
+{
+    const s32 a = (s32)((c0 >> sh) & 0xFF), b = (s32)((c1 >> sh) & 0xFF);
+    const s32 lo = a < b ? a : b, hi = a < b ? b : a;
+    return (u32)(v < lo ? lo : (v > hi ? hi : v));
 }
 
 /* ---- lines ----------------------------------------------------------------- */
 
 static void be_line(const HiresPrim *p0, int x0, int y0, u32 c0, int x1, int y1, u32 c1)
 {
-    if (!s_t) return;
+    if (!HAVE_T) return;
     HiresPrim pl = *p0;
     guard_clip(&pl);
     const HiresPrim *p = &pl;
@@ -837,12 +1239,22 @@ static void be_line(const HiresPrim *p0, int x0, int y0, u32 c0, int x1, int y1,
         int px_ = (PX), py_ = (PY);                                                             \
         if (px_ >= cx1 && px_ <= cx2 && py_ >= cy1 && py_ <= cy2) {                             \
             u16 o_; bool bl_;                                                                   \
-            u16 *d_ = s_t + (size_t)(py_ - s_oy) * s_tw + (px_ - s_ox);                         \
-            if (!(p->mask_check && (*d_ & 0x8000)) &&                                           \
-                shade(p, px_ / Sx, py_ / Sy, (CR), (CG), (CB), 0, 0, 0, 0, 0, p->semi, dith,    \
-                      &o_, &bl_)) {                                                             \
-                if (bl_) o_ = blend_px(p->blend, *d_, o_);                                      \
-                *d_ = o_ | p->mask_or;                                                          \
+            const size_t i_ = (size_t)(py_ - s_oy) * s_tw + (px_ - s_ox);                       \
+            if (s_t32) {                                                                        \
+                u32 *d_ = s_t32 + i_;                                                           \
+                if (!(p->mask_check && (*d_ & A32))) {                                          \
+                    u32 c_ = (u32)(CR) | ((u32)(CG) << 8) | ((u32)(CB) << 16);                  \
+                    if (p->semi) c_ = blend32(p->blend, *d_, c_);                               \
+                    *d_ = c_ | (p->mask_or ? A32 : 0);                                          \
+                }                                                                               \
+            } else {                                                                            \
+                u16 *d_ = s_t + i_;                                                             \
+                if (!(p->mask_check && (*d_ & 0x8000)) &&                                       \
+                    shade(p, px_ / Sx, py_ / Sy, (CR), (CG), (CB), 0, 0, 0, 0, 0, p->semi, dith,\
+                          &o_, &bl_)) {                                                         \
+                    if (bl_) o_ = blend_px(p->blend, *d_, o_);                                  \
+                    *d_ = o_ | p->mask_or;                                                      \
+                }                                                                               \
             }                                                                                   \
         }                                                                                       \
     } while (0)
@@ -875,7 +1287,9 @@ static void be_line(const HiresPrim *p0, int x0, int y0, u32 c0, int x1, int y1,
     const int steps = kh + (Sa - 1);
     for (int i = 0; i <= steps; i++) {
         int x = (int)(xf >> 32), y = (int)(yf >> 32);
-        u32 cr = (u32)(r >> 12), cg = (u32)(g >> 12), cb = (u32)(b >> 12);
+        /* the Sa - 1 steps past the end extrapolate the gradient: keep it between the end
+         * colours (no-op at 1x1, where the line stops at the end; it used to wrap below 0) */
+        u32 cr = lclamp(r >> 12, c0, c1, 0), cg = lclamp(g >> 12, c0, c1, 8), cb = lclamp(b >> 12, c0, c1, 16);
         if (xmajor) {
             for (int j = 0; j < Sy; j++) LINE_PLOT(x, y - Sy / 2 + j, cr, cg, cb);
         } else {
@@ -892,15 +1306,23 @@ static void be_line(const HiresPrim *p0, int x0, int y0, u32 c0, int x1, int y1,
 /* Fill the 1x columns [x0, x1) of 1x row y (both inside the region) with c. */
 static void fill_span(int x0, int x1, int y, u16 c)
 {
-    u16 *row0 = s_t + (size_t)(y * s_Sy - s_oy) * s_tw + (x0 * s_Sx - s_ox);
+    const size_t off = (size_t)(y * s_Sy - s_oy) * s_tw + (x0 * s_Sx - s_ox);
     const int n = (x1 - x0) * s_Sx;
+    if (s_t32) {
+        u32 *row0 = s_t32 + off;
+        const u32 c32 = c15to32(c);
+        for (int i = 0; i < n; i++) row0[i] = c32;
+        for (int j = 1; j < s_Sy; j++) memcpy(row0 + (size_t)j * s_tw, row0, (size_t)n * sizeof(u32));
+        return;
+    }
+    u16 *row0 = s_t + off;
     for (int i = 0; i < n; i++) row0[i] = c;
     for (int j = 1; j < s_Sy; j++) memcpy(row0 + (size_t)j * s_tw, row0, (size_t)n * sizeof(u16));
 }
 
 static void be_fill(int x, int y, int w, int h, u16 c)
 {
-    if (!s_t) return;
+    if (!HAVE_T) return;
     mark_rows_wrapped(y, h);
     for (int j = 0; j < h; j++) {
         int row = (y + j) & 511;
@@ -925,25 +1347,30 @@ static inline bool in_region(int x, int y)
     return x >= s_rx && x < s_rx + s_rw && y >= s_ry && y < s_ry + s_rh;
 }
 
+/* is target pixel i (either format) mask-bit protected? */
+static inline bool tmasked(size_t i) { return s_t32 ? (s_t32[i] & A32) != 0 : (s_t[i] & 0x8000) != 0; }
+
 static void be_put(int x, int y, u16 v, bool mc, bool ms)
 {
-    if (!s_t) return;
+    if (!HAVE_T) return;
     x &= 1023; y &= 511;
     if (!in_region(x, y)) return;
     mark_dirty(y, y);
     const u16 val = v | (ms ? 0x8000 : 0);
+    const u32 val32 = c15to32(val);
     for (int sy = 0; sy < s_Sy; sy++) {
-        u16 *d = s_t + (size_t)(y * s_Sy + sy - s_oy) * s_tw + (x * s_Sx - s_ox);
-        for (int sx = 0; sx < s_Sx; sx++, d++) {
-            if (mc && (*d & 0x8000)) continue;
-            *d = val;
+        const size_t off = (size_t)(y * s_Sy + sy - s_oy) * s_tw + (x * s_Sx - s_ox);
+        for (int sx = 0; sx < s_Sx; sx++) {
+            if (mc && tmasked(off + sx)) continue;
+            if (s_t32) s_t32[off + sx] = val32;
+            else s_t[off + sx] = val;
         }
     }
 }
 
 static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, bool ms)
 {
-    if (!s_t) return;
+    if (!HAVE_T) return;
     const int Sx = s_Sx, Sy = s_Sy;
     /* skip when the destination can't touch the region at all */
     bool any = false;
@@ -953,8 +1380,10 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
     }
     if (!any) return;
     mark_rows_wrapped(dy, ht);
-    static u16 buf[(size_t)HIRES_MAX_SCALE * VRAM_W * HIRES_MAX_SCALE];
+    /* one 1x row of the source, at the target scale; u32 = either format's pixel */
+    static u32 buf[(size_t)HIRES_MAX_RENDER_SCALE * VRAM_W * HIRES_MAX_RENDER_SCALE];
     const size_t stride = (size_t)wd * Sx;
+    const bool hp = s_t32 != NULL;
     for (int j = 0; j < ht; j++) {
         int srow = (sy + j) & 511, drow = (dy + j) & 511;
         if (drow < s_ry || drow >= s_ry + s_rh) continue;
@@ -962,19 +1391,22 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
             int scol = (sx + i) & 1023;
             bool in = in_region(scol, srow);
             for (int a = 0; a < Sy; a++)
-                for (int b = 0; b < Sx; b++)
-                    buf[a * stride + (size_t)i * Sx + b] = in
-                        ? s_t[(size_t)(srow * Sy + a - s_oy) * s_tw + (scol * Sx + b - s_ox)]
-                        : s_vram[srow * VRAM_W + scol];
+                for (int b = 0; b < Sx; b++) {
+                    const size_t si = (size_t)(srow * Sy + a - s_oy) * s_tw + (scol * Sx + b - s_ox);
+                    const u16 vv = s_vram[srow * VRAM_W + scol];
+                    buf[a * stride + (size_t)i * Sx + b] = in ? (hp ? s_t32[si] : s_t[si]) : (hp ? c15to32(vv) : vv);
+                }
         }
         for (int i = 0; i < wd; i++) {
             int dcol = (dx + i) & 1023;
             if (!in_region(dcol, drow)) continue;
             for (int a = 0; a < Sy; a++) {
-                u16 *d = s_t + (size_t)(drow * Sy + a - s_oy) * s_tw + (dcol * Sx - s_ox);
-                for (int b = 0; b < Sx; b++, d++) {
-                    if (mc && (*d & 0x8000)) continue;
-                    *d = buf[a * stride + (size_t)i * Sx + b] |(ms ? 0x8000 : 0);
+                const size_t di = (size_t)(drow * Sy + a - s_oy) * s_tw + (dcol * Sx - s_ox);
+                for (int b = 0; b < Sx; b++) {
+                    if (mc && tmasked(di + b)) continue;
+                    const u32 val = buf[a * stride + (size_t)i * Sx + b];
+                    if (hp) s_t32[di + b] = val | (ms ? A32 : 0);
+                    else s_t[di + b] = (u16)val | (ms ? 0x8000 : 0);
                 }
             }
         }
@@ -984,8 +1416,19 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
 static void seed(void)
 {
     for (int y = 0; y < s_rh; y++) {
-        u16 *row0 = s_t + (size_t)y * s_Sy * s_tw;
         const u16 *src = &s_vram[(s_ry + y) * VRAM_W + s_rx];
+        if (s_t32) {
+            u32 *row0 = s_t32 + (size_t)y * s_Sy * s_tw;
+            memset(row0, 0, (size_t)s_tw * sizeof(u32));   /* the guard band starts black */
+            u32 *real = row0 + (size_t)s_gx * s_Sx;
+            for (int x = 0; x < s_rw; x++) {
+                const u32 c = c15to32(src[x]);
+                for (int i = 0; i < s_Sx; i++) real[x * s_Sx + i] = c;
+            }
+            for (int j = 1; j < s_Sy; j++) memcpy(row0 + (size_t)j * s_tw, row0, (size_t)s_tw * sizeof(u32));
+            continue;
+        }
+        u16 *row0 = s_t + (size_t)y * s_Sy * s_tw;
         memset(row0, 0, (size_t)s_tw * sizeof(u16));   /* the guard band starts black */
         u16 *real = row0 + (size_t)s_gx * s_Sx;
         for (int x = 0; x < s_rw; x++)
@@ -997,21 +1440,27 @@ static void seed(void)
 static void be_destroy(void)
 {
     free(s_t);
+    free(s_t32);
     s_t = NULL;
+    s_t32 = NULL;
     s_Sx = s_Sy = 0;
     s_gx = 0; g_hires_guard = 0;
 }
 
 static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int rw, int rh)
 {
-    if (sx < 1 || sx > HIRES_MAX_SCALE || sy < 1 || sy > HIRES_MAX_SCALE || rw <= 0 || rh <= 0 ||
+    if (sx < 1 || sx > HIRES_MAX_RENDER_SCALE || sy < 1 || sy > HIRES_MAX_RENDER_SCALE || rw <= 0 || rh <= 0 ||
         rx < 0 || ry < 0 || rx + rw > VRAM_W || ry + rh > VRAM_H)
         return false;
     const int gx = s_pend_gx;
-    u16 *nt = malloc((size_t)(rw + 2 * gx) * sx * rh * sy * sizeof(u16));
+    const bool hp = hires_target_fmt() == HIRES_FMT_RGBA8;
+    const size_t npx = (size_t)(rw + 2 * gx) * sx * rh * sy;
+    void *nt = malloc(npx * (hp ? sizeof(u32) : sizeof(u16)));
     if (!nt) return false;
     free(s_t);
-    s_t = nt;
+    free(s_t32);
+    s_t = hp ? NULL : nt;
+    s_t32 = hp ? nt : NULL;
     s_vram = vram1x;
     s_Sx = sx; s_Sy = sy;
     s_rx = rx; s_ry = ry; s_rw = rw; s_rh = rh;
@@ -1028,14 +1477,18 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
 
 static bool be_view(int x, int y, int w, int h, HiresView *out)
 {
-    if (!s_t || w <= 0 || h <= 0) return false;
+    if (!HAVE_T || w <= 0 || h <= 0) return false;
     if (x < s_rx - s_gx || y < s_ry || x + w > s_rx + s_rw + s_gx || y + h > s_ry + s_rh) return false;
-    out->pixels = s_t + (size_t)(y * s_Sy - s_oy) * s_tw + (x * s_Sx - s_ox);
+    const size_t off = (size_t)(y * s_Sy - s_oy) * s_tw + (x * s_Sx - s_ox);
+    out->pixels = s_t ? s_t + off : NULL;
+    out->px32 = s_t32 ? s_t32 + off : NULL;
+    out->fmt = s_t32 ? HIRES_FMT_RGBA8 : HIRES_FMT_15;
     out->stride = s_tw;
     out->w = w * s_Sx;
     out->h = h * s_Sy;
     out->scale_x = s_Sx;
     out->scale_y = s_Sy;
+    out->ssaa = 1;
     out->gpu = NULL;
     out->gx = x * s_Sx - s_ox;
     out->gy = y * s_Sy - s_oy;
@@ -1054,8 +1507,14 @@ static const HiresBackend s_soft = {
 static const HiresBackend *s_be = &s_soft;   /* primary: presented, viewed, verified */
 static const HiresBackend *s_shadow;         /* compare mode: fed the same commands */
 static const HiresBackend *s_want_be = &s_soft, *s_want_shadow;
-static int s_cur_sx, s_cur_sy;               /* scales of the allocated target(s); 0 = off */
+static int s_base_sx, s_base_sy;             /* requested (base) scale of the allocated target */
+static int s_cur_sx, s_cur_sy;               /* render scale (base x ssaa) of the allocated target(s); 0 = off */
 static int s_cur_gx;                         /* guard band of the allocated target(s) */
+static int s_cur_fmt, s_cur_ssaa = 1;        /* format / supersampling of the allocated target(s) */
+static int s_cfg_ssaa = 1;                   /* hires_set_ssaa() */
+static int s_cfg_ssaa_cap;                   /* hires_set_ssaa_cap(): max render Sx*Sy, 0 = none */
+static bool s_cfg_full;                      /* hires_set_colour() */
+static int s_pend_fmt;                       /* format for the configure() in progress */
 
 /* tee: forwards every command to the primary and the shadow backend */
 static bool tee_configure(const u16 *v, int sx, int sy, int rx, int ry, int rw, int rh)
@@ -1090,6 +1549,56 @@ void hires_set_backend(const HiresBackend *be, const HiresBackend *shadow)
 
 const HiresBackend *hires_software_backend(void) { return &s_soft; }
 
+/* ---- render-quality settings ---- */
+
+static const char *const s_filter_names[] = { "nearest", "bilinear", "xbr" };
+void hires_set_tex_filter(int mode) { s_tex_filter = mode < 0 || mode > HIRES_TEX_XBR ? HIRES_TEX_NEAREST : mode; }
+int hires_get_tex_filter(void) { return s_tex_filter; }
+const char *hires_tex_filter_name(int mode) { return s_filter_names[mode < 0 || mode > 2 ? 0 : mode]; }
+int hires_tex_filter_from_name(const char *s)
+{
+    for (int i = 0; i < 3; i++)
+        if (!strcmp(s, s_filter_names[i])) return i;
+    return -1;
+}
+void hires_set_colour(bool full) { s_cfg_full = full; }
+bool hires_get_colour(void) { return s_cfg_full; }
+void hires_set_ssaa(int n) { s_cfg_ssaa = n < 1 ? 1 : (n > HIRES_MAX_SSAA ? HIRES_MAX_SSAA : n); }
+int hires_get_ssaa(void) { return s_cfg_ssaa; }
+void hires_set_ssaa_cap(int cap) { s_cfg_ssaa_cap = cap > 0 ? cap : 0; }
+int hires_ssaa(void) { return g_hires ? s_cur_ssaa : 1; }
+int hires_target_fmt(void) { return s_pend_fmt; }
+bool hires_get_render_scale(int *sx, int *sy)
+{
+    if (sx) *sx = g_hires ? s_cur_sx : 0;
+    if (sy) *sy = g_hires ? s_cur_sy : 0;
+    return g_hires != NULL;
+}
+
+/* Largest supersampling factor <= the requested one that keeps the render target within the
+ * limits (see hires.h); the region and guard band are the ones about to be configured. */
+static int ssaa_for(int sx, int sy, int gx)
+{
+    int n = s_cfg_ssaa;
+    for (; n > 1; n--) {
+        const s64 w = (s64)(s_cfg_rw + 2 * gx) * sx * n, h = (s64)s_cfg_rh * sy * n;
+        if (sx * n <= HIRES_MAX_RENDER_SCALE && sy * n <= HIRES_MAX_RENDER_SCALE && w <= HIRES_MAX_RENDER_DIM &&
+            h <= HIRES_MAX_RENDER_DIM && w * h <= HIRES_MAX_RENDER_PX &&
+            (!s_cfg_ssaa_cap || sx * n * sy * n <= s_cfg_ssaa_cap))
+            break;
+    }
+    return n;
+}
+
+static void off_state(void)
+{
+    g_hires = NULL;
+    s_cur_sx = s_cur_sy = 0;
+    s_base_sx = s_base_sy = 0;
+    s_cur_gx = 0; g_hires_guard = 0;
+    s_cur_ssaa = 1;
+}
+
 bool hires_set_scale(int sx, int sy)
 {
     if (sx <= 0 || sy <= 0) sx = sy = 0;
@@ -1097,14 +1606,17 @@ bool hires_set_scale(int sx, int sy)
     if (sy > HIRES_MAX_SCALE) sy = HIRES_MAX_SCALE;
     if (sx == 0) {
         if (g_hires) g_hires->destroy();
-        g_hires = NULL;
-        s_cur_sx = s_cur_sy = 0;
-        s_cur_gx = 0; g_hires_guard = 0;
+        off_state();
         return true;
     }
-    if (g_hires && s_cur_sx == sx && s_cur_sy == sy && s_rx == s_cfg_rx && s_ry == s_cfg_ry &&
+    const int fmt = s_cfg_full ? HIRES_FMT_RGBA8 : HIRES_FMT_15;
+    /* guard band: only if every backend in use supports it (else widescreen stays 4:3) */
+    int gx = s_cfg_gx;
+    if (!s_want_be->set_guard || (s_want_shadow && !s_want_shadow->set_guard)) gx = 0;
+    const int n = ssaa_for(sx, sy, gx);
+    if (g_hires && s_base_sx == sx && s_base_sy == sy && s_rx == s_cfg_rx && s_ry == s_cfg_ry &&
         s_rw == s_cfg_rw && s_rh == s_cfg_rh && s_be == s_want_be && s_shadow == s_want_shadow &&
-        s_cur_gx == s_cfg_gx)
+        s_cur_gx == gx && s_cur_fmt == fmt && s_cur_ssaa == n)
         return true;
     if (g_hires && (s_be != s_want_be || s_shadow != s_want_shadow)) { g_hires->destroy(); g_hires = NULL; }
     s_be = s_want_be;
@@ -1112,21 +1624,26 @@ bool hires_set_scale(int sx, int sy)
     const HiresBackend *be = s_shadow ? &s_tee : s_be;
     /* the software backend's region statics double as the control layer's record of it */
     s_rx = s_cfg_rx; s_ry = s_cfg_ry; s_rw = s_cfg_rw; s_rh = s_cfg_rh;
-    /* guard band: only if every backend in use supports it (else widescreen stays 4:3) */
-    int gx = s_cfg_gx;
-    if (!s_be->set_guard || (s_shadow && !s_shadow->set_guard)) gx = 0;
     if (s_be->set_guard) s_be->set_guard(gx);
     if (s_shadow && s_shadow->set_guard) s_shadow->set_guard(gx);
-    if (!be->configure(gpu_vram(), sx, sy, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh)) {
-        g_hires = NULL;
-        s_cur_sx = s_cur_sy = 0;
-        s_cur_gx = 0; g_hires_guard = 0;
+    s_pend_fmt = fmt;
+    if (!be->configure(gpu_vram(), sx * n, sy * n, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh)) {
+        off_state();
         return false;
     }
-    s_cur_sx = sx; s_cur_sy = sy;
+    s_base_sx = sx; s_base_sy = sy;
+    s_cur_sx = sx * n; s_cur_sy = sy * n;
     s_cur_gx = gx; g_hires_guard = gx;
+    s_cur_fmt = fmt;
+    s_cur_ssaa = n;
     g_hires = be;
     return true;
+}
+
+bool hires_reconfigure(void)
+{
+    if (!g_hires) return true;
+    return hires_set_scale(s_base_sx, s_base_sy);
 }
 
 /* Re-seed the target from the current 1x VRAM (after a save state is loaded). */
@@ -1134,17 +1651,14 @@ void hires_reseed(void)
 {
     if (!g_hires) return;
     const HiresBackend *be = g_hires;
-    if (!be->configure(gpu_vram(), s_cur_sx, s_cur_sy, s_rx, s_ry, s_rw, s_rh)) {
-        g_hires = NULL;
-        s_cur_sx = s_cur_sy = 0;
-        s_cur_gx = 0; g_hires_guard = 0;
-    }
+    s_pend_fmt = s_cur_fmt;
+    if (!be->configure(gpu_vram(), s_cur_sx, s_cur_sy, s_rx, s_ry, s_rw, s_rh)) off_state();
 }
 
 bool hires_get_scale(int *sx, int *sy)
 {
-    if (sx) *sx = g_hires ? s_cur_sx : 0;
-    if (sy) *sy = g_hires ? s_cur_sy : 0;
+    if (sx) *sx = g_hires ? s_base_sx : 0;
+    if (sy) *sy = g_hires ? s_base_sy : 0;
     return g_hires != NULL;
 }
 
@@ -1159,30 +1673,80 @@ bool hires_get_dither(void) { return s_dither_hi; }
 void hires_set_guard(int gx) { s_cfg_gx = gx < 0 ? 0 : (gx > HIRES_MAX_GUARD ? HIRES_MAX_GUARD : gx); }
 int hires_guard(void) { return g_hires ? s_cur_gx : 0; }
 
+static bool fin_view(bool ok, HiresView *v)
+{
+    if (ok) v->ssaa = s_cur_ssaa;
+    return ok;
+}
+
 bool hires_get_view(const GpuDisplay *d, HiresView *v)
 {
     if (!g_hires || !d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) return false;
-    return g_hires->view(d->x, d->y, d->w, d->h, v);
+    return fin_view(g_hires->view(d->x, d->y, d->w, d->h, v), v);
 }
 
 bool hires_get_view_wide(const GpuDisplay *d, int extra, HiresView *v)
 {
     if (!g_hires || !d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) return false;
     extra = imax(0, imin(extra, s_cur_gx));
-    return g_hires->view(d->x - extra, d->y, d->w + 2 * extra, d->h, v);
+    return fin_view(g_hires->view(d->x - extra, d->y, d->w + 2 * extra, d->h, v), v);
 }
 
 bool hires_read_view(const GpuDisplay *d, HiresView *v)
 {
     if (!g_hires || !d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) return false;
-    return g_hires->read(d->x, d->y, d->w, d->h, v);
+    return fin_view(g_hires->read(d->x, d->y, d->w, d->h, v), v);
 }
 
 bool hires_read_view_wide(const GpuDisplay *d, int extra, HiresView *v)
 {
     if (!g_hires || !d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) return false;
     extra = imax(0, imin(extra, s_cur_gx));
-    return g_hires->read(d->x - extra, d->y, d->w + 2 * extra, d->h, v);
+    return fin_view(g_hires->read(d->x - extra, d->y, d->w + 2 * extra, d->h, v), v);
+}
+
+/* 8-bit channels of a target pixel of either format (15-bit c -> c << 3) */
+static inline u32 px8(const HiresView *v, size_t i)
+{
+    if (v->fmt == HIRES_FMT_RGBA8) return v->px32[i] & 0xFFFFFF;
+    const u32 p = v->pixels[i];
+    return ((p & 0x7c00) << 9) | ((p & 0x03e0) << 6) | ((p & 0x001f) << 3);
+}
+
+void hires_view_to_rgba(const HiresView *v, u32 *dst, size_t dst_pitch_px, int y0, int y1)
+{
+    const int n = v->ssaa > 1 ? v->ssaa : 1;
+    const int ow = v->w / n, oh = v->h / n;
+    if (y1 > oh) y1 = oh;
+    for (int y = y0; y < y1; y++) {
+        u32 *d = dst + (size_t)y * dst_pitch_px;
+        if (n == 1 && v->fmt == HIRES_FMT_15) {
+            const u16 *src = v->pixels + (size_t)y * v->stride;
+            for (int x = 0; x < ow; x++) {   /* plain arithmetic: auto-vectorizes */
+                u32 p = src[x];
+                d[x] = 0xff000000u | ((p & 0x7c00) << 9) | ((p & 0x03e0) << 6) | ((p & 0x001f) << 3);
+            }
+            continue;
+        }
+        if (n == 1) {
+            const u32 *src = v->px32 + (size_t)y * v->stride;
+            for (int x = 0; x < ow; x++) d[x] = src[x] | 0xff000000u;
+            continue;
+        }
+        /* box average of n x n target pixels, rounded: the same in hires_gpu.c's present pass */
+        const u32 nn = (u32)(n * n), half = nn / 2;
+        for (int x = 0; x < ow; x++) {
+            u32 sr = 0, sg = 0, sb = 0;
+            for (int j = 0; j < n; j++) {
+                const size_t row = (size_t)(y * n + j) * v->stride + (size_t)x * n;
+                for (int i = 0; i < n; i++) {
+                    const u32 p = px8(v, row + i);
+                    sr += p & 255; sg += (p >> 8) & 255; sb += (p >> 16) & 255;
+                }
+            }
+            d[x] = 0xff000000u | ((sr + half) / nn) | (((sg + half) / nn) << 8) | (((sb + half) / nn) << 16);
+        }
+    }
 }
 
 void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int *sx, int *sy)
@@ -1210,10 +1774,15 @@ void hires_pick_scale_ar(int pw, int ph, int dw, int dh, double ar, int max_x, i
     *sy = imin(imax((vh + dh - 1) / dh, 1), max_y);
 }
 
+bool hires_verify_possible(void)
+{
+    return g_hires && s_cur_sx == 1 && s_cur_sy == 1 && s_cur_fmt == HIRES_FMT_15 && s_tex_filter == HIRES_TEX_NEAREST;
+}
+
 u32 hires_verify_1x(int *first_x, int *first_y)
 {
     HiresView v;
-    if (!g_hires || s_cur_sx != 1 || s_cur_sy != 1) return 0;
+    if (!hires_verify_possible()) return 0;
     if (!g_hires->read(s_rx, s_ry, s_rw, s_rh, &v)) return 0;
     const u16 *vram = gpu_vram();
     u32 bad = 0;
@@ -1236,6 +1805,25 @@ bool hires_compare(HiresCompare *c)
     const int x0 = s_rx - s_cur_gx, w = s_rw + 2 * s_cur_gx;
     if (!s_shadow->read(x0, s_ry, w, s_rh, &b)) return false;
     if (!s_be->read(x0, s_ry, w, s_rh, &a)) return false;
+    if (a.fmt != b.fmt) return false;
+    if (a.fmt == HIRES_FMT_RGBA8) {
+        for (int y = 0; y < a.h; y++) {
+            const u32 *pa = a.px32 + (size_t)y * a.stride, *pb = b.px32 + (size_t)y * b.stride;
+            if (!memcmp(pa, pb, (size_t)a.w * 4)) continue;
+            for (int x = 0; x < a.w; x++) {
+                u32 p = pa[x], q = pb[x];
+                if (p == q) continue;
+                if (((p ^ q) & 0xFFFFFF) == 0) { c->mask_diff++; continue; }
+                if (!c->diff) { c->first_x = x; c->first_y = y; }
+                c->diff++;
+                int dr = abs((int)(p & 255) - (int)(q & 255)), dg = abs((int)((p >> 8) & 255) - (int)((q >> 8) & 255)),
+                    db = abs((int)((p >> 16) & 255) - (int)((q >> 16) & 255));
+                if (dr > 8 || dg > 8 || db > 8) c->diff_big++;
+            }
+        }
+        c->pixels = (u64)a.w * a.h;
+        return true;
+    }
     for (int y = 0; y < a.h; y++) {
         const u16 *pa = a.pixels + (size_t)y * a.stride, *pb = b.pixels + (size_t)y * b.stride;
         if (!memcmp(pa, pb, (size_t)a.w * 2)) continue;

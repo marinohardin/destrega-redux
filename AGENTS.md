@@ -358,8 +358,8 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
 (below) or the command line.
 
 - **Netplay menu** (macOS `menu_mac.m` and Windows `menu_win.c`; top level, after View): Host
-  Game… (port, default 7000, and input delay, default 2, both remembered: NSUserDefaults on the
-  Mac, `HKCU\Software\Destrega\Netplay` on Windows; the dialog lists this computer's IPv4
+  Game… (port, default 7000, and input delay, default 2, both remembered in `settings.ini`
+  `[netplay]`, see "Settings file"; the dialog lists this computer's IPv4
   addresses, `plat_local_ipv4`), Join Game… (address:port, remembered, and delay),
   Disconnect (enabled while a session or an attempt runs), and a disabled status line
   (`netplay_status_text`: Not connected / Waiting for an opponent on port N / Connecting to X /
@@ -405,7 +405,7 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   (`recomp/*.py`) and its analysis inputs (seeds, overrides, procedure / overlay lists), line
   endings normalised. Left out: what only one platform compiles or what is presentation-only and
   proven not to reach emulated state (menus, `platform*.c|h`, `hires*.c|h`, shaders, Windows
-  resources), plus tools / tests / docs. No compiler, OS or build type: the Mac (clang) and Windows
+  resources, host input / settings / controls windows), plus tools / tests / docs. No compiler, OS or build type: the Mac (clang) and Windows
   (MinGW GCC) builds of the same commit have identical per-frame state hashes (`test_wine.sh`), so
   they emulate the same machine and must be allowed to play; any source change that could alter
   emulation is refused even if it looks harmless (both players update). The refusal is the
@@ -433,7 +433,45 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   impossible rollbacks and desyncs at the end of each match (NOTES.md). An impossible rollback is
   still counted and logged as a last resort; desync detection then reports what it caused.
 - **Time sync**: each packet carries the sender's frame and its frame advantage; the peer that is
-  ahead by >= 1 frame on average waits (at most 8 frames, once a second), like GGPO.
+  ahead by >= 1 frame on average slows down by that much (at most 8 frames), **spread over the next
+  frames**: 1 ms per frame (2 ms while more than 2.5 frames are owed), i.e. 6-12% slower for a
+  moment instead of a visible halt; then ~45 frames for both averages to show it before deciding
+  again. Windowed, `netplay_pace_extra_ns()` is added to main.c's pacing tick; headless paced
+  runs shift their pace origin. (It used to sleep the whole amount once a second: the picture froze
+  for up to 133 ms, and windowed the frontend's pacing then caught up by running fast.)
+- **Boot shortcut** (default; `--net-full-boot` turns it off, and both peers must agree: it is part
+  of the handshake's settings check): a session's fresh boot goes straight to VS mode's character
+  select, P1 = host, P2 = joiner. Frames 1-306 of the session play a fixed pad-1 script on both
+  peers (`k_boot_vs`: Start at 210 skips the KOEI logo and the intro FMV into the title menu,
+  Down, Down, Start at 300 on VS), whatever the players press meanwhile; the select screen is up by
+  frame ~380 instead of ~1560 on the scripted normal path: 19.7 s sooner. It is ordinary emulated
+  input, so both machines stay identical (no state comes from outside). After a match the game
+  itself returns to the VS character select with a win counter (NOTES.md), so rematches never need
+  the title. `--boot-to-vs` applies the same script offline (reference runs of the tests).
+- **Smoothness instrumentation** (`runtime/smooth.[ch]`, presentation-only): windowed runs record
+  every presented frame's interval and the host work behind it, stalls (waiting for the peer),
+  time-sync slowdowns, rollbacks (depth histogram, re-simulation time, frames shown before the
+  correction) and the audio queue (underrun = empty, low = < 1 frame, repeat = the deterministic
+  top-up re-queued samples). At exit (`netplay_finish`, also offline) a `smooth:` line and a
+  `smooth-json: {...}` line: interval p50/p95/p99/max/sd, frames held > 1.5 vblank and what held
+  each (the largest of rollback / stall / sync wait since the last present if it explains at least
+  half the overrun, else "slow host"), host busy % of the 16.7 ms budget, stalls, rollbacks, audio.
+  `--smooth-from F` starts counting at frame F. Headless runs present nothing (only the netplay
+  part is counted). `tools/netplay_smooth.py [solo|solo_win|mm_lan|mm_wan|mw_lan|mw_wide]` runs
+  windowed peers at 60 Hz on a VS replay (Mac<->Mac clean or 20 ms + 10 jitter + 2% loss each way,
+  Mac<->Wine with the software renderer there, optionally widescreen; `solo` = one offline window)
+  and prints one row per peer with the load average. Results depend heavily on machine load:
+  compare runs made back-to-back.
+- **Scale governor** (`smooth.c`, presentation-only): during a session, a host whose average frame
+  work stays above 90% of the budget lowers its hi-res render scale one step (4x6 -> 4x4 -> 3x4 ->
+  3x3 -> 2x3 -> 2x2 -> 1x2 -> 1x1) every 2.5 s until it keeps up, logging `smooth: this computer is
+  too slow for render scale ...`; the caps are lifted when the session ends. Otherwise a slow peer
+  drags the fast one (which waits for every late input). Never touches a forced `--scale`;
+  `--no-scale-governor` turns it off. Each input packet also carries the sender's load (% of its
+  frame budget, one byte at the end; older peers ignore it), and the status line says "Opponent's
+  computer is running slowly" (peer >= 95%) or "This computer is running slowly".
+- Windows: `plat_sleep_us` uses a high-resolution waitable timer; `Sleep()` rounds to the 15.6 ms
+  system tick, which turned every 0.5 ms netplay wait into a 16 ms one.
 - **Final frames and desync detection**: the state at the start of frame F is final once every
   input before F is confirmed and was used. Each packet carries the newest final frame's gameplay
   hash, its 16 field hashes (replay.c fields) and every 30 frames the complete state hash
@@ -470,8 +508,11 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   `menu: REFUSED NAME: ...`. Presentation-only actions (renderer, widescreen, full screen, reveal
   in Finder) still run. Test: the `menu` case of `test_netplay.py`.
 - Tests for the menu path (`test_netplay.py`): `menu_session` (two processes start offline, host
-  and join by `--menu-action` mid-run, both reboot, play synced: final-frame hashes equal on both
-  and equal to an offline run with the agreed delay; the joiner disconnects, the host gets the
+  and join by `--menu-action` mid-run, both reboot through the boot shortcut (both log it, both are
+  on the VS character select at frame 400: frame dump of the `--boot-to-vs` reference run, equal
+  hashes), play synced with the replay's picks moved 1180 frames earlier: final-frame hashes equal
+  on both and equal to an offline run with the agreed delay; the other cases pass
+  `--net-full-boot` so their replay scripts still start from power-on; the joiner disconnects, the host gets the
   "opponent left" alert, both keep playing offline to `--frames`) and `menu_fail` (a host with a
   different rollback window refuses with a reason, an unanswered join times out with an alert, all
   three keep playing offline, nobody restarts).
@@ -481,7 +522,7 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   with `--bottle destrega-test --no-gui`) over loopback, started with the menu actions
   (`netplay-host` / `netplay-join`) in both directions: `mac_hosts`, `win_hosts`, and both again
   with a lossy link (`--net-sim 15:10:5:5`: 15 ms + 10 jitter, 5% loss, 5% reorder each way). Each
-  plays the VS fight of a replay script, disconnects and continues offline; every confirmed
+  boots through the boot shortcut (both peers log it), plays the VS fight of a replay script, disconnects and continues offline; every confirmed
   frame's hash must match on both peers **and** an offline native run. `ident`: a Windows host
   claiming other emulation sources refuses the Mac joiner with the alert. Pace 120 Hz (2x real
   time; headless Wine runs ~1.3 ms/frame, so Wine is not the bottleneck there). Offline frames are
@@ -526,7 +567,13 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
   menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
 - **View > Renderer > Software / GPU**: action `renderer[=software|gpu]`, see "GPU renderer".
+- **View > Texture Filtering** (Off (Sharp Pixels) / Bilinear / Smooth 2D Edges + Bilinear 3D),
+  **View > Smooth Colours** (checkable) and **View > Anti-aliasing** (Off / 2x / 3x / 4x), Mac and
+  Windows: actions `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`;
+  see "Render quality".
 - **Netplay** menu (after View): Host Game…, Join Game…, Disconnect, status line; see "Rollback netplay".
+- **View > Controls…** (both platforms) and app menu **Settings… (Cmd+,)** on macOS: the Controls
+  window, see "Input, controls and settings". View toggles are saved in `settings.ini`.
 - **Full screen** on every platform from the SDL event loop in `main.c` (so not a Cocoa-only
   feature): **Alt+Enter** and **F11**, plus **Ctrl+Cmd+F** on macOS, queue the action
   `fullscreen` (`=on|off`, none = toggle; one toggle per frame, because Ctrl+Cmd+F can arrive both
@@ -541,7 +588,9 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
   `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`,
+  `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`,
   `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`,
+  `controls`, `settings`, `controls-*` (see "Input, controls and settings"),
   `menu-test=dump|click=PATH` (Windows, windowed). Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
   unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
@@ -553,13 +602,13 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **Windows** (`menu_win.c`): a Win32 menu bar on SDL's window (`SDL_PROP_WINDOW_WIN32_HWND_POINTER`),
   same items and rules: **File** (Load Game Image…, Show Game Files in Explorer, Save Games > Show
   Save Games in Explorer / Import / Export / Delete, Exit), **View** (Widescreen (16:9) with check
-  mark, Renderer > Software / GPU, Enter / Exit Full Screen), **Netplay** (Host Game…, Join Game…,
+  mark, Renderer > Software / GPU, Enter / Exit Full Screen, Controls…), **Netplay** (Host Game…, Join Game…,
   Disconnect, status line). The window procedure is subclassed: `WM_COMMAND` queues the action,
   `WM_INITMENUPOPUP` updates check marks, titles, the status line and greys out refused items
   (`frontend_menu_action_allowed`, as `validateMenuItem` on the Mac). SDL sizes the window by its
   client area and accounts for the menu bar, so the picture keeps its size; full screen covers the
   bar. Host / Join are a small modal form built in code (no resource script; values in
-  `HKCU\Software\Destrega\Netplay`), the waiting panel a modeless window with Cancel (queues
+  `settings.ini` `[netplay]`), the waiting panel a modeless window with Cancel (queues
   `netplay-disconnect`); file dialogs and alerts are SDL's (native). Explorer: `ShellExecuteW`
   (folder) / `explorer /select,`. No keyboard shortcuts besides Alt+Enter / F11 / F9 (SDL keeps
   Alt from opening the menu bar). The UI text never says "memory card" or console names, as on the
@@ -574,6 +623,89 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   On macOS and Linux `menu-test` logs that it is not available.
 - Not done: saves other than the game's own file, Linux menus, the Windows menus clicked by a
   person (only driven through `menu-test` under Wine), a real Windows machine.
+
+## Input, controls and settings (`runtime/input.[ch]`, `settings.[ch]`, `controls_mac.m`, `controls_win.c`)
+
+**One place turns host input into the two pad masks per frame**: `input_frame(out[2])` in `input.c`.
+`main.c` only forwards SDL events (`poll_events`: frontend keys first, then `input_handle_event`) and
+ORs in the `--press`/`--press2` script (`host_pads`). Netplay and replays are untouched: they still
+read / override `g_pad_buttons` in `ss_vblank_end` after that, so the local player's input reaches
+the netplay stream exactly as before. libpad only ever polls a **digital pad** (verified with a
+temporary SIO0 probe: commands are only `01 42`, never config/analog `43/44/4D`; see NOTES.md), so
+the left stick is mapped to the D-pad, never reported as analog.
+
+- **Devices per player**: `auto` (P1: keyboard plus the first controller; P2: the next controller),
+  `keyboard`, `gamepad:GUID` (a specific controller, remembered by SDL GUID + name; "(not connected)"
+  while absent), `none`. `input_assign()` gives specific GUIDs first, then keeps each player's previous
+  controller (sticky: unplugging P1's pad never moves P2's onto P1), then connection order. Hot-plug via
+  `SDL_EVENT_GAMEPAD_ADDED/REMOVED`; keys and buttons are released on focus loss.
+- **Defaults**: P1 keyboard arrows, Z Cross, X Circle, A Square, S Triangle, Q/W L1/R1, E/R L2/R2,
+  Return Start, Backspace Select; P2 keyboard I/J/K/L, M Cross, Comma Circle, U Square, O Triangle,
+  7/8 L1/R1, 9/0 L2/R2, P Start, Backslash Select. Controller: positional (south = Cross, east = Circle,
+  west = Square, north = Triangle), shoulders L1/R1, triggers L2/R2, Start, Back/Share = Select, D-pad,
+  left stick on with a 50 % radial deadzone and 8 sectors of 45 degrees.
+- **Reserved** (never bindable, never reach a pad): Escape, Tab, F9, F11, F12, the Cmd/Win keys and
+  anything pressed with them, and the Alt+Enter / Ctrl+Cmd+F combinations handled before input.c.
+  Bindings are **scancodes** (layout-independent positions), names from `SDL_GetScancodeName` with a
+  few aliases (Comma, Period, Backslash...) and `#N` for nameless ones; controller inputs are SDL
+  names (`south`, `dpup`, `leftx-`, `lefttrigger`...). Binding an input clears it from the player's
+  other buttons.
+- **Labels follow the controller**: PlayStation (Cross / Circle / L1 / L2 / Options / Share), Xbox
+  (A / B / LB / LT / Menu / View), Nintendo (B / A / ZL / Plus) from `SDL_GetGamepadTypeForID`; unknown
+  or none: A / B / X / Y. The game's own buttons keep their PS names in the left column.
+- **Controls window** (macOS View > Controls…, also app menu **Settings…** Cmd+,; Windows View >
+  Controls…): Player 1 / Player 2, Device, one row per game button with a keyboard and a controller
+  column (click, then press; Escape cancels; status line says what happened, including refused keys),
+  "Left stick moves too", deadzone, Reset to Defaults (confirmed), Done. Pressed buttons light up
+  (10 Hz refresh). While a binding is armed the pads read 0 and the next key / button goes to the
+  window, not the game; background controller events are allowed while the window is open. Native
+  Cocoa (`controls_mac.m`, key codes mapped kVK -> SDL scancode) and Win32 (`controls_win.c`, set-1
+  scan codes with the E0 bit -> SDL scancode, built in code, no resource script). Every change is
+  applied at once and saved.
+- Menu / test actions (`--menu-action F:...`, all platforms): `controls` / `settings` (open the
+  window; headless only logs), `controls-dump`, `controls-reset=P1|P2|all`,
+  `controls-bind=P1:cross=key:Z` / `=P2:l2=pad:lefttrigger` / `=P1:start=none`,
+  `controls-device=P2:keyboard|auto|none|gamepad:GUID`, `controls-stick=P1:on|off`,
+  `controls-deadzone=P1:40`.
+- Test hooks: `--input-event F:EVENT,...` injects host events in headless runs through the same
+  `input_handle_event` path (SDL virtual controllers: `pad-add:N[:ps4|xbox]`, `pad-remove:N`,
+  `pad-down:N:south`, `pad-up`, `pad-axis:N:leftx:-0.8` (triggers 0..1), `key-down:Z`, `key-up:Z`);
+  `--input-log FILE` writes `frame pad1 pad2` (hex, active high) whenever a mask changes.
+
+### Settings file (`settings.ini`)
+
+INI-like (`[section]`, `key = value`, `#`/`;` comments, UTF-8 BOM skipped, bad lines logged as
+`settings: line N ignored` and dropped, never fatal), in the data directory (SDL pref path, same
+folder as `destrega.pak`; `--data-dir` moves it). Written atomically (temp file, fsync,
+`plat_replace_file`), 0.5 s after the last change and at exit. Keys:
+`[display]` scale, max_scale, widescreen, renderer (software|gpu), fullscreen, window (WxH points);
+`[netplay]` port, delay, join_address; `[player1]` / `[player2]` device, device_name, stick,
+deadzone, `key.<button>`, `pad.<button>` (buttons: up down left right cross circle square triangle
+l1 r1 l2 r2 start select; empty = unbound; keys absent = default).
+
+- **Command-line flags win for that run and are never written back**: each flag locks its key
+  (`settings_lock`), so a View toggle cannot save it either. `--widescreen` / `--no-widescreen`,
+  `--renderer`, `--scale`, `--max-scale`, `--window`.
+- **Headless runs never read or write a settings file** unless given `--settings FILE`; tests stay
+  hermetic. `--no-settings` makes a windowed run use defaults and write nothing (the Wine netplay
+  test uses it). View toggles that persist: Widescreen, Renderer (not `compare`), Full Screen, window
+  size (not while full screen or maximised).
+- Netplay defaults moved from NSUserDefaults (`NetplayPort`, `NetplayJoinAddress`, `NetplayDelay`) /
+  `HKCU\Software\Destrega\Netplay` (`Port`, `JoinAddress`, `Delay`) to `[netplay]`: copied once when
+  the file has no value; the old values are left in place.
+- Not part of the netplay build identity: `input.[ch]`, `settings.[ch]` and the controls windows are
+  excluded in `tools/source_ident.py` (they only produce the pad masks that the netplay stream
+  already carries, and the equivalence test below proves they match `--press`).
+- Tests: `runtime/tests/test_input.c` (defaults, mapping, stick deadzone/sectors, rebinding,
+  reserved keys, name round trips, labels, device assignment incl. sticky hot-plug, settings round
+  trip, malformed / binary / huge files, locks, atomic save, unwritable path) and
+  `tools/test_input.py` (in `run_tests.sh`): a 6000-frame run driven by a custom settings file plus
+  injected key and virtual-controller events (PS4-type pad for P1, Xbox-type for P2, plus events that
+  must not reach a pad, plus a mid-run `controls-bind`) gives the **same masks and per-frame state
+  hash** as the equivalent `--press` run; hot-plug; persistence (flags not written, F9 refused);
+  a garbage file left untouched; a headless run touches no file.
+- Not tested with hardware: no physical controller was attached (only SDL virtual controllers);
+  the Windows window was checked under CrossOver only.
 
 ## High-resolution rendering (`runtime/hires.[ch]`)
 
@@ -777,7 +909,8 @@ The header comment of `hires_gpu.c` has the details.
   `SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER`); readback only for `--dump`, `--hires-verify`
   and compare (`HiresBackend.read`).
 - Exactness: target B5G5R5A1 (shader writes PS1 red into `.b` = the low 5 bits, so the download
-  is raw PS1 u16, alpha = mask bit). Attributes are the 1x plane equations evaluated as exact
+  is raw PS1 u16, alpha = mask bit), or R8G8B8A8 in full-precision colour (see "Render quality";
+  both pipeline sets are created at init). Attributes are the 1x plane equations evaluated as exact
   rationals in 64-bit integers per pixel (Metal `long`; emulated with 32-bit pairs on Vulkan). Semi modes are fixed-function
   blends (B/2+F/2 via constant 0.5 and F/2-1/4; see the file comment for the one F=0 tie case).
   Triangles with a vertex outside the target are drawn as their clipped bbox with an exact
@@ -830,6 +963,109 @@ The header comment of `hires_gpu.c` has the details.
   `tools/test_widescreen.sh` adds `ws46g` (16:9 on the GPU) and `wsrender` (renderer and
   widescreen switched back and forth mid-fight, state hash = 4:3 software run).
 
+## Render quality (`--tex-filter`, `--hires-colour`, `--ssaa`; View menu)
+
+Three presentation-only improvements of the hi-res target, implemented the same way in the software
+backend (`hires.c`) and the GPU backend (`hires_gpu.c` MSL + `shaders/hires.glsl`). All integer
+math, so the two backends stay **bit-identical in every mode** (`--renderer compare` reports 0
+differing pixels with `--pgxp off`, 4:3 and 16:9). No emulated state changes (state hashes equal
+with every mode on). Options are plain global setters/getters in `hires.h`
+(`hires_set_tex_filter`, `hires_set_colour`, `hires_set_ssaa`), no persistence.
+
+- **Defaults**: windowed = `xbr` filter, full-precision colour, and 2x SSAA when the GPU renderer
+  is active (1 on software; switching the renderer moves the default along unless `--ssaa` or the
+  menu chose a value). The *default* SSAA is capped to a render target of at most 24 hi-res pixels
+  per 1x pixel (`hires_set_ssaa_cap(24)`: render Sx*Sy <= 24, i.e. never beyond 4x6), so it only
+  applies to small windows (base Sx*Sy <= 6 for 2x, e.g. 2x3) and is off at the usual 4x6; an explicit
+  `--ssaa N` or a menu choice is never capped (`hires_set_ssaa_cap(0)`). Reason: 2x SSAA on a 4x6
+  base (8x12, 23.6 M px) costs ~46 ms/frame on the GPU (below). Headless = nearest, 15-bit, no SSAA: every existing test and hash is
+  unchanged. `--hires-verify` only runs where it is meaningful (1x1, 15-bit, nearest, no SSAA:
+  `hires_verify_possible()`).
+- **Menus / actions** (Mac and Windows View menu; also `--menu-action`): Texture Filtering > Off
+  (Sharp Pixels) / Bilinear / Smooth 2D Edges + Bilinear 3D = `tex-filter=nearest|bilinear|xbr`
+  (no argument: next); Smooth Colours = `smooth-colours[=on|off]`; Anti-aliasing > Off / 2x / 3x /
+  4x = `ssaa=1..4` (no argument: off <-> 2x). Each switch runs `hires_reconfigure()` between frames:
+  a format or SSAA change reallocates the target and seeds it from the 1x VRAM, like a resize. The
+  log says `hires: texture filter F, C colour, ssaa N (in use N, render scale WxH) at frame F`.
+
+### Texture smoothing (`--tex-filter nearest|bilinear|xbr`)
+- Filtering happens **after the CLUT lookup**, on the 15-bit texels, with integer weights summing
+  to 65536 (`tex_combine` / `tcomb`), result in 5.8 fixed point; modulation, raw texture, dither and
+  semi-transparency then work as before (a single texel `t << 8` gives exactly the old result).
+- **Transparency**: texel 0000 contributes no weight; the opaque taps are renormalised, and the
+  pixel is transparent (discarded) when the opaque weight is below half. So a sprite edge is the
+  sprite colour or the background, never darkened towards black (no fringe). The STP bit
+  (semi-transparency / mask) is the weighted majority of the opaque taps.
+- **No bleed**: the whole footprint stays inside the 1x-sampled UV range (the `uv_track_span`
+  clamp of "High-resolution rendering", now always on when filtering): taps outside it are clamped
+  to its edge texel (clamp-to-edge inside the range). Rects use the u/v range of the columns/rows
+  they draw (`hires_rect_uv_range`). Texture windows are applied to every tap. Pages that overlap
+  the framebuffer are sampled from 1x VRAM like before (the game never does this).
+- **Bilinear**: sample point at the hi-res pixel centre without the PS1's +0.5 rounding bias,
+  `i = floor(u - 0.5)`, fraction in 1/256.
+- **xbr (default)**: a Scale2x/xBR corner rule for **2D** primitives, bilinear for **3D** ones.
+  2D = textured rects, and triangles without PGXP depth whose u/v advance exactly ±1 texel per 1x
+  pixel along x/y (`hires_tri_is_2d`: HUD, fonts, portraits, sprites). For the nearest texel E
+  and the quadrant the sample lies in, if the two neighbours H (horizontal) and V (vertical) are
+  equal, differ from E, and differ from their own outer neighbours, the corner beyond the diagonal
+  |dx|+|dy| > 1/2 texel takes H's colour, with a one-hi-res-pixel ramp; otherwise E (nearest).
+  Exact colour equality means noisy textures are left alone while fonts and HUD outlines get
+  smooth diagonals and keep sharp straight edges. Bilinear blurs pixel art, so it is the 3D-only
+  half. 3D textures (stage, characters) are photographic/noisy at 1x: bilinear removes the
+  blockiness at 4x6 without inventing edges.
+- No texture cache: every tap reads the 1x VRAM (software) / VRAM texture (GPU) directly, so
+  there is nothing to invalidate. The software rect path precomputes per-column taps.
+
+### Full-precision colour (`--hires-colour 15|full`)
+- Target RGBA8 (u32 R | G << 8 | B << 16 | mask << 24 in software, R8G8B8A8_UNORM on the GPU)
+  instead of 15-bit. Channels are on the PS1's 8-bit scale: a 15-bit value c is c << 3 (VRAM
+  uploads, fills, copies and textures stay 15-bit sources), an untextured colour is the 8-bit
+  vertex colour, a modulated texel `min((t5.8 * c) >> 12, 255)`, gouraud interpolation keeps all
+  8 bits. Never dithered (dither only exists to hide 15-bit banding).
+- Semi-transparency in 8-bit units, clamped like the hardware: B/2+F/2 = (B+F) >> 1,
+  B+F = min(B+F, 255), B-F = max(B-F, 0), B+F/4 = min(B + F/4, 255). The GPU uses the same
+  fixed-function blends on the UNORM8 target (exact for integers; the mode-0 F = 0 tie case of the
+  15-bit target applies here too; mode 0 is unused by the game).
+- The mask bit is kept in the alpha byte (set-mask, check-mask work as before).
+- For opaque primitives `full >> 3 == 15-bit` exactly (unit test), so full precision only adds the
+  bits gouraud shading, modulation and blending produce: smooth gradients and fog instead of
+  15-bit banding.
+- The 15-bit mode stays (default headless, `--hires-verify`, every bit-exact test).
+
+### Anti-aliasing (`--ssaa N`, 1..4)
+- Rendering at N x the scale and box-downsampling N x N blocks at present (rounded average of the
+  8-bit channels, identical in `hires_view_to_rgba` and the GPU present pass). It is ordinary
+  rasterization at a higher integer scale, so it is exact by construction (same rules, same
+  compare) and also smooths texture/edge aliasing; MSAA was not used because its coverage samples
+  cannot be reproduced bit-exactly in software.
+- The base scale (auto from the window, capped by `--max-scale`, default 4x6) is multiplied:
+  `hires_get_scale` returns the base, `hires_get_render_scale` the target's. N is lowered until each
+  axis <= `HIRES_MAX_RENDER_SCALE` (16), each side <= `HIRES_MAX_RENDER_DIM` (8192, the GPU texture
+  limit everywhere) and the target <= `HIRES_MAX_RENDER_PX` (34 M px, 136 MB in RGBA8); 4x6 with
+  `--ssaa 2` = 8x12 = 4096 x 5760 (+ guard band in widescreen). If the allocation still fails the
+  frontend logs it and turns SSAA off. Dumps (`--dump`) are written after the box filter.
+
+### Tests and measurements
+- `runtime/tests/test_hires.c`: filter footprint vs the 1x-sampled range (taps outside show up as
+  foreign colours; 3D quad, 1:1 sprite quad, rects, x-flipped rect), transparent texels (no fringe,
+  bilinear and xbr, 15-bit and full), the four blend modes' clamping in full precision and the mask
+  bit, full >> 3 == 15-bit for opaque primitives, SSAA scales / limits / box average, 2D detection.
+- `runtime/tests/test_hires_gpu.c`: every random command stream also in bilinear, xbr, full,
+  2x SSAA and combinations, 1x1 .. 4x6, with and without the guard band: 0 differing pixels on
+  Metal and on Vulkan (MoltenVK). It added a 2D sprite-quad generator (the xbr 2D path).
+- `tools/test_render_quality.sh` (in `run_tests.sh`): compare runs per mode and combined, 4:3 and
+  16:9, `--compare-max 0` and 0 differing pixels overall; state hashes with every mode on (software
+  and GPU) and with the modes switched live through the menu actions.
+- Measurements (Apple Silicon Mac, machine heavily loaded by other jobs: 1-min load 18-124, so
+  treat as rough; A/B runs back to back, fight frames 3700-4500, `tools/fight_script.py`).
+  Headless 4x6, ms/frame emulation + hi-res: GPU base 12.4, bilinear 13.1, xbr 13.1, full 12.4,
+  2x SSAA (8x12) 46.0, all three 48.4; software (3 threads) base 11.6-12.6, bilinear 47, xbr 46,
+  full 24. The GPU filter cost was ~4x higher before two fast paths (single opaque tap:
+  `(s + 128) >> 8` without the division; bilinear taps with weight 0 are not fetched).
+  Windowed GPU emu + present: 960x720 window (4x6) default 14.1 vs all off 12.4, `--ssaa 2`
+  49.1; 640x480 (3x4) default 10.3, `--ssaa 2` (6x8) 24.6; 1280x720 16:9 (4x6) default 17.6.
+  So explicit 2x SSAA does not hold 60 Hz on this machine at these window sizes, hence the cap.
+
 ## Widescreen (`--widescreen`, default off)
 
 16:9 fights with **zero** change to emulated state (proved per frame by
@@ -880,6 +1116,30 @@ The header comment of `hires_gpu.c` has the details.
   registered with `widescreen_add_state_hook(save, restore)`, or the wide pass leaks into the
   real one.
 
+## Releases (`docs/RELEASES.md`)
+
+`gen/` is translated game code and is **never** published: CI has no disc, and no workflow,
+artifact or GitHub Release may contain a playable build. Design (options A/B/C, recommendation,
+notarization steps) is in `docs/RELEASES.md`.
+
+- `tools/package_release.sh mac|win` zips a finished build on the machine that built it (Mac:
+  `Destrega.app` via `ditto`; Windows: exe + DLLs found next to it / `--dll-dir` / `$MINGW_PREFIX/bin`,
+  zip made with Python). A game build needs `--personal` and is named
+  `...-PERSONAL-DO-NOT-REDISTRIBUTE.zip`; a stub build (marker string `DESTREGA-CI-STUB-BUILD` in
+  `tools/ci/stub_gen/stub.c`) becomes `Destrega-STUB-NOT-PLAYABLE-...zip`. Output in `dist/`.
+- CI packages and uploads only the stub (`STUB-NOT-PLAYABLE-windows|macos`, 3 days); a macOS job also
+  runs `make_app.sh`. CI robustness: curl with `--retry-all-errors` and a libsdl.org fallback,
+  SDL3 cache restore/save split with `restore-keys` (bump `SDL_CACHE_REV` to invalidate), MSYS2
+  `cache: true` and a second setup attempt if the first fails.
+- Versions: `VERSION` (base, e.g. 0.1.0) + git, via `tools/version.py` (`short|build|describe|rc-header`).
+  A tag `vX.Y.Z` on the commit wins over `VERSION`. `make_app.sh` writes `CFBundleShortVersionString`,
+  `CFBundleVersion` (commit count), `DestregaBuild` and `NSHumanReadableCopyright` (no personal
+  names/emails). Windows: `runtime/win/destrega.rc` (manifest with Common Controls 6, icon
+  `destrega.ico` from `tools/make_ico.py`, VERSIONINFO from the generated `destrega_version.h`).
+  The Win32 dialogs in `menu_win.c` already use the system message font; only the manifest
+  dependency was missing for the modern look. Checked under CrossOver (`--bottle destrega-test`).
+- `THIRD_PARTY_LICENSES.txt` goes into every package; update it when linking anything new.
+
 ## Pitfalls
 
 - Branches may target another branch's delay slot (e.g. 0x800951c0); the tracer
@@ -899,4 +1159,9 @@ The header comment of `hires_gpu.c` has the details.
   handler runs, queued (not merged) repeat completions, and writes with the
   read-only bit 31 set are treated as RMW (no flag ack). Check with
   `--trace` (prints per-second MDEC frame/CD sector counts; intro = 15 fps).
+- Hi-res lines run Sa - 1 steps past their end (to cover whole 1x pixels); the gouraud colour
+  used to keep stepping there and wrapped below 0 (software wrote a garbage u32, the GPU `& 255`),
+  so the two backends disagreed on the last hi-res pixels of a fading line. Both now clamp the
+  colour to the end colours' range (a no-op at 1x1). Found by checking the random compare test
+  after every primitive (later primitives had hidden it); the game draws no lines.
 - Fights run at 30 updates/s by design (`f_80027218(1)` -> `VSync(2)`); not a bug.

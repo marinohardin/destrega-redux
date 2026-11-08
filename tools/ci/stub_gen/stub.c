@@ -18,5 +18,9 @@ void f_80044918(void) { no_game(__func__); }
 void f_80045414(void) { no_game(__func__); }
 void f_80095188(void) { no_game(__func__); }
 
+/* Marker that tools/package_release.sh looks for (grep -a) to tell a stub build from a real
+ * one, so a stub can never be packaged under a playable name. */
+__attribute__((used)) const char g_destrega_stub_marker[] = "DESTREGA-CI-STUB-BUILD";
+
 const RecompEntry g_recomp_table[1] = { { 0, NULL, 0, 0, 0, 0 } };
 const u32 g_recomp_count = 0;

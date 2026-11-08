@@ -2,9 +2,17 @@
 <!-- Windows application manifest (embedded by destrega.rc). activeCodePage UTF-8 makes the
      C runtime's narrow file functions (fopen, rename, remove) take UTF-8 paths, which is what
      SDL returns (SDL_GetPrefPath, dialogs) and what the rest of the runtime uses. Needs
-     Windows 10 1903 or later; older versions ignore it (ASCII paths still work). -->
+     Windows 10 1903 or later; older versions ignore it (ASCII paths still work).
+     The Common-Controls 6.0 dependency gives the menu/dialog buttons, edit boxes and message
+     boxes (runtime/menu_win.c) the current visual style instead of the Windows 95 look. -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity type="win32" name="Destrega.Recompiled" version="1.0.0.0"/>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+                        processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>

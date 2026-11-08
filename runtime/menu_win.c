@@ -9,7 +9,8 @@
  * which main.c runs between frames, so nothing here touches the emulated machine.
  *
  * Dialogs are plain Win32 windows built here (no resource script): a modal form for Host Game /
- * Join Game (values remembered in HKCU\Software\Destrega\Netplay) and a small modeless panel with
+ * Join Game (values remembered in settings.ini [netplay]; read once from the registry key
+ * HKCU\Software\Destrega\Netplay that earlier versions used) and a small modeless panel with
  * Cancel while the host waits or the joiner connects. Alerts are SDL message boxes (main.c). The
  * windows run on SDL's own message pump (SDL_PumpEvents dispatches every window of the thread);
  * the modal form runs its own loop while open, so the game pauses there, as with the Mac alert. */
@@ -26,6 +27,7 @@
 #include "menu.h"
 #include "platform.h"
 #include "widescreen.h"
+#include "settings.h"
 
 void rt_log(const char *fmt, ...);
 
@@ -112,6 +114,7 @@ static void update_items(void) {
         if (!strcmp(name, "fullscreen"))
             set_text(it->id, frontend_fullscreen() ? "Exit Full Screen\tAlt+Enter" : "Enter Full Screen\tAlt+Enter");
         if (!strcmp(name, "widescreen")) checked = frontend_widescreen();
+        frontend_view_checked(it->action, &checked);
         if (!strcmp(name, "renderer") && eq) {
             checked = !strcmp(eq + 1, frontend_renderer());
             if (!strcmp(eq + 1, "gpu") && !frontend_gpu_available()) enabled = false;
@@ -164,8 +167,22 @@ void menu_init(void) {
     add(ren, "Software", "renderer=software");
     add(ren, "GPU", "renderer=gpu");
     add_sub(view, "Renderer", ren);
+    HMENU tf = CreatePopupMenu();   /* render quality: presentation only, reseeds like a resize */
+    add(tf, "Off (Sharp Pixels)", "tex-filter=nearest");
+    add(tf, "Bilinear", "tex-filter=bilinear");
+    add(tf, "Smooth 2D Edges + Bilinear 3D", "tex-filter=xbr");
+    add_sub(view, "Texture Filtering", tf);
+    add(view, "Smooth Colours", "smooth-colours");
+    HMENU aa = CreatePopupMenu();
+    add(aa, "Off", "ssaa=1");
+    add(aa, "2x", "ssaa=2");
+    add(aa, "3x", "ssaa=3");
+    add(aa, "4x", "ssaa=4");
+    add_sub(view, "Anti-aliasing", aa);
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     add(view, "Enter Full Screen\tAlt+Enter", "fullscreen");
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    add(view, "Controls…", "controls");
     add_sub(s_bar, "View", view);
 
     HMENU np = CreatePopupMenu();
@@ -307,21 +324,33 @@ static bool form_run(const char *title, const char *text, const char *l1, char *
     return true;
 }
 
-/* remembered values: HKCU\Software\Destrega\Netplay (strings) */
-static void reg_get(const char *name, char *out, int n, const char *def) {
+/* remembered values: settings.ini [netplay] port / join_address / delay. Earlier versions kept them
+ * in HKCU\Software\Destrega\Netplay (Port, JoinAddress, Delay): copied over once if the file has
+ * none (the registry values are left alone). */
+static bool reg_read(const char *name, char *out, int n) {
     wchar_t wn[64], wv[256];
     DWORD sz = sizeof wv;
     to_w(name, wn, 64);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Destrega\\Netplay", wn, RRF_RT_REG_SZ, NULL, wv, &sz) == ERROR_SUCCESS)
-        from_w(wv, out, n);
-    else snprintf(out, (size_t)n, "%s", def);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Destrega\\Netplay", wn, RRF_RT_REG_SZ, NULL, wv, &sz) != ERROR_SUCCESS) return false;
+    from_w(wv, out, n);
+    return true;
+}
+static void reg_get(const char *name, char *out, int n, const char *def) {
+    static const char *const map[3][2] = { { "Port", "port" }, { "JoinAddress", "join_address" }, { "Delay", "delay" } };
+    const char *key = name;
+    for (int i = 0; i < 3; i++) if (!strcmp(name, map[i][0])) key = map[i][1];
+    const char *v = settings_get("netplay", key);
+    char old[256];
+    if (!v && reg_read(name, old, sizeof old) && *old && settings_set("netplay", key, old)) {
+        settings_save();
+        v = settings_get("netplay", key);
+    }
+    snprintf(out, (size_t)n, "%s", v ? v : def);
 }
 static void reg_set(const char *name, const char *value) {
-    wchar_t wn[64], wv[256];
-    to_w(name, wn, 64);
-    to_w(value, wv, 256);
-    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Destrega\\Netplay", wn, REG_SZ, wv,
-                    (DWORD)((wcslen(wv) + 1) * sizeof(wchar_t)));
+    static const char *const map[3][2] = { { "Port", "port" }, { "JoinAddress", "join_address" }, { "Delay", "delay" } };
+    for (int i = 0; i < 3; i++) if (!strcmp(name, map[i][0])) settings_set("netplay", map[i][1], value);
+    settings_save();
 }
 
 static void trim(char *s) {
