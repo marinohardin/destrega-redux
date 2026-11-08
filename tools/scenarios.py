@@ -347,19 +347,24 @@ def hires_job(name, kind, base):
     os.makedirs(out, exist_ok=True)
     extra = ['--state-hash', os.path.join(out, kind + '.hash'), '--fight-from', str(scn.fight_from),
              '--hires-min-fight', '95', '--hires-threads', '1', '--frames', str(frames)]
-    extra += ['--scale', '1', '--hires-verify'] if kind == 'v1' else ['--scale', '2x3']
+    # 1x1 equivalence needs PGXP off (precise vertices leave the 1x grid); 2x3 runs PGXP on, so the
+    # hash comparison also proves PGXP does not change gameplay, on every stage
+    extra += ['--scale', '1', '--hires-verify', '--pgxp', 'off'] if kind == 'v1' else ['--scale', '2x3', '--pgxp', 'on']
     rc, log, dt = run_one(scn, out, extra, dump_every=0, trace=False, verify=False)
     open(os.path.join(out, kind + '.log'), 'w').write(log)
     return name, kind, rc, log, out, dt
 
 
+PGXP_OK = (r'pgxp-check: \d+ triangles with precise vertices; 0 with an on-screen vertex > 1.5 px from its '
+           r'integer, 0 with depth ratio > 2, 0 using a value older than 2 frames, 0 split vertices')
 UV_OK = r'hires-uv: \d+ textured samples, \d+ clamped to the 1x-sampled UV range, 0 out of range when fetched'
 
 
 def hires_main(a, extra):
     """Hi-res determinism + 1x1 equivalence on the scenarios tagged 'hires' (every stage): the
     per-frame hash of all emulated state must be identical at 1x1 (--hires-verify) and 2x3, the 1x1
-    target must equal VRAM at every frame, no textured sample may fetch outside the 1x-sampled UV
+    target (PGXP off) must equal VRAM at every frame, the PGXP vertices drawn at 2x3 must pass
+    pgxp-check (no cracks / false associations), no textured sample may fetch outside the 1x-sampled UV
     range and >= 95% of the fight frames must come from the hi-res target."""
     names = a.names or [n for n, s in SCENARIOS.items() if 'hires' in s.tags and not s.xfail]
     jobs = [(n, k) for n in names for k in ('v1', 's23')]
@@ -378,6 +383,7 @@ def hires_main(a, extra):
             if not re.search(UV_OK, log): bad.append(f'{k}: UV samples out of range (or no UV report)')
         _, log1, out = res[(n, 'v1')]
         _, log2, _ = res[(n, 's23')]
+        if not re.search(PGXP_OK, log2): bad.append('s23: PGXP consistency check failed (or no pgxp-check report)')
         if not re.search(r'hires-verify: %d frames checked \([1-9][0-9]* in fight window\), 0 mismatching' % scn.key, log1):
             bad.append('1x1 hi-res target differs from VRAM (or no fight-window frames)')
         try:
