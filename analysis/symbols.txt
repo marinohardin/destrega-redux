@@ -18,21 +18,41 @@
 80010000  data   overlay_slot_p1            verified  agents-md  P1 overlay load address (Mxxx.BIN, EVENT_SP.BIN, OPTOVL.BIN); file copied verbatim, code at file+4
 8001a268  data   overlay_slot_p2            verified  agents-md  P2 overlay load address (Mxxx2.BIN, EVENTOVL.BIN)
 8001a284  func   -                          verified  test       [MROSEN2] first function of P2 Rohzen (4 entries a284/a2b4/a2e4/a314 vs a26c/a29c/a2cc/a2fc of the others); was not recompiled until main-data slot pointers became seeds; scenario vs_villa
+8001c324  func   -                          verified  code       [EVENTOVL] contains GTE RTPS (generated code)
 800244d0-80026618  range  text_leading_data  verified  agents-md  data inside .text before the code; never linear-sweep
 80027218  func   frame_sync                 likely    agents-md  f_80027218(1) -> VSync(2); why fights update at 30/s
+80028c70  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+8002905c  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 8002b80c  func   main                       verified  code       game main(), called from crt0
 8002beb0  func   -                          verified  trace      on the guest call stack during a fight (main > 8006b35c > 8006acc4 > 8002c820 > 8002beb0 > 80037280 ...)
 8002c820  func   -                          verified  trace      on the fight call stack, see 8002beb0
+80035594  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 800363c8  func   -                          verified  trace      innermost frame of the fight call stack seen at the end of headless runs
-80036b0c  func   -                          verified  trace      on the fight call stack, see 8002beb0
+800367d8  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+80036b0c  func   -                          verified  probe      on the fight call stack (see 8002beb0); 1 RTPT + 1 RTPS plus MVMVA/lighting; produced ~63% of the GTE vertices drawn in fight frames 3700-4400 (PGXP producer probe, Gradd vs Milena); character mesh renderer is a guess
 80037144  func   -                          verified  trace      on the fight call stack, see 8002beb0
 80037280  func   -                          verified  trace      on the fight call stack, see 8002beb0
+80037360  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 8003e36c  func   overlay_loader_b           likely    rea        one of the three overlay loaders (memcpy file into P1/P2 slot); which files it loads: unconfirmed
+8003ebb0  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+8003fcb8  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+800401f8  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+80040820  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+80040e98  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+8004163c  func   -                          verified  probe      RTPT family 8003fcb8..80041c14; ~1.3% of fight GTE vertices (PGXP producer probe)
+80041c14  func   -                          verified  probe      2 RTPT + 2 RTPS + lighting (cop2 4af8002a, 4a780010), scratchpad work area; ~16% of fight GTE vertices (PGXP producer probe); last of the 6-function family 8003fcb8..80041c14 (primitive-type variants: guess)
+800423e0  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+800426c4  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+80042fec  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+800433c4  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+80043fd4  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 800465a4  func   sphere_vs_poly             verified  override   moving sphere vs stage collision polygons; readable version runtime/overrides/collision.c, checked by --verify-overrides
 80049e90  label  str_wait_loop              verified  trace      libpress STR playback wait loop; stuck here when MDEC/CD DMA completions race
 8004c1e8  func   overlay_loader_a           likely    rea        one of the three overlay loaders; see 8003e36c. Also on the guest call stack (8004be10 > 8004c1e8 > 80039cd8 > 8002c51c > 8002c820) when a VS fight overlay is loaded (verified: trace of the 8001a284 miss)
+80055b70  func   -                          verified  probe      RTPT family 80055820..80057100 (14 small functions, 1 RTPT each, some + RTPS / NCDS 4a486012); few fight vertices; 80056348 8005650c 80056704 80056908 80056b40 of the family also produced some (PGXP producer probe)
 8006acc4  func   -                          verified  trace      on the fight call stack, see 8002beb0
 8006b35c  func   overlay_loader_c           likely    rea        one of the three overlay loaders, and on the fight call stack right under main
+8007ec5c  func   -                          verified  probe      RTPS in a loop; ~10% of fight GTE vertices (PGXP producer probe); role unknown (effects/particles: guess)
 800951c0  label  -                          verified  agents-md  branch target that is another branch's delay slot (tracer pitfall)
 8009b8bc  func   ResetCallback              verified  code       libetc; setjmps into 800be224 and passes it to HookEntryInt
 8009b924  label  resetcallback_irq_resume   verified  test       setjmp return point resumed on every IRQ; seeded as its own native entry (extra_seeds.txt)

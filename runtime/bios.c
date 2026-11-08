@@ -411,7 +411,7 @@ static void bios_a0(u32 fn) {
     switch (fn) {
     case 0x39: break;                        /* InitHeap */
     case 0x44: break;                        /* FlushCache */
-    case 0x49: gpu_write_gp0(r[4]); break;   /* GPU_cw */
+    case 0x49: gpu_write_gp0_tag(r[4], g_pgxp_reg[4]); break;   /* GPU_cw */
     case 0x70: break;                        /* _bu_init */
     case 0x72: break;                        /* CdRemove */
     case 0xab: case 0xac: card_info_call(fn); break;   /* _card_info, _card_load */

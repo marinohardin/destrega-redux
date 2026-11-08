@@ -121,6 +121,8 @@ void gte_write_ctrl(int reg, u32 v);  /* ctc2 */
 
 void gpu_init(void);
 void gpu_write_gp0(u32 v);
+/* GP0 word with its PGXP precision tag (runtime/pgxp.h; 0 = none). */
+void gpu_write_gp0_tag(u32 v, u32 tag);
 void gpu_write_gp1(u32 v);
 u32 gpu_read_data(void);              /* GPUREAD 0x1f801810 */
 u32 gpu_read_stat(void);              /* GPUSTAT 0x1f801814 */

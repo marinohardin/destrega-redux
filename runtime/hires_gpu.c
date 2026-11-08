@@ -31,11 +31,29 @@
  * changed), CPU->VRAM uploads into the target (puts) and VRAM->VRAM copies (the source is
  * snapshotted with a texture copy).
  *
- * Vertices are float target coordinates plus a primitive index; per-vertex extras (PGXP W)
- * and a wider target (widescreen) only touch GVtx, the projection in vs_prim and configure().
+ * Vertices are float target coordinates plus a primitive index; a wider target (widescreen)
+ * only touches GVtx, the projection in vs_prim and configure().
+ *
+ * PGXP (runtime/pgxp.h; the vertices arrive already validated and welded by gpu.c):
+ * - Fractional 16.16 positions keep the exact coverage. A triangle with a fractional vertex is
+ *   drawn as itself grown by 1 px per edge (or its bounding box for slivers), and the shader
+ *   applies hires.c's edge rule (F_EDGE). Float vertices fed to the GPU rasterizer would be
+ *   snapped to its sub-pixel grid and break fill-rule ties. Attribute planes already took
+ *   16.16 positions, so gouraud and affine u/v stay exact: `--pgxp affine` compares at
+ *   0 differing pixels.
+ * - Perspective u/v (F_PERSP: textured, w on all three vertices, hires_get_perspective()):
+ *   q, u*q and v*q planes as hires.c builds them, re-based to the bbox corner and stored as
+ *   64-bit fixed point (2^-38). The shader evaluates them exactly at the start and end of
+ *   hires.c's 8-pixel run and divides exactly (div24: a float estimate corrected with integer
+ *   multiplies, since 64-bit division is slow on the GPU). It then steps linearly in between,
+ *   the same way hires.c does. hires.c uses double, so u/v differ in the last bits, and a
+ *   handful of samples land on the neighbouring texel (29 pixels over 331 fight frames at 4x6;
+ *   a float version gave 12,494). Colours stay affine, the UV clamp also applies at 1x1 when a
+ *   vertex is precise, and clamped GTE vertices never have precise values (pgxp.c).
  */
 #include "hires_gpu.h"
 #include <SDL3/SDL.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -59,6 +77,7 @@ enum { K_TRI = 0, K_RECT, K_FILL, K_COPY, K_PUT, K_LINEPX, K_SEED };
 #define F_MSET (1u << 18)
 #define F_EDGE (1u << 19)       /* triangle drawn as its bounding box; the shader tests coverage */
 #define F_LONGLEFT (1u << 20)
+#define F_PERSP (1u << 21)      /* PGXP: perspective-correct u/v from the pf planes */
 
 /* pipeline keys: 0 opaque, 1..4 semi-transparency mode 0..3; +5 = with mask check */
 #define NKEYS 10
@@ -70,10 +89,12 @@ typedef struct {   /* must match struct Prim in the MSL source */
     u32 rxy[5], pad;
     s64 cint[5];
     u32 pad2[2];
-    s32 ev[6];                  /* F_EDGE: sorted vertices a, b, c in hi-res 16.16 (x, y) */
+    s32 ev[6];                  /* sorted vertices a, b, c in hi-res 16.16 (x, y) */
     u32 pad3[2];
+    s64 pl[9];                  /* F_PERSP: q, u*q, v*q at pixel porg; then d/dX; then d/dY (2^-38) */
+    s32 porg[2];                /* hi-res pixel the pl planes are relative to */
 } GPrim;
-_Static_assert(sizeof(GPrim) == 192, "GPrim must match the MSL struct Prim");
+_Static_assert(sizeof(GPrim) == 272, "GPrim must match the MSL struct Prim");
 
 typedef struct { int sx, sy, ox, oy, pass, mode, rx, ry, rw, rh, p0, p1; } FragU;
 
@@ -81,7 +102,8 @@ static const char s_msl[] =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "struct Prim { uint kf, tp, clut, tw, clip0, clip1, uvr, cmin, cmax, color, aux0, aux1;\n"
-"  int qx[5]; int qy[5]; uint rxy[5]; uint pad; long cint[5]; uint pad2[2]; int ev[6]; uint pad3[2]; };\n"
+"  int qx[5]; int qy[5]; uint rxy[5]; uint pad; long cint[5]; uint pad2[2]; int ev[6]; uint pad3[2];\n"
+"  long pl[9]; int porg[2]; };\n"
 "struct VI { float2 pos [[attribute(0)]]; uint prim [[attribute(1)]]; };\n"
 "struct VO { float4 pos [[position]]; uint prim [[flat]]; };\n"
 "struct VU { float4 k; };\n"
@@ -140,6 +162,41 @@ static const char s_msl[] =
 "  long N = px * (qy - py) + (qx - px) * (Y16 - py), D = (qy - py) * 65536;\n"
 "  long xs = -fdiv(-N, D);\n"
 "  return xs < long(cx1) ? long(cx1) : xs; }\n"
+/* one past the last pixel of that span: ceil(right edge x), at most the clip */
+"static inline long span_end(device const Prim &p, int Y, int cx2) {\n"
+"  long Y16 = long(Y) * 65536;\n"
+"  long ax = p.ev[0], ay = p.ev[1], bx = p.ev[2], by = p.ev[3], cx = p.ev[4], cy = p.ev[5];\n"
+"  long px, py, qx, qy;\n"
+"  if ((p.kf & (1u << 20)) == 0u) { px = ax; py = ay; qx = cx; qy = cy; }\n"
+"  else if (Y16 < by) { px = ax; py = ay; qx = bx; qy = by; }\n"
+"  else { px = bx; py = by; qx = cx; qy = cy; }\n"
+"  long N = px * (qy - py) + (qx - px) * (Y16 - py), D = (qy - py) * 65536;\n"
+"  long xe = -fdiv(-N, D);\n"
+"  return xe > long(cx2) ? long(cx2) : xe; }\n"
+/* hires.c's perspective u/v (PGXP): exact (u*q)/q at the start of every 8-pixel run of the
+ * span, integer-stepped in between; float here, double there */
+/* floor(a * 2^24 / q) for q > 0 without 64-bit division (slow on the GPU): float estimates,
+ * corrected exactly with integer multiplies; r < q <= 2^38 keeps r << 24 in range */
+"static inline long div24(long a, long q) {\n"
+"  float fq = float(q);\n"
+"  long t = long(floor(float(a) / fq)), r = a - t * q;\n"
+"  for (int k = 0; k < 4 && r < 0; k++) { r += q; t--; }\n"
+"  for (int k = 0; k < 4 && r >= q; k++) { r -= q; t++; }\n"
+"  long s = r << 24, e = long(float(s) / fq), r2 = s - e * q;\n"
+"  for (int k = 0; k < 8 && r2 < 0; k++) { r2 += q; e--; }\n"
+"  for (int k = 0; k < 8 && r2 >= q; k++) { r2 -= q; e++; }\n"
+"  return t * 16777216 + e; }\n"
+/* u (k = 0) and v (k = 1) in 8.24 at hi-res pixel X: q, u*q, v*q planes in 2^-38 */
+"static inline long2 persp_at(device const Prim &p, long X, int Y) {\n"
+"  long fx = X - long(p.porg[0]), fy = long(Y - p.porg[1]);\n"
+"  long q = p.pl[0] + p.pl[3] * fx + p.pl[6] * fy;\n"
+"  if (q <= 0) return long2(8388608, 8388608);\n"
+"  long a = p.pl[1] + p.pl[4] * fx + p.pl[7] * fy, b = p.pl[2] + p.pl[5] * fx + p.pl[8] * fy;\n"
+"  return long2(div24(a, q) + 8388608, div24(b, q) + 8388608); }\n"
+"static inline long2 persp_uv(device const Prim &p, long xs, long xe, long X, int Y) {\n"
+"  long xr = xs + ((X - xs) & ~7L), n = xe - xr < 8 ? xe - xr : 8;\n"
+"  long2 U0 = persp_at(p, xr, Y), U1 = persp_at(p, xr + n, Y);\n"
+"  return long2(U0.x + (X - xr) * ((U1.x - U0.x) / n), U0.y + (X - xr) * ((U1.y - U0.y) / n)); }\n"
 /* hires.c's attribute value at X: the plane equation at the span start, then stepped by the
  * per-pixel gradient truncated to an integer (gdx / Sx) */
 "static inline long attr_span(device const Prim &p, int i, long xs, long X, long m, long sx, long sy) {\n"
@@ -188,7 +245,12 @@ static const char s_msl[] =
 "      cr = c3[0]; cg = c3[1]; cb = c3[2];\n"
 "    }\n"
 "    if (tex) {\n"
-"      int ui = int(attr_span(p, 3, xs, lX, m, lsx, lsy) >> 24), vi = int(attr_span(p, 4, xs, lX, m, lsx, lsy) >> 24);\n"
+"      int ui, vi;\n"
+"      if ((kf & (1u << 21)) != 0u) {\n"
+"        long xe = span_end(p, Y, cx2);\n"
+"        long2 uv = persp_uv(p, xs, xe, lX, Y);\n"
+"        ui = int(uv.x >> 24); vi = int(uv.y >> 24);\n"
+"      } else { ui = int(attr_span(p, 3, xs, lX, m, lsx, lsy) >> 24); vi = int(attr_span(p, 4, xs, lX, m, lsx, lsy) >> 24); }\n"
 "      if ((kf & (1u << 15)) != 0u) {\n"
 "        int umin = int(p.uvr & 255u), umax = int((p.uvr >> 8) & 255u), vmin = int((p.uvr >> 16) & 255u), vmax = int(p.uvr >> 24);\n"
 "        ui = ui < umin ? umin : (ui > umax ? umax : ui);\n"
@@ -547,6 +609,35 @@ static void be_put(int x, int y, u16 v, bool mc, bool ms)
 
 /* ---- triangles -------------------------------------------------------------------------- */
 
+/* Grow the triangle (target coordinates) by 1 px on every edge, so that the GPU's own
+ * rasterization surely covers every pixel centre hires.c's rule covers; the shader then tests
+ * coverage exactly (F_EDGE). Used for fractional (PGXP) vertices instead of the bounding box.
+ * False for slivers whose mitred corners would go far (the caller draws the bounding box). */
+static bool conservative_tri(GVtx v[3])
+{
+    double px[3], py[3], nx[3], ny[3];
+    for (int i = 0; i < 3; i++) { px[i] = v[i].x; py[i] = v[i].y; }
+    const double cx = (px[0] + px[1] + px[2]) / 3, cy = (py[0] + py[1] + py[2]) / 3;
+    for (int k = 0; k < 3; k++) {   /* outward unit normal of edge k -> k+1 */
+        int j = (k + 1) % 3;
+        double ex = px[j] - px[k], ey = py[j] - py[k], len = sqrt(ex * ex + ey * ey);
+        if (len < 1e-6) return false;
+        nx[k] = ey / len; ny[k] = -ex / len;
+        if (nx[k] * (cx - px[k]) + ny[k] * (cy - py[k]) > 0) { nx[k] = -nx[k]; ny[k] = -ny[k]; }
+    }
+    GVtx o[3];
+    for (int i = 0; i < 3; i++) {   /* vertex i is on edges i-1 and i: offset both lines by 1 */
+        int a = (i + 2) % 3;
+        double den = 1 + nx[a] * nx[i] + ny[a] * ny[i];
+        if (den < 0.02) return false;   /* miter > 10 px */
+        o[i].x = (float)(px[i] + (nx[a] + nx[i]) / den);
+        o[i].y = (float)(py[i] + (ny[a] + ny[i]) / den);
+        o[i].prim = v[i].prim;
+    }
+    memcpy(v, o, sizeof o);
+    return true;
+}
+
 static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
 {
     if (!s_ready) return;
@@ -579,6 +670,14 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
     if (yhi <= ylo || xhi <= xlo) return;
 
     const bool tex = p->tex, gour = p->gour;
+    /* PGXP (see hires.c): any precise vertex moves samples off the 1x grid (UV clamp at 1x1
+     * too); depth on all three = perspective-correct u/v; fractional positions are drawn with
+     * the exact edge test (the GPU rasterizer's sub-pixel snapping would not match hires.c) */
+    const bool precise = vin[0].w > 0 || vin[1].w > 0 || vin[2].w > 0;
+    const bool persp = tex && hires_get_perspective() && vin[0].w > 0 && vin[1].w > 0 && vin[2].w > 0;
+    const bool frac = ((vin[0].x | vin[0].y | vin[1].x | vin[1].y | vin[2].x | vin[2].y) & 0xFFFF) != 0;
+    s_st.tris++;
+    s_st.persp_tris += persp;
     const u32 av[5] = { a->r, a->g, a->b, a->u, a->v };
     const u32 bv[5] = { b->r, b->g, b->b, b->u, b->v };
     const u32 cv[5] = { c->r, c->g, c->b, c->u, c->v };
@@ -600,7 +699,8 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
     GPrim *g = new_prim(&idx);
     const bool dith = dither_on(p);
     g->kf = base_flags(p, K_TRI, tex) | (gour ? F_GOUR : 0) | (dith ? F_DITHER : 0) |
-            (gour && p->has_cr ? F_C1X : 0) | ((Sx > 1 || Sy > 1) ? F_CLAMP : 0);
+            (gour && p->has_cr ? F_C1X : 0) | ((Sx > 1 || Sy > 1 || precise) ? F_CLAMP : 0) |
+            (persp ? F_PERSP : 0);
     set_tex(g, p);
     set_clip(g, p);
     g->uvr = (u32)umin | ((u32)umax << 8) | ((u32)vmin << 16) | ((u32)vmax << 24);
@@ -647,6 +747,38 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
         v[i].prim = idx;
         if (v[i].x < 0 || v[i].y < 0 || v[i].x > (float)s_aw || v[i].y > (float)s_ah) inside = false;
     }
+    bool cons = false;
+    if (frac) {   /* fractional vertices: grown triangle, else the bounding box; both edge-tested */
+        cons = inside && conservative_tri(v);
+        inside = false;
+    }
+    if (persp) {
+        /* the same planes as hires.c tri_impl (vertices sorted the same way, relative to a,
+         * normalised by the smallest w), re-based to hi-res pixel (xlo, ylo):
+         * P(X) - ax = (X - xlo) / Sx + ((xlo + 0.5) / Sx - 0.5 - ax) */
+        const HiresVtx *vv[3] = { a, b, c };
+        double wmin = a->w;
+        if (b->w < wmin) wmin = b->w;
+        if (c->w < wmin) wmin = c->w;
+        double f[3][3], X[3], Y[3];
+        for (int k = 0; k < 3; k++) {
+            double q = wmin / (double)vv[k]->w;
+            f[k][0] = q; f[k][1] = (double)vv[k]->u * q; f[k][2] = (double)vv[k]->v * q;
+            X[k] = (double)vv[k]->x / 65536.0; Y[k] = (double)vv[k]->y / 65536.0;
+        }
+        double den = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+        double ox = ((double)xlo + 0.5) / Sx - 0.5 - X[0], oy = ((double)ylo + 0.5) / Sy - 0.5 - Y[0];
+        for (int i = 0; i < 3; i++) {
+            double dx = ((f[1][i] - f[0][i]) * (Y[2] - Y[0]) - (f[2][i] - f[0][i]) * (Y[1] - Y[0])) / den;
+            double dy = ((f[2][i] - f[0][i]) * (X[1] - X[0]) - (f[1][i] - f[0][i]) * (X[2] - X[0])) / den;
+            /* fixed point 2^-38: q <= 1 (normalised), u*q, v*q <= 255 */
+            g->pl[i] = llround((f[0][i] + dx * ox + dy * oy) * 274877906944.0);
+            g->pl[3 + i] = llround(dx / Sx * 274877906944.0);
+            g->pl[6 + i] = llround(dy / Sy * 274877906944.0);
+        }
+        g->porg[0] = xlo;
+        g->porg[1] = ylo;
+    }
     g->kf |= denom > 0 ? F_LONGLEFT : 0;
     {
         const HiresVtx *sv[3] = { a, b, c };
@@ -655,7 +787,10 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
             g->ev[2 * i + 1] = (s32)((s64)sv[i]->y * Sy);
         }
     }
-    if (!inside) {
+    if (cons) {
+        g->kf |= F_EDGE;   /* geometry is only a bound: the shader tests coverage */
+        s_st.edge_tris++;
+    } else if (!inside) {
         g->kf |= F_EDGE;
         quad(v, (float)(xlo - s_ox), (float)(ylo - s_oy), (float)(xhi - s_ox), (float)(yhi - s_oy), idx);
         nv = 6;

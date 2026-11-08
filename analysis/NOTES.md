@@ -69,6 +69,49 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   fills, 3638 VRAM->VRAM copies (3547 with the source inside the framebuffer region), and
   29.6M CPU->VRAM upload pixels (29.26M inside the framebuffer region, i.e. mostly FMV).
 
+### GTE projection call sites (PGXP work)
+
+- 34 functions contain RTPS/RTPT (`symbols.txt`, evidence `code`): two families of small
+  per-primitive-type renderers (`8003fcb8..80041c14`, 6 functions with 2 RTPT each, and
+  `80055820..80057100`, 14 functions with 1 RTPT each, lit variants use NCDS/NCCS), plus
+  single sites (`80036b0c`, `8007ec5c`, `80028c70`, ...). They use the scratchpad
+  (`0x1f800000`) as work area. (verified: generated code)
+- The usual pattern is RTPT, then `swc2 SXY0..2` **straight into the primitive packet**
+  (offsets 8/20/32 for GT3-like, 8/12/16 for F3-like), followed by integer compares of the
+  stored X/Y for clipping/culling; some sites store to the stack first and copy with lw/sw.
+  (verified: generated code; the copies are handled by the PGXP lw/sw hooks)
+- Producer probe, fight frames 3700-4400 (Gradd vs Milena, temple stage): of the polygon
+  vertices that reached the GPU with a tracked GTE origin, ~63% came from `80036b0c`, ~16% from
+  `80041c14`, ~10% from `8007ec5c`, ~1.3% from `8004163c`, the rest from the `80055xxx` family.
+  ~95% of all polygon vertices in those fight frames carry a valid precise value; over the whole
+  boot->fight run it is ~62-65% (title, menus and character select draw 2D polygons). Only
+  ~0.5% of the misses equal a recent GTE result, so nearly all misses are CPU-computed 2D
+  polygons (HUD, menus), not lost associations. No stale-tag misses observed. (verified: probe)
+- Character meshes depend on integer snapping (verified: dumps + `pgxp-check`). Over a boot->fight run
+  ~24% of precise vertex uses (572K of 2.43M in 4300 frames) share their SXY word with another use that has a *different*
+  precise value (all 388 logged samples came from `80036b0c`, e.g. word 48,-24 at
+  0.92,0.66 and 0.24,0.93). They are distinct GTE results (separate RTPT calls for neighbouring
+  pieces of hair, face, shoulder pads, limbs) that the PS1 merges by rounding. Drawn at their
+  precise positions the pieces separate by up to 1 px: the hair breaks into spikes with gaps,
+  the face behind shows through as a dark smear, shoulder/arm pieces look torn (fight-script
+  frame 4209 at 4x6). Welding equal words per batch (`pgxp_weld`) removes it. Whether the mesh
+  data really duplicates shared vertices per piece (the likely reason) is a guess: the mesh
+  format is not decoded yet.
+- Different meshes also share SXY words by coincidence (verified, fight-script frame 5338: word
+  100,-94 from the stage path `80041c14` at w=9073 and from `80036b0c` at w~3065). Welding by
+  word alone gave the character triangle the stage vertex's W (texture warp; caught by the
+  depth-ratio check). The weld is therefore keyed by word *and* similar depth (ratio <= 1.25).
+  Single-site triangles spanning a depth ratio > 2 are legitimate (stage `80041c14` near the
+  camera, w 830..1812 with clamped off-screen vertices), so the check flags only mixed-site ones.
+- GPU backend with PGXP (renderer facts, not game facts; verified by `--renderer compare`): the
+  fight geometry is 80% precise vertices, so 2.75M of the triangles in a 7000-frame run take
+  the shader's exact-coverage path instead of the GPU rasterizer (232K with `--pgxp off`).
+  Perspective u/v in float32 differed from hires.c's double in 12.5K pixels over the fight
+  frames; with 2^-38 fixed point that drops to 29.
+- PGXP never changed the per-frame state hash, i.e. no game code observes the precise values;
+  this says nothing yet about whether gameplay depends on the *integer* GTE results (open
+  question below).
+
 ## Memory card
 
 - Access path (verified: trace): never SIO0. A libmcrd-style library (`800a4xxx`-`800a7xxx`) calls
@@ -194,7 +237,8 @@ Highest value first. Move items to "done" with the PR that did them.
 2. **Random number generator** (address unknown): rollback needs to know every RNG source.
 3. **Pad input -> fighter commands**: where inputs enter game state (rollback, input display).
 4. **Camera, projection and GTE call sites** (RTPS/RTPT, screen offset/H): PGXP and
-   widescreen work here.
+   widescreen work here. Call sites are now listed (see "GTE projection call sites"); start
+   with `80036b0c` (most fight vertices) and the `8003fcb8..80041c14` family.
 5. **Visibility culling / off-screen tests**: widescreen must widen these without touching
    gameplay.
 6. **Fight frame update** (somewhere under `8002beb0`, see the call stack above).

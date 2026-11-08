@@ -76,25 +76,25 @@ static bool exec_simple(u32 pc, u32 w) {
         break;
     case 0x12:
         if (rs & 0x10) gte_command(w);
-        else if (rs == 0) { v = gte_read_data(rd); dst = rt; }
+        else if (rs == 0) { v = gte_read_data(rd); dst = rt; if (rt) pgxp_mfc2((int)rt, (int)rd); }
         else if (rs == 2) { v = gte_read_ctrl(rd); dst = rt; }
-        else if (rs == 4) gte_write_data(rd, r[rt]);
+        else if (rs == 4) { gte_write_data(rd, r[rt]); pgxp_mtc2((int)rd, (int)rt); }
         else if (rs == 6) gte_write_ctrl(rd, r[rt]);
         break;
     case 0x20: v = ld(r[rs] + simm, 1, true); dst = rt; break;
     case 0x21: v = ld(r[rs] + simm, 2, true); dst = rt; break;
     case 0x22: v = op_lwl(r[rt], r[rs] + simm); dst = rt; break;
-    case 0x23: v = ld(r[rs] + simm, 4, false); dst = rt; break;
+    case 0x23: v = ld(r[rs] + simm, 4, false); dst = rt; if (rt) pgxp_lw((int)rt, r[rs] + simm); break;
     case 0x24: v = ld(r[rs] + simm, 1, false); dst = rt; break;
     case 0x25: v = ld(r[rs] + simm, 2, false); dst = rt; break;
     case 0x26: v = op_lwr(r[rt], r[rs] + simm); dst = rt; break;
     case 0x28: mem_w8(r[rs] + simm, r[rt]); break;
     case 0x29: mem_w16(r[rs] + simm, r[rt]); break;
     case 0x2a: op_swl(r[rt], r[rs] + simm); break;
-    case 0x2b: mem_w32(r[rs] + simm, r[rt]); break;
+    case 0x2b: pgxp_sw(r[rs] + simm, (int)rt); mem_w32(r[rs] + simm, r[rt]); break;
     case 0x2e: op_swr(r[rt], r[rs] + simm); break;
-    case 0x32: gte_write_data(rt, mem_r32(r[rs] + simm)); break;
-    case 0x3a: mem_w32(r[rs] + simm, gte_read_data(rt)); break;
+    case 0x32: gte_write_data(rt, mem_r32(r[rs] + simm)); pgxp_lwc2((int)rt, r[rs] + simm); break;
+    case 0x3a: pgxp_swc2(r[rs] + simm, (int)rt); mem_w32(r[rs] + simm, gte_read_data(rt)); break;
     default: rt_invalid(pc, w); break;
     }
     if (dst > 0) r[dst] = v;

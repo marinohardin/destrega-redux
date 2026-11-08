@@ -10,7 +10,9 @@
  * values, normalised on write (16-bit signed regs stored sign-extended,
  * unsigned 16-bit regs stored zero-extended) so reads are mostly direct.
  */
+#include <math.h>
 #include "psx.h"
+#include "pgxp.h"
 
 static u32 d[32]; /* cop2 data registers */
 static u32 c[32]; /* cop2 control registers (c[31] unused; see g_flag) */
@@ -149,6 +151,15 @@ static void push_sz(s64 z)
     d[D_SZ3] = (u32)z;
 }
 
+/* PGXP: the precision tag FIFO moves with SXY0..2; a new entry has no association until the
+ * caller attaches one. */
+static inline void pgxp_shift(void)
+{
+    g_pgxp_gte[0] = g_pgxp_gte[1];
+    g_pgxp_gte[1] = g_pgxp_gte[2];
+    g_pgxp_gte[2] = 0;
+}
+
 static void push_sxy(s64 x, s64 y)
 {
     if (x < -0x400) { g_flag |= 1u << 14; x = -0x400; }
@@ -158,6 +169,7 @@ static void push_sxy(s64 x, s64 y)
     d[D_SXY0] = d[D_SXY1];
     d[D_SXY1] = d[D_SXY2];
     d[D_SXY2] = ((u32)x & 0xFFFF) | ((u32)y << 16);
+    pgxp_shift();
 }
 
 static u32 lzc(u32 v)
@@ -251,6 +263,30 @@ static void get_ir_vec(s32 v[3]) { v[0] = ir(1); v[1] = ir(2); v[2] = ir(3); }
 
 /* ---- commands ------------------------------------------------------------ */
 
+/* PGXP: the same projection without the integer steps (UNR reciprocal of the integer SZ3,
+ * IR saturation, SX/SY truncation), from the 44-bit accumulators of the RT*V+TR product.
+ * Only read by the hi-res renderer; the guest-visible results above are untouched. A vertex
+ * gets a precise value only where the hardware result is not clamped or saturated (otherwise
+ * the integer one is what the game meant) and the two agree to within a few pixels. */
+static void pgxp_project(const s64 acc[3], int shift, int lm)
+{
+    double z = (double)acc[2] / 4096.0;            /* SZ3 before rounding / clamping */
+    double h = (double)(c[C_H] & 0xFFFF);
+    double scale = 1.0 / (double)(1 << shift);
+    double ix = (double)acc[0] * scale, iy = (double)acc[1] * scale;
+    double lo = lm ? 0 : -32768.0;
+    if (!(z > 0 && z <= 65535.0 && h < 2.0 * z)) return;          /* divide overflow / clamped SZ */
+    if (ix < lo || ix > 32767.0 || iy < lo || iy > 32767.0) return;   /* IR1/IR2 saturated */
+    double fx = ix * (h / z) + (double)(s32)c[C_OFX] / 65536.0;
+    double fy = iy * (h / z) + (double)(s32)c[C_OFY] / 65536.0;
+    u32 w = d[D_SXY2];
+    double isx = (double)sx16(w), isy = (double)sx16(w >> 16);
+    double ddx = fx - isx, ddy = fy - isy;
+    if (isx <= -0x400 || isx >= 0x3FF || isy <= -0x400 || isy >= 0x3FF) return;   /* SX/SY clamped */
+    if (fabs(ddx) >= 4.0 || fabs(ddy) >= 4.0) return;            /* way off: keep the integer */
+    g_pgxp_gte[2] = pgxp_new(w, (float)ddx, (float)ddy, (float)z);
+}
+
 static void rtp(int n, int shift, int lm, int last)
 {
     s32 v[3];
@@ -274,6 +310,7 @@ static void rtp(int n, int shift, int lm, int last)
     s64 sxv = mac0_chk(hd * ir(1) + (s64)(s32)c[C_OFX]);
     s64 syv = mac0_chk(hd * ir(2) + (s64)(s32)c[C_OFY]);
     push_sxy(sar64(sxv, 16), sar64(syv, 16));
+    if (g_pgxp) pgxp_project(acc, shift, lm);
     if (last) {
         s64 dq = mac0_chk(hd * sx16(c[C_DQA]) + (s64)(s32)c[C_DQB]);
         set_mac(0, (s32)dq);
@@ -439,6 +476,7 @@ void gte_init(void)
     for (int i = 0; i < 32; i++) { d[i] = 0; c[i] = 0; }
     g_flag = 0;
     d[D_LZCR] = 32; /* LZCS=0 -> 32 leading zeros */
+    g_pgxp_gte[0] = g_pgxp_gte[1] = g_pgxp_gte[2] = 0;
 }
 
 void gte_command(u32 instr)
@@ -535,6 +573,11 @@ void gte_write_data(int reg, u32 v)
         d[D_SXY0] = d[D_SXY1];
         d[D_SXY1] = d[D_SXY2];
         d[D_SXY2] = v;
+        pgxp_shift();
+        break;
+    case D_SXY0: case D_SXY1: case D_SXY2:
+        d[reg] = v;
+        g_pgxp_gte[reg - D_SXY0] = 0;   /* the mtc2/lwc2 hook attaches the source's tag */
         break;
     case D_IRGB:
         d[D_IRGB] = v & 0x7FFF;
