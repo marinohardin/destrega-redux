@@ -460,7 +460,9 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   delay 3, an injected desync, refused menu actions, and the two menu-session cases below. Pass: both peers' final-frame hashes equal each other **and an
   offline run of the same inputs shifted by the delay**, >= 95% of frames final, no desync, no
   impossible rollback; the desync case must be detected and its two report replays must behave
-  (clean peer replays cleanly, faulty one diverges at the injected frame naming `p1.hp`).
+  (clean peer replays cleanly, faulty one diverges at the injected frame naming `p1.hp`). The report is deferred
+  until the in-memory recording holds its frame (`replay_last_frame`: the hash check runs in `netplay_vblank_begin`,
+  before `replay_vblank_begin` records that frame, so an early peer packet used to give a report file one frame short).
   `--pace 60` runs in real time. ~90 s.
 - **Menu actions during netplay**: `frontend_menu_action_allowed()` (main.c) refuses the ones that
   change emulated state: `load`, `save-import`, `save-export` (it flushes the card first) and
