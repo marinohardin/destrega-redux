@@ -208,6 +208,18 @@ Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
 `--press2 F:MASK,...` is the same for pad 2 (VS mode waits for it). Presses are taps (held 6 frames).
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
 
+**Quick check** (`tools/quick_check.sh`, ~25 s; run it before the full suite, after any
+runtime/renderer change): two replays (`vs_tieme_rohzen_villa`, `1p_reyus_cpu`: every frame's
+gameplay hashes and the state hash vs the recording); GPU == software (`--renderer compare
+--pgxp off --compare-max 0`, every 10th frame) on the Hills match replay at the 3834x2328 window
+(4x6 + widescreen guard band; hi-res from frame 3600 via `--resize`, so it is fast) with the
+headless defaults and with xbr + full colour; then, alone, a timing run of the user configuration
+(GPU, widescreen, 3834x2328 -> 4x6, xbr, full colour, PGXP on, 4000 frames) printing ms/frame per
+segment against `tools/quick_check_baseline.txt` (one line per machine, keyed by CPU name;
+`--update-baseline` writes this machine's). Timing only warns (> `TOL`% (25) and > 1 ms slower):
+the machine is noisy. Exit 1 only for gameplay or renderer differences. Files in `build/quick/`.
+The old Metal shader (64-bit divisions) shows as ~3x slower in every hi-res segment.
+
 GPU backend checks: `run_tests.sh` also builds `runtime/tests/test_hires_gpu.c` (GPU vs software
 on random command streams, no disc needed) and runs it on the default driver (`gpu-auto`, Metal
 on macOS) and on Vulkan (`gpu-vulkan`: MoltenVK; "skipped" when there is no Vulkan loader). The
@@ -991,7 +1003,17 @@ The header comment of `hires_gpu.c` has the details.
   `hires-gpu:` at exit prints submits, passes/draws/prims per submit, uploads, copies.
 - Speed (headless fight, frames 3700-4500, machine heavily loaded): 4x6 software 34.6 vs GPU
   11.1 ms/frame; 8x8 software 95.1 vs GPU 19.7 ms/frame (no hi-res: ~6 ms). Windowed 4x6 fight:
-  emu 1.3 ms + present 6.6 ms per frame.
+  emu 1.3 ms + present 6.6 ms per frame. (Older numbers: see the next point.)
+- **No integer division in the MSL per-pixel path** (header comment of `hires_gpu.c`): Apple GPUs
+  emulate integer division, 64-bit very slowly. Before, the MSL divided 64-bit values ~11 times
+  per gouraud textured pixel and was slower than the same shader on MoltenVK (which already had
+  divide-free forms): user configuration (GPU, 3834x2328 window = 4x6, widescreen, xbr, full
+  colour, PGXP on; M1 Pro with the GPU partly busy) headless fight 17-18 ms/frame on Metal, 9.5 on
+  MoltenVK; now 5.2-5.5 on Metal. Windowed at that size: 49-55 fps with 30% of presents late ->
+  a steady 60 fps (present+convert 14.5 -> 3.7 ms per fight frame). Bit-exact: compare vs software
+  0 pixels with `--pgxp off`, the PGXP-on difference counts unchanged, `test_hires_gpu` 0.
+  Any new per-pixel `/` or `%` in the MSL costs real time: use the float-estimate + exact-correction
+  helpers (`floordiv`, `lceil`, `div24`) or precompute per primitive.
 - Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
   mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
   chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), no DXBC
@@ -1236,3 +1258,6 @@ notarization steps) is in `docs/RELEASES.md`.
   colour to the end colours' range (a no-op at 1x1). Found by checking the random compare test
   after every primitive (later primitives had hidden it); the game draws no lines.
 - Fights run at 30 updates/s by design (`f_80027218(1)` -> `VSync(2)`); not a bug.
+- Windowed pacing (`frontend_vblank` end, main.c): `s_next_tick_ns` is when the current frame
+  should end. A frame more than 4 frames late restarts the clock at "now" *without* sleeping; it
+  used to reset and then add a frame, so every very slow frame slept another 16 ms on top.

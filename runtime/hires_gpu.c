@@ -9,6 +9,17 @@
  * top-left. The graphics API is chosen per device (s_apis, s_order; hires_gpu_shutdown +
  * hires_gpu_init switch it at runtime).
  *
+ * Speed: the fragment shader is the cost (it scales with hi-res pixels; submission is ~1 submit
+ * and ~150 draws per frame). Apple GPUs have no integer divider: 64-bit division is a long
+ * emulated sequence and even 32-bit division is slow. The MSL therefore divides nothing on the
+ * per-pixel path: the plane-equation fraction is a 0/1 carry after a 32-bit floor, span edges and
+ * 1x pixel coordinates are float quotients corrected exactly with integer multiplies, gdx / Sx
+ * comes from the stored split gdx = qx*2Sx + rx, (U1-U0)/n is a 32-bit (or 16-bit long) division
+ * (perspective runs only). Removing the 64-bit divisions made a 4x6 widescreen fight 3x faster
+ * (18 -> 6 ms/frame headless, M1 Pro), the 32-bit ones another 8%. hires.glsl has the same
+ * divide-free forms except the gdx / Sx split and the float floordiv (it still uses 32-bit
+ * division there; porting them needs the DXIL to be regenerated, which needs DXC).
+ *
  * Implements HiresBackend with the same rules as the software rasterizer in hires.c, which
  * stays the reference: same coverage (the scaled vertices are shifted by half a pixel so the
  * GPU's pixel-centre sampling with the top-left fill rule equals the software rasterizer's
