@@ -246,6 +246,12 @@ static void test_weld(void)
     pgxp_new_batch();
     CHECK(pgxp_weld(shared, NULL) == NULL && pgxp_weld(shared, pgxp_lookup(a, shared)) == NULL,
           "integer-first word got a precise value");
+    /* another mesh on the same integer pixel at a very different depth keeps its own W */
+    pgxp_new_batch();
+    u32 far = pgxp_new(shared, 0.6f, 0.1f, 3000.0f);
+    q = pgxp_weld(shared, pgxp_lookup(a, shared));
+    const PgxpVert *qf = pgxp_weld(shared, pgxp_lookup(far, shared));
+    CHECK(q && qf && q->w == 500.0f && qf->w == 3000.0f && qf->dx == 0.6f, "welded across depths");
     hires_set_scale(0, 0);
     g_pgxp = false;
 }

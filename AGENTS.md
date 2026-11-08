@@ -314,6 +314,8 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   DMA, or one vblank) every use of an SXY word gets one position: the first precise value seen
   for it, or the integer if it was first sent without one (`pgxp_weld`). Vertices on different
   integer pixels stay independent, so the stage and the character outlines remain wobble-free.
+  A precise value whose W differs by more than 1.25x is another mesh on the same pixel (stage
+  vertex w=9073 vs character vertex w=3065 on one word) and is welded separately, keeping its W.
 - `gpu.c` adds the offsets to polygon vertices for `g_hires` only (`HiresVtx.x/y` 16.16 plus
   `HiresVtx.w`, 0 = none). Lines and rects (2D sprites, HUD, text) are untouched.
 - `hires.c`: a textured triangle with `w` on all three vertices is textured perspective-
@@ -328,9 +330,10 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   `g_pgxp`. At 1x1 with PGXP on, `--hires-verify` reports mismatches by design (vertices leave
   the integer grid); equivalence is tested with `--pgxp off`.
 - Run summary: `pgxp-check:` (vertices actually drawn: on-screen vertices > 1.5 px from their
-  integer, depth ratio > 2 inside a triangle, values older than 2 vblanks, and "split" = an SXY
-  word drawn at two positions in one batch, i.e. a crack; all must be 0, the determinism script
-  checks it), `pgxp-weld:` (uses snapped), `--pgxp-diag N` logs up to N offenders with the GTE
+  integer, depth ratio > 2 inside a triangle between vertices from different GTE call sites,
+  values older than 2 vblanks, and "split" = an SXY word at a similar depth drawn at two
+  positions in one batch, i.e. a crack; all must be 0, the determinism script and the s23
+  scenario check it), `pgxp-weld:` (uses snapped), `--pgxp-diag N` logs up to N offenders with the GTE
   call site, `--dump-from F` limits `--dump` to frames >= F. `pgxp: H of N polygon vertices
   precise, ... misses: S stale tag, G equal to a recent GTE result` (G estimates GTE vertices whose association was lost; the rest of the
   misses are CPU-computed 2D polygons). Fight at 4x6: see the PR / NOTES.md for numbers.

@@ -115,16 +115,20 @@ extern const u32 *g_pgxp_depth;
  * limbs and back geometry poking through. So within one batch (one GPU linked-list DMA or one
  * vblank, whichever ends first) every primitive vertex with the same SXY word gets the same
  * position: the precise value seen first for that word, or the integer one if the word was first
- * sent without a precise value. Returns the value to use (NULL = integer). */
+ * sent without a precise value. A precise value at a clearly different depth (w ratio > 1.25)
+ * is another mesh on the same integer pixel and is welded separately, so it keeps its own W.
+ * Returns the value to use (NULL = integer). */
 extern u32 g_pgxp_batch;
 static inline void pgxp_new_batch(void) { g_pgxp_batch++; }
 const PgxpVert *pgxp_weld(u32 sxy, const PgxpVert *q);
 extern u64 g_pgxp_stat_welded, g_pgxp_stat_weld_int, g_pgxp_stat_weld_full;
 
 /* Diagnostics / regression check on the vertices actually sent to the hi-res target (after
- * welding): per triangle, a vertex > 1.5 px from its integer, a depth ratio > 2 within the
- * triangle, a value older than 2 vblanks; per batch, an SXY word sent at two different
- * positions ("split": the crack/tear bug; must be 0). q[i] = NULL for integer vertices. */
+ * welding): per triangle, an on-screen vertex > 1.5 px from its integer, a depth ratio > 2
+ * between precise vertices from different GTE call sites (a vertex from another mesh = false
+ * association; one mesh may legitimately span depth, e.g. the stage floor near the camera), a
+ * value older than 2 vblanks; per batch, an SXY word at a similar depth sent at two different
+ * positions ("split": the crack/tear bug). All must be 0. q[i] = NULL for integer vertices. */
 void pgxp_check_tri(const PgxpVert *const q[3], const u32 sxy[3]);
 extern int g_pgxp_diag;                      /* --pgxp-diag N: log up to N suspicious triangles */
 extern u64 g_pgxp_stat_bad_d, g_pgxp_stat_bad_w, g_pgxp_stat_old, g_pgxp_stat_tris, g_pgxp_stat_split;

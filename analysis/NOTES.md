@@ -91,6 +91,12 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   frame 4209 at 4x6). Welding equal words per batch (`pgxp_weld`) removes it. Whether the mesh
   data really duplicates shared vertices per piece (the likely reason) is a guess: the mesh
   format is not decoded yet.
+- Different meshes also share SXY words by coincidence (verified, fight-script frame 5338: word
+  100,-94 from the stage path `80041c14` at w=9073 and from `80036b0c` at w~3065). Welding by
+  word alone gave the character triangle the stage vertex's W (texture warp; caught by the
+  depth-ratio check). The weld is therefore keyed by word *and* similar depth (ratio <= 1.25).
+  Single-site triangles spanning a depth ratio > 2 are legitimate (stage `80041c14` near the
+  camera, w 830..1812 with clamped off-screen vertices), so the check flags only mixed-site ones.
 - PGXP never changed the per-frame state hash, i.e. no game code observes the precise values;
   this says nothing yet about whether gameplay depends on the *integer* GTE results (open
   question below).
