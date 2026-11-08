@@ -63,6 +63,31 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   clamping to the colour range the 1x draw produced). (verified: pixel probe)
 - About 21% of textured triangles cover no 1x pixel at all (mostly character-mesh slivers).
 
+## Memory card
+
+- Access path (verified: trace): never SIO0. A libmcrd-style library (`800a4xxx`-`800a7xxx`) calls
+  the BIOS: InitCARD/StartCARD, `_card_info` (A0:ab), `_card_load` (A0:ac), `_card_write`
+  (B0:4e, only to clear the changed flag), `_new_card` (B0:50) and the `bu00:` file calls
+  open/lseek/read/write/close/firstfile/nextfile/erase/format (B0:32..45). Reads and writes are
+  asynchronous (open mode bit 0x8000): the call returns 0 and the BIOS later posts SwCARD
+  (f4000001) and HwCARD (f0000011) events (IOE 0004, ERROR 8000, TIMOUT 0100, NEW 2000) that
+  the library receives through callbacks it registered at `800a6518..65a4`. One 128-byte sector
+  per event, so a save of N sectors takes ~N frames. The library also walks the kernel DCB table
+  (words at 0x150/0x154) looking for device "bu"; HLE must provide it (bios.c).
+- What it saves (verified): MEMORY CARD > SAVE writes one 1-block file `BASLUS-00732DESTREGA`
+  (8192 bytes, standard `SC` icon header; title in Shift-JIS "DESTREGA: TRY STORY MODE" for a
+  fresh game, other titles "NEXT SCENE" / "STORY MODE CLEARED" exist in the message table). Data
+  starts at file offset 0x200 (1 checksum byte, then the option block: ROUND COUNT verified at
+  +8; story/unlock progress is presumably in the rest, unverified). The game also reads the first
+  6 sectors at boot (frame ~100) and applies them to the live option block `800bee64` without
+  any menu action; MEMORY CARD > LOAD re-reads. AUTO SAVE ON/OFF is a menu item (not exercised).
+- Startup sequence with a card: `_card_info` -> NEW, `_new_card`+write sector 63 (accept),
+  `_card_load`, `firstfile`, `_card_info`, `_card_load`. Real cards report NEW until the first
+  write; the runtime models that flag (memcard.c).
+- Not exercised yet: second slot, FORMAT flow, full card, unformatted/corrupt cards, deleting.
+  Unformatted card = ERROR event on `_card_load`; the game's messages for these are in the table
+  at `800b5474`. (guess: untested in game)
+
 ## Collision
 
 - Stage collision is a separate list of polygons (up to 4 vertices, precomputed 4.12 normal),
@@ -71,8 +96,7 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
 
 ## Input / hardware use
 
-- Pads: libpad drives SIO0 directly (not BIOS InitPAD). Memory card is reported absent, so the
-  game never saves. (verified: runtime)
+- Pads: libpad drives SIO0 directly (not BIOS InitPAD). Memory cards: see "Memory card" below.
 - CD: libcd at register level; XA audio and the 5 STR movies live in `XADATA.BNS`.
 
 ## Menus, modes, characters, stages (found while building `tools/scenarios.py`)
@@ -99,7 +123,7 @@ frame numbers repeat exactly; they are not "game constants".
 - **Overlays per fight** (verified: `--trace` CD seeks mapped to the disc listing): P1's character is
   `Mxxx.BIN`, P2's is `Mxxx2.BIN`. Portrait -> file stem: Gradd MGRAD, Celia MSEREA, Tieme MTEEM,
   Anjie MANZEAL, Milena MMILENA, Zauber MZAUBER, Laon MLAON, Falma MFALMA, Doyle MDOIL, Reyus MREUS,
-  Cougar MKUGA, Rohzen MROSEN (all twelve seen loaded as P1; every P2 file except MROSEN2 seen too).
+  Cougar MKUGA, Rohzen MROSEN (all twelve seen loaded as P1 and 11 as P2; Rohzen as P2 in `vs_villa`).
 - **Stage data** lives in `DATA.BNS`: one ~49-sector pack per stage, read as two seeks at these sector
   offsets (inside DATA.BNS): Hamlet 7756, Fortress 7861, Villa 7973, Remains 8096, Hills 8212,
   Canyon 8329, Cave 8447, Gate 8580, Castle 1 8702, Castle 2 8831, Throne 8959, Shrine 9086 (second
@@ -108,7 +132,7 @@ frame numbers repeat exactly; they are not "game constants".
   (unknown).
 - **1P BATTLE / TIME ATTACK / ENDURANCE / PRACTICE**: after a character is confirmed with Cross the
   game picks opponent and stage itself. The same character gets a *different opponent/stage depending
-  on the timing of the inputs* (Gradd met Milena on Villa in `fight_script.py`, Doyle on Gate in the
+  on the timing of the inputs* (Gradd met Milena on Villa in `fight_script.py`, Doyle on Villa in the
   scenarios). Guess: the opponent comes from an RNG seeded by elapsed time. Practice puts the player on
   the Hills field vs Celia (MSEREA2) with TOTAL/DAMAGE counters; Time Attack and Endurance have a
   countdown (55 -> ...) in the HUD.
@@ -122,12 +146,26 @@ frame numbers repeat exactly; they are not "game constants".
   Circle backs out of a page. RECORDS shows the 1P-battle ranking; EXTRA has CHARACTER PROFILES / IN
   GAME CONTROL / EXIT.
 
+## Overlay entry points (fixed bug, verified)
+
+The per-character function tables in the main exe's data (from `0x800b310c`, 4 pointers per character
+for each of P1/P2) point into the overlay slots, and `8004c1e8` calls them with `jalr`. Rohzen's P2
+overlay (`MROSEN2.BIN`) starts with 24 bytes of string data (`"...%d..."`) before its first function, so
+its entries are `8001a284 / a2b4 / a2e4 / a314` instead of the other characters' `8001a26c / a29c /
+a2cc / a2fc`. REA's procedure list had merged `8001a284` into a bogus function at `8001a268` that
+covers the string data, so it was never a recompiled entry: playing P2 Rohzen hit `dispatch: no
+recompiled function at 8001a284` (fatal with `--no-interp`, interpreter fallback otherwise).
+Fix (`recomp/recomp.py`): data words in the main executable that point into the overlay slots are now
+overlay seeds too (as already done for overlay data and `jal` targets). A static check over all P1/P2
+overlays, EVENT_SP/EVENTOVL and OPTOVL found no other function-looking referenced address that was
+not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset = address - slot base
+(the 4-byte header sits at the slot base itself, code is not shifted).
+
 ## Test coverage facts
 
 - `tools/scenarios.py` (22 scenarios, see its docstring and `tools/scenario_expect.json`): every VS
   stage (12), 1P BATTLE x3 characters, TEAM BATTLE, TIME ATTACK, ENDURANCE, PRACTICE, STORY up to its
-  first fight, OPTION. Every character appears on both sides across the VS scenarios except Rohzen
-  as P2 (see Open questions). `tools/fight_script.py` is the older single path used by the smoke test
+  first fight, OPTION. Every character appears on both sides across the VS scenarios. `tools/fight_script.py` is the older single path used by the smoke test
   and the determinism script.
 - Per-scenario check: exit status, no FATAL / dispatch miss / unhandled BIOS call / `--verify-overrides`
   mismatch, expected overlay files loaded in order, recorded fingerprint (overlays + stage packs) equal,
@@ -158,13 +196,6 @@ Done:
 - Purpose of the original port's extra seeds `800a8e28` and `800a9528`.
 - Does any gameplay code depend on the GTE results beyond the screen coordinates it draws
   with (e.g. on-screen tests that change behaviour)? Matters for widescreen and PGXP.
-- **BUG (found by `tools/scenarios.py`, not fixed): P2-side Rohzen crashes under `--no-interp`.** VS with
-  Rohzen on the P2 side (scenario `vs_bug_rohzen_p2`: Tieme vs Rohzen on Villa) dies right after
-  `MROSEN2.BIN` is loaded: `dispatch: no recompiled function at 8001a284 (ra=8004c084)` then FATAL
-  (without `--no-interp` it would fall back to the interpreter). `f_8001a268_MROSEN2` sets
-  `ra = 0x8001a284` (gen/ovl_MROSEN2.c:14), so `8001a284` is probably a return/resume point or a
-  function REA missed in `analysis/overlays/MROSEN2.procs.json`; other `Mxxx2.BIN` files do not do this.
-  Likely fix: add `8001a284 MROSEN2` to `analysis/extra_seeds.txt` (guess, not tried). Rohzen as P1 is fine.
 - Which RAM address holds the mode / stage / character ids? Not searched (the scenarios fingerprint the
   CD reads instead). `--watch ADDR` (8 slots, 32-bit) is the probe to use.
 - Why do 1P-battle opponent and stage differ with input timing (RNG seeded by time?) and what chooses

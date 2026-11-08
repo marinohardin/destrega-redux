@@ -1,6 +1,7 @@
 /* Frontend: boot, SDL3 window/audio/input, headless test mode. */
 #include "recomp.h"
 #include "mdec.h"
+#include "memcard.h"
 #include "hires.h"
 #include "overrides/override.h"
 #include <SDL3/SDL.h>
@@ -52,6 +53,9 @@ static int seg_of(u64 frame) {
 static bool s_hires_dither;
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
+static const char *s_memcard_path[2];  /* --memcard1/2 */
+static bool s_no_memcard;
+static const char *s_ram_dump;     /* --ram-dump FILE: main RAM at the end of a headless run */
 static FILE *s_state_hash;         /* --state-hash FILE */
 typedef struct { u64 frame; int w, h; } ResizeStep;
 static ResizeStep s_resizes[256];
@@ -277,6 +281,7 @@ static void write_state_hash(void) {
     for (int i = 0; i < 32; i++) misc[4 + i] = g_cpu.cop0[i];
     misc[36] = g_cpu.next_event;
     h = hash_mix(h, misc, sizeof misc);
+    h = memcard_hash(h);
     fprintf(s_state_hash, "%llu %016llx\n", (unsigned long long)s_frame, (unsigned long long)h);
 }
 
@@ -461,6 +466,7 @@ void frontend_vblank(void) {
                 snprintf(p, sizeof p, "%s/frame_final.png", s_dump_dir);
                 frontend_screenshot(p);
             }
+            if (s_ram_dump) { FILE *rf = fopen(s_ram_dump, "wb"); if (rf) { fwrite(g_ram, 1, RAM_SIZE, rf); fclose(rf); } }
             if (s_wav) { wav_header(s_wav, s_wav_bytes); fclose(s_wav); }
             rt_log("headless: reached %llu frames", (unsigned long long)s_frame);
             void rt_dump_stack(void); rt_dump_stack();
@@ -597,6 +603,11 @@ static void usage(void) {
         "  --hires-min-fight P   exit non-zero unless P%% of fight frames were shown from the hi-res target\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
+        "  --ram-dump FILE       headless: write main RAM to FILE at the end\n"
+        "  --memcard1 PATH       memory card image for slot 1 (raw 128 KiB .mcd; created if missing)\n"
+        "  --memcard2 PATH       memory card image for slot 2 (default: empty slot)\n"
+        "  --no-memcard          no memory cards at all (the game cannot save)\n"
+        "                        (default: <data dir>/memcard1.mcd; headless runs: no card unless given)\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
@@ -743,6 +754,10 @@ int main(int argc, char **argv) {
                 if (*s == ',') s++;
             }
         }
+        else if (!strcmp(argv[i], "--ram-dump") && i + 1 < argc) s_ram_dump = argv[++i];
+        else if (!strcmp(argv[i], "--memcard1") && i + 1 < argc) s_memcard_path[0] = argv[++i];
+        else if (!strcmp(argv[i], "--memcard2") && i + 1 < argc) s_memcard_path[1] = argv[++i];
+        else if (!strcmp(argv[i], "--no-memcard")) s_no_memcard = true;
         else if (!strcmp(argv[i], "--import") && i + 1 < argc) import_path = argv[++i];
         else if (!strcmp(argv[i], "--data-dir") && i + 1 < argc) data_dir = argv[++i];
         else if (!strcmp(argv[i], "--help")) { usage(); return 0; }
@@ -755,6 +770,9 @@ int main(int argc, char **argv) {
     char *pref = data_dir ? NULL : SDL_GetPrefPath("", "Destrega");
     snprintf(pak, sizeof pak, "%s%sdestrega.pak", data_dir ? data_dir : (pref ? pref : "./"),
              data_dir ? "/" : "");
+    char default_card[2048];
+    snprintf(default_card, sizeof default_card, "%s%smemcard1.mcd",
+             data_dir ? data_dir : (pref ? pref : "./"), data_dir ? "/" : "");
     SDL_free(pref);
 
     if (import_path) {
@@ -779,6 +797,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s\n", verr);
         if (!s_headless) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Destrega", verr, s_win);
         return 1;
+    }
+
+    if (!s_no_memcard) {
+        /* Windowed play defaults to the user's card; headless runs only get a card when asked
+         * for, so tests never depend on whatever the user has saved. */
+        if (!s_memcard_path[0] && !s_headless) s_memcard_path[0] = default_card;
+        for (int p = 0; p < 2; p++) {
+            const char *err = memcard_attach(p, s_memcard_path[p]);
+            if (err) fprintf(stderr, "%s\n", err);
+            else if (s_memcard_path[p]) rt_log("memcard: slot %d = %s", p + 1, s_memcard_path[p]);
+        }
+        atexit(memcard_flush);
     }
 
     bus_init();

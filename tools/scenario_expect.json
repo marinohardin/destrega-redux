@@ -5,8 +5,8 @@
    "MREUS2.BIN"
   ],
   "stage_sig": [
-   8580,
-   8629
+   7973,
+   8022
   ]
  },
  "1p_cougar": {
@@ -15,8 +15,8 @@
    "MMILENA2.BIN"
   ],
   "stage_sig": [
-   8580,
-   8629
+   7973,
+   8022
   ]
  },
  "1p_gradd": {
@@ -25,8 +25,8 @@
    "MDOIL2.BIN"
   ],
   "stage_sig": [
-   8580,
-   8629
+   7973,
+   8022
   ]
  },
  "endurance": {
@@ -203,7 +203,7 @@
  "vs_villa": {
   "overlays": [
    "MTEEM.BIN",
-   "MSEREA2.BIN"
+   "MROSEN2.BIN"
   ],
   "stage_sig": [
    7973,

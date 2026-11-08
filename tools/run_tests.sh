@@ -18,6 +18,7 @@ cc_job gpu $CC runtime/gpu.c runtime/tests/test_gpu.c -o build/tests/test_gpu &
 cc_job hires $CC runtime/gpu.c runtime/hires.c runtime/tests/test_hires.c -o build/tests/test_hires -lm &
 cc_job spu $CC runtime/spu.c runtime/xa.c runtime/tests/test_spu.c -o build/tests/test_spu &
 cc_job mdec $CC runtime/mdec.c runtime/tests/test_mdec.c -o build/tests/test_mdec -lm &
+cc_job memcard $CC runtime/memcard.c runtime/tests/test_memcard.c -o build/tests/test_memcard &
 
 # 2. the long runs start right away (the binary is already built): smoke + hi-res matrix
 tools/smoke_test.sh > build/smoke/out.txt 2>&1 &
@@ -34,16 +35,18 @@ if [ "${SCENARIOS:-1}" != 0 ]; then
   python3 tools/scenarios.py hires -j "$JOBS_SC" > build/scenarios/hires_out.txt 2>&1 &
   SCNH=$!
 fi
+tools/test_memcard.sh > build/memcard.out 2>&1 &
+MCARD=$!
 
-wait %1 %2 %3 %4 %5 2>/dev/null
+wait %1 %2 %3 %4 %5 %6 2>/dev/null
 fail=0
 # 3. run the unit tests concurrently, report in order
-for t in gte gpu hires spu mdec; do
+for t in gte gpu hires spu mdec memcard; do
   if [ "$(cat build/tests/$t.cc.rc)" != 0 ]; then echo "$t: COMPILE FAIL"; cat build/tests/$t.cc.log; fail=1; continue; fi
   ./build/tests/test_$t > build/tests/test_$t.log 2>&1 &
   eval "UT_$t=$!"
 done
-for t in gte gpu hires spu mdec; do
+for t in gte gpu hires spu mdec memcard; do
   eval "pid=\$UT_$t"
   [ -n "$pid" ] || continue
   printf '%-6s ' "$t"
@@ -59,5 +62,7 @@ if [ "${SCENARIOS:-1}" != 0 ]; then
   wait $SCNH || { fail=1; echo "scenarios hires: FAILED"; }
   cat build/scenarios/hires_out.txt
 fi
+wait $MCARD || { fail=1; echo "memcard e2e: FAILED"; }
+cat build/memcard.out
 echo "tests: $(( $(date +%s) - START ))s wall clock, $([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail

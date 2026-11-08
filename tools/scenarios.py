@@ -168,15 +168,10 @@ def add_vs(p1, p2, stage, tags=(), name=None, **kw):
 
 
 # every stage once; every character appears on each side across the list
-# (Rohzen as P2 is the known bug below, so villa's P2 is Celia and Rohzen-P2 has its own xfail scenario)
+# (P2 Rohzen is on villa: it used to be a dispatch miss, fixed by seeding the main exe's overlay pointers)
 for _k, _s in enumerate(STAGES):
-    add_vs(ROSTER[_k], 'celia' if _s == 'villa' else ROSTER[(_k + 5) % 12], _s, tags=('hires',),
+    add_vs(ROSTER[_k], ROSTER[(_k + 5) % 12], _s, tags=('hires',),
            **({'min_lit': 0.04} if _s == 'cave' else {}))     # the cave is genuinely dark
-# KNOWN BUG (not fixed here): P2-side Rohzen's overlay (MROSEN2.BIN) enters a guest address that has no
-# recompiled function, 0x8001a284 (the return address function 0x8001a268 sets up), so the run dies with FATAL
-# under --no-interp. xfail: the run must still fail that way; when it is fixed this scenario XPASSes and
-# must be turned into a normal one.
-add_vs('tieme', 'rohzen', 'villa', name='vs_bug_rohzen_p2', xfail='no recompiled function at 8001a284')
 
 # 1P BATTLE (the title cursor starts on it): pick a character, the game picks opponent and stage
 for _name, _i in (('gradd', 0), ('celia', 1), ('cougar', 11)):

@@ -17,7 +17,7 @@
 
 80010000  data   overlay_slot_p1            verified  agents-md  P1 overlay load address (Mxxx.BIN, EVENT_SP.BIN, OPTOVL.BIN); file copied verbatim, code at file+4
 8001a268  data   overlay_slot_p2            verified  agents-md  P2 overlay load address (Mxxx2.BIN, EVENTOVL.BIN)
-8001a284  label  -                          verified  trace      [MROSEN2] dispatch miss: 'no recompiled function at 8001a284 (ra=8004c084)' when P2-side Rohzen loads (scenario vs_bug_rohzen_p2); 8001a268 sets ra to it
+8001a284  func   -                          verified  test       [MROSEN2] first function of P2 Rohzen (4 entries a284/a2b4/a2e4/a314 vs a26c/a29c/a2cc/a2fc of the others); was not recompiled until main-data slot pointers became seeds; scenario vs_villa
 800244d0-80026618  range  text_leading_data  verified  agents-md  data inside .text before the code; never linear-sweep
 80027218  func   frame_sync                 likely    agents-md  f_80027218(1) -> VSync(2); why fights update at 30/s
 8002b80c  func   main                       verified  code       game main(), called from crt0
@@ -41,4 +41,24 @@
 800a8e28  func   -                          verified  agents-md  extra seed from the original port; role not recorded
 800a9528  func   -                          verified  agents-md  extra seed from the original port; role not recorded
 800aa000-  range  text_trailing_data        verified  agents-md  data inside .text from here on; never linear-sweep
+800b310c  data   char_overlay_fn_table       likely    code       main-exe table of overlay function pointers, 4 per character per slot; 8004c1e8 jalr's them (Rohzen P2 pointers at 800b318c..)
 800be224  data   resetcallback_jmpbuf       verified  code       setjmp buffer used for IRQ hook (HookEntryInt)
+# --- memory card (libmcrd-style library at 0x800a4xxx-0x800a7xxx, game wrappers in main_05) ---
+800a47bc  func   mcrd_exist_step              likely    rea        per-frame state machine: _card_info, retries 5x on ERROR/TIMEOUT, maps event to McErr via 800a5f2c
+800a5f2c  func   mcrd_event_to_error          verified  code       event ordinal (0 IOE,1 ERROR,2 TIMEOUT,4 NEW) -> McErr (0 ok,2 invalid,1 no card,3 new card)
+800a63c8  func   mcrd_accept_card             verified  trace      _new_card (B0:50) then _card_write(chan, sector 63, zeros): clears the card-changed flag
+800a4eb0  func   mcrd_read_step               likely    rea        state machine: lseek, read(fd,buf,128) until it returns 0, wait SwCARD event, advance one sector
+800a50e4  func   mcrd_write_step              verified  trace      same for write(fd,buf,128); one sector per event (~1 per frame here)
+800a56a0  func   mcrd_get_direntry            likely    rea        builds "bu00:" + pattern, calls firstfile wrapper 800a60d8 then nextfile
+800a5a28  func   mcrd_create_file             likely    trace      open(name,FREAD) probe -> open(name,FCREAT|blocks<<16) -> close
+800a60d8  func   libapi_firstfile_wrapper     verified  trace      searches the kernel DCB table (word 0x150/0x154) for device "bu"; without it never calls B0:42 and the lib hangs on a missing event
+800a6274  func   mcrd_dcb_hook                 likely    rea        installed by 800a60d8 into DCB+52; saves/restores and chains to the old pointer; never called by our HLE
+800a65e8  func   mcrd_open_events             verified  trace      OpenEvent x8: SwCARD f4000001 and HwCARD f0000011 with specs 0004/8000/0100/2000, mode 0x1000 (callback)
+800a6518  func   mcrd_cb_sw_ioe               verified  trace      event callbacks (800a6518/652c/6540/6554 Sw IOE/ERR/TIMOUT/NEW, 800a6568/657c/6590/65a4 Hw): set flags at 800f0df0..; extra seeds
+800a6898  func   mcrd_clear_events            likely    rea        TestEvent on all 8 events and zero the flags before each BIOS card call
+800a69a0  func   mcrd_wait_sw_event           likely    rea        busy-waits for a SwCARD flag; returns ordinal (flag sum >> 1); clears the Hw flags
+800a6a78  func   mcrd_wait_hw_event           likely    rea        same for HwCARD flags; clears the Sw flags
+800a6068  func   bios_open_stub                likely    code       B0:32 stub; 6078 lseek(33) 6088 read(34) 6098 close(36) 60a8 format(41) 60b8 nextfile(43) 60c8 erase(45) 6378 firstfile(42)
+800a6388  func   bios_card_info_stub           likely    code       A0:ab; 6398 _card_load (A0:ac); 63a8 _card_write (B0:4e); 63b8 _new_card (B0:50); 7118/7128/7138 InitCARD/StartCARD/StopCARD
+800b5474  data   memcard_message_table        likely    code       string pointers: LOAD OK!, SAVE OK!, NOW SAVING..., ..., NO MEMORY CARD, UNFORMATTED CARD, NO DATA FILE, NO SAVE SPACE, BROKEN DATA, BROKEN CARD
+800bee64  data   game_option_block            verified  test       live options block (checksum byte, ..., +8 round-count index 1=2 rounds, 2=3 rounds); filled from the card at boot and by MEMORY CARD > LOAD; test_memcard.sh peeks +8
