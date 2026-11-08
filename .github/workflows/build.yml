@@ -10,7 +10,7 @@
 #                                         Xvfb; Windows: the default API (Direct3D 12: the runner
 #                                         has only Microsoft's software adapter, WARP, if any) and
 #                                         Vulkan (no driver: the backend must refuse cleanly,
-#                                         exit 77 = skip), plus the API switch test
+#                                         exit 77 = skip), plus the API switch test (CTest); WARP: ~10 min
 #   shaders                               runtime/shaders/hires.glsl compiles and validates
 #                                         (SPIR-V), runtime/shaders/hires_dxil.h was generated
 #                                         from it, and it still compiles to signed DXIL with
@@ -93,10 +93,10 @@ jobs:
         run: cmake --build build/ci -j4
       - name: Unit tests
         run: ctest --test-dir build/ci --output-on-failure -V
-      - name: GPU test, Direct3D 12 and Vulkan explicitly, and the live API switch
+      - name: GPU test, Vulkan explicitly (CTest hires_gpu already ran Direct3D 12 = auto, and the switch)
         run: |
           set +e
-          for d in d3d12 vulkan switch; do
+          for d in vulkan; do
             echo "== test_hires_gpu $d"
             ./build/ci/test_hires_gpu.exe $d > hg_$d.txt 2>&1
             rc=$?

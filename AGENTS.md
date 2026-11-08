@@ -114,8 +114,8 @@ SDL **3.4+** (`SDL_CreateGPURenderer(device, window)`), zlib, Python 3 and the d
   `-DDESTREGA_STUB_GEN=ON` to link the runtime against `tools/ci/stub_gen` (empty function table,
   stubs that exit) and `-DDESTREGA_TESTS=ON` for the CTest unit tests; the executable then starts,
   parses options and fails with "no data pack". Windows CI: MSYS2 CLANG64, no Vulkan driver and
-  at most Microsoft's WARP for Direct3D 12 (the GPU tests run `d3d12`, `vulkan`, `switch`: each
-  passes or is refused cleanly, exit 77). Linux CI: gcc and clang, the GPU test on Mesa lavapipe
+  Microsoft's WARP for Direct3D 12 (CTest `hires_gpu` runs on D3D12 there and passes; `switch` and
+  an explicit `vulkan` run, which must be refused cleanly, exit 77). Linux CI: gcc and clang, the GPU test on Mesa lavapipe
   under Xvfb, `tools/gen_spirv.py --check`, `tools/gen_dxil.py --check-fresh` and (clang job)
   `gen_dxil.py --check` with the official Linux DXC release downloaded.
 
@@ -912,7 +912,9 @@ The header comment of `hires_gpu.c` has the details.
   native Vulkan driver (NVIDIA/AMD/Intel) or a native D3D12 driver: that, and the semi-transparency
   blend rounding on other hardware (UNORM5 blending precision is implementation-defined), are
   unverified.
-- Direct3D 12 results (CrossOver 26: vkd3d over MoltenVK, no native driver): `test_hires_gpu d3d12`
+- Direct3D 12 results: on the Windows CI runner (Microsoft Basic Render Driver = WARP, Microsoft's
+  own D3D12 implementation, ~10 min) `test_hires_gpu` 114 cases and `switch` 19, 0 differing
+  pixels. Under CrossOver 26 (vkd3d over MoltenVK): `test_hires_gpu d3d12`
   114 cases, 0 differing pixels (PGXP perspective and every render-quality mode included);
   `switch` 19 passed; full game `--renderer compare` 4x6 16:9 `--pgxp off` 0 differing pixels over
   500 frames (131 fight frames); `--renderer gpu` 4x6 state hashes and dumped frames identical to
