@@ -1,3 +1,12 @@
 800a9528
 800a8e28
 8009b924
+# libmcrd memory card event callbacks (registered with OpenEvent, called via bios_deliver_event)
+800a6518
+800a652c
+800a6540
+800a6554
+800a6568
+800a657c
+800a6590
+800a65a4
