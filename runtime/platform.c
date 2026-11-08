@@ -18,6 +18,10 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__) || defined(__GLIBC__)
+#include <execinfo.h>
+#define HAVE_BACKTRACE 1
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #include <pthread/qos.h>
@@ -350,3 +354,42 @@ void plat_thread_boost(void)
 #endif
 }
 #endif
+
+/* ---- time, host call chain ------------------------------------------- */
+
+uint64_t plat_mono_ns(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+void plat_sleep_us(uint64_t us)
+{
+#ifdef _WIN32
+    Sleep((DWORD)((us + 999) / 1000));
+#else
+    struct timespec ts = { (time_t)(us / 1000000), (long)(us % 1000000) * 1000 };
+    nanosleep(&ts, NULL);
+#endif
+}
+
+__attribute__((noinline)) int plat_backtrace(void **pc, int max)
+{
+#ifdef _WIN32
+    return (int)CaptureStackBackTrace(1, (DWORD)max, pc, NULL);
+#elif defined(HAVE_BACKTRACE)
+    return backtrace(pc, max);
+#else
+    (void)pc; (void)max;
+    return 0;
+#endif
+}

@@ -11,6 +11,7 @@ frame window of interest and what must be true there. `tools/scenario_test.sh` r
   scenarios.py run NAME... [--out DIR] [--dump-every N] [-- extra destrega args]
   scenarios.py run --all [-j N]           run and check everything (parallel)
   scenarios.py raw "DSL" FRAMES [--out DIR] [--dump-every N]   explore: run an ad-hoc script
+  scenarios.py savestate [NAME...] [-j N]  every scenario with periodic save-state rewinds: unchanged hashes
 
 DSL (whitespace separated tokens, evaluated left to right with a frame cursor):
   @N        set the cursor to absolute frame N
@@ -424,9 +425,53 @@ def hires_main(a, extra):
     return 1 if fail else 0
 
 
+def ss_job(name, kind, base):
+    """Save-state check run of a scenario: 'plain' or 'rewind' (every 41 frames go back 17+ frames and
+    re-run, plus a save / corrupt / restore round trip every 13 frames)."""
+    scn = SCENARIOS[name]
+    out = os.path.join(base, 'savestate_' + name)
+    os.makedirs(out, exist_ok=True)
+    extra = ['--state-hash', os.path.join(out, kind + '.hash'), '--ss-hash', os.path.join(out, kind + '.ss')]
+    if kind == 'rewind': extra += ['--savestate-rewind', '41:17', '--savestate-inplace', '13']
+    rc, log, dt = run_one(scn, out, extra, dump_every=0, trace=False, verify=False)
+    open(os.path.join(out, kind + '.log'), 'w').write(log)
+    return name, kind, rc, log, out, dt
+
+
+def ss_main(a):
+    """Every scenario with periodic save-state rewinds and in-place round trips: the run must not fail,
+    every re-run frame must hash like its first run, and the final timeline's --state-hash and complete
+    state hash (--ss-hash) must equal a plain run's."""
+    names = a.names or [n for n, s in SCENARIOS.items() if not s.xfail]
+    jobs = [(n, k) for n in names for k in ('plain', 'rewind')]
+    res = {}
+    t0 = time.time()
+    with cf.ThreadPoolExecutor(a.j) as ex:
+        for name, kind, rc, log, out, dt in ex.map(lambda j: ss_job(j[0], j[1], a.out), jobs):
+            res[(name, kind)] = (rc, log, out)
+    fail = 0
+    for n in names:
+        bad = []
+        for k in ('plain', 'rewind'):
+            rc, log, out = res[(n, k)]
+            if rc != 0 or BAD_LOG.search(log): bad.append(f'{k}: run failed (exit {rc})')
+        log = res[(n, 'rewind')][1]
+        m = re.search(r'savestate: (\d+) rewinds, (\d+) frames compared, (\d+) mismatches', log)
+        if not m or int(m.group(1)) == 0: bad.append('no rewinds happened')
+        try:
+            for ext, what in (('hash', '--state-hash'), ('ss', 'complete state hash')):
+                if open(f'{out}/plain.{ext}').read() != open(f'{out}/rewind.{ext}').read(): bad.append(f'{what} differs from a plain run')
+        except OSError: bad.append('missing hash file')
+        print(f'{"FAIL" if bad else "ok  "} {n:14s} {m.group(0) if m else ""}')
+        for b in bad: print('       ', b)
+        fail += bool(bad)
+    print(f'savestate scenarios: {len(names) - fail}/{len(names)} ok ({len(jobs)} runs, {time.time() - t0:.0f}s)')
+    return 1 if fail else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['list', 'press', 'press2', 'run', 'record', 'raw', 'hires'])
+    ap.add_argument('cmd', choices=['list', 'press', 'press2', 'run', 'record', 'raw', 'hires', 'savestate'])
     ap.add_argument('names', nargs='*')
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--tag')
@@ -450,6 +495,8 @@ def main():
         return rc
     if a.cmd == 'hires':
         return hires_main(a, extra)
+    if a.cmd == 'savestate':
+        return ss_main(a)
     names = pick(a.names, a)
     expect = load_expect()
     results = {}

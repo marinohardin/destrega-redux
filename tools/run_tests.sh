@@ -31,8 +31,9 @@ tools/test_hires_determinism.sh > build/hires/out.txt 2>&1 &
 HIRES=$!
 JOBS=4 tools/test_widescreen.sh > build/widescreen/out.txt 2>&1 &
 WIDE=$!
-# 3. scenario library: every mode / stage / character path, --no-interp (SCENARIOS=0 to skip), and the
-#    hi-res determinism + 1x1 equivalence checks on the stage subset
+# 3. scenario library: every mode / stage / character path, --no-interp (SCENARIOS=0 to skip), the
+#    hi-res determinism + 1x1 equivalence checks on the stage subset, and every scenario with
+#    periodic save-state rewinds
 JOBS_SC=${JOBS_SC:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
 if [ "${SCENARIOS:-1}" != 0 ]; then
   mkdir -p build/scenarios
@@ -40,11 +41,25 @@ if [ "${SCENARIOS:-1}" != 0 ]; then
   SCN=$!
   python3 tools/scenarios.py hires -j "$JOBS_SC" > build/scenarios/hires_out.txt 2>&1 &
   SCNH=$!
+  python3 tools/scenarios.py savestate -j "$JOBS_SC" > build/scenarios/savestate_out.txt 2>&1 &
+  SCNS=$!
 fi
 tools/test_memcard.sh > build/memcard.out 2>&1 &
 MCARD=$!
 tools/test_menu.sh > build/menu.out 2>&1 &
 MENU=$!
+tools/test_savestate.sh > build/savestate.out 2>&1 &
+SAVST=$!
+# gameplay regression replays (tools/replays/*.dtr.gz): every frame's gameplay fields must match
+python3 tools/replays.py run -j 4 > build/replays.out 2>&1 &
+REPL=$!
+# rollback netplay: host + join over loopback with simulated latency / loss, against an offline run
+python3 tools/test_netplay.py -j 6 > build/netplay.out 2>&1 &
+NETP=$!
+# the same between the native build and the Windows build under Wine (skips itself without Wine /
+# build/win/destrega.exe)
+python3 tools/test_netplay_wine.py > build/netplay_wine.out 2>&1 &
+NETW=$!
 
 wait %1 %2 %3 %4 %5 %6 %7 %8 2>/dev/null
 fail=0
@@ -82,10 +97,20 @@ if [ "${SCENARIOS:-1}" != 0 ]; then
   cat build/scenarios/out.txt
   wait $SCNH || { fail=1; echo "scenarios hires: FAILED"; }
   cat build/scenarios/hires_out.txt
+  wait $SCNS || { fail=1; echo "scenarios savestate: FAILED"; }
+  cat build/scenarios/savestate_out.txt
 fi
 wait $MCARD || { fail=1; echo "memcard e2e: FAILED"; }
 cat build/memcard.out
 wait $MENU || { fail=1; echo "menu: FAILED"; }
 cat build/menu.out
+wait $SAVST || { fail=1; echo "savestate: FAILED"; }
+cat build/savestate.out
+wait $REPL || { fail=1; echo "replays: FAILED (a gameplay change? see AGENTS.md \"Replays\")"; }
+cat build/replays.out
+wait $NETP || { fail=1; echo "netplay: FAILED"; }
+cat build/netplay.out
+wait $NETW || { fail=1; echo "netplay (Mac <-> Windows under Wine): FAILED"; }
+cat build/netplay_wine.out
 echo "tests: $(( $(date +%s) - START ))s wall clock, $([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail

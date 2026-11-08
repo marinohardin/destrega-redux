@@ -7,6 +7,7 @@
 #include "widescreen.h"
 #include "hires_gpu.h"
 #include "overrides/override.h"
+#include "savestate.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -495,11 +496,13 @@ static void ws_apply(void) {
 
 extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g_hires_stat_inline_jobs;
 static void finish(void) {
+    ss_finish();   /* savestate / replay / netplay reports (savestate.c) */
     void widescreen_report(void); widescreen_report();
     if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
     if (s_state_hash) fclose(s_state_hash);
     if (s_gameplay) fclose(s_gameplay);
     int rc = 0;
+    if (ss_failed()) rc = 7;
     if (s_ws_used)
         rt_log("widescreen-frames: %llu presented wider than 4:3 (%llu in fight window of %llu)",
                (unsigned long long)s_ws_wide[0], (unsigned long long)s_ws_wide[1],
@@ -612,8 +615,37 @@ static void finish(void) {
     exit(rc);
 }
 
+/* Status text in the window title (netplay connection quality); headless: ignored. */
+void frontend_set_status(const char *st) {
+    if (!s_win) return;
+    char t[320];
+    snprintf(t, sizeof t, "Destrega (recompiled)%s%s", st && *st ? " - " : "", st ? st : "");
+    SDL_SetWindowTitle(s_win, t);
+}
+
+/* Exit after frame n (headless and windowed), e.g. at the end of a --replay. */
+void frontend_set_max_frames(u64 n) { if (!s_max_frames || n < s_max_frames) s_max_frames = n; }
+
+/* --press / --press2 scripts for the current frame (taps held 6 frames). */
+static void script_pads(void) {
+    u16 pad = 0;
+    for (int i = 0; i < s_script_n; i++)
+        if (s_script[i].frame <= s_frame && s_frame < s_script[i].frame + 6) pad |= s_script[i].mask;
+    g_pad_buttons[0] = (u16)~pad;
+    u16 pad2 = 0;
+    for (int i = 0; i < s_script2_n; i++)
+        if (s_script2[i].frame <= s_frame && s_frame < s_script2[i].frame + 6) pad2 |= s_script2[i].mask;
+    if (s_script2_n) g_pad_buttons[1] = (u16)~pad2;
+}
+
 void frontend_vblank(void) {
     s_frame++;
+    if (ss_resimulating()) {   /* rollback / save-state re-run: emulation only (savestate.h) */
+        static s16 resim_audio[735 * 2];
+        spu_render(resim_audio, 735);
+        if (s_headless) script_pads();
+        return;
+    }
     for (int i = 0; i < s_ws_step_n; i++)
         if (s_ws_steps[i].frame == s_frame) s_ws_req = s_ws_steps[i].on;
     ws_apply();
@@ -739,14 +771,7 @@ void frontend_vblank(void) {
     if (s_headless) {
         spu_render(audio, 735);
         if (s_wav) { fwrite(audio, 4, 735, s_wav); s_wav_bytes += 735 * 4; }
-        u16 pad = 0;
-        for (int i = 0; i < s_script_n; i++)
-            if (s_script[i].frame <= s_frame && s_frame < s_script[i].frame + 6) pad |= s_script[i].mask;
-        g_pad_buttons[0] = (u16)~pad;
-        u16 pad2 = 0;
-        for (int i = 0; i < s_script2_n; i++)
-            if (s_script2[i].frame <= s_frame && s_frame < s_script2[i].frame + 6) pad2 |= s_script2[i].mask;
-        if (s_script2_n) g_pad_buttons[1] = (u16)~pad2;
+        script_pads();
         if (s_dump_dir && s_dump_every && s_frame >= s_dump_from && s_frame % s_dump_every == 0) {
             char p[512];
             snprintf(p, sizeof p, "%s/frame_%06llu.png", s_dump_dir, (unsigned long long)s_frame);
@@ -797,7 +822,8 @@ void frontend_vblank(void) {
     if (SDL_GetAudioStreamQueued(s_audio) < 735 * 4 * 6 && !s_fast)
         SDL_PutAudioStreamData(s_audio, audio, 735 * 4);
     if (SDL_GetAudioStreamQueued(s_audio) < 735 * 4 * 2 && !s_fast) {
-        spu_render(audio, 367);
+        /* the extra render advances the SPU: not allowed when emulation must be reproducible */
+        if (!ss_deterministic_audio()) spu_render(audio, 367);
         SDL_PutAudioStreamData(s_audio, audio, 367 * 4);
     }
 
@@ -949,11 +975,13 @@ static void usage(void) {
         "  --menu-action F:NAME[=ARG]  (testing) run a menu action on frame F: load=IMAGE, reveal-game,\n"
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete,\n"
         "                        widescreen[=on|off], renderer[=software|gpu|compare] (View menu;\n"
-        "                        no argument = toggle)\n"
+        "                        no argument = toggle), netplay-host=PORT[,DELAY],\n"
+        "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect (Netplay menu)\n"
         "                        (save actions use card slot 1; headless needs --data-dir or --memcard1)\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
+    ss_usage();
 }
 
 /* ---- first-launch import (bring your own disc) ----------------------------------- */
@@ -1109,19 +1137,38 @@ static void import_progress(void *ud, float frac) {
     if (!s_headless) draw_progress(NULL, frac);
 }
 
-/* After a new data pack is in place: re-exec the process (a clean machine, never a half-reset one). */
-static void restart_process(void) {
+/* Re-exec the process: a clean machine, never a half-reset one.
+ *   load:    after a new data pack is in place (drops the positional image and every --menu-action)
+ *   netplay: a synced fresh boot for a menu-started session (frontend_restart_with): drops earlier
+ *            netplay options, appends `extra`, and keeps the --menu-action steps that are still in
+ *            the future, re-based to the new boot's frame numbers (so tests can script past it). */
+static void restart_exec(bool netplay, const char *const *extra, int nextra) {
     char exe[4096];
     if (!menu_executable_path(exe, sizeof exe)) snprintf(exe, sizeof exe, "%s", s_argv[0]);
-    char **av = calloc((size_t)s_argc + 2, sizeof *av);
+    char **av = calloc((size_t)s_argc + (size_t)nextra + 2 * 16 + 2, sizeof *av);
     int n = 0;
     av[n++] = exe;
     for (int i = 1; i < s_argc; i++) {
         if (!strcmp(s_argv[i], "--menu-action") && i + 1 < s_argc) { i++; continue; }
-        if (s_disc_path && s_argv[i] == s_disc_path) continue;   /* run from the new pack instead */
+        if (netplay) {
+            if ((!strcmp(s_argv[i], "--host") || !strcmp(s_argv[i], "--join") || !strcmp(s_argv[i], "--net-delay"))
+                && i + 1 < s_argc) { i++; continue; }
+            if (!strcmp(s_argv[i], "--net-from-menu")) continue;
+        } else if (s_disc_path && s_argv[i] == s_disc_path) continue;   /* run from the new pack instead */
         av[n++] = s_argv[i];
     }
-    rt_log("menu: restarting on the new data pack");
+    if (netplay) {
+        for (int i = 0; i < s_menu_script_n; i++) {
+            const MenuStep *m = &s_menu_script[i];
+            if (m->frame <= s_frame) continue;
+            char *a = malloc(2100);
+            snprintf(a, 2100, "%llu:%s%s%s", (unsigned long long)(m->frame - s_frame), m->name, *m->arg ? "=" : "", m->arg);
+            av[n++] = "--menu-action";
+            av[n++] = a;
+        }
+        for (int i = 0; i < nextra; i++) av[n++] = (char *)extra[i];
+    }
+    rt_log(netplay ? "netplay: restarting for the session (fresh boot on both sides)" : "menu: restarting on the new data pack");
     memcard_flush();
     if (s_state_hash) fflush(s_state_hash);
     fflush(NULL);
@@ -1131,6 +1178,17 @@ static void restart_process(void) {
     fprintf(stderr, "menu: ERROR: cannot restart (%s)\n", exe);
     exit(1);
 }
+static void restart_process(void) { restart_exec(false, NULL, 0); }
+void frontend_restart_with(const char *const *args, int n) { restart_exec(true, args, n); }
+
+/* Netplay (netplay.c): alerts and keeping the window alive while it waits. */
+void frontend_alert(const char *msg) {
+    rt_log("netplay: alert: %s", msg);
+    /* DESTREGA_TEST_NO_ALERTS=1: windowed test runs log the alert instead of waiting for a click */
+    const char *na = getenv("DESTREGA_TEST_NO_ALERTS");
+    if (!s_headless && !(na && *na == '1')) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Destrega Netplay", msg, s_win);
+}
+void frontend_pump_events(void) { if (!s_headless) SDL_PumpEvents(); }
 
 static void action_load(const char *arg) {
     char path[2048];
@@ -1262,14 +1320,54 @@ static void action_card_delete(const char *arg) {
     rt_log("menu: save-delete OK slot %d (%s)", slot + 1, e.name);
 }
 
+/* During a netplay session both peers must emulate the same machine: actions that change emulated
+ * state (a new game image, the memory card) are refused; presentation-only ones stay allowed.
+ * Export only reads the card but flushes it first, so it is blocked too (netplay detaches cards). */
+bool netplay_active(void);   /* netplay.c */
+bool netplay_busy(void);
+void netplay_menu_host(int port, int delay);
+void netplay_menu_join(const char *addr, int port, int delay);
+void netplay_menu_disconnect(void);
+bool frontend_menu_action_allowed(const char *name) {
+    static const char *const blocked[] = { "load", "save-import", "save-export", "save-delete" };
+    if (!strcmp(name, "netplay-host") || !strcmp(name, "netplay-join")) return !netplay_busy();
+    if (!strcmp(name, "netplay-disconnect")) return netplay_busy();
+    if (!netplay_active()) return true;
+    for (size_t i = 0; i < sizeof blocked / sizeof *blocked; i++) if (!strcmp(name, blocked[i])) return false;
+    return true;
+}
+bool frontend_netplay_busy(void) { return netplay_busy(); }
+
 static void menu_run(const char *name, const char *arg) {
     rt_log("menu: action %s%s%s", name, *arg ? " " : "", arg);
+    if (!frontend_menu_action_allowed(name)) {
+        if (!strncmp(name, "netplay-", 8))
+            rt_log("menu: REFUSED %s: %s", name, netplay_busy() ? "a netplay session is already running" : "no netplay session");
+        else rt_log("menu: REFUSED %s: not available during a netplay session (it would desync the peers)", name);
+        return;
+    }
     if (!strcmp(name, "load")) action_load(arg);
     else if (!strcmp(name, "reveal-game")) action_reveal(false);
     else if (!strcmp(name, "reveal-saves")) action_reveal(true);
     else if (!strcmp(name, "save-import")) action_card_import(arg);
     else if (!strcmp(name, "save-export")) action_card_export(arg);
     else if (!strcmp(name, "save-delete")) action_card_delete(arg);
+    else if (!strcmp(name, "netplay-host")) {   /* PORT[,DELAY] */
+        int port = 7000, delay = 2;
+        if (*arg) sscanf(arg, "%d,%d", &port, &delay);
+        netplay_menu_host(port, delay);
+    }
+    else if (!strcmp(name, "netplay-join")) {   /* HOST:PORT[,DELAY] */
+        char host[256] = "";
+        int port = 0, delay = 2;
+        const char *c = strrchr(arg, ':');
+        if (c) {
+            snprintf(host, sizeof host, "%.*s", (int)(c - arg), arg);
+            sscanf(c + 1, "%d,%d", &port, &delay);
+        }
+        netplay_menu_join(host, port, delay);
+    }
+    else if (!strcmp(name, "netplay-disconnect")) netplay_menu_disconnect();
     else if (!strcmp(name, "renderer")) {   /* View > Renderer; arg software|gpu|compare, none = toggle */
         if (!strcmp(arg, "gpu")) renderer_switch(R_GPU);
         else if (!strcmp(arg, "software")) renderer_switch(R_SOFTWARE);
@@ -1285,6 +1383,8 @@ static void menu_run(const char *name, const char *arg) {
         frontend_set_widescreen(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
                                 : !strcmp(arg, "off") || !strcmp(arg, "0") ? false
                                 : !frontend_widescreen());
+    else if (!strcmp(name, "menu-test"))    /* Windows menu bar test hook (menu.h): dump | click=PATH */
+        menu_test(arg);
     else rt_log("menu: unknown action %s", name);
 }
 
@@ -1332,6 +1432,8 @@ static void create_window(void) {
 int main(int argc, char **argv) {
     const char *disc_path = NULL, *import_path = NULL, *data_dir = NULL;
     s_argc = argc; s_argv = argv;
+    int ss_k;
+    ss_set_frame_counter(&s_frame);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--headless")) s_headless = true;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) s_max_frames = strtoull(argv[++i], 0, 0);
@@ -1454,6 +1556,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--import") && i + 1 < argc) import_path = argv[++i];
         else if (!strcmp(argv[i], "--data-dir") && i + 1 < argc) data_dir = argv[++i];
         else if (!strcmp(argv[i], "--help")) { usage(); return 0; }
+        else if ((ss_k = ss_parse_arg(argc, argv, i)) > 0) i += ss_k - 1;   /* savestate.c / replay.c */
         else disc_path = argv[i];
     }
 

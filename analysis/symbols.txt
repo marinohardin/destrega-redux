@@ -64,6 +64,8 @@
 80093d08  func   -                          verified  probe      only calls 80095f98; the caller that changes GTE H during fights (camera zoom)
 800951c0  label  -                          verified  agents-md  branch target that is another branch's delay slot (tracer pitfall)
 80095f98  func   SetGeomScreen              verified  probe      libgte: ctc2 H (GTE reg 26); H changes during fights between ~0x38a and 0x3bb (camera zoom); OFX/OFY stay 0
+8009b4f8  func   VSync                      likely    code       libetc VSync(mode): reads a pointer at 800be17c (GPUSTAT/counter, guess) and the vblank count 800bf2b4, waits in vsync_wait (8009b670); frame_sync calls it
+8009b670  func   vsync_wait                 likely    code       libetc VSync helper: spins while the vblank count at 800bf2b4 < a0, timeout counter a1<<15 (prints via 80099328 on timeout); also verified/trace: innermost guest function at the VSync-wait vblank of every 30 Hz fight update (--ss-stats: 2100 of 4200 fight vblanks, one host context)
 8009b8bc  func   ResetCallback              verified  code       libetc; setjmps into 800be224 and passes it to HookEntryInt
 8009b924  label  resetcallback_irq_resume   verified  test       setjmp return point resumed on every IRQ; seeded as its own native entry (extra_seeds.txt)
 8009b994  func   irq_dispatcher             verified  code       libetc interrupt dispatcher; ends in ReturnFromException (C longjmp in rt.c)
@@ -74,14 +76,14 @@
 800b310c  data   char_overlay_fn_table       likely    code       main-exe table of overlay function pointers, 4 per character per slot; 8004c1e8 jalr's them (Rohzen P2 pointers at 800b318c..)
 800be224  data   resetcallback_jmpbuf       verified  code       setjmp buffer used for IRQ hook (HookEntryInt)
 800c0724  data   ot_pointer_table           verified  test       per double-buffer (index = scratch 1f800000, stride 0x14) u32 pointer to the stage/scene ordering table, 2048 slots (index 0..0x7ff); widescreen.c walks it
-800c9938  data   fighter_p1                 verified  probe      player 1 fighter struct, 0x1dc bytes (P2 follows at 800c9b14); +0xc s16 health (200 max, falls on hits), +0xe s16 gauge, +0xa0/+0xa4/+0xa8 s32 position, +0xc8 model/camera block
+800c9938  data   fighter_p1                 verified  probe      player 1 fighter struct, 0x1dc bytes (P2 follows at 800c9b14); +0xc s16 health (200 max, falls on hits), +0xe s16 gauge, +0xa0/+0xa4/+0xa8 s32 position, +0xc8 model/camera block; also verified/trace (replays.py, 6 recorded fights): +0xc is 200 at every round start and reaches 0 exactly at the KO that ends the round; +0xe stays in 0..1800 and drops by > 100 in one update ~30 times per 3000-frame random fight (magic spend; that it is the magic gauge is likely); +0xa0..+0xa8 change as the fighters move (which axis is height: guess)
 800c9b14  data   fighter_p2                 verified  probe      player 2 fighter struct; layout as fighter_p1
 800e344c  data   time_limit_setting         likely    rea        0..3; selects the round time limit in round_timer_and_judge (0 = 30 s, 1 = 60 s, 2 = 99 s, 3 = none in some modes)
 800e3780  data   round_start_hp             likely    rea        s32 x2 (P1, P2): health carried into the next round; fight_match_loop copies them to fighter +0xc
-800e3788  data   round_wins                 likely    rea        s32 x2 (P1 at 800e3788, P2 at 800e378c): rounds won, incremented by round_timer_and_judge
+800e3788  data   round_wins                 verified  trace      s32 x2 (P1 at 800e3788, P2 at 800e378c): rounds won; +1 for the other fighter at each KO (incremented by round_timer_and_judge, rea), back to 0 after a fighter reaches 2 (match over; replays.py match_gradd_celia_hills)
 800e3794  data   game_mode                  guess     rea        compared with 1, 4, 5, 6, 10 by the round code; 1 seems to disable the time limit (practice?)
-800e379c  data   round_time                 likely    rea        u32 elapsed round time, +2 per 30 Hz update (= vblanks); compared with limit * 60
-800e7560  data   rand_seed                  verified  code       rand()/srand() seed = the game RNG state; that it picks the 1P-battle opponent/stage is likely (NOTES.md, scenarios)
+800e379c  data   round_time                 verified  trace      u32 elapsed round time, +2 per 30 Hz update (= vblanks), frozen from the KO until the next round, 0 at round start; compared with limit * 60 (rea); netplay.c predicts remote input only while it advances (in_round), verified by tools/test_netplay.py "match"
+800e7560  data   rand_seed                  verified  code       rand()/srand() seed = the game RNG state; that it picks the 1P-battle opponent/stage is likely (NOTES.md, scenarios); also verified/trace: advances during fights, also with no input (CPU AI and round-end code)
 800ed4c8  data   camera_matrix              likely    rea        camera rotation + translation (MATRIX) loaded into the GTE by stage_render and the character renderers
 # --- memory card (libmcrd-style library at 0x800a4xxx-0x800a7xxx, game wrappers in main_05) ---
 800a47bc  func   mcrd_exist_step              likely    rea        per-frame state machine: _card_info, retries 5x on ERROR/TIMEOUT, maps event to McErr via 800a5f2c

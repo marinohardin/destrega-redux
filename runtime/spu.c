@@ -734,3 +734,35 @@ void spu_push_cd_audio(const s16 *stereo, int frames) {
         cd_wr++;
     }
 }
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+void spu_state_io(StateIO *io) {
+    SS_VAR(io, ram); SS_VAR(io, regs);
+    for (int v = 0; v < NUM_VOICES; v++) {
+        Voice *p = &voices[v];
+        SS_VAR(io, p->addr); SS_VAR(io, p->repeat); SS_VAR(io, p->ignore_loop); SS_VAR(io, p->has_samples);
+        SS_VAR(io, p->flags); SS_VAR(io, p->counter); SS_VAR(io, p->buf); SS_VAR(io, p->old); SS_VAR(io, p->older);
+        SS_VAR(io, p->phase); SS_VAR(io, p->envx); SS_VAR(io, p->env_counter);
+        for (int k = 0; k < 2; k++) {
+            SS_VAR(io, p->vol[k].level); SS_VAR(io, p->vol[k].counter);
+            SS_VAR(io, p->vol[k].active); SS_VAR(io, p->vol[k].reg);
+        }
+        SS_VAR(io, p->out);
+    }
+    for (int k = 0; k < 2; k++) {
+        SS_VAR(io, main_vol[k].level); SS_VAR(io, main_vol[k].counter);
+        SS_VAR(io, main_vol[k].active); SS_VAR(io, main_vol[k].reg);
+    }
+    SS_VAR(io, spucnt); SS_VAR(io, stat_irq); SS_VAR(io, endx); SS_VAR(io, xfer_addr);
+    SS_VAR(io, noise_level); SS_VAR(io, noise_timer); SS_VAR(io, capture_pos);
+    SS_VAR(io, rv_base); SS_VAR(io, rv_cur); SS_VAR(io, rv_in_hist); SS_VAR(io, rv_out_hist); SS_VAR(io, rv_pos);
+    /* CD audio ring: only the queued (unplayed) frames */
+    SS_VAR(io, cd_rd); SS_VAR(io, cd_wr);
+    u32 n = cd_wr - cd_rd;
+    if (n > CD_BUF_FRAMES) n = CD_BUF_FRAMES;
+    u32 at = cd_rd & (CD_BUF_FRAMES - 1);
+    u32 first = n < CD_BUF_FRAMES - at ? n : CD_BUF_FRAMES - at;
+    ss_io(io, cd_buf + at * 2, (size_t)first * 4);
+    ss_io(io, cd_buf, (size_t)(n - first) * 4);
+}

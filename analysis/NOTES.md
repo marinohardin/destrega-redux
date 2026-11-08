@@ -116,6 +116,14 @@ Round globals: `round_time` 800e379c, `round_wins` 800e3788/800e378c, `round_sta
 800e3780/800e3784, `time_limit_setting` 800e344c, `game_mode` 800e3794 (guess). RNG: Psy-Q
 `rand` (8008d198) with `rand_seed` at 800e7560 (verified: code); the round-end code calls it.
 Whether other RNG sources exist: unknown. `--gameplay-trace FILE` prints these per frame.
+Verified by trace over the recorded replays (`tools/replays.py`, 6 fights incl. a full best-of-3
+match): health is 200 at each round start and hits 0 exactly at the KO; the other fighter's
+`round_wins` goes +1 at that KO and both reset to 0 after a fighter reaches 2 wins (match over);
+`round_time` goes +2 per update and freezes from the KO to the next round; the gauge stays in
+0..1800 and drops sharply ~30 times per 3000 random fight frames (magic spends; likely). The rest of
+the fighter struct (0x1dc bytes) is covered by the replays' struct hashes but not mapped.
+Rollback-relevant: gameplay state reacts to pad input within one frame (an edited input at frame F
+changes the fighter struct at the start of F+1).
 ### GTE projection call sites (PGXP work)
 
 - 34 functions contain RTPS/RTPT (`symbols.txt`, evidence `code`): two families of small
@@ -293,6 +301,74 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
   0x8009b924 on every interrupt, `ReturnFromException` = C `longjmp` through recompiled frames)
   works with MinGW's setjmp/longjmp on Win64. It also shows that GCC-compiled generated code
   behaves the same as clang-compiled code.
+
+## Save states and the snapshot-safe point (runtime/savestate.c)
+
+- **Where emulated state lives** (verified: `--savestate-rewind` over every scenario, every re-run
+  frame hashes like its first run): `g_cpu` (rt.c, incl. cycles / next_event / COP0); bus.c (RAM,
+  scratchpad, scheduler slots incl. their callbacks, I_STAT/I_MASK, timers, DMA registers and
+  completion times, misc I/O words, `g_frame_start`); bios.c (events, SysEnqIntRP chains, the
+  HookEntryInt buffer address, pad buffers, card completion queue, directory cursor,
+  `g_pad_buttons`); gpu.c (1x VRAM, GPUSTAT bits, draw/texture/display state, the GP0 FIFO and
+  VRAM transfers, polyline state); gte.c; spu.c (RAM, regs, voices incl. ADPCM history / ADSR /
+  sweeps, reverb, noise, capture position, the unplayed part of the CD-audio ring); cdrom.c
+  (registers, position, 8 sector buffers, interrupt queue, XA decoder); mdec.c (tables, received
+  parameter words, unread output words); sio.c; memcard.c (images, changed flags, open files); the
+  frontend frame counter (scripted input is keyed by it). Presentation-only state (hi-res target,
+  PGXP associations, widescreen captures, GPU tracking for the UV clamp) is not saved; a load
+  re-seeds the hi-res target from the 1x VRAM and drops PGXP associations.
+- Kernel tables and the guest stack are in RAM / scratchpad (the fight stack is in the scratchpad).
+- **Snapshot-safe point** (verified: tests): recompiled guest code is a C call chain, so the host
+  stack holds the guest's return addresses. Generated code keeps no guest value in a C local across
+  a call or an `EVT_CHECK` (conditions and jump targets are consumed first), so at any `EVT_CHECK`
+  the globals are the whole machine *given the host call chain*. A snapshot is taken in the VBlank
+  scheduler event (`bus.c vblank_cb` -> `ss_vblank_begin`, before `frontend_vblank`) and can only be
+  restored at a vblank whose host context is identical: same host return-address chain
+  (`backtrace()` / `CaptureStackBackTrace`), same host frame address, same shadow call stack.
+  Excluded: vblanks inside an interrupt handler (`take_interrupt` keeps the interrupted `Cpu` in a
+  local; 16-18 per boot-to-fight run) and inside C helpers that keep guest state in locals
+  (`g_ss_unsafe`: bios.c event delivery and SysEnqIntRP calls, override verification, the
+  interpreter). The widescreen shadow pass runs with `next_event = ~0`, so no vblank happens in it.
+- **How often it recurs** (verified: `--ss-stats 3800`, frames 3800-8000 of the smoke fight, 4200
+  vblanks): fights alternate. The vblank after a 30 Hz update's work is spent in `vsync_wait`
+  (8009b670) with one host context (2100 = every second vblank); the other vblank lands in the middle
+  of the update (1740 in `char_mesh_quads_to_ot` 800363c8, the rest spread over ~20 points in the
+  renderers). So a fight has exactly one restorable point per game update. Menus and the title wait
+  in VSync too (few contexts, recurring); FMV playback waits at 80049d64 (STR loop). Character select
+  around frame 2450 of the smoke script did not recur within 120 frames (one-off contexts).
+- Cost (measured, Apple M-series, headless): 3.55 MB per snapshot (3.68 with a card), save avg
+  0.08-0.15 ms (max 0.45), load avg 0.18-0.29 ms (max 0.9) incl. PGXP reset.
+
+## Rollback netplay: what the game allows (runtime/netplay.c)
+
+- **Restorable points in fights** (verified: `tools/test_netplay.py`, `NETPLAY_DEBUG=1`): the
+  VSync-wait vblank of each game update recurs with one host context, but the mid-update vblank
+  lands in one of ~20 contexts, some rare. Restoring at a mid-update vblank therefore often had to
+  go 10-20 frames back (max rollback depth 24 vblanks, 35 ms re-simulation); waiting up to 2 vblanks
+  for a context with a snapshot within 2 frames of the bad frame cut the max depth to 10 vblanks
+  (~12 ms) at the same latency.
+- **Loop exits break rollback** (verified: the `match` case without the round gate): after a match
+  ends (KO -> win animation -> next match), mispredictions made shortly before the game left its loop
+  were found when no snapshot with the new host context existed: 9 / 11 impossible rollbacks per
+  peer, then 500+ final-frame desyncs. Gating prediction on `round_time` advancing (it freezes from
+  the KO, verified/trace in "Fight state") removed all of them in every case; the fight loop keeps
+  running through the KO animation for much longer than the 8-vblank window, so predictions made
+  before the KO stay correctable (likely: no impossible rollback seen in 6 cases x 2 peers since).
+- A mispredicted input that the game ignored still changed the complete state hash while every
+  gameplay field stayed equal (seen in those desyncs: equal gameplay hashes, different state
+  hashes). Where the pad state lands in RAM (libpad / the game's own button buffers): guess, not
+  traced. It is why the full-state hash is part of the exchanged hashes.
+- **Re-simulation cost** (measured, Apple M-series): 1.1-1.5 ms per re-simulated vblank in fights
+  (fight emulation ~0.9 ms/vblank + a snapshot ~0.1 ms + restore once per rollback ~0.2 ms); avg
+  2.5-8 ms per rollback, max ~12 ms at 20 ms one-way latency with jitter. At 60 Hz that fits in a
+  frame with the default window of 8 vblanks.
+
+- Netplay between the macOS build and the Windows build under Wine (`tools/test_netplay_wine.py`,
+  CrossOver 26): `verified` that every confirmed frame's gameplay hash (and the full state hash every
+  30 frames) is identical on a clang/arm64 peer and a MinGW-GCC/x86-64 peer and equal to an offline
+  run, through a VS fight with rollbacks over a lossy simulated link, in both host directions. So
+  rollback (snapshot restore at a matching host call chain) works the same on both hosts. Nothing new
+  about the game's own code; no addresses added to `symbols.txt`.
 
 ## Cleanup priority (readable C / overrides)
 

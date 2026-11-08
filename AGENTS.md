@@ -73,21 +73,29 @@ SDL **3.4+** (`SDL_CreateGPURenderer(device, window)`), zlib, Python 3 and the d
   the generated code.
 - Platform differences live in `runtime/platform.[ch]` (file replace via `MoveFileEx`, `fsync`/
   `_commit`, `realpath`/`_fullpath`, `setenv`/`_putenv_s`, exec, executable path, thread CPU time,
-  performance-core count, and the hi-res worker pool's threads: pthreads or Win32 SRW locks +
-  condition variables). `\` is a path separator on Windows (cue -> bin, folders). Menus stay
-  Mac-only (`menu_stub.c`); Alt+Enter/F11 full screen and F9 widescreen work everywhere.
+  performance-core count, the hi-res worker pool's threads: pthreads or Win32 SRW locks +
+  condition variables, the monotonic clock / sleep, the host call chain for save states:
+  `backtrace` / `CaptureStackBackTrace`) and `runtime/platform_net.c` (this machine's IPv4
+  addresses for Host Game: `getifaddrs` / `GetAdaptersAddresses`; separate so the unit tests that
+  link platform.c need no socket libraries). Sockets stay in `net.c` (BSD sockets / Winsock; on
+  Windows created with `WSA_FLAG_NO_HANDLE_INHERIT`: `SetHandleInformation` on a bound socket
+  made it receive nothing under Wine). `\` is a path separator on Windows (cue -> bin, folders).
+  Native menus on macOS (`menu_mac.m`) and Windows (`menu_win.c`, see "Application menus"); Linux
+  has none (`menu_stub.c`). Alt+Enter/F11 full screen and F9 widescreen work everywhere.
 - GPU renderer: Vulkan (SPIR-V) on both, the windowed default when a device exists, else software
-  (see "GPU renderer"). `--renderer` works everywhere; View > Renderer is Mac-only.
+  (see "GPU renderer"). `--renderer` works everywhere; View > Renderer on macOS and Windows.
 - **Cross-compiling the Windows exe** (macOS or Linux, MinGW-w64 GCC: Homebrew `mingw-w64`):
   `cmake -S . -B build/win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
   -DCMAKE_PREFIX_PATH=<prefix>` where `<prefix>` holds SDL3 and zlib built for
   `x86_64-w64-mingw32` (SDL's `SDL3-devel-*-mingw` release, or SDL/zlib from source configured
   with the same toolchain file), then copy `<prefix>/bin/SDL3.dll` next to `build/win/destrega.exe`.
   With MinGW GCC the exe links `-static` (GCC's `_Thread_local` uses emutls on libwinpthread),
-  so it needs only SDL3.dll plus the system UCRT. GCC builds the generated code fine (`__int128`
+  so it needs only SDL3.dll plus the system UCRT. (A minimal zlib without the `gz*` file API is
+  enough: replays are read with `inflate`, `replay.c read_maybe_gz`.) GCC builds the generated code fine (`__int128`
   included); it evaluates function arguments in a different order than clang, which once broke
   `--state-hash` (`f(p(&n), n)`: keep such calls in separate statements).
-- **Wine / CrossOver**: `tools/test_wine.sh` runs the same headless boot-to-fight (`--no-interp
+- **Wine / CrossOver**: `tools/test_netplay_wine.py` plays netplay between the native and the Windows build
+  (see "Rollback netplay"); `tools/test_wine.sh` runs the same headless boot-to-fight (`--no-interp
   --verify-overrides`) natively and under Wine and requires identical per-frame state hashes
   and dumped frames (`WINE=` the wine command, `WINE_ARGS=` its options; CrossOver:
   `WINE=".../CrossOver-Hosted Application/wine" WINE_ARGS="--bottle destrega-test --no-gui"`, a
@@ -235,12 +243,230 @@ a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as 
 - Tests: `runtime/tests/test_memcard.c` (format, chained files, directory, erase, persistence,
   refusing bad images) and `tools/test_memcard.sh` (scripted save of a changed option from a fresh card, load in
   a new run, identical hashes and card files across identical runs).
-- **Rollback netplay (future, not implemented): card writes must be suppressed during netplay**
-  (a rolled-back frame must not leave files behind, and the two peers' cards differ). The hook is
-  `memcard_set_write_protect(true)` (in-memory state keeps updating, flushing becomes a no-op);
-  card state must also be part of any snapshot (`memcard_hash` shows what it covers).
+- **Netplay: no cards, nothing written.** A rolled-back frame must not leave files behind and the
+  two peers' cards differ, so `netplay.c` flushes, detaches both slots (`memcard_attach(p, NULL)`)
+  and sets `memcard_set_write_protect(true)` at the first vblank (before the game touches a card);
+  the game sees no card on either peer. The Save Games actions and Load Game Image are refused
+  during netplay (see "Rollback netplay"). Card state is part of every save state (`memcard_state_io`: images, changed flags, open files; a
+  load that changes an image marks it dirty).
 
-## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
+## Save states (`runtime/savestate.[ch]`)
+
+Complete snapshots of the emulated machine, taken and restored only at the frame boundary.
+
+- Every hardware module has one visitor `<module>_state_io(StateIO *)` at the bottom of its file
+  (rt.c cpu, bus.c, bios.c, gpu.c, gte.c, spu.c, cdrom.c, mdec.c, sio.c, memcard.c) listing its
+  state variables; the same visitor saves, loads and hashes (`SS_VAR`, `ss_io`, header-only so
+  module unit tests still link alone). **A new piece of emulated state must be added to its
+  module's visitor**, or rewinds will diverge (the tests below catch it). Scheduler callbacks are
+  host pointers: saved raw, hashed only as null / non-null (comparable across processes).
+  Presentation-only state is not saved; a load re-seeds the hi-res target from the 1x VRAM
+  (`hires_reseed`) and drops PGXP associations.
+- **Frame boundary**: `bus.c vblank_cb` calls `ss_vblank_begin()` before `frontend_vblank()` and
+  `ss_vblank_end()` after it (inputs for the frame are final there). Guest code is a C call chain,
+  so a snapshot is only restorable while the host is at the same point of that chain: the
+  snapshot stores the host return-address chain (`backtrace()`; `CaptureStackBackTrace` on Windows),
+  the host frame address and the shadow call stack, and `ss_restore` refuses a different context.
+  Not snapshot-safe: inside an interrupt handler, or while `g_ss_unsafe > 0` (C helpers that keep
+  guest state in locals: bios.c event delivery / SysEnqIntRP calls, override verification, the
+  interpreter). Increment `g_ss_unsafe` around any new C code that calls guest code and keeps
+  guest-derived values in locals across the call. Details and measurements: analysis/NOTES.md
+  "Save states and the snapshot-safe point". In fights only every second vblank (the one where the
+  game waits in `vsync_wait` 8009b670) is restorable: one point per 30 Hz update.
+- Cost: ~3.6 MB per snapshot; save ~0.1 ms, load ~0.2 ms average (< 1 ms max).
+- Re-simulated frames (`ss_resimulating()`): `frontend_vblank` only advances the SPU (735 samples)
+  and the `--press` script; no presentation, audio output, dumps or per-frame logs.
+  `ss_deterministic_audio()`: windowed runs render exactly 735 SPU samples per vblank (no extra
+  underrun render, which advanced the SPU depending on host timing) when recording / replaying /
+  testing.
+- Options: `--savestate-test N:M,...` (save at N, restore at the first frame >= M with the same
+  context, re-run; every frame's complete state hash must equal the first pass; a point whose
+  context does not recur is retried later), `--savestate-rewind E:D` (the same every E frames for
+  the whole run), `--savestate-inplace E` (save, overwrite all state with garbage, load: round
+  trip), `--ss-hash FILE` (per-frame complete state hash of the final timeline), `--ss-stats F`
+  (safe points and host contexts at vblanks from frame F). Failures exit with status 7.
+- Tests: `tools/test_savestate.sh` (11 points across logo, FMV/XA, title, menus, character select,
+  stage load and fight; a whole run rewinding every 37 frames with a memory card, whose per-frame
+  hashes, `--state-hash` and card file must equal a plain run's; in-place round trips) and
+  `scenarios.py savestate` (every scenario with rewinds every 41 frames + round trips every 13:
+  `--state-hash` and complete state hash equal to a plain run). Both run in `tools/run_tests.sh`.
+
+## Replays: gameplay regression tests (`runtime/replay.c`, `tools/replays.py`)
+
+- `--record FILE`: both pads' input per frame (the pad state after the frontend's per-frame work,
+  whatever produced it: keyboard, gamepad, `--press`), disc identity (SLUS_007.32 CRC + sector
+  count), build identity (hash of the recompiled-function table, informational), a 16-bit hash of
+  each gameplay field at the start of every frame (both fighters' health, gauge, position, FNV of the
+  whole 0x1dc-byte fighter struct; round time, wins, RNG seed; addresses in analysis/symbols.txt) and
+  the complete emulated-state hash (`ss_hash_all`) every 60 frames. Works windowed and headless
+  (forces deterministic SPU rendering). Text format documented at the top of replay.c, may be gzipped.
+  **Recordings hold inputs and hashes only, never game values** (no game data in the repo).
+- `--replay FILE`: drives both pads from the file (other input is overridden), stops at its last
+  frame, compares every frame. First divergence: `replay: DIVERGED at frame F` with every field
+  marked DIFFERS / same, its live value, and its value at the last frame where everything matched;
+  exit status 7. A differing complete state hash with equal gameplay fields is a warning
+  (`--replay-strict` makes it fatal). Get the expected values by replaying with the old build and
+  `--gameplay-trace`.
+- Library (`tools/replays/*.dtr.gz`, `replays.py list`): a full best-of-3 VS match (Gradd vs Celia,
+  Hills), four VS fights with other characters / stages (Tieme-Rohzen Villa, Milena-Cougar
+  Fortress, Zauber-Doyle Throne, Anjie-Laon Canyon) and a 1P battle against the CPU (Reyus), all
+  with seeded random input on both pads (taps, chords, motions, charges, walks, jumps): KOs, round
+  wins, a decided match, ~30 gauge spends per fight. `replays.py run` also replays three of them
+  with `--savestate-rewind`, hi-res + widescreen and 4x4 / PGXP off (must still match) and checks
+  that an edited input is reported as a divergence. ~45 s on 10 cores; in `tools/run_tests.sh`.
+- **Re-recording (only for an intentional gameplay change)**: a failing replay means emulated
+  gameplay changed. Find out why first (`replays.py trace NAME OUT` with both builds and compare the
+  values). If the change is intended (e.g. an emulation fix), `python3 tools/replays.py record
+  [NAME...]`, check the summary it prints (KOs, rounds, matches) and commit the new `.dtr.gz` files
+  with the reason in the commit message. Adding one: append an `add_vs(...)` / `add_1p(...)` call.
+
+## Rollback netplay (`runtime/netplay.c`, `runtime/net.[ch]`)
+
+GGPO-style rollback on top of save states, two peers, UDP. Started from the **Netplay** menu
+(below) or the command line.
+
+- **Netplay menu** (macOS `menu_mac.m` and Windows `menu_win.c`; top level, after View): Host
+  Game… (port, default 7000, and input delay, default 2, both remembered: NSUserDefaults on the
+  Mac, `HKCU\Software\Destrega\Netplay` on Windows; the dialog lists this computer's IPv4
+  addresses, `plat_local_ipv4`), Join Game… (address:port, remembered, and delay),
+  Disconnect (enabled while a session or an attempt runs), and a disabled status line
+  (`netplay_status_text`: Not connected / Waiting for an opponent on port N / Connecting to X /
+  Connected to X, ping N ms / Desync at frame F). While hosting or connecting a small non-modal
+  panel says so with Cancel; the game keeps running offline. UI words: Netplay, Host Game, Join
+  Game, opponent (no console jargon). Menu actions (also `--menu-action`, every platform):
+  `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`.
+- **Synchronised start = fresh boot on both sides.** The game is already running when someone
+  picks Host / Join, so the two machines differ. A short lobby exchange runs between frames
+  (`lobby_poll`, packet types 5-7): the joiner sends a hello every 200 ms, the host checks the
+  same identity as the session handshake (protocol, disc, game code, emulation sources, rollback
+  window) and either
+  refuses with a plain-language reason (the joiner gets an alert; the host keeps waiting) or
+  welcomes with the agreed delay (the larger of the two). Then both re-execute themselves
+  (`frontend_restart_with` in main.c, the same clean restart as Load Game Image) with `--host` /
+  `--join`, `--net-delay D` and `--net-from-menu`; the normal handshake runs at frame 1 of the new
+  boot. Sending a running snapshot instead is not possible in general: a snapshot only restores
+  under the same host call chain (savestate.c), which the other process does not have at an
+  arbitrary moment. A restart keeps the future `--menu-action` steps, re-based to the new boot's
+  frames, and drops earlier netplay options. Sockets are close-on-exec so the port is free again.
+- `--net-from-menu` (set by that restart): every failure is a native alert and offline play, never
+  an exit: no answer (join gives up after `--net-timeout` + 5 s = 20 s), refused settings / disc /
+  version, port in use, the opponent not reconnecting after the restart (30 s), losing the
+  connection (no data for `--net-timeout`, 15 s), the opponent leaving, and a desync (report
+  written, then the session ends). A desync does not change the exit status in that mode.
+- **Ending a session** (`session_end`: Disconnect, the opponent's BYE, lost connection, desync from
+  the menu): sends BYE, prints the statistics, stops the hash log, re-attaches the cards the session
+  detached and lifts the write protection, releases both pads (the frontend's own input, incl. a
+  local pad 2, takes over next frame) and keeps playing offline from the current state. Command-line
+  sessions end the same way when the opponent leaves or the link is lost (they used to exit).
+
+- `--host PORT` (player 1) / `--join HOST:PORT` (player 2). Each peer's own input is whatever its
+  frontend puts into pad 1 (keyboard, gamepad, `--press`); netplay writes both pads at the end of
+  every vblank (`netplay_vblank_end`, from `ss_vblank_end`). Handshake: the joiner sends hello until
+  the host answers; both check protocol version, disc identity (SLUS_007.32 CRC + sector count),
+  build identity and equal `--net-delay` / `--net-window`, and refuse otherwise. `--net-port`
+  picks the joiner's local port.
+- **Build identity = game code + emulation sources, never the platform** (protocol 2). Two hashes:
+  the recompiled-code table (`replay_build_id`: each recompiled function's address, overlay, bounds
+  and the hash of its original MIPS bytes, so "which game code runs natively") and
+  `DESTREGA_SOURCE_IDENT` (`tools/source_ident.py`, generated into the build directory by CMake):
+  a hash of the emulation runtime (`runtime/*.c|h`, `runtime/overrides/`), the recompiler
+  (`recomp/*.py`) and its analysis inputs (seeds, overrides, procedure / overlay lists), line
+  endings normalised. Left out: what only one platform compiles or what is presentation-only and
+  proven not to reach emulated state (menus, `platform*.c|h`, `hires*.c|h`, shaders, Windows
+  resources), plus tools / tests / docs. No compiler, OS or build type: the Mac (clang) and Windows
+  (MinGW GCC) builds of the same commit have identical per-frame state hashes (`test_wine.sh`), so
+  they emulate the same machine and must be allowed to play; any source change that could alter
+  emulation is refused even if it looks harmless (both players update). The refusal is the
+  plain-language "the two players run different versions of Destrega" with both ids.
+  `--net-test-ident build=HEX|source=HEX` fakes a difference for tests.
+- **Frames are vblanks (60 Hz)**, not game updates: inputs, packets, delay and window are counted
+  in vblanks (the game polls the pad per vblank in menus, and fights only run every second one, so
+  60 Hz is the only clock that covers both). Local input sampled at the end of frame F is used for
+  F + delay (`--net-delay`, default 2, minimum 1). A missing remote input is predicted (its last
+  known value) up to `--net-window` vblanks (default 8 = 4 game updates = 133 ms) past the last
+  confirmed one; beyond that the peer waits.
+- **Rollback**: a received input that differs from the one used marks the frame; at the start of
+  the next vblank the newest snapshot at or before it whose host context matches is restored
+  (`ss_restore`, savestate.c rules) and the frames up to now are re-simulated with the corrected
+  inputs. Snapshots: one per vblank where restorable, a ring of 24. In fights only every second
+  vblank's context recurs, so a rollback waits up to 2 vblanks for one within 2 frames of the bad
+  frame (deeper restores re-simulate more). During re-simulation `ss_resimulating()` is true:
+  `frontend_vblank` only renders (and discards) the vblank's audio, nothing is presented or queued
+  to the audio device, hi-res rendering is off except for the last 3 re-simulated vblanks (so the
+  target holds the final frame), cards are detached anyway.
+- **Prediction only during a round** (`in_round`: `round_time` 800e379c advanced in the last 4
+  vblanks). Menus, intros, KO / win animations and loads run in lockstep (input delay only):
+  there the game leaves its loop at some point, and a misprediction found after the game left the
+  snapshot's host context cannot be rolled back. Without this gate the `match` test hit ~10
+  impossible rollbacks and desyncs at the end of each match (NOTES.md). An impossible rollback is
+  still counted and logged as a last resort; desync detection then reports what it caused.
+- **Time sync**: each packet carries the sender's frame and its frame advantage; the peer that is
+  ahead by >= 1 frame on average waits (at most 8 frames, once a second), like GGPO.
+- **Final frames and desync detection**: the state at the start of frame F is final once every
+  input before F is confirmed and was used. Each packet carries the newest final frame's gameplay
+  hash, its 16 field hashes (replay.c fields) and every 30 frames the complete state hash
+  (`--net-hash-every`). A mismatch is logged (`netplay: DESYNC at frame F`), counted (exit status 7)
+  and the first one writes `desync-F-host|join.txt` (both hashes, every field DIFFERS / same with the
+  local value, last agreeing frame, link stats) and `desync-F-host|join.dtr`, a replay file
+  (M2 format) of this peer's timeline: `destrega --headless --replay desync-F-join.dtr` re-runs the
+  confirmed inputs offline and, on the peer that went wrong, reports its first wrong frame.
+  `--net-desync-dir DIR` (default: cwd), `--net-desync-stop`, `--net-inject-desync F` (test fault).
+- **Readout**: once a second the window title shows ping (RTT), delay, fps, rollbacks/s, % of
+  vblanks predicted, % of time waiting, DESYNC; every 10 s the same line goes to stderr. Exit
+  summary: frames, predicted / mispredicted inputs, rollbacks (max depth, deferred, impossible),
+  re-simulated frames and cost, stalls, time-sync waits, packets, final frames, hashes checked.
+- **Transport** (`net.c`): non-blocking UDP over IPv4 (the host listens on IPv4 only), the host
+  answers whoever says hello first. Packets carry every unacknowledged input (up to 120 frames),
+  so loss only costs latency. `--net-sim LAT:JITTER:LOSS:REORDER[:SEED]` (ms, ms, %, %) delays /
+  drops / reorders this peer's sends (deterministic per seed) for tests. `--net-pace HZ` paces
+  headless runs; `--net-hash-log FILE` writes every final frame's hashes (also without netplay, for
+  an offline reference run); `--net-lockstep` never predicts.
+- Tests: `tools/test_netplay.py` (in `run_tests.sh`): nine cases, each two headless processes over
+  loopback with seeded VS menu + random fight input (`replays.py` scripts), paced at 240 Hz (4x real
+  time, so the simulated latencies cover 4x as many frames): lan, wan (20 ms + 8 jitter, 1% loss, 2%
+  reorder), lossy (15+15 ms, 10% loss, 10% reorder), asym (35 / 5 ms), a full best-of-3 match with
+  delay 3, an injected desync, refused menu actions, and the two menu-session cases below. Pass: both peers' final-frame hashes equal each other **and an
+  offline run of the same inputs shifted by the delay**, >= 95% of frames final, no desync, no
+  impossible rollback; the desync case must be detected and its two report replays must behave
+  (clean peer replays cleanly, faulty one diverges at the injected frame naming `p1.hp`).
+  `--pace 60` runs in real time. ~90 s.
+- **Menu actions during netplay**: `frontend_menu_action_allowed()` (main.c) refuses the ones that
+  change emulated state: `load`, `save-import`, `save-export` (it flushes the card first) and
+  `save-delete`. The Mac menu greys them out (`validateMenuItem`), `--menu-action` logs
+  `menu: REFUSED NAME: ...`. Presentation-only actions (renderer, widescreen, full screen, reveal
+  in Finder) still run. Test: the `menu` case of `test_netplay.py`.
+- Tests for the menu path (`test_netplay.py`): `menu_session` (two processes start offline, host
+  and join by `--menu-action` mid-run, both reboot, play synced: final-frame hashes equal on both
+  and equal to an offline run with the agreed delay; the joiner disconnects, the host gets the
+  "opponent left" alert, both keep playing offline to `--frames`) and `menu_fail` (a host with a
+  different rollback window refuses with a reason, an unanswered join times out with an alert, all
+  three keep playing offline, nobody restarts).
+- **Mac <-> Windows** (`tools/test_netplay_wine.py`, in `run_tests.sh`; skipped with a message
+  when Wine, `build/win/destrega.exe` + `SDL3.dll` or the data pack is missing): the native build
+  and the Windows build under Wine (`WINE`, `WINE_ARGS`, `WIN_EXE`, `PAK`; default CrossOver's wine
+  with `--bottle destrega-test --no-gui`) over loopback, started with the menu actions
+  (`netplay-host` / `netplay-join`) in both directions: `mac_hosts`, `win_hosts`, and both again
+  with a lossy link (`--net-sim 15:10:5:5`: 15 ms + 10 jitter, 5% loss, 5% reorder each way). Each
+  plays the VS fight of a replay script, disconnects and continues offline; every confirmed
+  frame's hash must match on both peers **and** an offline native run. `ident`: a Windows host
+  claiming other emulation sources refuses the Mac joiner with the alert. Pace 120 Hz (2x real
+  time; headless Wine runs ~1.3 ms/frame, so Wine is not the bottleneck there). Offline frames are
+  not paced, so the script starts the Wine peer first and the native one once Wine is hosting /
+  joining (Wine needs 2-3 s to start). ~3.5 min. `--windowed` runs both peers windowed at 60 Hz
+  with real audio output (slow under Wine, not in `run_tests.sh`; alerts are logged instead of
+  shown with `DESTREGA_TEST_NO_ALERTS=1`): the check that the windowed audio top-up stays off in a
+  session (`ss_deterministic_audio()`, set by `netplay.c start()` on every platform, which a
+  menu-started session also runs after its restart).
+- Windows specifics: the menu restart is `plat_exec` = `CreateProcess` + wait + exit with the
+  child's code, so the parent process stays alive meanwhile; its socket is closed before (and not
+  inheritable), so the child can bind the same port.
+- Not done / not verified: NAT traversal or a server-assisted lobby (direct UDP only: the host
+  forwards the port over the internet), spectators, Linux menus (the actions work there), a real
+  Windows machine (only Wine), the Mac dialogs, panel and greyed-out items by hand (compiled; two
+  windowed processes were driven through the same actions with `--menu-action`),
+  windowed-vs-windowed play by two people.
+
+## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_win.c`, `menu_stub.c`, `main.c`)
 
 macOS gets a native **File** menu inserted after the app menu (SDL3 keeps building the standard
 app/Window menus; Quit still works). `menu_mac.m` (Cocoa, ARC, Apple only; `menu_stub.c` no-ops
@@ -267,6 +493,7 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
   menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
 - **View > Renderer > Software / GPU**: action `renderer[=software|gpu]`, see "GPU renderer".
+- **Netplay** menu (after View): Host Game…, Join Game…, Disconnect, status line; see "Rollback netplay".
 - **Full screen** on every platform from the SDL event loop in `main.c` (so not a Cocoa-only
   feature): **Alt+Enter** and **F11**, plus **Ctrl+Cmd+F** on macOS, queue the action
   `fullscreen` (`=on|off`, none = toggle; one toggle per frame, because Ctrl+Cmd+F can arrive both
@@ -280,7 +507,9 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   px` and the new `render scale`. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
-  `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`. Headless: no dialogs (the file argument is
+  `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`,
+  `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`,
+  `menu-test=dump|click=PATH` (Windows, windowed). Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
   unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
   Log lines start with `menu:`; errors with `menu: ERROR:`.
@@ -288,7 +517,30 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   with state hash equal to a plain run on that pack, 9 rejection cases, save import with backup (the game
   really loads the imported save: ROUND COUNT byte), export, delete, invalid files. It rebuilds
   a disc image from the pack with `tools/pak_to_bin.py` when `Destrega/Destrega.cue` is absent.
-- Not done: saves other than the game's own file, Windows/Linux menus.
+- **Windows** (`menu_win.c`): a Win32 menu bar on SDL's window (`SDL_PROP_WINDOW_WIN32_HWND_POINTER`),
+  same items and rules: **File** (Load Game Image…, Show Game Files in Explorer, Save Games > Show
+  Save Games in Explorer / Import / Export / Delete, Exit), **View** (Widescreen (16:9) with check
+  mark, Renderer > Software / GPU, Enter / Exit Full Screen), **Netplay** (Host Game…, Join Game…,
+  Disconnect, status line). The window procedure is subclassed: `WM_COMMAND` queues the action,
+  `WM_INITMENUPOPUP` updates check marks, titles, the status line and greys out refused items
+  (`frontend_menu_action_allowed`, as `validateMenuItem` on the Mac). SDL sizes the window by its
+  client area and accounts for the menu bar, so the picture keeps its size; full screen covers the
+  bar. Host / Join are a small modal form built in code (no resource script; values in
+  `HKCU\Software\Destrega\Netplay`), the waiting panel a modeless window with Cancel (queues
+  `netplay-disconnect`); file dialogs and alerts are SDL's (native). Explorer: `ShellExecuteW`
+  (folder) / `explorer /select,`. No keyboard shortcuts besides Alt+Enter / F11 / F9 (SDL keeps
+  Alt from opening the menu bar). The UI text never says "memory card" or console names, as on the
+  Mac.
+- Test hook `menu-test` (Windows): `--menu-action F:menu-test=dump` logs every item with
+  `[greyed]` / `[checked]` after the same update a menu opening does; `menu-test=click=Netplay/Host
+  Game…` posts that item's `WM_COMMAND` like a click. `DESTREGA_MENU_AUTOTEST=1` accepts the Host /
+  Join form after 0.7 s with the remembered values, `=2` cancels it after 3 s. Verified under
+  CrossOver (windowed): the dump before / during hosting / after Disconnect (Host and Join greyed
+  and Disconnect enabled while waiting, status "Waiting for an opponent on port N"), widescreen
+  check mark, full screen in and out (title follows), Exit, both forms (screenshots), the panel.
+  On macOS and Linux `menu-test` logs that it is not available.
+- Not done: saves other than the game's own file, Linux menus, the Windows menus clicked by a
+  person (only driven through `menu-test` under Wine), a real Windows machine.
 
 ## High-resolution rendering (`runtime/hires.[ch]`)
 

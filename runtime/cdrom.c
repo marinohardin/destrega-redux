@@ -326,3 +326,27 @@ u32 cdrom_dma_read(u32 *dst, u32 words) {
         d[i] = s_data_pos < s_data_len ? s_data[s_data_pos++] : 0;
     return words;
 }
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+/* In-flight reads are the EVT_CDROM / EVT_CDROM_READ scheduler slots (bus.c) plus the
+ * position, sector buffers and interrupt queue here. */
+void cdrom_state_io(StateIO *io) {
+    SS_VAR(io, s_index); SS_VAR(io, s_params); SS_VAR(io, s_nparams);
+    SS_VAR(io, s_resp); SS_VAR(io, s_resp_len); SS_VAR(io, s_resp_pos);
+    SS_VAR(io, s_int_enable); SS_VAR(io, s_int_flag); SS_VAR(io, s_stat); SS_VAR(io, s_mode);
+    SS_VAR(io, s_filter_file); SS_VAR(io, s_filter_chan); SS_VAR(io, s_request);
+    SS_VAR(io, s_muted); SS_VAR(io, s_busy);
+    SS_VAR(io, s_setloc); SS_VAR(io, s_curloc); SS_VAR(io, s_setloc_pending); SS_VAR(io, s_reading);
+    SS_VAR(io, s_sector); SS_VAR(io, s_data); SS_VAR(io, s_data_len); SS_VAR(io, s_data_pos);
+    SS_VAR(io, s_last_header);
+    SS_VAR(io, s_xa.prev); SS_VAR(io, s_xa.resample_hist); SS_VAR(io, s_xa.resample_pos);
+    SS_VAR(io, s_xa.resample_frac);
+    SS_VAR(io, s_atv); SS_VAR(io, s_atv_pending);
+    SS_VAR(io, s_secbuf); SS_VAR(io, s_secbuf_next); SS_VAR(io, s_int1_dropped);
+    for (int i = 0; i < 8; i++) {
+        SS_VAR(io, s_q[i].type); SS_VAR(io, s_q[i].resp); SS_VAR(io, s_q[i].len);
+        SS_VAR(io, s_q[i].delay); SS_VAR(io, s_q[i].slot);
+    }
+    SS_VAR(io, s_qn);
+}

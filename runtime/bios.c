@@ -1,6 +1,7 @@
 /* High-level emulation of the PS1 kernel (BIOS A0/B0/C0 calls used by Destrega). */
 #include "recomp.h"
 #include "memcard.h"
+#include "savestate.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -46,7 +47,9 @@ void bios_deliver_event(u32 cls, u32 spec) {
             Cpu saved = g_cpu;
             g_cpu.r[31] = 0;
             if (s_deliver_on_bios_stack) g_cpu.r[29] = 0x8000fe00;
+            g_ss_unsafe++;   /* `saved` lives in this C frame while guest code runs */
             rt_call(e->func);
+            g_ss_unsafe--;
             u64 c = g_cpu.cycles, n = g_cpu.next_event;
             g_cpu = saved; g_cpu.cycles = c; g_cpu.next_event = n;
         }
@@ -139,7 +142,9 @@ static u32 call_guest(u32 fn, u32 a0) {
     g_cpu.r[4] = a0;
     g_cpu.r[29] = 0x8000fe00;   /* BIOS exception stack (kernel RAM) */
     g_cpu.r[31] = 0;
+    g_ss_unsafe++;   /* `saved` lives in this C frame while guest code runs */
     rt_call(fn);
+    g_ss_unsafe--;
     u32 v = g_cpu.r[2];
     u64 c = g_cpu.cycles, n = g_cpu.next_event;
     g_cpu = saved; g_cpu.cycles = c; g_cpu.next_event = n;
@@ -508,4 +513,19 @@ void bios_call(u32 vec) {
     if (vec == 0xa0) bios_a0(fn);
     else if (vec == 0xb0) bios_b0(fn);
     else bios_c0(fn);
+}
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+void bios_state_io(StateIO *io) {
+    ss_io(io, (void *)g_pad_buttons, sizeof g_pad_buttons);
+    SS_VAR(io, s_ev);
+    SS_VAR(io, s_deliver_on_bios_stack);
+    SS_VAR(io, s_pad_buf); SS_VAR(io, s_pad_len); SS_VAR(io, s_pad_started); SS_VAR(io, s_old_pad_dest);
+    SS_VAR(io, s_intrp); SS_VAR(io, s_intrp_n);
+    SS_VAR(io, s_hook_addr);
+    for (int i = 0; i < 32; i++) { SS_VAR(io, s_cev[i].due); SS_VAR(io, s_cev[i].hw); SS_VAR(io, s_cev[i].sw); }
+    SS_VAR(io, s_cev_n); SS_VAR(io, s_allow_new);
+    SS_VAR(io, s_dir_valid); SS_VAR(io, s_dir_pat); SS_VAR(io, s_dir_port); SS_VAR(io, s_dir_cursor);
+    SS_VAR(io, s_fd_async);
 }

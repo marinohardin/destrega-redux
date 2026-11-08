@@ -65,14 +65,32 @@ add_executable(destrega
   runtime/main.c runtime/rt.c runtime/bus.c runtime/bios.c runtime/interp.c
   runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/memcard.c runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/gte.c runtime/pgxp.c runtime/spu.c runtime/xa.c runtime/mdec.c
   runtime/overrides/override.c runtime/overrides/collision.c runtime/menu_stub.c
-  runtime/overrides/widescreen.c runtime/platform.c)
-target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE})
+  runtime/overrides/widescreen.c runtime/platform.c runtime/platform_net.c
+  runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c)
+target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE} ${CMAKE_CURRENT_BINARY_DIR})
+# Emulation source identity for the netplay handshake (rule in tools/source_ident.py): the same
+# on every platform for the same sources.
+file(GLOB _ident_deps CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/runtime/*.c ${CMAKE_SOURCE_DIR}/runtime/*.h
+  ${CMAKE_SOURCE_DIR}/runtime/overrides/*.c ${CMAKE_SOURCE_DIR}/runtime/overrides/*.h
+  ${CMAKE_SOURCE_DIR}/recomp/*.py ${CMAKE_SOURCE_DIR}/analysis/*.txt ${CMAKE_SOURCE_DIR}/analysis/*.json
+  ${CMAKE_SOURCE_DIR}/analysis/overlays/*)
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/source_ident.h
+  COMMAND ${Python3_EXECUTABLE} tools/source_ident.py ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/source_ident.h
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/source_ident.py ${_ident_deps}
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Emulation source identity (netplay)")
+target_sources(destrega PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/source_ident.h)
 target_compile_options(destrega PRIVATE -Wall -Wno-unused-function -fno-strict-aliasing)
 target_link_libraries(destrega PRIVATE gen SDL3::SDL3 ZLIB::ZLIB)
 if(UNIX)
   target_link_libraries(destrega PRIVATE m)
 endif()
 if(WIN32)
+  # netplay UDP (net.c), local address list (platform.c), native menus (menu_win.c)
+  target_link_libraries(destrega PRIVATE ws2_32 iphlpapi)
+  target_sources(destrega PRIVATE runtime/menu_win.c)
   # Embedded manifest (UTF-8 code page for file names) and a larger main-thread stack: the
   # recompiled code nests C calls like the game nests MIPS calls, and Windows' default 1 MiB
   # is far below the 8 MiB macOS and Linux give the main thread.

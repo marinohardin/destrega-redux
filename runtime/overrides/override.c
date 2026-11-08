@@ -1,4 +1,5 @@
 #include "override.h"
+#include "../savestate.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -71,6 +72,7 @@ static bool mem_equal_live(const MemImage *saved, u32 entry_sp) {
 
 void override_call(const char *name, RecompFn orig, RecompFn fresh) {
     if (!g_verify_overrides) { fresh(); return; }
+    g_ss_unsafe++;   /* the verification keeps guest state in this C frame */
 
     EVT_CHECK();                      /* deliver pending interrupts before snapshotting */
     Cpu saved = g_cpu;
@@ -102,6 +104,7 @@ void override_call(const char *name, RecompFn orig, RecompFn fresh) {
         g_cpu = after_orig;
         mem_restore(&s_orig);
     }
+    g_ss_unsafe--;
 }
 
 void override_report(void) {

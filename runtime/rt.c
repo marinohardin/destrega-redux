@@ -254,3 +254,10 @@ void rt_event(void) {
         break;
     }
 }
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+void cpu_state_io(StateIO *io) {
+    SS_VAR(io, g_cpu.r); SS_VAR(io, g_cpu.hi); SS_VAR(io, g_cpu.lo); SS_VAR(io, g_cpu.pc);
+    SS_VAR(io, g_cpu.cop0); SS_VAR(io, g_cpu.cycles); SS_VAR(io, g_cpu.next_event);
+}

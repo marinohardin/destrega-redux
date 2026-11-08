@@ -37,6 +37,17 @@ void plat_exec(const char *exe, char **argv);
 /* localtime_r / localtime_s */
 void plat_localtime(const time_t *t, struct tm *out);
 
+/* Monotonic clock, nanoseconds. */
+uint64_t plat_mono_ns(void);
+void plat_sleep_us(uint64_t us);
+/* Return addresses of the calling thread's host call chain, innermost first, starting at the
+ * caller of plat_backtrace (execinfo backtrace / CaptureStackBackTrace; 0 where unsupported).
+ * Save states compare it to know whether a snapshot can be restored here. */
+int plat_backtrace(void **pc, int max);
+/* This machine's IPv4 addresses (up interfaces, no loopback) as "a, b, ..." for the Host Game
+ * dialog (getifaddrs / GetAdaptersAddresses). Returns how many were written. */
+int plat_local_ipv4(char *out, size_t n);
+
 /* CPU time of the calling thread, nanoseconds. */
 uint64_t plat_thread_cpu_ns(void);
 /* Logical CPUs of the fastest core class (macOS: performance cores; Windows: the highest

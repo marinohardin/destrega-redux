@@ -352,3 +352,18 @@ u32 mdec_read_status(void)
     else st |= s_status_low & 0xFFFF;
     return st;
 }
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+void mdec_state_io(StateIO *io) {
+    SS_VAR(io, s_qt_y); SS_VAR(io, s_qt_c); SS_VAR(io, s_scale);
+    SS_VAR(io, s_cmd); SS_VAR(io, s_in_count); SS_VAR(io, s_in_need);
+    SS_VAR(io, s_cur_block); SS_VAR(io, s_status_low);
+    u32 nin = s_in_count < IN_MAX_WORDS ? s_in_count : IN_MAX_WORDS;   /* received parameter words */
+    ss_io(io, s_in, (size_t)nin * 4);
+    SS_VAR(io, s_out_rd); SS_VAR(io, s_out_wr);
+    if (s_out_rd <= s_out_wr && s_out_wr <= OUT_MAX_WORDS)            /* unread output words */
+        ss_io(io, s_out + s_out_rd, (size_t)(s_out_wr - s_out_rd) * 4);
+    SS_VAR(io, s_out_bytes); SS_VAR(io, s_out_nbytes);
+    SS_VAR(io, s_en_in); SS_VAR(io, s_en_out);
+}
