@@ -1,4 +1,5 @@
-/* macOS menu bar: File menu (game image, game files, save games) and View menu (widescreen).
+/* macOS menu bar: File menu (game image, game files, save games) and View menu (widescreen,
+ * renderer).
  * SDL3 builds the standard application/Window menus itself (and a View menu only for
  * fullscreen-capable windows); this inserts File after the app menu and adds to SDL's View menu,
  * or creates one after File.
@@ -28,8 +29,14 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
 }
 /* check marks follow the state (requested state, so a click shows at once) */
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
-    if ([item.representedObject isEqual:@"widescreen"])
+    NSString *a = item.representedObject;
+    if ([a isEqual:@"widescreen"])
         item.state = frontend_widescreen() ? NSControlStateValueOn : NSControlStateValueOff;
+    if ([a hasPrefix:@"renderer="]) {
+        NSString *r = [a substringFromIndex:9];
+        item.state = [r isEqualToString:@(frontend_renderer())] ? NSControlStateValueOn : NSControlStateValueOff;
+        if ([r isEqualToString:@"gpu"]) return frontend_gpu_available();
+    }
     return YES;
 }
 @end
@@ -86,6 +93,14 @@ void menu_init(void) {
         ws.target = s_target;
         ws.representedObject = @"widescreen";
         [view insertItem:ws atIndex:0];
+
+        /* View > Renderer: Software / GPU (radio-style check marks; switches between frames) */
+        NSMenu *ren = [[NSMenu alloc] initWithTitle:@"Renderer"];
+        add(ren, @"Software", @"renderer=software", nil, 0);
+        add(ren, @"GPU", @"renderer=gpu", nil, 0);
+        NSMenuItem *renItem = [[NSMenuItem alloc] initWithTitle:@"Renderer" action:nil keyEquivalent:@""];
+        renItem.submenu = ren;
+        [view insertItem:renItem atIndex:1];
     }
 }
 

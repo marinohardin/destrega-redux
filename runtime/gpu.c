@@ -21,6 +21,7 @@ static u16 s_vram[VRAM_W * VRAM_H];
  * forwarded there; nothing in it is ever read back into the emulated machine. */
 const HiresBackend *g_hires;
 int g_hires_guard;
+bool g_hires_shadow;
 
 /* ---- state ------------------------------------------------------------- */
 
@@ -989,6 +990,7 @@ void gpu_shadow_packet(const u32 *w, int n)
     bool mset = s_mask_set, mchk = s_mask_check;
     u32 tau = s_tw_and_u, tou = s_tw_or_u, tav = s_tw_and_v, tov = s_tw_or_v;
     s_shadow = true;
+    g_hires_shadow = true;
     for (int i = 0; i < n;) {
         u32 cmd = w[i] >> 24;
         int len = gp0_len(cmd);
@@ -1003,6 +1005,7 @@ void gpu_shadow_packet(const u32 *w, int n)
         i += len;
     }
     s_shadow = false;
+    g_hires_shadow = false;
     s_stat = stat; s_drawmode = drawmode; s_texwin = texwin; s_area_tl = area_tl; s_area_br = area_br;
     s_clip_x1 = cx1; s_clip_y1 = cy1; s_clip_x2 = cx2; s_clip_y2 = cy2; s_off_x = ox; s_off_y = oy;
     s_off_raw = off_raw;

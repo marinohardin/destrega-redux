@@ -206,6 +206,7 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   card-changed flag like a real swap (`memcard_mark_new` after a delete).
 - **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
   menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
+- **View > Renderer > Software / GPU**: action `renderer[=software|gpu]`, see "GPU renderer".
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`. Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
@@ -287,10 +288,68 @@ hashing all emulated state per frame).
   `tools/contact_sheet.py --cell WxH --cols N` tiles them; `tools/fight_script.py` prints a
   boot->fight `--press` script.
 - Tests: `runtime/tests/test_hires.c` (rasterizer vs hand-checked counts at several
-  Sx x Sy, including Sx != Sy; UV-bleed and 1x-sampled-range regressions; 0 vs 4 worker threads identical), `tools/test_hires_determinism.sh` (8 concurrent runs, some with worker threads: off,
+  Sx x Sy, including Sx != Sy; UV-bleed and 1x-sampled-range regressions; 0 vs 4 worker threads identical), `tools/test_hires_determinism.sh` (12 runs, 8 at a time, some with worker threads: off,
   2x2, 4x4, 8x8, 2x3, 4x6, a resize schedule with Sx != Sy, and the 1x1 equivalence run; all
   state hashes equal, >=95% of fight frames hi-res, 0 UV fetches outside the 1x-sampled range, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
   tests, `tools/smoke_test.sh` and the determinism script concurrently (~1.7 min).
+
+## GPU renderer (`runtime/hires_gpu.[ch]`, `--renderer gpu`)
+
+A second `HiresBackend` on SDL3's SDL_GPU (Metal, MSL shaders embedded in the C file). Same
+contract as the software backend: commands in, target out, presentation only. It is
+**bit-identical to the software backend** at every scale tested (1x1, 2x3, 4x6, 8x8 over a
+7000-frame fight run) and to the 1x VRAM at 1x1. Keep it that way: a rule change in `hires.c`
+needs the same change in the shader. The header comment of `hires_gpu.c` has the details.
+
+- `--renderer software|gpu|compare`. Default: **gpu in a macOS window** (if the SDL GPU renderer
+  or the backend cannot be created: `hires-gpu: GPU renderer unavailable ...` and software),
+  software headless (the tests' reference). `--renderer software` forces software and the
+  plain SDL renderer (no live switch to GPU then). **View > Renderer > Software / GPU**
+  (radio check marks; menu action `renderer[=software|gpu|compare]`, no argument toggles)
+  switches at any time between frames: `hires_set_backend` + `hires_set_scale` at the current
+  scale, i.e. the old target is destroyed and the new one seeded from the 1x VRAM, as on a
+  resize. The window always uses SDL's GPU renderer, which presents either target. `compare` draws every command on both
+  backends, presents the software one and every `--compare-every N` frames (default 30) reads
+  both back: `hires-compare:` lines at exit (all / fight frames, pixels differing, by >1 step,
+  mask-bit only, worst frame); `--compare-max PCT` exits 6 if a fight frame differs more.
+  Headless works (own device, needs `SDL_InitSubSystem(VIDEO)` with the default driver; the
+  `offscreen` driver has no GPU backend). Without Metal it logs `GPU renderer unavailable` and
+  uses software. Windowed it presents straight from the GPU texture (SDL GPU renderer +
+  `SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER`); readback only for `--dump`, `--hires-verify`
+  and compare (`HiresBackend.read`).
+- Exactness: target B5G5R5A1 (shader writes PS1 red into `.b` = the low 5 bits, so the download
+  is raw PS1 u16, alpha = mask bit). Attributes are the 1x plane equations evaluated as exact
+  rationals in 64-bit integers per pixel (Metal supports `long`). Semi modes are fixed-function
+  blends (B/2+F/2 via constant 0.5 and F/2-1/4; see the file comment for the one F=0 tie case).
+  Triangles with a vertex outside the target are drawn as their clipped bbox with an exact
+  edge test in the shader: GPU clipping produces inexact vertices that flip shared-edge
+  fill-rule ties (single-pixel diffs at 1x1).
+- The software backend's span-start evaluation was a `double` expression; for Sy=6 (1/6 is
+  inexact) it rounded exact-integer u/v down and picked neighbouring texels. It is now the same
+  exact rational floor as the shader (`EXACT_AT` in `hires.c`), which made the two agree.
+- Batching: per-primitive storage-buffer records, one draw per blend pipeline key per group;
+  a group closes when a primitive would be reordered against an earlier overlapping one of a
+  later key (32x32 1x-tile masks). Render passes break only for VRAM texture uploads, puts
+  and VRAM copies. One command buffer per view/readback, 2 frames in flight.
+  `hires-gpu:` at exit prints submits, passes/draws/prims per submit, uploads, copies.
+- Speed (headless fight, frames 3700-4500, machine heavily loaded): 4x6 software 34.6 vs GPU
+  11.1 ms/frame; 8x8 software 95.1 vs GPU 19.7 ms/frame (no hi-res: ~6 ms). Windowed 4x6 fight:
+  emu 1.3 ms + present 6.6 ms per frame.
+- Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
+  mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
+  chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), MSL only
+  (no SPIR-V/DXIL), no `--hires-threads` (n/a).
+- Widescreen guard band: supported (`set_guard`): `s_ox` is negative with the default region
+  at x = 0, so the clip rectangle's x is packed signed, the shader's 1x column uses floor
+  division and the 32x32 tile masks are shifted by the guard width. Guard-band-only packets
+  (`g_hires_shadow`, set by gpu.c around `gpu_shadow_packet`) do not mark VRAM blocks dirty
+  (they never touch VRAM; marking them caused re-uploads and 10x the render passes).
+  `--renderer compare` compares the guard band too: 0 differing pixels at 2x2 and 4x6, 4:3
+  and 16:9.
+- Tests: `tools/test_hires_determinism.sh` adds `g4x6` (state hash), `gverify1` (1x1 ==
+  1x VRAM), `c1x1` and `c4x6` (compare vs software, `CMP_MAX` default 0 %);
+  `tools/test_widescreen.sh` adds `ws46g` (16:9 on the GPU) and `wsrender` (renderer and
+  widescreen switched back and forth mid-fight, state hash = 4:3 software run).
 
 ## Widescreen (`--widescreen`, default off)
 

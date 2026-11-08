@@ -6,8 +6,8 @@
  * at an integer multiple S of the 1x resolution. The target is never read by
  * the emulated machine (textures/CLUTs are fetched from the 1x VRAM).
  *
- * The renderer sits behind HiresBackend (command in -> target out) so a GPU
- * (Metal/SDL_GPU) backend can replace the software one later. Vertices carry
+ * The renderer sits behind HiresBackend (command in -> target out): the software
+ * rasterizer (hires.c, the reference and default) or the SDL_GPU backend (hires_gpu.c). Vertices carry
  * 16.16 fixed-point positions (in 1x pixel units) so sub-pixel inputs (e.g.
  * PGXP-style GTE precision) can be supplied later; today they are integers.
  */
@@ -50,6 +50,10 @@ typedef struct {
     int stride;          /* in pixels */
     int w, h;            /* in target pixels */
     int scale_x, scale_y;
+    /* GPU-resident view (GPU backend): pixels is NULL; gpu is the backend's target and
+     * (gx, gy) the view's top-left pixel in it. hires_read_view() gives CPU pixels. */
+    void *gpu;
+    int gx, gy;
 } HiresView;
 
 typedef struct HiresBackend {
@@ -65,6 +69,7 @@ typedef struct HiresBackend {
     void (*copy)(int sx, int sy, int dx, int dy, int w, int h, bool mask_check, bool mask_set);
     void (*put)(int x, int y, u16 v, bool mask_check, bool mask_set);   /* CPU->VRAM pixel */
     bool (*view)(int x, int y, int w, int h, HiresView *out);          /* 1x rect -> target */
+    bool (*read)(int x, int y, int w, int h, HiresView *out);          /* same, CPU pixels (readback) */
     void (*destroy)(void);
     /* Optional (NULL = unsupported; widescreen then stays 4:3). Guard band: gx virtual 1x
      * columns on each side of the region, taking effect at the next configure(). They are
@@ -81,6 +86,16 @@ typedef struct HiresBackend {
 extern const HiresBackend *g_hires;
 /* Guard band columns of the active target (0 = none). Defined in gpu.c, set by hires.c. */
 extern int g_hires_guard;
+/* True while gpu.c forwards a presentation-only (guard-band) packet: it was not drawn into the
+ * 1x VRAM, so a backend must not treat its area as changed VRAM. Defined in gpu.c. */
+extern bool g_hires_shadow;
+
+/* Backend selection (takes effect on the next hires_set_scale that allocates). be = NULL:
+ * software. shadow != NULL: every command is also fed to shadow (same scales), for
+ * hires_compare(); views and presentation come from be. */
+void hires_set_backend(const HiresBackend *be, const HiresBackend *shadow);
+const HiresBackend *hires_software_backend(void);
+bool hires_get_dither(void);                  /* --hires-dither setting */
 
 /* ---- control (runtime/hires.c) ------------------------------------------- */
 
@@ -104,6 +119,8 @@ int hires_guard(void);
 bool hires_get_view(const GpuDisplay *d, HiresView *v);
 /* Same, widened by `extra` guard-band columns on each side (clamped to the guard band). */
 bool hires_get_view_wide(const GpuDisplay *d, int extra, HiresView *v);
+bool hires_read_view(const GpuDisplay *d, HiresView *v);   /* same with CPU pixels (GPU: readback) */
+bool hires_read_view_wide(const GpuDisplay *d, int extra, HiresView *v);
 /* Scales for a window of pw x ph physical pixels showing a dw x dh display: the 4:3 letterbox
  * viewport (vw x vh) is covered without ever upsampling on either axis,
  * sx = ceil(vw/dw), sy = ceil(vh/dh), each capped to 1..max_x / 1..max_y. */
@@ -134,5 +151,12 @@ void hires_get_uv_stats(HiresUvStats *st);
 /* Compare the target against the 1x VRAM region (meaningful at scale 1x1, where they must
  * be identical). Returns the number of differing pixels; reports the first one. */
 u32 hires_verify_1x(int *first_x, int *first_y);
+
+/* Compare the primary backend's target against the shadow's over the whole region (and the
+ * guard band, if any).
+ * diff = pixels whose 15-bit value differs (mask bit ignored), diff_big = those where some
+ * channel differs by more than 1 (of 31); mask_diff = pixels where only bit 15 differs. */
+typedef struct { u64 pixels, diff, diff_big, mask_diff; int first_x, first_y; } HiresCompare;
+bool hires_compare(HiresCompare *c);
 
 #endif

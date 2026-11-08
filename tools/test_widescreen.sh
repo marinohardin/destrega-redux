@@ -8,6 +8,8 @@
 #   ws46     --widescreen, 4x6, worker threads
 #   wsresize --widescreen, auto scale, window resized between 16:9, 4:3, 21:9 and 16:10 mid-fight
 #   ws1      --widescreen, 1x1 with --hires-verify (the 4:3 part of the target == 1x VRAM)
+#   wsrender starts on the software renderer and 4:3, switches renderer and widescreen mid-fight
+#   ws46g    --widescreen, 4x6, --renderer gpu
 #   wstoggle starts 4:3, switched on/off six times mid-fight: five times through View >
 #            Widescreen (--menu-action widescreen[=on|off], the path the menu and F9 take), once
 #            via --widescreen-at; screenshots every 50 frames
@@ -20,7 +22,10 @@
 #  4. >= 80% of fight-window frames were presented wider than 4:3 in the 16:9 runs;
 #  5. 0 textured samples outside their clamp range; 1x1: 0 mismatching frames;
 #  6. wstoggle: presented wide only while switched on, and soon after every switch-on
-#     (tools/check_ws_toggle.py, from the log and the screenshots).
+#     (tools/check_ws_toggle.py, from the log and the screenshots);
+#  7. wsrender: View > Renderer switched software <-> gpu six times mid-fight, interleaved with
+#     four widescreen switches (also while on): every switch applied, same checks as 1-3 and 6.
+#     ws46g: --widescreen on the GPU renderer at 4x6.
 # Usage: tools/test_widescreen.sh [frames]   (default 9000; needs build/cmake/destrega)
 cd "$(dirname "$0")/.."
 if [ "$1" != "--job" ]; then FRAMES=${1:-9000}; fi
@@ -41,7 +46,7 @@ fi
 
 mkdir -p $OUT
 rm -f $OUT/*.hash $OUT/*.trace $OUT/*.log $OUT/*.rc
-rm -rf $OUT/toggle; mkdir -p $OUT/toggle
+rm -rf $OUT/toggle $OUT/render; mkdir -p $OUT/toggle $OUT/render
 JOBS=${JOBS:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
 cat > $OUT/jobs.txt <<EOF
 ws46 --widescreen --scale 4x6 --window 1280x720 --hires-threads 3
@@ -50,6 +55,8 @@ ws2 --widescreen --scale 2 --window 1280x720 --hires-threads 1
 ws2b --widescreen --scale 2 --window 1280x720 --hires-threads 0
 ws1 --widescreen --scale 1 --window 1280x720 --hires-verify --hires-threads 0
 off --scale 2 --hires-threads 0
+wsrender --scale 2 --window 1280x720 --hires-threads 0 --renderer software --menu-action 3800:renderer=gpu --menu-action 4200:widescreen=on --menu-action 4500:renderer=software --menu-action 5000:renderer=gpu --menu-action 5400:widescreen=off --menu-action 5800:renderer=software --menu-action 6300:widescreen=on --menu-action 6600:renderer=gpu --menu-action 7200:renderer --menu-action 7600:widescreen=off --dump build/widescreen/render --dump-every 50
+ws46g --widescreen --scale 4x6 --window 1280x720 --renderer gpu
 wstoggle --scale 2 --window 1280x720 --hires-threads 0 --menu-action 3900:widescreen=on --menu-action 4600:widescreen --widescreen-at 5300:1 --menu-action 6200:widescreen=off --menu-action 6900:widescreen --menu-action 8000:widescreen=off --dump build/widescreen/toggle --dump-every 50
 EOF
 START=$(date +%s)
@@ -57,7 +64,7 @@ xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
 ELAPSED=$(( $(date +%s) - START ))
 
 fail=0
-WS="ws2 ws2b ws46 wsresize ws1 wstoggle"
+WS="ws2 ws2b ws46 wsresize ws1 wstoggle wsrender ws46g"
 echo "widescreen: ran $(wc -l < $OUT/jobs.txt) runs of $FRAMES frames, $JOBS at a time, in ${ELAPSED}s"
 for n in off $WS; do
   rc=$(cat $OUT/$n.rc 2>/dev/null || echo missing)
@@ -78,7 +85,7 @@ for n in $WS; do
   grep -q "hires-uv: [0-9]* textured samples, [0-9]* clamped to the 1x-sampled UV range, 0 out of range when fetched" $OUT/$n.log ||
     { echo "widescreen: $n: UV out-of-range samples (or no UV report)"; fail=1; }
 done
-for n in ws2 ws2b ws46 ws1; do
+for n in ws2 ws2b ws46 ws1 ws46g; do
   l=$(grep -h "widescreen-frames:" $OUT/$n.log | sed 's/^\[ *[0-9]*\] //')
   echo "widescreen: $n: $l"
   wide=$(echo "$l" | sed -n 's/.*(\([0-9]*\) in fight window of \([0-9]*\)).*/\1 \2/p')
@@ -90,5 +97,10 @@ grep -h "hires-verify" $OUT/ws1.log | sed 's/^\[ *[0-9]*\] /widescreen: ws1: /'
 grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/ws1.log ||
   { echo "widescreen: ws1: the 4:3 part of the target differs from the 1x VRAM"; fail=1; }
 python3 tools/check_ws_toggle.py $OUT/wstoggle.log $OUT/toggle 6 || fail=1
+python3 tools/check_ws_toggle.py $OUT/wsrender.log $OUT/render 4 > $OUT/wsrender.chk || fail=1
+sed 's/wstoggle/wsrender/' $OUT/wsrender.chk
+nr=$(grep -c "hires: renderer [a-z]* at frame" $OUT/wsrender.log)
+echo "widescreen: wsrender: $nr renderer switches applied: $(grep -h 'hires: renderer [a-z]* at frame' $OUT/wsrender.log | sed 's/.*renderer \([a-z]*\) at frame \([0-9]*\)/\1@\2/' | tr '\n' ' ')"
+[ "$nr" = 6 ] || { echo "widescreen: wsrender: expected 6 renderer switches"; fail=1; }
 [ $fail = 0 ] || { echo "widescreen: FAIL"; exit 1; }
 echo "widescreen: gameplay and all emulated state identical with --widescreen; shadow pass + 16:9 presentation ok"

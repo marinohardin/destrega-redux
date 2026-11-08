@@ -5,6 +5,7 @@
 #include "menu.h"
 #include "hires.h"
 #include "widescreen.h"
+#include "hires_gpu.h"
 #include "overrides/override.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -96,6 +97,17 @@ static ResizeStep s_resizes[256];
 static int s_resize_n;
 static SDL_Texture *s_hitex;
 static int s_hitex_w, s_hitex_h;
+/* --renderer software|gpu|compare (see AGENTS.md "GPU renderer") */
+enum { R_SOFTWARE, R_GPU, R_COMPARE };
+static int s_renderer = R_SOFTWARE;
+static bool s_renderer_given;              /* --renderer on the command line */
+static bool s_gpu_ok;                      /* GPU backend initialised (live switching possible) */
+static bool s_gpu_used;                    /* the GPU backend ran at some point (stats) */
+static SDL_GPUTexture *s_gputex_src;       /* GPU texture wrapped by s_gputex */
+static SDL_Texture *s_gputex;
+static int s_compare_every = 30;           /* --compare-every N */
+static double s_compare_max = -1;          /* --compare-max PCT: fail if a fight frame differs more */
+static struct { u64 frames, exact, px, diff, big, mask; double worst; u64 worst_frame; } s_cmp[2];
 
 static void wav_header(FILE *f, u32 bytes) {
     u32 hdr[11] = {0x46464952, 36 + bytes, 0x45564157, 0x20746d66, 16, 0x00020001, 44100,
@@ -200,7 +212,7 @@ void frontend_screenshot(const char *path) {
     GpuDisplay d;
     HiresView hv;
     gpu_get_display(&d);
-    if (hires_get_view_wide(&d, ws_present_extra(&d), &hv)) {
+    if (hires_read_view_wide(&d, ws_present_extra(&d), &hv)) {
         u32 *buf = malloc((size_t)hv.w * hv.h * 4);
         if (buf) {
             convert_view(&hv, buf, (size_t)hv.w);
@@ -384,6 +396,39 @@ static void apply_window_size(int pw, int ph, bool simulated) {
     }
 }
 
+/* ---- runtime renderer switch (View > Renderer, --menu-action renderer=software|gpu) ----
+ * Between frames: select the backend and reallocate the hi-res target at the current scale,
+ * seeded from the 1x VRAM like a resize (hires_set_scale destroys the old backend's target).
+ * Nothing emulated is touched. The SDL renderer stays (the GPU renderer presents both). */
+static const char *renderer_name(int r) { return r == R_GPU ? "gpu" : r == R_COMPARE ? "compare" : "software"; }
+const char *frontend_renderer(void) { return renderer_name(s_renderer); }
+bool frontend_gpu_available(void) { return s_gpu_ok || s_headless; }
+
+static void renderer_switch(int r) {
+    if (r == s_renderer) return;
+    if (r != R_SOFTWARE && !s_gpu_ok) {
+        /* headless: create the backend's own device on first use; windowed: needs the GPU renderer */
+        if (s_headless) s_gpu_ok = hires_gpu_init(NULL);
+        if (!s_gpu_ok) { rt_log("hires: renderer %s unavailable; staying on %s", renderer_name(r), renderer_name(s_renderer)); return; }
+    }
+    if (r == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
+    else if (r == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
+    else hires_set_backend(NULL, NULL);
+    int sx, sy;
+    bool on = hires_get_scale(&sx, &sy);
+    if (on && !hires_set_scale(sx, sy)) {
+        rt_log("hires: renderer %s cannot allocate %dx%d; back to %s", renderer_name(r), sx, sy, renderer_name(s_renderer));
+        if (s_renderer == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
+        else if (s_renderer == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
+        else hires_set_backend(NULL, NULL);
+        hires_set_scale(sx, sy);
+        return;
+    }
+    rt_log("hires: renderer %s at frame %llu", renderer_name(r), (unsigned long long)s_frame);
+    s_renderer = r;
+    s_gpu_used |= r != R_SOFTWARE;
+}
+
 /* ---- runtime 4:3 / 16:9 switch ---- */
 
 void frontend_set_widescreen(bool on) { s_ws_req = on; }
@@ -447,6 +492,33 @@ static void finish(void) {
                    (unsigned long long)uv.escaped, (unsigned long long)uv.tris_1x_range,
                    (unsigned long long)uv.tris);
         if (uv.escaped) rc = 5;
+    }
+    if (s_renderer == R_COMPARE) {
+        for (int k = 0; k < 2; k++) {
+            if (!s_cmp[k].frames) continue;
+            rt_log("hires-compare: %s: %llu frames compared, %llu identical; %llu of %llu pixels differ (%.5f%%), "
+                   "%llu by more than 1 step in a channel, %llu in the mask bit only; worst frame %llu: %.4f%%",
+                   k ? "fight" : "all", (unsigned long long)s_cmp[k].frames, (unsigned long long)s_cmp[k].exact,
+                   (unsigned long long)s_cmp[k].diff, (unsigned long long)s_cmp[k].px,
+                   100.0 * (double)s_cmp[k].diff / (double)s_cmp[k].px, (unsigned long long)s_cmp[k].big,
+                   (unsigned long long)s_cmp[k].mask, (unsigned long long)s_cmp[k].worst_frame, s_cmp[k].worst);
+        }
+        if (s_compare_max >= 0 && (!s_cmp[1].frames || s_cmp[1].worst > s_compare_max)) {
+            rt_log("hires-compare: FAIL: worst fight frame %.4f%% > %.4f%% (or no fight frames compared)",
+                   s_cmp[1].worst, s_compare_max);
+            rc = 6;
+        }
+    }
+    if (s_gpu_used) {
+        HiresGpuStats st;
+        hires_gpu_get_stats(&st);
+        double n = st.submits ? (double)st.submits : 1;
+        rt_log("hires-gpu: %llu submits, %.1f render passes / %.1f draws / %.0f primitives per submit "
+               "(%llu triangles coverage-tested in the shader), "
+               "%llu VRAM texels uploaded, %llu VRAM copies, %llu readbacks",
+               (unsigned long long)st.submits, st.passes / n, st.draws / n, st.prims / n,
+               (unsigned long long)st.edge_tris,
+               (unsigned long long)st.vram_up_texels, (unsigned long long)st.tcopies, (unsigned long long)st.readbacks);
     }
     for (int k = 0; k <= s_seg_n; k++) {
         if (!s_seg[k].frames) continue;
@@ -514,7 +586,7 @@ void frontend_vblank(void) {
             bool wide = used && ws_present_extra(&d) > 0;
             if (wide) { s_ws_wide[0]++; if (f) s_ws_wide[1]++; }
             static bool was_wide;
-            if (wide != was_wide && (s_ws_step_n || g_trace))   /* checked by test_widescreen.sh */
+            if (wide != was_wide && (s_ws_step_n || s_menu_script_n || g_trace))   /* checked by test_widescreen.sh */
                 rt_log("widescreen-present: frame %llu %s", (unsigned long long)s_frame, wide ? "wide" : "4:3");
             was_wide = wide;
         }
@@ -532,6 +604,23 @@ void frontend_vblank(void) {
                        (unsigned long long)s_frame, bad, fx, fy);
             s_verify_bad_frames++;
         }
+        }
+    }
+    if (s_renderer == R_COMPARE && s_compare_every > 0 && s_frame % (u64)s_compare_every == 0) {
+        HiresCompare c;
+        if (hires_compare(&c) && c.pixels) {
+            double pct = 100.0 * (double)c.diff / (double)c.pixels;
+            for (int k = 0; k < 2; k++) {
+                if (k && s_frame < s_fight_from) continue;
+                s_cmp[k].frames++;
+                if (!c.diff) s_cmp[k].exact++;
+                s_cmp[k].px += c.pixels; s_cmp[k].diff += c.diff; s_cmp[k].big += c.diff_big; s_cmp[k].mask += c.mask_diff;
+                if (pct > s_cmp[k].worst || !s_cmp[k].worst_frame) { s_cmp[k].worst = pct; s_cmp[k].worst_frame = s_frame; }
+            }
+            if (c.diff && g_trace)
+                rt_log("hires-compare: frame %llu: %llu pixels differ (%.4f%%), %llu by > 1, first at target (%d,%d)",
+                       (unsigned long long)s_frame, (unsigned long long)c.diff, pct,
+                       (unsigned long long)c.diff_big, c.first_x, c.first_y);
         }
     }
     if (s_state_hash) write_state_hash();
@@ -682,8 +771,27 @@ static void present_frame(void) {
     int extra = ws_present_extra(&d);
     SDL_FRect dst = letterbox_ar(pw, ph, 4.0 / 3.0);
     SDL_RenderClear(s_ren);
-    if (hires_get_view_wide(&d, extra, &hv)) {
-        if (extra) dst = letterbox_ar(pw, ph, 4.0 / 3.0 * (d.w + 2 * extra) / d.w);
+    bool have = hires_get_view_wide(&d, extra, &hv);
+    if (have && extra) dst = letterbox_ar(pw, ph, 4.0 / 3.0 * (d.w + 2 * extra) / d.w);
+    if (have && hv.gpu) {
+        /* GPU backend: present straight from the GPU (target -> RGBA8 conversion pass), no readback */
+        SDL_GPUTexture *t = hires_gpu_present(&hv);
+        if (t && (t != s_gputex_src || !s_gputex || s_gputex->w != hv.w || s_gputex->h != hv.h)) {
+            if (s_gputex) SDL_DestroyTexture(s_gputex);
+            SDL_PropertiesID pr = SDL_CreateProperties();
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, SDL_PIXELFORMAT_ABGR8888);
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STATIC);
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, hv.w);
+            SDL_SetNumberProperty(pr, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, hv.h);
+            SDL_SetPointerProperty(pr, SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER, t);
+            s_gputex = SDL_CreateTextureWithProperties(s_ren, pr);
+            SDL_DestroyProperties(pr);
+            if (!s_gputex) rt_log("hires-gpu: cannot wrap the GPU texture: %s", SDL_GetError());
+            else SDL_SetTextureScaleMode(s_gputex, SDL_SCALEMODE_LINEAR);
+            s_gputex_src = t;
+        }
+        if (t && s_gputex) SDL_RenderTexture(s_ren, s_gputex, NULL, &dst);
+    } else if (have) {
         /* true hi-res target: downsampled/filtered into the viewport, never an upsampled 1x image */
         if (!s_hitex || s_hitex_w != hv.w || s_hitex_h != hv.h) {
             if (s_hitex) SDL_DestroyTexture(s_hitex);
@@ -753,13 +861,19 @@ static void usage(void) {
         "  --gameplay-trace FILE per frame: fighters' health/gauge/position, round time, wins, RNG seed\n"
         "  --ram-snap DIR        write raw guest RAM + scratchpad to DIR every --ram-snap-every N frames (100)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
+        "  --renderer R          hi-res renderer: software, gpu (SDL_GPU/Metal), or compare (default: gpu\n"
+        "                        in a macOS window, else software; View > Renderer switches at runtime)\n"
+        "                        (software shown, gpu fed the same commands and compared to it)\n"
+        "  --compare-every N     compare mode: compare the targets every N frames (default 30)\n"
+        "  --compare-max PCT     compare mode: exit non-zero if a fight frame differs in more than PCT%% of pixels\n"
         "  --widescreen          16:9 fights: wider stage culling + hi-res guard band (menus/FMV stay 4:3;\n"
         "                        needs hi-res; the window aspect picks 4:3..16:9; default window 1280x720;\n"
         "                        View > Widescreen (16:9) or F9 switches at runtime)\n"
         "  --widescreen-at F:0|1,...  headless: switch widescreen off/on at the given frames\n"
         "  --menu-action F:NAME[=ARG]  (testing) run a menu action on frame F: load=IMAGE, reveal-game,\n"
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete,\n"
-        "                        widescreen[=on|off] (View menu; no argument = toggle)\n"
+        "                        widescreen[=on|off], renderer[=software|gpu|compare] (View menu;\n"
+        "                        no argument = toggle)\n"
         "                        (save actions use card slot 1; headless needs --data-dir or --memcard1)\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
@@ -1083,6 +1197,13 @@ static void menu_run(const char *name, const char *arg) {
     else if (!strcmp(name, "save-import")) action_card_import(arg);
     else if (!strcmp(name, "save-export")) action_card_export(arg);
     else if (!strcmp(name, "save-delete")) action_card_delete(arg);
+    else if (!strcmp(name, "renderer")) {   /* View > Renderer; arg software|gpu|compare, none = toggle */
+        if (!strcmp(arg, "gpu")) renderer_switch(R_GPU);
+        else if (!strcmp(arg, "software")) renderer_switch(R_SOFTWARE);
+        else if (!strcmp(arg, "compare")) renderer_switch(R_COMPARE);
+        else if (!*arg) renderer_switch(s_renderer == R_SOFTWARE ? R_GPU : R_SOFTWARE);
+        else rt_log("menu: renderer: software, gpu or compare");
+    }
     else if (!strcmp(name, "widescreen"))   /* View > Widescreen (16:9); arg on/off, none = toggle */
         frontend_set_widescreen(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
                                 : !strcmp(arg, "off") || !strcmp(arg, "0") ? false
@@ -1107,7 +1228,24 @@ static void create_window(void) {
     }
     s_win = SDL_CreateWindow("Destrega (recompiled)", s_win_w, s_win_h,
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    s_ren = SDL_CreateRenderer(s_win, NULL);
+    s_ren = NULL;
+#ifdef __APPLE__
+    if (!s_renderer_given) s_renderer = R_GPU;   /* windowed default on macOS */
+#endif
+    /* SDL's GPU renderer, whose device the hi-res backend draws with. Created whenever the GPU
+     * backend may be used, so View > Renderer can switch at any time; --renderer software
+     * forces the plain renderer (and software only). */
+    if (s_renderer != R_SOFTWARE || !s_renderer_given) {
+        s_ren = SDL_CreateGPURenderer(NULL, s_win);
+        s_gpu_ok = s_ren && hires_gpu_init(SDL_GetGPURendererDevice(s_ren));
+        if (!s_gpu_ok) {
+            rt_log("hires-gpu: GPU renderer unavailable (%s); using the software renderer", SDL_GetError());
+            if (s_ren) SDL_DestroyRenderer(s_ren);
+            s_ren = NULL;
+            s_renderer = R_SOFTWARE;
+        }
+    }
+    if (!s_ren) s_ren = SDL_CreateRenderer(s_win, NULL);
     SDL_SetRenderLogicalPresentation(s_ren, 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 640, 512);
     SDL_SetTextureScaleMode(s_tex, SDL_SCALEMODE_NEAREST);
@@ -1176,6 +1314,16 @@ int main(int argc, char **argv) {
             if (!s_gameplay) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
         }
         else if (!strcmp(argv[i], "--ram-snap-every") && i + 1 < argc) s_ram_snap_every = strtoull(argv[++i], 0, 0);
+        else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) {
+            const char *r = argv[++i];
+            s_renderer_given = true;
+            if (!strcmp(r, "software")) s_renderer = R_SOFTWARE;
+            else if (!strcmp(r, "gpu")) s_renderer = R_GPU;
+            else if (!strcmp(r, "compare")) s_renderer = R_COMPARE;
+            else { fprintf(stderr, "--renderer: software, gpu or compare\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--compare-every") && i + 1 < argc) s_compare_every = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--compare-max") && i + 1 < argc) s_compare_max = atof(argv[++i]);
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
             s_state_hash = fopen(argv[++i], "w");
             if (!s_state_hash) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
@@ -1289,6 +1437,17 @@ int main(int argc, char **argv) {
     gpu_init();
     hires_set_dither(s_hires_dither);
     hires_set_threads(s_hires_threads);
+    if (s_renderer != R_SOFTWARE) {
+        s_gpu_ok = hires_gpu_init(NULL);   /* headless: a device of its own; windowed: already done */
+        if (!s_gpu_ok) {
+            rt_log("hires-gpu: GPU renderer unavailable; using the software renderer");
+            s_renderer = R_SOFTWARE;
+        }
+    }
+    s_gpu_used = s_renderer != R_SOFTWARE;
+    rt_log("hires: renderer %s", s_renderer == R_GPU ? "gpu" : s_renderer == R_COMPARE ? "compare" : "software");
+    if (s_renderer == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
+    else if (s_renderer == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
     if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))
         rt_log("hires: cannot allocate scale %dx%d", s_opt_sx, s_opt_sy);
     spu_init();
