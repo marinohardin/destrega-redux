@@ -10,6 +10,15 @@
 #                                         Xvfb; Windows: no Vulkan driver on the runner, so the
 #                                         test checks the backend refuses cleanly (exit 77 = skip)
 #   shaders                               runtime/shaders/hires.glsl compiles and validates
+#
+# Each OS job also packages the STUB build with tools/package_release.sh (proves packaging works:
+# app bundle / DLL collection, licence files, version resources) and uploads it as
+# STUB-NOT-PLAYABLE-<os>: no game code, cannot run the game, kept 3 days. Real (playable)
+# builds contain code translated from a disc and are never made or published by CI; see
+# "Releases" in AGENTS.md.
+#
+# Network robustness: downloads retry with backoff (and fall back to libsdl.org, the official
+# mirror), the SDL3 build and the MSYS2 packages are cached, and setup-msys2 is retried once.
 name: build
 
 on:
@@ -20,6 +29,10 @@ on:
 
 env:
   SDL_VERSION: 3.4.18
+  SDL_CACHE_REV: 1   # bump to invalidate every cached SDL3 build
+
+permissions:
+  contents: read
 
 jobs:
   windows:
@@ -30,10 +43,18 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
+        with:
+          fetch-depth: 0   # tools/version.py counts commits
+      # setup-msys2 downloads the MSYS2 installer from GitHub; a 504 there failed a run once.
+      # Try twice (the second attempt only runs if the first failed).
+      - name: Set up MSYS2
+        id: msys_a
+        continue-on-error: true
+        uses: msys2/setup-msys2@v2
         with:
           msystem: CLANG64
           update: true
+          cache: true
           install: >-
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-cmake
@@ -42,6 +63,23 @@ jobs:
             mingw-w64-clang-x86_64-python
             mingw-w64-clang-x86_64-sdl3
             mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-llvm
+      - name: Set up MSYS2 (retry)
+        if: steps.msys_a.outcome == 'failure'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          cache: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-sdl3
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-llvm
       - name: Configure
         run: |
           pacman -Q mingw-w64-clang-x86_64-sdl3 mingw-w64-clang-x86_64-clang
@@ -76,6 +114,14 @@ jobs:
           cat out.txt
           test $rc = 1 && grep -q "no data pack" out.txt
           ldd ./build/ci/destrega.exe | grep -iv "windows\\\\system32" || true
+      - name: Package the stub build
+        run: tools/package_release.sh win --exe build/ci/destrega.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: STUB-NOT-PLAYABLE-windows
+          path: dist/Destrega-STUB-NOT-PLAYABLE-*
+          retention-days: 3
+          if-no-files-found: error
 
   linux:
     name: Linux (${{ matrix.cc }})
@@ -94,20 +140,35 @@ jobs:
             libdrm-dev libgbm-dev libdbus-1-dev libudev-dev \
             libxkbcommon-dev libwayland-dev libdecor-0-dev libegl-dev libgl-dev libasound2-dev libpulse-dev \
             libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb glslang-tools spirv-tools
-      - name: Cache SDL3
+      # Restore is separate from save so a partial (restore-keys) hit still rebuilds and
+      # saves under the exact key. Caches made on main are readable from PR branches.
+      - name: Restore SDL3 cache
         id: sdl-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/sdl3
-          key: sdl3-${{ env.SDL_VERSION }}-ubuntu-24.04
+          key: sdl3-${{ env.SDL_VERSION }}-r${{ env.SDL_CACHE_REV }}-ubuntu-24.04
+          restore-keys: |
+            sdl3-${{ env.SDL_VERSION }}-r${{ env.SDL_CACHE_REV }}-
       - name: Build SDL3 ${{ env.SDL_VERSION }}
         if: steps.sdl-cache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL -o sdl.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL3-$SDL_VERSION.tar.gz
+          # GitHub release first, then libsdl.org (the official mirror); each with retries.
+          fetch() {
+            curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 --connect-timeout 20 -o sdl.tar.gz "$1"
+          }
+          fetch https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL3-$SDL_VERSION.tar.gz \
+            || fetch https://libsdl.org/release/SDL3-$SDL_VERSION.tar.gz
           tar xzf sdl.tar.gz
           cmake -S SDL3-$SDL_VERSION -B sdlbuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/sdl3 -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
           cmake --build sdlbuild
           cmake --install sdlbuild
+      - name: Save SDL3 cache
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/sdl3
+          key: sdl3-${{ env.SDL_VERSION }}-r${{ env.SDL_CACHE_REV }}-ubuntu-24.04
       - name: Shaders compile and validate
         run: python3 tools/gen_spirv.py --check
       - name: Configure
@@ -128,3 +189,38 @@ jobs:
           set -e
           cat out.txt
           test $rc = 1 && grep -q "no data pack" out.txt
+
+  macos:
+    name: macOS (stub app bundle)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Dependencies
+        run: |
+          for i in 1 2 3 4; do brew install sdl3 ninja && break; echo "brew failed, retry $i"; sleep $((i * 15)); done
+          brew list --versions sdl3
+      - name: Configure
+        run: cmake -S . -B build/ci -G Ninja -DDESTREGA_STUB_GEN=ON -DDESTREGA_TESTS=ON
+      - name: Build (also bundles Destrega.app with tools/make_app.sh)
+        run: cmake --build build/ci
+      - name: Unit tests
+        run: ctest --test-dir build/ci --output-on-failure -V
+      - name: Executable starts
+        run: |
+          ./build/ci/destrega --help | head -3
+          set +e
+          ./build/ci/destrega --headless --frames 10 --data-dir "$RUNNER_TEMP/nodata" > out.txt 2>&1
+          rc=$?
+          set -e
+          cat out.txt
+          test $rc = 1 && grep -q "no data pack" out.txt
+      - name: Package the stub build
+        run: tools/package_release.sh mac --app build/ci/Destrega.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: STUB-NOT-PLAYABLE-macos
+          path: dist/Destrega-STUB-NOT-PLAYABLE-*
+          retention-days: 3
+          if-no-files-found: error

@@ -847,6 +847,30 @@ The header comment of `hires_gpu.c` has the details.
   registered with `widescreen_add_state_hook(save, restore)`, or the wide pass leaks into the
   real one.
 
+## Releases (`docs/RELEASES.md`)
+
+`gen/` is translated game code and is **never** published: CI has no disc, and no workflow,
+artifact or GitHub Release may contain a playable build. Design (options A/B/C, recommendation,
+notarization steps) is in `docs/RELEASES.md`.
+
+- `tools/package_release.sh mac|win` zips a finished build on the machine that built it (Mac:
+  `Destrega.app` via `ditto`; Windows: exe + DLLs found next to it / `--dll-dir` / `$MINGW_PREFIX/bin`,
+  zip made with Python). A game build needs `--personal` and is named
+  `...-PERSONAL-DO-NOT-REDISTRIBUTE.zip`; a stub build (marker string `DESTREGA-CI-STUB-BUILD` in
+  `tools/ci/stub_gen/stub.c`) becomes `Destrega-STUB-NOT-PLAYABLE-...zip`. Output in `dist/`.
+- CI packages and uploads only the stub (`STUB-NOT-PLAYABLE-windows|macos`, 3 days); a macOS job also
+  runs `make_app.sh`. CI robustness: curl with `--retry-all-errors` and a libsdl.org fallback,
+  SDL3 cache restore/save split with `restore-keys` (bump `SDL_CACHE_REV` to invalidate), MSYS2
+  `cache: true` and a second setup attempt if the first fails.
+- Versions: `VERSION` (base, e.g. 0.1.0) + git, via `tools/version.py` (`short|build|describe|rc-header`).
+  A tag `vX.Y.Z` on the commit wins over `VERSION`. `make_app.sh` writes `CFBundleShortVersionString`,
+  `CFBundleVersion` (commit count), `DestregaBuild` and `NSHumanReadableCopyright` (no personal
+  names/emails). Windows: `runtime/win/destrega.rc` (manifest with Common Controls 6, icon
+  `destrega.ico` from `tools/make_ico.py`, VERSIONINFO from the generated `destrega_version.h`).
+  The Win32 dialogs in `menu_win.c` already use the system message font; only the manifest
+  dependency was missing for the modern look. Checked under CrossOver (`--bottle destrega-test`).
+- `THIRD_PARTY_LICENSES.txt` goes into every package; update it when linking anything new.
+
 ## Pitfalls
 
 - Branches may target another branch's delay slot (e.g. 0x800951c0); the tracer

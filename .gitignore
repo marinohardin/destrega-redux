@@ -9,3 +9,4 @@ analysis/overlays/*.err
 analysis/overlays/_run.log
 analysis/*.rea-snapshot
 *.wav
+dist/
