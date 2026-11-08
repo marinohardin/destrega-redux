@@ -35,6 +35,7 @@
 #include "widescreen.h"
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 int g_widescreen;                       /* shadow pass on (frontend_set_widescreen, main.c) */
 extern int g_widescreen_cull;           /* rt.c: WS_IMM() yields the widened bound */
@@ -119,6 +120,14 @@ static PktList s_a, s_b;
 static u8 *s_ram_bak, *s_scr_bak;
 static bool s_used[2];
 static u64 s_passes, s_extras, s_rejected;
+static u64 s_cost_ns;                   /* thread CPU time of the shadow pass (all but the real run) */
+
+static u64 cpu_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return (u64)t.tv_sec * 1000000000u + (u64)t.tv_nsec;
+}
 
 static int cmp_slot(const void *x, const void *y)
 {
@@ -220,6 +229,7 @@ static void stage_render(void)
         g_gpu_ll_hook = ll_hook;
     }
     const u32 base = ot_base();
+    u64 t0 = cpu_ns();
     /* 1. snapshot */
     const Cpu cpu = g_cpu;
     const u32 depth = g_depth;
@@ -244,25 +254,33 @@ static void stage_render(void)
     for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].restore) s_hooks[i].restore();
     g_cpu = cpu;
     g_depth = depth;
+    u64 t1 = cpu_ns();
     f_80044210_orig();
+    u64 t2 = cpu_ns();
     /* 4. extras for this table */
     ok = ok && collect(&s_b, base);
     Capture *c = &s_cap[s_cap[0].base == base || !s_cap[0].valid ? 0 : 1];
     if (s_cap[1].valid && s_cap[1].base == base) c = &s_cap[1];
     s_passes++;
     if (!ok) {
+        s_cost_ns += (t1 - t0) + (cpu_ns() - t2);
         if (s_rejected++ < 3) rt_log("widescreen: shadow pass rejected (hardware access or bad table)");
         c->valid = false;
         return;
     }
     build_capture(c, base);
+    s_cost_ns += (t1 - t0) + (cpu_ns() - t2);
 }
 
 void f_80044210(void) { override_call("stage_render", f_80044210_orig, stage_render); }
 
 void widescreen_report(void)
 {
-    if (s_passes || g_widescreen)
+    if (s_passes || g_widescreen) {
         rt_log("widescreen: %llu shadow passes, %llu extra stage packets, %llu rejected",
                (unsigned long long)s_passes, (unsigned long long)s_extras, (unsigned long long)s_rejected);
+        if (s_passes)
+            rt_log("widescreen-cost: shadow pass %.3f ms CPU per pass (snapshot, wide run, restore, diff;"
+                   " the guard-band drawing is in the hi-res totals)", s_cost_ns / 1e6 / (double)s_passes);
+    }
 }

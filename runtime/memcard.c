@@ -23,6 +23,9 @@ typedef struct {
     uint8_t img[MC_SIZE];
 } Card;
 
+typedef struct { bool used, writable; int port, head; uint32_t size, pos; } Fd;
+static Fd s_fd[MC_MAXFD];
+
 static Card s_card[2];
 static bool s_write_protect;
 
@@ -61,6 +64,8 @@ const char *memcard_attach(int port, const char *path) {
     Card *c = &s_card[port & 1];
     free(c->path);
     memset(c, 0, sizeof *c);
+    for (int h = 0; h < MC_MAXFD; h++)        /* swapping a card invalidates handles open on it */
+        if (s_fd[h].used && s_fd[h].port == (port & 1)) s_fd[h].used = false;
     if (!path || !*path) return NULL;
     FILE *f = fopen(path, "rb");
     if (f) {
@@ -86,6 +91,47 @@ const char *memcard_attach(int port, const char *path) {
 }
 
 bool memcard_present(int port) { return s_card[port & 1].present; }
+const char *memcard_path(int port) { return s_card[port & 1].path; }
+void memcard_mark_new(int port) { if (s_card[port & 1].present) s_card[port & 1].is_new = true; }
+
+const char *memcard_validate_file(const char *path) {
+    static uint8_t img[MC_SIZE];
+    FILE *f = fopen(path, "rb");
+    if (!f) return "Could not open that file.";
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    bool ok = n == MC_SIZE && fread(img, 1, MC_SIZE, f) == MC_SIZE;
+    fclose(f);
+    if (!ok) return "That is not a raw 128 KiB memory card image (.mcd). DexDrive/.gme-style files with a header are not supported.";
+    if (img[0] != 'M' || img[1] != 'C') return "That file is 128 KiB but has no memory card header (\"MC\"); it is not a formatted memory card image.";
+    if (img[127] != xor127(img)) return "That memory card image has a damaged header (checksum mismatch).";
+    return NULL;
+}
+
+/* Write `img` to `path` atomically (temp file + rename). */
+static bool write_file_atomic(const char *path, const uint8_t *img) {
+    size_t n = strlen(path) + 8;
+    char *tmp = malloc(n);
+    snprintf(tmp, n, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    bool ok = f && fwrite(img, 1, MC_SIZE, f) == MC_SIZE && fflush(f) == 0;
+    if (f) fclose(f);
+#ifdef _WIN32
+    if (ok) remove(path);
+#endif
+    if (ok) ok = rename(tmp, path) == 0;
+    if (!ok) remove(tmp);
+    free(tmp);
+    return ok;
+}
+
+const char *memcard_export(int port, const char *dst) {
+    Card *c = &s_card[port & 1];
+    if (!c->present) return "No card is inserted in that slot.";
+    memcard_flush();
+    return write_file_atomic(dst, c->img) ? NULL : "Could not write the file (is the destination writable?).";
+}
 void memcard_set_write_protect(bool on) { s_write_protect = on; }
 
 void memcard_flush(void) {
@@ -189,9 +235,6 @@ static int find_file(Card *c, const char *name) {
     }
     return 0;
 }
-
-typedef struct { bool used, writable; int port, head; uint32_t size, pos; } Fd;
-static Fd s_fd[MC_MAXFD];
 
 int memcard_open(int port, const char *name, bool create, int blocks, bool writable) {
     Card *c = &s_card[port & 1];

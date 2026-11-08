@@ -164,6 +164,43 @@ a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as 
   `memcard_set_write_protect(true)` (in-memory state keeps updating, flushing becomes a no-op);
   card state must also be part of any snapshot (`memcard_hash` shows what it covers).
 
+## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
+
+macOS gets a native **File** menu inserted after the app menu (SDL3 keeps building the standard
+app/Window menus; Quit still works). `menu_mac.m` (Cocoa, ARC, Apple only; `menu_stub.c` no-ops
+elsewhere) only builds items; each item calls `frontend_menu_action(NAME, ARG)` which **queues**. `main.c`
+runs the queue at the top of each VBlank (`menu_script_and_poll`), i.e. between frames on the main
+thread, so menus cannot disturb emulation. Headless runs never create menus.
+
+- **Load Game Image… (Cmd+O)**: native open dialog (SDL), `.cue/.bin/.iso`, then `import_image()` ->
+  `disc_import()` (the same code as the first-launch dialog and `--import`) into the data pack, then
+  `restart_process()` = clean re-exec (`DESTREGA_RESTARTED=1`, same argv minus `--menu-action` and any
+  positional image). Errors show a native alert and the game keeps running. `disc_import` parks the
+  running disc's module state while importing, so it is safe mid-game. Checks live in `disc.c`: wrong type,
+  raw sync pattern (a 2048-byte-sector `.iso` cannot hold the XA/FMV sectors and is refused with that
+  explanation; a raw 2352 `.iso` is fine), whole sectors, SLUS_007.32 CRC, and the ISO9660 volume size vs the
+  file size (catches truncated copies).
+- **Show Game Files in Finder (Cmd+Shift+R)**: opens the folder of the pack in use (or the loose image).
+- **Save Games** submenu (the UI deliberately never says "memory card" except for the file type; one slot, card
+  slot 1; slot 2, `--memcard2` and `--no-memcard` stay in the runtime for development/tests): Show Save Games in
+  Finder; Import Save Games… (open dialog "PlayStation memory card image (.mcd)"; validates 128 KiB + "MC" header
+  + checksum, confirms, keeps `memcard1-backup-YYYYmmdd-HHMMSS.mcd`, copies in place, re-attaches); Export Save
+  Games… (writes a standard .mcd after flushing); Delete Save Game… (the `BASLUS-00732*` file, confirmed).
+  Every swap flushes first and goes through `memcard_attach`, which closes open handles and raises the
+  card-changed flag like a real swap (`memcard_mark_new` after a delete).
+- **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
+  menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
+- Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
+  `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`. Headless: no dialogs (the file argument is
+  required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
+  unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
+  Log lines start with `menu:`; errors with `menu: ERROR:`.
+- Tests: `tools/test_menu.sh` (in `run_tests.sh`): load from `.cue` and raw `.iso` into a scratch data dir
+  with state hash equal to a plain run on that pack, 9 rejection cases, save import with backup (the game
+  really loads the imported save: ROUND COUNT byte), export, delete, invalid files. It rebuilds
+  a disc image from the pack with `tools/pak_to_bin.py` when `Destrega/Destrega.cue` is absent.
+- Not done: saves other than the game's own file, Windows/Linux menus.
+
 ## High-resolution rendering (`runtime/hires.[ch]`)
 
 Presentation-only. `gpu.c` stays the authoritative 1x GPU: every GP0 command still runs
@@ -274,11 +311,13 @@ hashing all emulated state per frame).
   position of both fighters, round time, wins, RNG seed, fighter-struct hash), `--ram-snap DIR`
   / `--ram-snap-every N` (raw RAM dumps for diffing). The run summary prints
   `widescreen: N shadow passes, M extra stage packets, R rejected` and `widescreen-frames: ...`.
-- Runtime switch (`runtime/widescreen.h`): `frontend_set_widescreen(bool)` (temporary hotkey
-  F9; for a menu item) takes effect at the next vblank. The first switch-on allocates the guard
-  band (a hi-res reconfigure, like a resize); switching off keeps it and only stops the shadow
-  pass and the wide presentation. `--widescreen` is the startup state; headless
-  `--widescreen-at F:0|1,...` schedules switches (tested by `wstoggle` in the test script).
+- Runtime switch (`runtime/widescreen.h`): View > Widescreen (16:9) (checkable, `menu_mac.m`)
+  and F9 queue the menu action `widescreen` (`=on`/`=off`, none = toggle), which calls
+  `frontend_set_widescreen(bool)`; the switch takes effect in that vblank, between frames.
+  The first switch-on allocates the guard band (a hi-res reconfigure, like a resize);
+  switching off keeps it and only stops the shadow pass and the wide presentation.
+  `--widescreen` is the startup state. Headless: `--menu-action F:widescreen[=on|off]` or
+  `--widescreen-at F:0|1,...` (both used by `wstoggle` in the test script).
 - Host-side state that generated code mutates outside guest state (e.g. PGXP tags) must be
   registered with `widescreen_add_state_hook(save, restore)`, or the wide pass leaks into the
   real one.

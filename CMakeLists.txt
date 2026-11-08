@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(destrega_recomp C)
+if(APPLE)
+  enable_language(OBJC)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 if(NOT CMAKE_BUILD_TYPE)
@@ -36,11 +39,17 @@ target_compile_options(gen PRIVATE -O1 -w -fno-strict-aliasing)
 add_executable(destrega
   runtime/main.c runtime/rt.c runtime/bus.c runtime/bios.c runtime/interp.c
   runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/memcard.c runtime/gpu.c runtime/hires.c runtime/gte.c runtime/spu.c runtime/xa.c runtime/mdec.c
-  runtime/overrides/override.c runtime/overrides/collision.c
+  runtime/overrides/override.c runtime/overrides/collision.c runtime/menu_stub.c
   runtime/overrides/widescreen.c)
 target_include_directories(destrega PRIVATE runtime gen)
 target_compile_options(destrega PRIVATE -Wall -Wno-unused-function -fno-strict-aliasing)
 target_link_libraries(destrega PRIVATE gen SDL3::SDL3 ZLIB::ZLIB m)
+if(APPLE)
+  # native File menu (Cocoa); menu_stub.c compiles to nothing on Apple
+  target_sources(destrega PRIVATE runtime/menu_mac.m)
+  set_source_files_properties(runtime/menu_mac.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall")
+  target_link_libraries(destrega PRIVATE "-framework Cocoa")
+endif()
 
 # macOS: also wrap the binary in a self-contained Destrega.app (bundled SDL3,
 # app icon, ad-hoc signature). The plain `destrega` binary is left in place for

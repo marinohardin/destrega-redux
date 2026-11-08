@@ -101,6 +101,41 @@ int main(void) {
     CHECK(memcard_attach(0, "build/tests/mc_bad.mcd") != NULL && !memcard_present(0));
     CHECK(fsize("build/tests/mc_bad.mcd") == 4);
 
+    /* validate / export / swap helpers used by the File > Memory Card menu */
+    CHECK(memcard_validate_file("build/tests/mc_bad.mcd") != NULL);
+    CHECK(memcard_validate_file("build/tests/does_not_exist.mcd") != NULL);
+    CHECK(memcard_attach(0, path) == NULL);
+    memcard_format(0);
+    int hs = memcard_open(0, "SAVE", true, 1, true);
+    CHECK(hs >= 0);
+    CHECK(memcard_write(hs, buf, 300) == 300);
+    CHECK(memcard_export(0, "build/tests/mc_export.mcd") == NULL);        /* flushes first */
+    CHECK(memcard_validate_file("build/tests/mc_export.mcd") == NULL);
+    CHECK(memcard_attach(1, "build/tests/mc_export.mcd") == NULL);
+    cur = 0;
+    CHECK(memcard_dir_next(1, "SAVE", &cur, &e));
+    CHECK(memcard_export(0, "build/tests/no_such_dir/x.mcd") != NULL);
+    uint8_t blank[MC_SIZE];
+    memcard_make_blank(blank);
+    blank[1] = 'X';
+    f = fopen("build/tests/mc_badhdr.mcd", "wb");
+    fwrite(blank, 1, MC_SIZE, f);
+    fclose(f);
+    CHECK(memcard_validate_file("build/tests/mc_badhdr.mcd") != NULL);    /* 128 KiB without "MC" */
+    blank[1] = 'C'; blank[5] ^= 1;
+    f = fopen("build/tests/mc_badsum.mcd", "wb");
+    fwrite(blank, 1, MC_SIZE, f);
+    fclose(f);
+    CHECK(memcard_validate_file("build/tests/mc_badsum.mcd") != NULL);
+    /* swapping the card closes handles open on it and raises the changed flag */
+    CHECK(memcard_attach(0, "build/tests/mc_export.mcd") == NULL);
+    CHECK(memcard_read(hs, back, 1) == -1 && memcard_new_flag(0));
+    CHECK(memcard_attach(0, NULL) == NULL && !memcard_present(0) && memcard_path(0) == NULL);
+    CHECK(memcard_attach(0, path) == NULL && !strcmp(memcard_path(0), path));
+    memcard_clear_new(0);
+    memcard_mark_new(0);
+    CHECK(memcard_new_flag(0));
+
     if (fails) { printf("memcard: %d FAILED\n", fails); return 1; }
     printf("memcard: all tests passed\n");
     return 0;

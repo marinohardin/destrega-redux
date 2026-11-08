@@ -8,8 +8,9 @@
 #   ws46     --widescreen, 4x6, worker threads
 #   wsresize --widescreen, auto scale, window resized between 16:9, 4:3, 21:9 and 16:10 mid-fight
 #   ws1      --widescreen, 1x1 with --hires-verify (the 4:3 part of the target == 1x VRAM)
-#   wstoggle starts 4:3, switched on/off six times mid-fight (--widescreen-at; the same path as
-#            frontend_set_widescreen / F9), screenshots every 50 frames
+#   wstoggle starts 4:3, switched on/off six times mid-fight: five times through View >
+#            Widescreen (--menu-action widescreen[=on|off], the path the menu and F9 take), once
+#            via --widescreen-at; screenshots every 50 frames
 # Checks:
 #  1. per frame, the gameplay trace (both fighters' health, gauge and position, round time,
 #     round wins, RNG seed, a hash of both fighter structs; --gameplay-trace) equals off's;
@@ -49,7 +50,7 @@ ws2 --widescreen --scale 2 --window 1280x720 --hires-threads 1
 ws2b --widescreen --scale 2 --window 1280x720 --hires-threads 0
 ws1 --widescreen --scale 1 --window 1280x720 --hires-verify --hires-threads 0
 off --scale 2 --hires-threads 0
-wstoggle --scale 2 --window 1280x720 --hires-threads 0 --widescreen-at 3900:1,4600:0,5300:1,6200:0,6900:1,8000:0 --dump build/widescreen/toggle --dump-every 50
+wstoggle --scale 2 --window 1280x720 --hires-threads 0 --menu-action 3900:widescreen=on --menu-action 4600:widescreen --widescreen-at 5300:1 --menu-action 6200:widescreen=off --menu-action 6900:widescreen --menu-action 8000:widescreen=off --dump build/widescreen/toggle --dump-every 50
 EOF
 START=$(date +%s)
 xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
