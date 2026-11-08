@@ -12,8 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 #include <limits.h>
+#include "platform.h"
 #include <zlib.h>
 
 void bus_init(void);
@@ -1076,15 +1076,7 @@ static bool menu_pick(bool save, const SDL_DialogFileFilter *f, int nf, const ch
 
 static bool file_exists(const char *p) { SDL_PathInfo i; return SDL_GetPathInfo(p, &i); }
 
-static bool same_file(const char *a, const char *b) {
-    if (!strcmp(a, b)) return true;
-#ifndef _WIN32
-    char ra[PATH_MAX], rb[PATH_MAX];
-    return realpath(a, ra) && realpath(b, rb) && !strcmp(ra, rb);
-#else
-    return false;
-#endif
-}
+static bool same_file(const char *a, const char *b) { return plat_same_file(a, b); }
 
 static bool copy_file(const char *src, const char *dst) {
     char tmp[2100];
@@ -1096,14 +1088,14 @@ static bool copy_file(const char *src, const char *dst) {
     while (ok && (k = fread(buf, 1, sizeof buf, i)) > 0) ok = fwrite(buf, 1, k, o) == k;
     if (i) fclose(i);
     if (o) ok = fclose(o) == 0 && ok;
-    if (ok) ok = rename(tmp, dst) == 0;
+    if (ok) ok = plat_replace_file(tmp, dst);
     if (!ok) remove(tmp);
     return ok;
 }
 
 static void dir_of(const char *path, char *out, size_t n) {
     snprintf(out, n, "%s", path);
-    char *sl = strrchr(out, '/');
+    char *sl = (char *)plat_last_sep(out);
     if (sl && sl != out) *sl = 0;
     else if (!sl) snprintf(out, n, ".");
 }
@@ -1115,7 +1107,7 @@ static void import_progress(void *ud, float frac) {
 
 /* After a new data pack is in place: re-exec the process (a clean machine, never a half-reset one). */
 static void restart_process(void) {
-    char exe[PATH_MAX];
+    char exe[4096];
     if (!menu_executable_path(exe, sizeof exe)) snprintf(exe, sizeof exe, "%s", s_argv[0]);
     char **av = calloc((size_t)s_argc + 2, sizeof *av);
     int n = 0;
@@ -1129,9 +1121,9 @@ static void restart_process(void) {
     memcard_flush();
     if (s_state_hash) fflush(s_state_hash);
     fflush(NULL);
-    setenv("DESTREGA_RESTARTED", "1", 1);
+    plat_setenv("DESTREGA_RESTARTED", "1");
     if (!s_headless) { if (s_audio) SDL_DestroyAudioStream(s_audio); SDL_Quit(); }
-    execv(exe, av);
+    plat_exec(exe, av);
     fprintf(stderr, "menu: ERROR: cannot restart (%s)\n", exe);
     exit(1);
 }
@@ -1162,7 +1154,7 @@ static void action_reveal(bool cards) {
         else if (s_card_dir[0]) snprintf(dir, sizeof dir, "%s", s_card_dir);
         else { menu_alert("No save location is known (try --memcard1 or --data-dir)."); return; }
         size_t l = strlen(dir);
-        if (l > 1 && dir[l - 1] == '/') dir[l - 1] = 0;
+        if (l > 1 && plat_is_sep(dir[l - 1])) dir[l - 1] = 0;
     } else dir_of(s_disc_path ? s_disc_path : s_pak_path, dir, sizeof dir);
     SDL_CreateDirectory(dir);
     rt_log("menu: show %s in file manager: %s", cards ? "save games" : "game files", dir);
@@ -1472,7 +1464,7 @@ int main(int argc, char **argv) {
     s_disc_path = disc_path;
     SDL_free(pref);
     if (getenv("DESTREGA_RESTARTED")) {
-        unsetenv("DESTREGA_RESTARTED");
+        plat_unsetenv("DESTREGA_RESTARTED");
         fprintf(stderr, "menu: restarted on the new data pack\n");
     }
 

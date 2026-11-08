@@ -16,11 +16,11 @@ cc_job() { # name cmd...
 }
 cc_job gte $CC runtime/gte.c runtime/pgxp.c runtime/tests/test_gte.c -o build/tests/test_gte &
 cc_job gpu $CC runtime/gpu.c runtime/pgxp.c runtime/tests/test_gpu.c -o build/tests/test_gpu &
-cc_job hires $CC runtime/gpu.c runtime/hires.c runtime/pgxp.c runtime/tests/test_hires.c -o build/tests/test_hires -lm &
-cc_job pgxp $CC runtime/gte.c runtime/gpu.c runtime/hires.c runtime/pgxp.c runtime/tests/test_pgxp.c -o build/tests/test_pgxp -lm &
+cc_job hires $CC runtime/gpu.c runtime/hires.c runtime/pgxp.c runtime/platform.c runtime/tests/test_hires.c -o build/tests/test_hires -lm &
+cc_job pgxp $CC runtime/gte.c runtime/gpu.c runtime/hires.c runtime/pgxp.c runtime/platform.c runtime/tests/test_pgxp.c -o build/tests/test_pgxp -lm &
 cc_job spu $CC runtime/spu.c runtime/xa.c runtime/tests/test_spu.c -o build/tests/test_spu &
 cc_job mdec $CC runtime/mdec.c runtime/tests/test_mdec.c -o build/tests/test_mdec -lm &
-cc_job memcard $CC runtime/memcard.c runtime/tests/test_memcard.c -o build/tests/test_memcard &
+cc_job memcard $CC runtime/memcard.c runtime/platform.c runtime/tests/test_memcard.c -o build/tests/test_memcard &
 
 # 2. the long runs start right away (the binary is already built): smoke + hi-res matrix
 tools/smoke_test.sh > build/smoke/out.txt 2>&1 &

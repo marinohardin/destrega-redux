@@ -13,9 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
-#include <unistd.h>
-#endif
+#include "platform.h"
 
 typedef struct {
     bool present, dirty, is_new;
@@ -117,10 +115,7 @@ static bool write_file_atomic(const char *path, const uint8_t *img) {
     FILE *f = fopen(tmp, "wb");
     bool ok = f && fwrite(img, 1, MC_SIZE, f) == MC_SIZE && fflush(f) == 0;
     if (f) fclose(f);
-#ifdef _WIN32
-    if (ok) remove(path);
-#endif
-    if (ok) ok = rename(tmp, path) == 0;
+    if (ok) ok = plat_replace_file(tmp, path);
     if (!ok) remove(tmp);
     free(tmp);
     return ok;
@@ -143,16 +138,9 @@ void memcard_flush(void) {
         snprintf(tmp, n, "%s.tmp", c->path);
         FILE *f = fopen(tmp, "wb");
         bool ok = f && fwrite(c->img, 1, MC_SIZE, f) == MC_SIZE && fflush(f) == 0;
-#ifndef _WIN32
-        if (ok) fsync(fileno(f));
-#endif
+        if (ok) plat_fsync(f);
         if (f) fclose(f);
-        if (ok) {
-#ifdef _WIN32
-            remove(c->path);
-#endif
-            ok = rename(tmp, c->path) == 0;
-        }
+        if (ok) ok = plat_replace_file(tmp, c->path);
         if (!ok) { fprintf(stderr, "memcard: cannot write %s\n", c->path); remove(tmp); }
         else c->dirty = false;
         free(tmp);

@@ -36,7 +36,7 @@
 #include "pgxp.h"
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include "platform.h"
 
 int g_widescreen;                       /* shadow pass on (frontend_set_widescreen, main.c) */
 extern int g_widescreen_cull;           /* rt.c: WS_IMM() yields the widened bound */
@@ -140,12 +140,7 @@ static bool s_used[2];
 static u64 s_passes, s_extras, s_rejected;
 static u64 s_cost_ns;                   /* thread CPU time of the shadow pass (all but the real run) */
 
-static u64 cpu_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
-    return (u64)t.tv_sec * 1000000000u + (u64)t.tv_nsec;
-}
+static u64 cpu_ns(void) { return plat_thread_cpu_ns(); }
 
 static int cmp_slot(const void *x, const void *y)
 {
