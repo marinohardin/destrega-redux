@@ -66,7 +66,8 @@ add_executable(destrega
   runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/memcard.c runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/gte.c runtime/pgxp.c runtime/spu.c runtime/xa.c runtime/mdec.c
   runtime/overrides/override.c runtime/overrides/collision.c runtime/menu_stub.c
   runtime/overrides/widescreen.c runtime/platform.c runtime/platform_net.c
-  runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c)
+  runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c
+  runtime/input.c runtime/settings.c)
 target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE} ${CMAKE_CURRENT_BINARY_DIR})
 # Emulation source identity for the netplay handshake (rule in tools/source_ident.py): the same
 # on every platform for the same sources.
@@ -90,7 +91,7 @@ endif()
 if(WIN32)
   # netplay UDP (net.c), local address list (platform.c), native menus (menu_win.c)
   target_link_libraries(destrega PRIVATE ws2_32 iphlpapi)
-  target_sources(destrega PRIVATE runtime/menu_win.c)
+  target_sources(destrega PRIVATE runtime/menu_win.c runtime/controls_win.c)
   # Embedded manifest (UTF-8 code page for file names) and a larger main-thread stack: the
   # recompiled code nests C calls like the game nests MIPS calls, and Windows' default 1 MiB
   # is far below the 8 MiB macOS and Linux give the main thread.
@@ -107,8 +108,8 @@ if(WIN32)
 endif()
 if(APPLE)
   # native File menu (Cocoa); menu_stub.c compiles to nothing on Apple
-  target_sources(destrega PRIVATE runtime/menu_mac.m)
-  set_source_files_properties(runtime/menu_mac.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall")
+  target_sources(destrega PRIVATE runtime/menu_mac.m runtime/controls_mac.m)
+  set_source_files_properties(runtime/menu_mac.m runtime/controls_mac.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall")
   target_link_libraries(destrega PRIVATE "-framework Cocoa")
 endif()
 
@@ -136,6 +137,15 @@ if(DESTREGA_TESTS)
     endif()
     add_test(NAME ${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
+  # input mapping + settings file (needs SDL for key names, not a display)
+  add_executable(test_input runtime/input.c runtime/settings.c runtime/platform.c runtime/tests/test_input.c)
+  target_include_directories(test_input PRIVATE runtime)
+  target_compile_options(test_input PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(test_input PRIVATE SDL3::SDL3)
+  if(UNIX)
+    target_link_libraries(test_input PRIVATE m)
+  endif()
+  add_test(NAME input COMMAND test_input WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   # SDL_GPU backend vs software on random command streams (needs a GPU device; exit 77 =
   # skipped when there is none, e.g. a CI runner without Vulkan)
   add_executable(test_hires_gpu runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c

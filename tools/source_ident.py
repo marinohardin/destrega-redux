@@ -12,7 +12,8 @@ were recompiled from which original bytes) and the disc. The rule:
     builds that differ there are refused, even if the change looks harmless.
   - not covered: what only one platform compiles or what is presentation only and proven not to
     reach emulated state (native menus, the platform shims, the hi-res / GPU renderers and their
-    shaders, Windows resources), plus tools, tests and docs. A Mac and a Windows build of the
+    shaders, Windows resources), the input layer and settings file (host keys -> pad bits; the
+    bits are what netplay exchanges), plus tools, tests and docs. A Mac and a Windows build of the
     same commit therefore agree, and so do builds that differ only in those files.
   - contents are hashed with line endings normalised (CR LF -> LF), so a Windows checkout with
     core.autocrlf hashes like a Unix one. The compiler, OS and build type are not part of it:
@@ -29,6 +30,11 @@ EXCLUDE = {
     "runtime/menu_mac.m", "runtime/menu_win.c", "runtime/menu_stub.c", "runtime/menu.h",
     "runtime/platform.c", "runtime/platform_net.c", "runtime/platform.h",
     "runtime/hires.c", "runtime/hires.h", "runtime/hires_gpu.c", "runtime/hires_gpu.h",
+    # host input -> pad bits and the settings file: they decide which key or controller button
+    # sets which pad bit on this machine, never what the emulated machine does with the bits
+    # (netplay exchanges the bits themselves, replays record them)
+    "runtime/input.c", "runtime/input.h", "runtime/settings.c", "runtime/settings.h",
+    "runtime/controls_mac.m", "runtime/controls_win.c",
 }
 
 
