@@ -140,7 +140,10 @@ static const char s_msl[] =
 /* 64-bit integer division is emulated on Apple GPUs (and costs about as much as the rest of a
  * pixel), so, as in hires.glsl, none is left on the per-pixel path: floor/trunc of 32-bit values
  * by small positive divisors, and float estimates corrected exactly with integer multiplies */
-"static inline int floordiv(int a, int b) { int q = a / b; if (q * b != a && a < 0) q -= 1; return q; }\n"
+/* floor(a / b) for b > 0 and |a / b| < 2^21: the float quotient is within 1 of it, then exact */
+"static inline int floordiv(int a, int b) {\n"
+"  int q = int(floor(float(a) / float(b))), r = a - q * b;\n"
+"  return r < 0 ? q - 1 : (r >= b ? q + 1 : q); }\n"
 /* floor of the 1x plane equation at hi-res pixel (n = 2X+1-Sx, m = 2Y+1-Sy), exactly:
  * E = cint + qx*n + qy*m + floor((cf*D + 65536*G) / (65536*D)), D = 4*Sx*Sy,
  * G = rx*n*2*Sy + ry*m*2*Sx; with G = q*D + r the last term is q + (cf*D + 65536*r >= 65536*D) */
@@ -311,15 +314,18 @@ static const char s_msl[] =
 /* hires.c's attribute value at X: the plane equation at the span start, then stepped by the
  * per-pixel gradient truncated to an integer (gdx / Sx) */
 "static inline long attr_span(device const Prim &p, int i, int xs, int X, int m, int sx, int sy) {\n"
-"  int gdx = int(uint(p.qx[i]) * uint(2 * sx) + (p.rxy[i] & 0xFFu));\n"   /* the original 32-bit gradient */
-"  return attr(p, i, 2 * xs + 1 - sx, m, sx, sy) + long(X - xs) * long(gdx / sx); }\n"
+"  int qx = p.qx[i], rx = int(p.rxy[i] & 0xFFu);\n"
+/* gdx / Sx truncated, without dividing: gdx = qx*2Sx + rx with 0 <= rx < 2Sx (gdx is negative
+ * exactly when qx is, and inexact unless rx is 0 or Sx) */
+"  int step = 2 * qx + (rx >= sx ? 1 : 0) + ((qx < 0 && rx != 0 && rx != sx) ? 1 : 0);\n"
+"  return attr(p, i, 2 * xs + 1 - sx, m, sx, sy) + long(X - xs) * long(step); }\n"
 "fragment float4 fs_prim(VO in [[stage_in]], constant FU &u [[buffer(0)]], device const Prim *prims [[buffer(1)]],\n"
 "    texture2d<float> tmp [[texture(0)]], texture2d<uint> putt [[texture(1)]], texture2d<ushort> vram [[texture(2)]]) {\n"
 "  device const Prim &p = prims[in.prim];\n"
 "  int X = int(in.pos.x) + u.ox, Y = int(in.pos.y) + u.oy;\n"
 "  uint kf = p.kf, kind = kf & 15u;\n"
 "  int hp = u.p0;\n"
-"  int x1 = (X >= 0 ? X : X - u.sx + 1) / u.sx, y1 = Y / u.sy;\n"
+"  int x1 = floordiv(X, u.sx), y1 = Y >= 0 ? floordiv(Y, u.sy) : Y / u.sy;\n"
 "  if (kind == 2u) { if (u.pass != 0) discard_fragment(); return pack4(c15u(p.color & 0xFFFFu, hp), 0, 0, hp); }\n"
 "  if (kind == 6u) return pack4(c15u(vram_at(vram, uint(x1), uint(y1)), hp), 0, 0, hp);\n"
 "  if (kind == 4u) {\n"
