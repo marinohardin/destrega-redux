@@ -374,7 +374,8 @@ heavy story one), one counter per recompiled function (first execution recorded)
 - Test runtime (the machine had load averages 100-370 from other work, so wall times are unreliable):
   default replay set 29 replays, 255k frames, heavy `--all` +26k (story); headless runs are ~200x real
   time when idle (30k frames ~ 13 s), i.e. ~110 s CPU for the default set, ~30 s wall on 10 idle cores
-  (estimate: not measured idle). Measured under load 100-370: the whole `coverage.py run` took ~40 min.
+  (estimate). Measured: `replays.py run` (default set + the 3 variants + selftest, 33 jobs, -j 10) 93 s wall at load
+  average 62-80 on 10 cores; under load 100-370 the whole `coverage.py run` (everything, one at a time) took ~40 min.
 
 ## Save states and the snapshot-safe point (runtime/savestate.c)
 

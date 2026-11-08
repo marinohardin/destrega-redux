@@ -269,7 +269,7 @@ def png_stats(path):
     return lit / (w * h), len(cols)
 
 
-def run_one(scn, outdir, extra=(), dump_every=100, trace=True, timeout=900, verify=True):
+def run_one(scn, outdir, extra=(), dump_every=100, trace=True, timeout=int(os.environ.get("SCN_TIMEOUT", "7200")), verify=True):
     os.makedirs(outdir, exist_ok=True)
     for f in os.listdir(outdir):
         if f.endswith('.png'): os.remove(os.path.join(outdir, f))
