@@ -257,14 +257,34 @@ static u16 script_mask(const InputStep *sc, int n) {
     return m;
 }
 
+/* Full screen: the mouse pointer hides after 2 s without movement and comes back when the mouse
+ * moves (e.g. to the top of the screen for the menu bar on macOS). Windowed it always shows. */
+#define CURSOR_IDLE_NS 2000000000ull
+static u64 s_mouse_moved_ns;
+static void cursor_idle_update(void) {
+    if (!s_win) return;
+    bool fs = (SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN) != 0;
+    bool hide = fs && SDL_GetTicksNS() - s_mouse_moved_ns > CURSOR_IDLE_NS;
+    if (hide == !SDL_CursorVisible()) return;
+    if (hide) SDL_HideCursor();
+    else SDL_ShowCursor();
+}
+
 static void poll_events(void) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) exit(0);
+        if (e.type == SDL_EVENT_MOUSE_MOTION || e.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+            e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
+            s_mouse_moved_ns = SDL_GetTicksNS();
         if (input_capture_event(&e)) continue;   /* press-to-bind (Controls window) */
         if (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) {
             bool down = e.type == SDL_EVENT_KEY_DOWN;
-            if (e.key.key == SDLK_ESCAPE && down) exit(0);
+            if (e.key.key == SDLK_ESCAPE && down) {   /* full screen: leave it (macOS habit); windowed: quit */
+                if (!frontend_fullscreen()) exit(0);
+                if (!e.key.repeat) frontend_menu_action("fullscreen", "off");
+                continue;
+            }
             if (e.key.key == SDLK_TAB) s_fast = down;
             if (e.key.key == SDLK_F9 && down && !e.key.repeat)   /* = View > Widescreen (16:9) */
                 frontend_menu_action("widescreen", NULL);
@@ -292,6 +312,7 @@ static void poll_events(void) {
         window_settings_event(&e);
         input_handle_event(&e);
     }
+    cursor_idle_update();
 }
 
 /* This frame's pads: host input (input.c) plus the --press scripts. */
@@ -1605,6 +1626,10 @@ static void create_window(void) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         exit(1);
     }
+    /* macOS: keep the menu bar reachable (mouse to the top of the screen) in full screen. SDL's
+     * default hides it completely when full screen is entered by SDL_SetWindowFullscreen, which
+     * is every path here (View menu, Ctrl+Cmd+F, Alt+Enter, F11), leaving only the shortcut. */
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_MENU_VISIBILITY, "1");
     s_win = SDL_CreateWindow("Destrega (recompiled)", s_win_w, s_win_h,
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     s_ren = NULL;
