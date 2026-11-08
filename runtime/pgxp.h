@@ -29,6 +29,8 @@ typedef struct {
     u32 sxy;        /* the integer SXY word this vertex was produced as */
     float dx, dy;   /* precise screen position minus the integer SX / SY */
     float w;        /* view depth (the unclamped SZ), > 0 */
+    u32 site;       /* diagnostics: guest function that ran the RTPS/RTPT */
+    u32 frame;      /* diagnostics: g_pgxp_frame when it was produced */
 } PgxpVert;
 
 #define PGXP_POOL_BITS 18
@@ -103,6 +105,14 @@ void pgxp_reset(void);                       /* drop every association */
 /* Diagnostics: polygon vertices sent to the hi-res target, and those with a valid precise
  * vertex (counted in gpu.c while hi-res and tracking are on). */
 extern u64 g_pgxp_stat_vtx, g_pgxp_stat_hit, g_pgxp_stat_new;
+extern u32 g_pgxp_frame;                     /* bumped every vblank (diagnostics) */
+extern const u32 *g_pgxp_callstack;          /* optional: rt.c call stack, for pgxp_new's site */
+extern const u32 *g_pgxp_depth;
+/* Diagnostics: check a triangle about to be drawn with precise vertices. */
+typedef struct { const PgxpVert *v; } PgxpTriCheck;
+void pgxp_check_tri(const PgxpVert *const q[3], const u32 sxy[3]);
+extern int g_pgxp_diag;                      /* --pgxp-diag N: log up to N suspicious triangles */
+extern u64 g_pgxp_stat_bad_d, g_pgxp_stat_bad_w, g_pgxp_stat_old, g_pgxp_stat_tris;
 /* Misses whose integer word equals a recent GTE result (a hash set of the last ~64K produced
  * words): an estimate of GTE vertices whose association was lost on the way (the rest are
  * mostly 2D primitives computed by the CPU), and misses that carried a stale tag. */

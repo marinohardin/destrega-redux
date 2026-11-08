@@ -533,6 +533,8 @@ static void gp0_polygon(const u32 *w)
     int n = quad ? 4 : 3;
     Vtx v[4];
     PVtx pv[4];
+    const PgxpVert *pq[4] = { 0 };
+    u32 pxy[4] = { 0 };
     bool any_pv = false;
     const bool want_pv = g_hires && g_pgxp;
     int i = 0;
@@ -545,6 +547,7 @@ static void gp0_polygon(const u32 *w)
         if (want_pv) {
             const PgxpVert *q = pgxp_lookup(s_cmd_tag[i], w[i]);
             g_pgxp_stat_vtx++;
+            pq[k] = q; pxy[k] = w[i];
             if (q) {
                 pv[k].dx = q->dx; pv[k].dy = q->dy; pv[k].w = q->w; pv[k].ok = true;
                 any_pv = true;
@@ -581,6 +584,10 @@ static void gp0_polygon(const u32 *w)
     p.dither = ((s_drawmode >> 9) & 1) && (gour || (tex && !raw));
     if (tex && raw) {
         for (int k = 0; k < n; k++) v[k].r = v[k].g = v[k].b = 0x80;
+    }
+    if (any_pv) {
+        pgxp_check_tri(pq, pxy);
+        if (quad) pgxp_check_tri(pq + 1, pxy + 1);
     }
     draw_tri(&p, &v[0], &v[1], &v[2], any_pv ? &pv[0] : NULL, tex, raw, semi, shaded);
     if (quad) draw_tri(&p, &v[1], &v[2], &v[3], any_pv ? &pv[1] : NULL, tex, raw, semi, shaded);
@@ -1071,6 +1078,7 @@ u32 gpu_read_stat(void)
 
 void gpu_vblank(void)
 {
+    g_pgxp_frame++;
     if (interlaced()) s_field = !s_field;
 }
 

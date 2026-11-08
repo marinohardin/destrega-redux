@@ -21,6 +21,7 @@ static bool s_headless, s_fast;
 static u64 s_frame, s_max_frames;
 static const char *s_dump_dir;
 static int s_dump_every;
+static u64 s_dump_from;           /* --dump-from F: first frame written by --dump */
 static u64 s_next_tick_ns;
 static u32 s_rgba[640 * 512];
 static FILE *s_wav;
@@ -328,6 +329,11 @@ static void finish(void) {
                (unsigned long long)s_verify_bad_frames);
         if (s_verify_bad_frames || !s_verify_fight) rc = 3;
     }
+    if (g_pgxp_stat_tris)
+        rt_log("pgxp-check: %llu triangles with precise vertices; %llu with a vertex > 1.5 px from its integer, "
+               "%llu with depth ratio > 2, %llu using a value older than 2 frames",
+               (unsigned long long)g_pgxp_stat_tris, (unsigned long long)g_pgxp_stat_bad_d,
+               (unsigned long long)g_pgxp_stat_bad_w, (unsigned long long)g_pgxp_stat_old);
     if (g_pgxp_stat_vtx) {
         u64 tris, persp;
         hires_get_persp_stats(&tris, &persp);
@@ -460,7 +466,7 @@ void frontend_vblank(void) {
         for (int i = 0; i < s_script_n; i++)
             if (s_script[i].frame <= s_frame && s_frame < s_script[i].frame + 6) pad |= s_script[i].mask;
         g_pad_buttons[0] = (u16)~pad;
-        if (s_dump_dir && s_dump_every && s_frame % s_dump_every == 0) {
+        if (s_dump_dir && s_dump_every && s_frame >= s_dump_from && s_frame % s_dump_every == 0) {
             char p[512];
             snprintf(p, sizeof p, "%s/frame_%06llu.png", s_dump_dir, (unsigned long long)s_frame);
             frontend_screenshot(p);
@@ -597,6 +603,7 @@ static void usage(void) {
         "  --frames N            exit after N frames (headless)\n"
         "  --dump DIR            write screenshots to DIR (headless)\n"
         "  --dump-every N        screenshot every N frames\n"
+        "  --dump-from F         first frame --dump writes (default 0)\n"
         "  --press F:MASK,...    headless input script (MASK = hex PSX button bits, active high)\n"
         "  --wav FILE            record audio output (headless)\n"
         "  --scale N|NxM         internal render scale (horizontal x vertical): 0 = hi-res off, 1..8\n"
@@ -699,6 +706,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) s_max_frames = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) s_dump_dir = argv[++i];
         else if (!strcmp(argv[i], "--dump-every") && i + 1 < argc) s_dump_every = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dump-from") && i + 1 < argc) s_dump_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--trace")) g_trace++;
         else if (!strcmp(argv[i], "--no-interp")) g_no_interp = 1;
         else if (!strcmp(argv[i], "--verify-overrides")) { g_verify_overrides = 1; atexit(override_report); }
@@ -737,6 +745,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fight-from") && i + 1 < argc) s_fight_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--hires-min-fight") && i + 1 < argc) s_hires_min_fight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
+        else if (!strcmp(argv[i], "--pgxp-diag") && i + 1 < argc) g_pgxp_diag = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pgxp") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "on")) s_pgxp = 2;
@@ -822,6 +831,7 @@ int main(int argc, char **argv) {
     gpu_init();
     hires_set_dither(s_hires_dither);
     g_pgxp = s_pgxp > 0;
+    { extern u32 g_callstack[1024]; extern u32 g_depth; g_pgxp_callstack = g_callstack; g_pgxp_depth = &g_depth; }
     hires_set_perspective(s_pgxp == 2);
     hires_set_threads(s_hires_threads);
     if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))
