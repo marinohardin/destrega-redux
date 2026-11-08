@@ -367,3 +367,31 @@ bool memcard_erase(int port, const char *name) {
     c->is_new = false;
     return true;
 }
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+/* Images, card-changed flags and open files. The attached file paths and write protection are
+ * host settings, not machine state. A restored image that differs from the current one is
+ * marked dirty so the next flush writes it (no-op while write-protected, e.g. netplay). */
+void memcard_state_io(StateIO *io) {
+    for (int p = 0; p < 2; p++) {
+        Card *c = &s_card[p];
+        bool present = c->present;
+        SS_VAR(io, present);
+        SS_VAR(io, c->is_new);
+        if (io->mode == SS_LOAD && present != c->present) {   /* different card setup: skip */
+            if (present) io->pos += MC_SIZE;
+            continue;
+        }
+        if (!present) continue;
+        if (io->mode == SS_LOAD) {
+            if (io->pos + MC_SIZE <= io->cap && memcmp(c->img, io->buf + io->pos, MC_SIZE)) c->dirty = true;
+        }
+        ss_io(io, c->img, MC_SIZE);
+    }
+    for (int i = 0; i < MC_MAXFD; i++) {
+        Fd *f = &s_fd[i];
+        SS_VAR(io, f->used); SS_VAR(io, f->writable); SS_VAR(io, f->port); SS_VAR(io, f->head);
+        SS_VAR(io, f->size); SS_VAR(io, f->pos);
+    }
+}

@@ -179,7 +179,49 @@ a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as 
 - **Rollback netplay (future, not implemented): card writes must be suppressed during netplay**
   (a rolled-back frame must not leave files behind, and the two peers' cards differ). The hook is
   `memcard_set_write_protect(true)` (in-memory state keeps updating, flushing becomes a no-op);
-  card state must also be part of any snapshot (`memcard_hash` shows what it covers).
+  card state is part of every save state (`memcard_state_io`: images, changed flags, open files; a
+  load that changes an image marks it dirty).
+
+## Save states (`runtime/savestate.[ch]`)
+
+Complete snapshots of the emulated machine, taken and restored only at the frame boundary.
+
+- Every hardware module has one visitor `<module>_state_io(StateIO *)` at the bottom of its file
+  (rt.c cpu, bus.c, bios.c, gpu.c, gte.c, spu.c, cdrom.c, mdec.c, sio.c, memcard.c) listing its
+  state variables; the same visitor saves, loads and hashes (`SS_VAR`, `ss_io`, header-only so
+  module unit tests still link alone). **A new piece of emulated state must be added to its
+  module's visitor**, or rewinds will diverge (the tests below catch it). Scheduler callbacks are
+  host pointers: saved raw, hashed only as null / non-null (comparable across processes).
+  Presentation-only state is not saved; a load re-seeds the hi-res target from the 1x VRAM
+  (`hires_reseed`) and drops PGXP associations.
+- **Frame boundary**: `bus.c vblank_cb` calls `ss_vblank_begin()` before `frontend_vblank()` and
+  `ss_vblank_end()` after it (inputs for the frame are final there). Guest code is a C call chain,
+  so a snapshot is only restorable while the host is at the same point of that chain: the
+  snapshot stores the host return-address chain (`backtrace()`; `CaptureStackBackTrace` on Windows),
+  the host frame address and the shadow call stack, and `ss_restore` refuses a different context.
+  Not snapshot-safe: inside an interrupt handler, or while `g_ss_unsafe > 0` (C helpers that keep
+  guest state in locals: bios.c event delivery / SysEnqIntRP calls, override verification, the
+  interpreter). Increment `g_ss_unsafe` around any new C code that calls guest code and keeps
+  guest-derived values in locals across the call. Details and measurements: analysis/NOTES.md
+  "Save states and the snapshot-safe point". In fights only every second vblank (the one where the
+  game waits in `vsync_wait` 8009b670) is restorable: one point per 30 Hz update.
+- Cost: ~3.6 MB per snapshot; save ~0.1 ms, load ~0.2 ms average (< 1 ms max).
+- Re-simulated frames (`ss_resimulating()`): `frontend_vblank` only advances the SPU (735 samples)
+  and the `--press` script; no presentation, audio output, dumps or per-frame logs.
+  `ss_deterministic_audio()`: windowed runs render exactly 735 SPU samples per vblank (no extra
+  underrun render, which advanced the SPU depending on host timing) when recording / replaying /
+  testing.
+- Options: `--savestate-test N:M,...` (save at N, restore at the first frame >= M with the same
+  context, re-run; every frame's complete state hash must equal the first pass; a point whose
+  context does not recur is retried later), `--savestate-rewind E:D` (the same every E frames for
+  the whole run), `--savestate-inplace E` (save, overwrite all state with garbage, load: round
+  trip), `--ss-hash FILE` (per-frame complete state hash of the final timeline), `--ss-stats F`
+  (safe points and host contexts at vblanks from frame F). Failures exit with status 7.
+- Tests: `tools/test_savestate.sh` (11 points across logo, FMV/XA, title, menus, character select,
+  stage load and fight; a whole run rewinding every 37 frames with a memory card, whose per-frame
+  hashes, `--state-hash` and card file must equal a plain run's; in-place round trips) and
+  `scenarios.py savestate` (every scenario with rewinds every 41 frames + round trips every 13:
+  `--state-hash` and complete state hash equal to a plain run). Both run in `tools/run_tests.sh`.
 
 ## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
 

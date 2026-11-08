@@ -64,6 +64,8 @@
 80093d08  func   -                          verified  probe      only calls 80095f98; the caller that changes GTE H during fights (camera zoom)
 800951c0  label  -                          verified  agents-md  branch target that is another branch's delay slot (tracer pitfall)
 80095f98  func   SetGeomScreen              verified  probe      libgte: ctc2 H (GTE reg 26); H changes during fights between ~0x38a and 0x3bb (camera zoom); OFX/OFY stay 0
+8009b4f8  func   VSync                      likely    code       libetc VSync(mode): reads a pointer at 800be17c (GPUSTAT/counter, guess) and the vblank count 800bf2b4, waits in vsync_wait (8009b670); frame_sync calls it
+8009b670  func   vsync_wait                 likely    code       libetc VSync helper: spins while the vblank count at 800bf2b4 < a0, timeout counter a1<<15 (prints via 80099328 on timeout); also verified/trace: innermost guest function at the VSync-wait vblank of every 30 Hz fight update (--ss-stats: 2100 of 4200 fight vblanks, one host context)
 8009b8bc  func   ResetCallback              verified  code       libetc; setjmps into 800be224 and passes it to HookEntryInt
 8009b924  label  resetcallback_irq_resume   verified  test       setjmp return point resumed on every IRQ; seeded as its own native entry (extra_seeds.txt)
 8009b994  func   irq_dispatcher             verified  code       libetc interrupt dispatcher; ends in ReturnFromException (C longjmp in rt.c)

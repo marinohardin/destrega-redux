@@ -1159,6 +1159,18 @@ bool hires_set_scale(int sx, int sy)
     return true;
 }
 
+/* Re-seed the target from the current 1x VRAM (after a save state is loaded). */
+void hires_reseed(void)
+{
+    if (!g_hires) return;
+    const HiresBackend *be = g_hires;
+    if (!be->configure(gpu_vram(), s_cur_sx, s_cur_sy, s_rx, s_ry, s_rw, s_rh)) {
+        g_hires = NULL;
+        s_cur_sx = s_cur_sy = 0;
+        s_cur_gx = 0; g_hires_guard = 0;
+    }
+}
+
 bool hires_get_scale(int *sx, int *sy)
 {
     if (sx) *sx = g_hires ? s_cur_sx : 0;

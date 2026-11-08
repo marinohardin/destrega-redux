@@ -7,6 +7,7 @@
 #include "widescreen.h"
 #include "hires_gpu.h"
 #include "overrides/override.h"
+#include "savestate.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -494,11 +495,13 @@ static void ws_apply(void) {
 
 extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g_hires_stat_inline_jobs;
 static void finish(void) {
+    ss_finish();   /* savestate / replay / netplay reports (savestate.c) */
     void widescreen_report(void); widescreen_report();
     if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
     if (s_state_hash) fclose(s_state_hash);
     if (s_gameplay) fclose(s_gameplay);
     int rc = 0;
+    { int ss_failed(void); if (ss_failed()) rc = 7; }
     if (s_ws_used)
         rt_log("widescreen-frames: %llu presented wider than 4:3 (%llu in fight window of %llu)",
                (unsigned long long)s_ws_wide[0], (unsigned long long)s_ws_wide[1],
@@ -611,8 +614,26 @@ static void finish(void) {
     exit(rc);
 }
 
+/* --press / --press2 scripts for the current frame (taps held 6 frames). */
+static void script_pads(void) {
+    u16 pad = 0;
+    for (int i = 0; i < s_script_n; i++)
+        if (s_script[i].frame <= s_frame && s_frame < s_script[i].frame + 6) pad |= s_script[i].mask;
+    g_pad_buttons[0] = (u16)~pad;
+    u16 pad2 = 0;
+    for (int i = 0; i < s_script2_n; i++)
+        if (s_script2[i].frame <= s_frame && s_frame < s_script2[i].frame + 6) pad2 |= s_script2[i].mask;
+    if (s_script2_n) g_pad_buttons[1] = (u16)~pad2;
+}
+
 void frontend_vblank(void) {
     s_frame++;
+    if (ss_resimulating()) {   /* rollback / save-state re-run: emulation only (savestate.h) */
+        static s16 resim_audio[735 * 2];
+        spu_render(resim_audio, 735);
+        if (s_headless) script_pads();
+        return;
+    }
     for (int i = 0; i < s_ws_step_n; i++)
         if (s_ws_steps[i].frame == s_frame) s_ws_req = s_ws_steps[i].on;
     ws_apply();
@@ -738,14 +759,7 @@ void frontend_vblank(void) {
     if (s_headless) {
         spu_render(audio, 735);
         if (s_wav) { fwrite(audio, 4, 735, s_wav); s_wav_bytes += 735 * 4; }
-        u16 pad = 0;
-        for (int i = 0; i < s_script_n; i++)
-            if (s_script[i].frame <= s_frame && s_frame < s_script[i].frame + 6) pad |= s_script[i].mask;
-        g_pad_buttons[0] = (u16)~pad;
-        u16 pad2 = 0;
-        for (int i = 0; i < s_script2_n; i++)
-            if (s_script2[i].frame <= s_frame && s_frame < s_script2[i].frame + 6) pad2 |= s_script2[i].mask;
-        if (s_script2_n) g_pad_buttons[1] = (u16)~pad2;
+        script_pads();
         if (s_dump_dir && s_dump_every && s_frame >= s_dump_from && s_frame % s_dump_every == 0) {
             char p[512];
             snprintf(p, sizeof p, "%s/frame_%06llu.png", s_dump_dir, (unsigned long long)s_frame);
@@ -796,7 +810,8 @@ void frontend_vblank(void) {
     if (SDL_GetAudioStreamQueued(s_audio) < 735 * 4 * 6 && !s_fast)
         SDL_PutAudioStreamData(s_audio, audio, 735 * 4);
     if (SDL_GetAudioStreamQueued(s_audio) < 735 * 4 * 2 && !s_fast) {
-        spu_render(audio, 367);
+        /* the extra render advances the SPU: not allowed when emulation must be reproducible */
+        if (!ss_deterministic_audio()) spu_render(audio, 367);
         SDL_PutAudioStreamData(s_audio, audio, 367 * 4);
     }
 
@@ -950,6 +965,7 @@ static void usage(void) {
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
+    ss_usage();
 }
 
 /* ---- first-launch import (bring your own disc) ----------------------------------- */
@@ -1335,6 +1351,8 @@ static void create_window(void) {
 int main(int argc, char **argv) {
     const char *disc_path = NULL, *import_path = NULL, *data_dir = NULL;
     s_argc = argc; s_argv = argv;
+    int ss_k;
+    ss_set_frame_counter(&s_frame);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--headless")) s_headless = true;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) s_max_frames = strtoull(argv[++i], 0, 0);
@@ -1454,6 +1472,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--import") && i + 1 < argc) import_path = argv[++i];
         else if (!strcmp(argv[i], "--data-dir") && i + 1 < argc) data_dir = argv[++i];
         else if (!strcmp(argv[i], "--help")) { usage(); return 0; }
+        else if ((ss_k = ss_parse_arg(argc, argv, i)) > 0) i += ss_k - 1;   /* savestate.c / replay.c */
         else disc_path = argv[i];
     }
 

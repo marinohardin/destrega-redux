@@ -109,6 +109,7 @@ bool hires_get_dither(void);                  /* --hires-dither setting */
  * current 1x VRAM. Never touches emulated state. */
 bool hires_set_scale(int sx, int sy);
 bool hires_get_scale(int *sx, int *sy);   /* false when off */
+void hires_reseed(void);                 /* re-seed the target from the 1x VRAM (save-state load) */
 /* 1x VRAM rectangle the target tracks (default 0,0,512,480). Takes effect on the
  * next hires_set_scale(). */
 void hires_set_region(int rx, int ry, int rw, int rh);

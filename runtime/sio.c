@@ -89,3 +89,11 @@ void sio_write(u32 off, u32 v, int size) {
     case 0xe: s_baud = (u16)v; break;
     }
 }
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+void sio_state_io(StateIO *io) {
+    SS_VAR(io, s_mode); SS_VAR(io, s_ctrl); SS_VAR(io, s_baud); SS_VAR(io, s_stat_irq);
+    SS_VAR(io, s_rx_full); SS_VAR(io, s_rx); SS_VAR(io, s_step); SS_VAR(io, s_device);
+    SS_VAR(io, s_pending_rx); SS_VAR(io, s_pending_ack);
+}

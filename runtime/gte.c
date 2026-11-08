@@ -649,3 +649,7 @@ void gte_restore(const GteState *s)
     memcpy(c, s->c, sizeof c);
     g_flag = s->flag;
 }
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+void gte_state_io(StateIO *io) { SS_VAR(io, d); SS_VAR(io, c); SS_VAR(io, g_flag); }

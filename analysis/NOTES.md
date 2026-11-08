@@ -282,6 +282,43 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
   frame is not black/flat. The fingerprints were recorded after looking at the key frames
   (`scenarios.py record`); if the game flow legitimately changes, re-record and re-look.
 
+## Save states and the snapshot-safe point (runtime/savestate.c)
+
+- **Where emulated state lives** (verified: `--savestate-rewind` over every scenario, every re-run
+  frame hashes like its first run): `g_cpu` (rt.c, incl. cycles / next_event / COP0); bus.c (RAM,
+  scratchpad, scheduler slots incl. their callbacks, I_STAT/I_MASK, timers, DMA registers and
+  completion times, misc I/O words, `g_frame_start`); bios.c (events, SysEnqIntRP chains, the
+  HookEntryInt buffer address, pad buffers, card completion queue, directory cursor,
+  `g_pad_buttons`); gpu.c (1x VRAM, GPUSTAT bits, draw/texture/display state, the GP0 FIFO and
+  VRAM transfers, polyline state); gte.c; spu.c (RAM, regs, voices incl. ADPCM history / ADSR /
+  sweeps, reverb, noise, capture position, the unplayed part of the CD-audio ring); cdrom.c
+  (registers, position, 8 sector buffers, interrupt queue, XA decoder); mdec.c (tables, received
+  parameter words, unread output words); sio.c; memcard.c (images, changed flags, open files); the
+  frontend frame counter (scripted input is keyed by it). Presentation-only state (hi-res target,
+  PGXP associations, widescreen captures, GPU tracking for the UV clamp) is not saved; a load
+  re-seeds the hi-res target from the 1x VRAM and drops PGXP associations.
+- Kernel tables and the guest stack are in RAM / scratchpad (the fight stack is in the scratchpad).
+- **Snapshot-safe point** (verified: tests): recompiled guest code is a C call chain, so the host
+  stack holds the guest's return addresses. Generated code keeps no guest value in a C local across
+  a call or an `EVT_CHECK` (conditions and jump targets are consumed first), so at any `EVT_CHECK`
+  the globals are the whole machine *given the host call chain*. A snapshot is taken in the VBlank
+  scheduler event (`bus.c vblank_cb` -> `ss_vblank_begin`, before `frontend_vblank`) and can only be
+  restored at a vblank whose host context is identical: same host return-address chain
+  (`backtrace()` / `CaptureStackBackTrace`), same host frame address, same shadow call stack.
+  Excluded: vblanks inside an interrupt handler (`take_interrupt` keeps the interrupted `Cpu` in a
+  local; 16-18 per boot-to-fight run) and inside C helpers that keep guest state in locals
+  (`g_ss_unsafe`: bios.c event delivery and SysEnqIntRP calls, override verification, the
+  interpreter). The widescreen shadow pass runs with `next_event = ~0`, so no vblank happens in it.
+- **How often it recurs** (verified: `--ss-stats 3800`, frames 3800-8000 of the smoke fight, 4200
+  vblanks): fights alternate. The vblank after a 30 Hz update's work is spent in `vsync_wait`
+  (8009b670) with one host context (2100 = every second vblank); the other vblank lands in the middle
+  of the update (1740 in `char_mesh_quads_to_ot` 800363c8, the rest spread over ~20 points in the
+  renderers). So a fight has exactly one restorable point per game update. Menus and the title wait
+  in VSync too (few contexts, recurring); FMV playback waits at 80049d64 (STR loop). Character select
+  around frame 2450 of the smoke script did not recur within 120 frames (one-off contexts).
+- Cost (measured, Apple M-series, headless): 3.55 MB per snapshot (3.68 with a card), save avg
+  0.08-0.15 ms (max 0.45), load avg 0.18-0.29 ms (max 0.9) incl. PGXP reset.
+
 ## Cleanup priority (readable C / overrides)
 
 Highest value first. Move items to "done" with the PR that did them.

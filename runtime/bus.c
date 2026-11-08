@@ -2,6 +2,7 @@
 #include "psx.h"
 #include "mdec.h"
 #include "pgxp.h"
+#include "savestate.h"
 
 u32 sio_read(u32 off, int size);
 void sio_write(u32 off, u32 v, int size);
@@ -465,7 +466,9 @@ static void vblank_cb(void) {
     g_frame_start = g_cpu.cycles;
     gpu_vblank();
     irq_raise(IRQ_VBLANK);
+    ss_vblank_begin();    /* frame boundary: save states / rollback (savestate.c) */
     frontend_vblank();
+    ss_vblank_end();      /* inputs for this frame are final: replay / netplay */
     sched_event(EVT_VBLANK, CYCLES_PER_FRAME, vblank_cb);
 }
 
@@ -476,4 +479,27 @@ void bus_init(void) {
     for (int n = 0; n < 3; n++) s_tmr[n] = (Timer){0};
     g_cpu.next_event = ~0ull;
     sched_event(EVT_VBLANK, CYCLES_PER_FRAME, vblank_cb);
+}
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+void bus_state_io(StateIO *io) {
+    ss_io(io, g_ram, sizeof g_ram);
+    ss_io(io, g_scratch, sizeof g_scratch);
+    for (int i = 0; i < EVT_COUNT; i++) {
+        SS_VAR(io, s_events[i].when);
+        SS_VAR(io, s_events[i].active);
+        ss_io_ptr(io, &s_events[i].cb, sizeof s_events[i].cb);
+    }
+    SS_VAR(io, g_istat); SS_VAR(io, g_imask);
+    for (int n = 0; n < 3; n++) {
+        SS_VAR(io, s_tmr[n].mode); SS_VAR(io, s_tmr[n].target);
+        SS_VAR(io, s_tmr[n].base); SS_VAR(io, s_tmr[n].base_val);
+    }
+    SS_VAR(io, s_tmr_due);
+    SS_VAR(io, s_dma_madr); SS_VAR(io, s_dma_bcr); SS_VAR(io, s_dma_chcr);
+    SS_VAR(io, s_dpcr); SS_VAR(io, s_dicr);
+    SS_VAR(io, s_dma_done_at); SS_VAR(io, s_dma_queued);
+    SS_VAR(io, s_io_misc); SS_VAR(io, s_spu_last);
+    SS_VAR(io, g_frame_start);
 }

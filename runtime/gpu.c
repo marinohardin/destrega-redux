@@ -1221,3 +1221,24 @@ void gpu_init(void)
     s_read_latch = 0;
     gpu_reset_state();
 }
+
+/* ---- save states (savestate.h) ---------------------------------------------- */
+#include "savestate.h"
+/* Emulated GPU state only: the presentation-only parts (hi-res forwarding, shadow packets,
+ * PGXP tags, UV/colour tracking for the hi-res clamp) are not part of the machine. */
+void gpu_state_io(StateIO *io) {
+    SS_VAR(io, s_vram);
+    SS_VAR(io, s_stat); SS_VAR(io, s_drawmode); SS_VAR(io, s_texwin);
+    SS_VAR(io, s_clip_x1); SS_VAR(io, s_clip_y1); SS_VAR(io, s_clip_x2); SS_VAR(io, s_clip_y2);
+    SS_VAR(io, s_area_tl); SS_VAR(io, s_area_br);
+    SS_VAR(io, s_off_x); SS_VAR(io, s_off_y); SS_VAR(io, s_off_raw);
+    SS_VAR(io, s_mask_set); SS_VAR(io, s_mask_check); SS_VAR(io, s_tex_disable_allowed);
+    SS_VAR(io, s_read_latch);
+    SS_VAR(io, s_tw_and_u); SS_VAR(io, s_tw_or_u); SS_VAR(io, s_tw_and_v); SS_VAR(io, s_tw_or_v);
+    SS_VAR(io, s_disp_x); SS_VAR(io, s_disp_y); SS_VAR(io, s_hrange); SS_VAR(io, s_vrange); SS_VAR(io, s_field);
+    SS_VAR(io, s_cmd); SS_VAR(io, s_cmd_len); SS_VAR(io, s_cmd_need);
+    SS_VAR(io, s_mode);
+    SS_VAR(io, s_wr); SS_VAR(io, s_rd); SS_VAR(io, s_rd_active);
+    SS_VAR(io, s_pl_gouraud); SS_VAR(io, s_pl_semi); SS_VAR(io, s_pl_x); SS_VAR(io, s_pl_y);
+    SS_VAR(io, s_pl_color); SS_VAR(io, s_pl_pending_color); SS_VAR(io, s_pl_have_color);
+}

@@ -109,7 +109,7 @@ static void interp_call(u32 t, u32 ret) {
 
 int g_no_interp;   /* --no-interp: entering the interpreter is fatal */
 
-void interp_run(u32 pc, u32 ret_addr) {
+static void interp_run_inner(u32 pc, u32 ret_addr) {
     u32 *r = g_cpu.r;
     if (g_no_interp)
         rt_fatal("interpreter entered at %08x (ra=%08x): missing recompiled entry", pc, g_cpu.r[31]);
@@ -179,4 +179,12 @@ void interp_run(u32 pc, u32 ret_addr) {
             pc += 8;
         }
     }
+}
+
+/* The interpreter keeps the guest pc in a C local: no snapshot while it runs (savestate.h). */
+extern int g_ss_unsafe;
+void interp_run(u32 pc, u32 ret_addr) {
+    g_ss_unsafe++;
+    interp_run_inner(pc, ret_addr);
+    g_ss_unsafe--;
 }
