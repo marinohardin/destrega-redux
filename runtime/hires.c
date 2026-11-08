@@ -425,7 +425,7 @@ tri_impl(const TriArgs *ta, int by0, int by1,
     if (denom == 0) return;
 
     /* Attribute plane gradients per 1x pixel: identical to gpu.c (12-bit quotient << 12). */
-    double gdx[5] = { 0 }, gdy[5] = { 0 };
+    s64 gdx[5] = { 0 }, gdy[5] = { 0 };
     u32 gstep_x[5] = { 0 };   /* per hi-res pixel along x */
     u32 base[5];
     const u32 av[5] = { a->v->r, a->v->g, a->v->b, a->v->u, a->v->v };
@@ -442,8 +442,8 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                   (s64)((s32)bv[i] - (s32)av[i]) * ((s64)c->X1 - a->X1);
         u32 dx = (u32)(s32)(s64)(((__int128)n_x << 28) / denom) << 12;
         u32 dy = (u32)(s32)(s64)(((__int128)n_y << 28) / denom) << 12;
-        gdx[i] = (double)(s32)dx;
-        gdy[i] = (double)(s32)dy;
+        gdx[i] = (s32)dx;
+        gdy[i] = (s32)dy;
         gstep_x[i] = (u32)((s32)dx / Sx);
     }
     const s64 ustep = (s64)(s32)gstep_x[3], vstep = (s64)(s32)gstep_x[4];
@@ -483,7 +483,18 @@ tri_impl(const TriArgs *ta, int by0, int by1,
             if ((int)o[k][4] > vmax) vmax = (int)o[k][4];
         }
     }
-    const double ax = (double)a->X1 / 65536.0, ay = (double)a->Y1 / 65536.0;
+    /* Exact span-start evaluation: E = base + gdx*(P - ax) + gdy*(Q - ay) with the sample point
+     * P = (2xs+1-Sx)/(2Sx), Q = (2y+1-Sy)/(2Sy) (1x pixel units) and ax = X1/65536, taken as one
+     * rational over D = 4*Sx*Sy*65536 and floored exactly. A double evaluation rounds exact-integer
+     * values down for scales like Sy=6 (1/6 is inexact) and picks the neighbouring texel; the GPU
+     * backend evaluates the same rational, so both agree bit for bit. */
+    const s64 eD = (s64)4 * Sx * Sy * 65536;
+    __int128 e0[5];
+    for (int i = 0; i < 5; i++)
+        e0[i] = (__int128)base[i] * eD - (__int128)gdx[i] * a->X1 * (4 * Sx * Sy) -
+                (__int128)gdy[i] * a->Y1 * (4 * Sx * Sy);
+#define EXACT_AT(I, XS, Y) floor_div128(e0[I] + (__int128)gdx[I] * ((s64)2 * (XS) + 1 - Sx) * (2 * Sy * 65536) \
+        + (__int128)gdy[I] * ((s64)2 * (Y) + 1 - Sy) * (2 * Sx * 65536), eD)
 
     const bool long_left = denom > 0;
     const s64 long_step = floor_div128(((__int128)(c->Xh - a->Xh)) << 32, c->Yh - a->Yh);
@@ -517,18 +528,17 @@ tri_impl(const TriArgs *ta, int by0, int by1,
             if (xe > cx2 + 1) xe = cx2 + 1;
             if (xs < xe) {
                 /* attribute values at the first pixel of the span */
-                const double P = ((double)xs + 0.5) / Sx - 0.5, Q = ((double)y + 0.5) / Sy - 0.5;
                 /* colours are kept signed and unwrapped (s64) so they can be clamped; see CCOL */
                 s64 r = base[0], g = base[1], bb = base[2];
                 s64 U = 0, V = 0;
                 if (GOUR) {
-                    r = (s64)floor((double)base[0] + gdx[0] * (P - ax) + gdy[0] * (Q - ay));
-                    g = (s64)floor((double)base[1] + gdx[1] * (P - ax) + gdy[1] * (Q - ay));
-                    bb = (s64)floor((double)base[2] + gdx[2] * (P - ax) + gdy[2] * (Q - ay));
+                    r = EXACT_AT(0, xs, y);
+                    g = EXACT_AT(1, xs, y);
+                    bb = EXACT_AT(2, xs, y);
                 }
                 if (TEX) {   /* true (unwrapped) fixed-point values, so the clamp sees real excursions */
-                    U = (s64)floor((double)base[3] + gdx[3] * (P - ax) + gdy[3] * (Q - ay));
-                    V = (s64)floor((double)base[4] + gdx[4] * (P - ax) + gdy[4] * (Q - ay));
+                    U = EXACT_AT(3, xs, y);
+                    V = EXACT_AT(4, xs, y);
                 }
                 u16 *dst = s_t + (size_t)(y - s_oy) * s_tw + (xs - s_ox);
                 const int y1 = y / Sy;
@@ -955,14 +965,55 @@ static bool be_view(int x, int y, int w, int h, HiresView *out)
     out->h = h * s_Sy;
     out->scale_x = s_Sx;
     out->scale_y = s_Sy;
+    out->gpu = NULL;
+    out->gx = x * s_Sx - s_ox;
+    out->gy = y * s_Sy - s_oy;
     return true;
 }
 
 static const HiresBackend s_soft = {
-    "software", be_configure, be_tri, be_rect, be_line, be_fill, be_copy, be_put, be_view, be_destroy,
+    "software", be_configure, be_tri, be_rect, be_line, be_fill, be_copy, be_put, be_view, be_view, be_destroy,
 };
 
 /* ---- control --------------------------------------------------------------------- */
+
+static const HiresBackend *s_be = &s_soft;   /* primary: presented, viewed, verified */
+static const HiresBackend *s_shadow;         /* compare mode: fed the same commands */
+static const HiresBackend *s_want_be = &s_soft, *s_want_shadow;
+static int s_cur_sx, s_cur_sy;               /* scales of the allocated target(s); 0 = off */
+
+/* tee: forwards every command to the primary and the shadow backend */
+static bool tee_configure(const u16 *v, int sx, int sy, int rx, int ry, int rw, int rh)
+{ return s_be->configure(v, sx, sy, rx, ry, rw, rh) && s_shadow->configure(v, sx, sy, rx, ry, rw, rh); }
+static void tee_tri(const HiresPrim *p, const HiresVtx v[3]) { s_be->tri(p, v); s_shadow->tri(p, v); }
+static void tee_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g, u32 b,
+                     u32 u0, u32 v0, bool fx, bool fy)
+{ s_be->rect(p, x, y, w, h, r, g, b, u0, v0, fx, fy); s_shadow->rect(p, x, y, w, h, r, g, b, u0, v0, fx, fy); }
+static void tee_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, u32 c1)
+{ s_be->line(p, x0, y0, c0, x1, y1, c1); s_shadow->line(p, x0, y0, c0, x1, y1, c1); }
+static void tee_fill(int x, int y, int w, int h, u16 c) { s_be->fill(x, y, w, h, c); s_shadow->fill(x, y, w, h, c); }
+static void tee_copy(int sx, int sy, int dx, int dy, int w, int h, bool mc, bool ms)
+{ s_be->copy(sx, sy, dx, dy, w, h, mc, ms); s_shadow->copy(sx, sy, dx, dy, w, h, mc, ms); }
+static void tee_put(int x, int y, u16 v, bool mc, bool ms) { s_be->put(x, y, v, mc, ms); s_shadow->put(x, y, v, mc, ms); }
+static bool tee_view(int x, int y, int w, int h, HiresView *o)
+{
+    HiresView sv;
+    s_shadow->view(x, y, w, h, &sv);   /* lets the shadow flush its frame */
+    return s_be->view(x, y, w, h, o);
+}
+static bool tee_read(int x, int y, int w, int h, HiresView *o) { return s_be->read(x, y, w, h, o); }
+static void tee_destroy(void) { s_be->destroy(); s_shadow->destroy(); }
+static const HiresBackend s_tee = {
+    "tee", tee_configure, tee_tri, tee_rect, tee_line, tee_fill, tee_copy, tee_put, tee_view, tee_read, tee_destroy,
+};
+
+void hires_set_backend(const HiresBackend *be, const HiresBackend *shadow)
+{
+    s_want_be = be ? be : &s_soft;
+    s_want_shadow = shadow;
+}
+
+const HiresBackend *hires_software_backend(void) { return &s_soft; }
 
 bool hires_set_scale(int sx, int sy)
 {
@@ -972,23 +1023,32 @@ bool hires_set_scale(int sx, int sy)
     if (sx == 0) {
         if (g_hires) g_hires->destroy();
         g_hires = NULL;
+        s_cur_sx = s_cur_sy = 0;
         return true;
     }
-    if (g_hires && s_Sx == sx && s_Sy == sy && s_rx == s_cfg_rx && s_ry == s_cfg_ry &&
-        s_rw == s_cfg_rw && s_rh == s_cfg_rh)
+    if (g_hires && s_cur_sx == sx && s_cur_sy == sy && s_rx == s_cfg_rx && s_ry == s_cfg_ry &&
+        s_rw == s_cfg_rw && s_rh == s_cfg_rh && s_be == s_want_be && s_shadow == s_want_shadow)
         return true;
-    if (!s_soft.configure(gpu_vram(), sx, sy, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh)) {
+    if (g_hires && (s_be != s_want_be || s_shadow != s_want_shadow)) { g_hires->destroy(); g_hires = NULL; }
+    s_be = s_want_be;
+    s_shadow = s_want_shadow;
+    const HiresBackend *be = s_shadow ? &s_tee : s_be;
+    /* the software backend's region statics double as the control layer's record of it */
+    s_rx = s_cfg_rx; s_ry = s_cfg_ry; s_rw = s_cfg_rw; s_rh = s_cfg_rh;
+    if (!be->configure(gpu_vram(), sx, sy, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh)) {
         g_hires = NULL;
+        s_cur_sx = s_cur_sy = 0;
         return false;
     }
-    g_hires = &s_soft;
+    s_cur_sx = sx; s_cur_sy = sy;
+    g_hires = be;
     return true;
 }
 
 bool hires_get_scale(int *sx, int *sy)
 {
-    if (sx) *sx = g_hires ? s_Sx : 0;
-    if (sy) *sy = g_hires ? s_Sy : 0;
+    if (sx) *sx = g_hires ? s_cur_sx : 0;
+    if (sy) *sy = g_hires ? s_cur_sy : 0;
     return g_hires != NULL;
 }
 
@@ -998,11 +1058,18 @@ void hires_set_region(int rx, int ry, int rw, int rh)
 }
 
 void hires_set_dither(bool enable) { s_dither_hi = enable; }
+bool hires_get_dither(void) { return s_dither_hi; }
 
 bool hires_get_view(const GpuDisplay *d, HiresView *v)
 {
     if (!g_hires || !d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) return false;
     return g_hires->view(d->x, d->y, d->w, d->h, v);
+}
+
+bool hires_read_view(const GpuDisplay *d, HiresView *v)
+{
+    if (!g_hires || !d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) return false;
+    return g_hires->read(d->x, d->y, d->w, d->h, v);
 }
 
 void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int *sx, int *sy)
@@ -1025,13 +1092,42 @@ void hires_pick_scale(int pw, int ph, int dw, int dh, int max_x, int max_y, int 
 
 u32 hires_verify_1x(int *first_x, int *first_y)
 {
-    if (!g_hires || s_Sx != 1 || s_Sy != 1) return 0;
+    HiresView v;
+    if (!g_hires || s_cur_sx != 1 || s_cur_sy != 1) return 0;
+    if (!g_hires->read(s_rx, s_ry, s_rw, s_rh, &v)) return 0;
+    const u16 *vram = gpu_vram();
     u32 bad = 0;
     for (int y = 0; y < s_rh; y++)
         for (int x = 0; x < s_rw; x++)
-            if (s_t[y * s_tw + x] != s_vram[(s_ry + y) * VRAM_W + s_rx + x]) {
+            if (v.pixels[(size_t)y * v.stride + x] != vram[(s_ry + y) * VRAM_W + s_rx + x]) {
                 if (!bad) { if (first_x) *first_x = s_rx + x; if (first_y) *first_y = s_ry + y; }
                 bad++;
             }
     return bad;
+}
+
+bool hires_compare(HiresCompare *c)
+{
+    memset(c, 0, sizeof *c);
+    c->first_x = c->first_y = -1;
+    if (!g_hires || !s_shadow) return false;
+    HiresView a, b;
+    if (!s_shadow->read(s_rx, s_ry, s_rw, s_rh, &b)) return false;
+    if (!s_be->read(s_rx, s_ry, s_rw, s_rh, &a)) return false;
+    for (int y = 0; y < a.h; y++) {
+        const u16 *pa = a.pixels + (size_t)y * a.stride, *pb = b.pixels + (size_t)y * b.stride;
+        if (!memcmp(pa, pb, (size_t)a.w * 2)) continue;
+        for (int x = 0; x < a.w; x++) {
+            u16 p = pa[x], q = pb[x];
+            if (p == q) continue;
+            if (((p ^ q) & 0x7FFF) == 0) { c->mask_diff++; continue; }
+            if (!c->diff) { c->first_x = x; c->first_y = y; }
+            c->diff++;
+            int dr = abs((p & 31) - (q & 31)), dg = abs(((p >> 5) & 31) - ((q >> 5) & 31)),
+                db = abs(((p >> 10) & 31) - ((q >> 10) & 31));
+            if (dr > 1 || dg > 1 || db > 1) c->diff_big++;
+        }
+    }
+    c->pixels = (u64)a.w * a.h;
+    return true;
 }
