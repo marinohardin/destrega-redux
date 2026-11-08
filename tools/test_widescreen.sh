@@ -7,7 +7,7 @@
 #   ws2      --widescreen, 2x2, 16:9 window          ws2b  the same again (run-to-run determinism)
 #   ws46     --widescreen, 4x6, worker threads
 #   wsresize --widescreen, auto scale, window resized between 16:9, 4:3, 21:9 and 16:10 mid-fight
-#   ws1      --widescreen, 1x1 with --hires-verify (the 4:3 part of the target == 1x VRAM)
+#   ws1      --widescreen, 1x1 with --hires-verify and --pgxp off (the 4:3 part of the target == 1x VRAM)
 #   wsrender starts on the software renderer and 4:3, switches renderer and widescreen mid-fight
 #   ws46g    --widescreen, 4x6, --renderer gpu
 #   ws2c     --widescreen, 2x2, --renderer compare --pgxp off: GPU == software, guard band included
@@ -58,7 +58,7 @@ ws46 --widescreen --scale 4x6 --window 1280x720 --hires-threads 3
 wsresize --widescreen --max-scale 4x6 --hires-threads 1 --resize 2000:1280x720,4300:960x720,5200:2560x1080,6100:1440x900,7000:1920x1080
 ws2 --widescreen --scale 2 --window 1280x720 --hires-threads 1
 ws2b --widescreen --scale 2 --window 1280x720 --hires-threads 0
-ws1 --widescreen --scale 1 --window 1280x720 --hires-verify --hires-threads 0
+ws1 --widescreen --scale 1 --window 1280x720 --hires-verify --hires-threads 0 --pgxp off
 off --scale 2 --hires-threads 0
 wsrender --scale 2 --window 1280x720 --hires-threads 0 --renderer software --menu-action 3800:renderer=gpu --menu-action 4200:widescreen=on --menu-action 4500:renderer=software --menu-action 5000:renderer=gpu --menu-action 5400:widescreen=off --menu-action 5800:renderer=software --menu-action 6300:widescreen=on --menu-action 6600:renderer=gpu --menu-action 7200:renderer --menu-action 7600:widescreen=off --menu-action 4100:fullscreen=on --menu-action 6900:fullscreen --dump build/widescreen/render --dump-every 50
 ws46g --widescreen --scale 4x6 --window 1280x720 --renderer gpu
