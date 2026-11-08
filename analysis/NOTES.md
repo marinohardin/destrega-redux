@@ -81,6 +81,16 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   boot->fight run it is ~62-65% (title, menus and character select draw 2D polygons). Only
   ~0.5% of the misses equal a recent GTE result, so nearly all misses are CPU-computed 2D
   polygons (HUD, menus), not lost associations. No stale-tag misses observed. (verified: probe)
+- Character meshes depend on integer snapping (verified: dumps + `pgxp-check`). Over a boot->fight run
+  ~24% of precise vertex uses (572K of 2.43M in 4300 frames) share their SXY word with another use that has a *different*
+  precise value (all 388 logged samples came from `80036b0c`, e.g. word 48,-24 at
+  0.92,0.66 and 0.24,0.93). They are distinct GTE results (separate RTPT calls for neighbouring
+  pieces of hair, face, shoulder pads, limbs) that the PS1 merges by rounding. Drawn at their
+  precise positions the pieces separate by up to 1 px: the hair breaks into spikes with gaps,
+  the face behind shows through as a dark smear, shoulder/arm pieces look torn (fight-script
+  frame 4209 at 4x6). Welding equal words per batch (`pgxp_weld`) removes it. Whether the mesh
+  data really duplicates shared vertices per piece (the likely reason) is a guess: the mesh
+  format is not decoded yet.
 - PGXP never changed the per-frame state hash, i.e. no game code observes the precise values;
   this says nothing yet about whether gameplay depends on the *integer* GTE results (open
   question below).

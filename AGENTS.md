@@ -306,6 +306,14 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   pass each word's tag to `gpu_write_gp0_tag`. A tag is used only if the pool entry's integer
   word still equals the GP0 word (`pgxp_lookup`), so stale tags (ALU ops, sh/sb rewrites,
   ring reuse) just fall back to the integer vertex. No invalidation anywhere.
+- **Welding (required, see NOTES.md "GTE projection call sites")**: the character meshes rely on
+  integer snapping. Vertices of different primitives that are meant to meet (hair/face/limb
+  pieces) are distinct GTE results that only coincide after rounding to the same SXY word; drawn
+  at their own precise positions they separate by up to 1 px: cracks, torn shoulders, back
+  geometry and a dark smear showing through the face. So within one batch (one GPU linked-list
+  DMA, or one vblank) every use of an SXY word gets one position: the first precise value seen
+  for it, or the integer if it was first sent without one (`pgxp_weld`). Vertices on different
+  integer pixels stay independent, so the stage and the character outlines remain wobble-free.
 - `gpu.c` adds the offsets to polygon vertices for `g_hires` only (`HiresVtx.x/y` 16.16 plus
   `HiresVtx.w`, 0 = none). Lines and rects (2D sprites, HUD, text) are untouched.
 - `hires.c`: a textured triangle with `w` on all three vertices is textured perspective-
@@ -319,12 +327,16 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   Off = previous output exactly (tracking disabled, `w` = 0). The hooks are guarded by
   `g_pgxp`. At 1x1 with PGXP on, `--hires-verify` reports mismatches by design (vertices leave
   the integer grid); equivalence is tested with `--pgxp off`.
-- Run summary: `pgxp: H of N polygon vertices precise, ... misses: S stale tag, G equal to a
-  recent GTE result` (G estimates GTE vertices whose association was lost; the rest of the
+- Run summary: `pgxp-check:` (vertices actually drawn: on-screen vertices > 1.5 px from their
+  integer, depth ratio > 2 inside a triangle, values older than 2 vblanks, and "split" = an SXY
+  word drawn at two positions in one batch, i.e. a crack; all must be 0, the determinism script
+  checks it), `pgxp-weld:` (uses snapped), `--pgxp-diag N` logs up to N offenders with the GTE
+  call site, `--dump-from F` limits `--dump` to frames >= F. `pgxp: H of N polygon vertices
+  precise, ... misses: S stale tag, G equal to a recent GTE result` (G estimates GTE vertices whose association was lost; the rest of the
   misses are CPU-computed 2D polygons). Fight at 4x6: see the PR / NOTES.md for numbers.
 - Tests: `runtime/tests/test_pgxp.c` (GTE registers bit-identical on/off; GTE -> register ->
   RAM -> lw -> move -> sw -> GP0 path; dropped after sh rewrite, stale register, untracked
-  store; FIFO shift; perspective only with three depths), and the determinism matrix runs
+  store; FIFO shift; perspective only with three depths; welding within and not across batches), and the determinism matrix runs
   `--pgxp on/affine` at several scales against a `--pgxp off`, hi-res-off reference.
 - For other backends (`HiresBackend`): `w` is optional; ignore it for affine texturing.
 
