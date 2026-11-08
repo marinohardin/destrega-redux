@@ -17,7 +17,4 @@ bool menu_executable_path(char *out, size_t n);
 /* ---- provided by main.c ---- */
 /* Queue action NAME[, ARG] (copied). Safe to call from menu callbacks. Names: see main.c. */
 void frontend_menu_action(const char *name, const char *arg);
-/* Is a memory card inserted in slot 0/1? (menu titles: Insert vs Eject) */
-bool frontend_card_inserted(int slot);
-
 #endif

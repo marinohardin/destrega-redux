@@ -7,7 +7,7 @@
 #              the process restarts on the new pack -> same state hashes as a plain run from that pack
 #   reject   : wrong type, 2048-byte .iso, junk image, truncated copies, missing file, a data pack:
 #              error reported, game keeps running, no pack written
-#   cards    : import (valid/invalid, with timestamped backup), export, eject/insert, delete, and a
+#   saves    : import (valid/invalid, with timestamped backup), export, delete, and a
 #              swapped-in card's save really is loaded by the game (ROUND COUNT option byte)
 set -e
 cd "$(dirname "$0")/.."
@@ -138,8 +138,8 @@ LOAD_SCRIPT=1200:8
 # (a) a card swapped in while the game runs is the one it loads its options from (round count 3 -> index 2)
 cp /dev/null $D/c/slot1.mcd; rm $D/c/slot1.mcd
 $BIN --headless --no-interp --data-dir $D/c --memcard1 $D/c/slot1.mcd --frames 1700 --press $LOAD_SCRIPT \
-  --ram-dump $D/c/swap.ram --menu-action 100:card-import=1:$D/c/saved.mcd "$IMG" > $D/c/swap.log 2>&1 || fail "swap run"
-logok $D/c/swap.log "menu: card-import OK slot 1"
+  --ram-dump $D/c/swap.ram --menu-action 100:save-import=$D/c/saved.mcd "$IMG" > $D/c/swap.log 2>&1 || fail "swap run"
+logok $D/c/swap.log "menu: save-import OK slot 1"
 logok $D/c/swap.log "menu: confirm"
 cmp -s $D/c/slot1.mcd $D/c/saved.mcd || fail "imported card differs from the source"
 BK=$(ls $D/c/slot1-backup-*.mcd 2>/dev/null | head -1)
@@ -150,52 +150,31 @@ python3 -c "import sys; d=open(sys.argv[1],'rb').read(); assert len(d)==131072 a
 clean $D/c/swap.log
 echo "menu: imported card is loaded by the game (round count index 2), old card backed up as $(basename "$BK")"
 
-# (b) eject / insert (card 2 starts empty) and the card-changed flag: ejecting slot 1 then inserting the
-#     saved card loads it too
-$BIN --headless --no-interp --data-dir $D/c --memcard1 $D/c/blank1.mcd --frames 1700 --press $LOAD_SCRIPT \
-  --ram-dump $D/c/ins.ram --menu-action 50:card-eject=1 --menu-action 60:card-insert=1:$D/c/saved.mcd \
-  --menu-action 70:card-insert=2:$D/c/slot2.mcd --menu-action 75:card-eject=2 --menu-action 80:card-eject=2 \
-  --menu-action 85:card-insert=1 "$IMG" > $D/c/ins.log 2>&1 || fail "insert run"
-logok $D/c/ins.log "menu: card-eject OK slot 1"
-logok $D/c/ins.log "menu: card-insert OK slot 1"
-logok $D/c/ins.log "menu: card-insert OK slot 2"
-logok $D/c/ins.log "menu: card-eject OK slot 2"
-logok $D/c/ins.log "ERROR: No card is inserted"            # second eject of slot 2
-logok $D/c/ins.log "ERROR: A card is already inserted"      # insert into occupied slot 1
-[ "$(peek $D/c/ins.ram $OPT_ADDR)" = 2 ] || fail "inserted card's save not loaded"
-python3 -c "import sys; d=open(sys.argv[1],'rb').read(); assert len(d)==131072 and d[:2]==b'MC'" $D/c/slot2.mcd \
-  || fail "card inserted in slot 2 was not created blank"
-echo "menu: eject / insert per slot ok (slot 2 starts empty, a missing file becomes a blank card)"
-
-# (c) export, invalid imports, delete
+# export, invalid imports, delete
 cp $D/c/saved.mcd $D/c/work.mcd
 head -c 4 /dev/zero > $D/c/tiny.mcd
 head -c 131072 /dev/zero > $D/c/nomc.mcd
 python3 -c "
 d=bytearray(open('$D/c/saved.mcd','rb').read()); d[127]^=1; open('$D/c/badsum.mcd','wb').write(d)"
 $BIN --headless --no-interp --data-dir $D/c --memcard1 $D/c/work.mcd --frames 200 \
-  --menu-action 10:card-export=1:$D/c/exported.mcd \
-  --menu-action 20:card-import=1:$D/c/tiny.mcd --menu-action 21:card-import=1:$D/c/nomc.mcd \
-  --menu-action 22:card-import=1:$D/c/badsum.mcd --menu-action 23:card-import=1:$D/c/nothere.mcd \
-  --menu-action 24:card-import=1:$D/c/work.mcd \
-  --menu-action 30:card-delete=1 --menu-action 31:card-delete=1 --menu-action 40:card-export=2:$D/c/e2.mcd \
-  --menu-action 50:card-import=3:$D/c/saved.mcd \
-  --menu-action 60:reveal-cards --menu-action 61:reveal-game \
+  --menu-action 10:save-export=$D/c/exported.mcd \
+  --menu-action 20:save-import=$D/c/tiny.mcd --menu-action 21:save-import=$D/c/nomc.mcd \
+  --menu-action 22:save-import=$D/c/badsum.mcd --menu-action 23:save-import=$D/c/nothere.mcd \
+  --menu-action 24:save-import=$D/c/work.mcd \
+  --menu-action 30:save-delete --menu-action 31:save-delete \
+  --menu-action 60:reveal-saves --menu-action 61:reveal-game \
   "$IMG" > $D/c/misc.log 2>&1 || fail "misc card run"
 cmp -s $D/c/exported.mcd $D/c/saved.mcd || fail "exported card differs from the card in the slot"
-[ "$(grep -c 'menu: card-import REJECTED' $D/c/misc.log)" = 4 ] || fail "expected 4 rejected card imports"
+[ "$(grep -c 'menu: save-import REJECTED' $D/c/misc.log)" = 4 ] || fail "expected 4 rejected card imports"
 logok $D/c/misc.log "ERROR: That is not a raw 128 KiB memory card image"
 logok $D/c/misc.log "ERROR: That file is 128 KiB but has no memory card header"
 logok $D/c/misc.log "ERROR: That memory card image has a damaged header"
 logok $D/c/misc.log "ERROR: Could not open that file"
-logok $D/c/misc.log "ERROR: That file is already the card in this slot"
-logok $D/c/misc.log "menu: card-delete OK slot 1 (BASLUS-00732DESTREGA)"
-logok $D/c/misc.log "ERROR: This card has no Destrega save"       # second delete
-logok $D/c/misc.log "ERROR: No card is inserted in that slot"     # export from empty slot 2
-logok $D/c/misc.log "ERROR: Memory card slot must be 1 or 2"
-logok $D/c/misc.log "menu: show memory cards in file manager: $D/c"
+logok $D/c/misc.log "ERROR: Those are already your current save games"
+logok $D/c/misc.log "menu: save-delete OK slot 1 (BASLUS-00732DESTREGA)"
+logok $D/c/misc.log "ERROR: There is no save game to delete"       # second delete
+logok $D/c/misc.log "menu: show save games in file manager: $D/c"
 logok $D/c/misc.log "menu: show game files in file manager"
-[ ! -e $D/c/e2.mcd ] || fail "exported an empty slot"
 python3 - $D/c/work.mcd <<'EOF' || fail "card after delete"
 import functools, sys
 d = open(sys.argv[1], 'rb').read()
@@ -208,7 +187,7 @@ clean $D/c/misc.log
 echo "menu: export, invalid-card rejection, delete ok"
 
 # (d) headless safety: without --data-dir or --memcardN a card import has nowhere to go
-$BIN --headless --no-interp --frames 60 --menu-action 10:card-import=1:$D/c/saved.mcd "$IMG" > $D/c/safe.log 2>&1 || fail "safety run"
-logok $D/c/safe.log "ERROR: No card location"
-nolog $D/c/safe.log "card-import OK"
+$BIN --headless --no-interp --frames 60 --menu-action 10:save-import=$D/c/saved.mcd "$IMG" > $D/c/safe.log 2>&1 || fail "safety run"
+logok $D/c/safe.log "ERROR: No save location"
+nolog $D/c/safe.log "save-import OK"
 echo "menu: ok"

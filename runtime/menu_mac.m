@@ -1,4 +1,4 @@
-/* macOS menu bar: File menu (game image, game files, memory cards). SDL3 builds the standard
+/* macOS menu bar: File menu (game image, game files, save games). SDL3 builds the standard
  * application/Window/View menus itself; this only inserts one more menu after the app menu.
  * Every item just queues a named action for main.c (see menu.h), so nothing here touches the
  * emulated machine. Compiled with ARC (see CMakeLists.txt). */
@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include "menu.h"
 
-@interface DestregaMenu : NSObject <NSMenuDelegate, NSMenuItemValidation>
+@interface DestregaMenu : NSObject
 @end
 
 static DestregaMenu *s_target;   /* menu items hold their target weakly */
@@ -23,18 +23,6 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
     else frontend_menu_action([s substringToIndex:r.location].UTF8String,
                               [s substringFromIndex:r.location + 1].UTF8String);
 }
-/* Insert/Eject titles follow the slot's state each time the submenu opens. */
-- (void)menuNeedsUpdate:(NSMenu *)menu {
-    for (NSMenuItem *it in menu.itemArray) {
-        NSString *s = it.representedObject;
-        if ([s hasPrefix:@"card-eject="] || [s hasPrefix:@"card-insert="]) {
-            int slot = [[s substringFromIndex:[s rangeOfString:@"="].location + 1] intValue] - 1;
-            bool in = frontend_card_inserted(slot);
-            it.title = in ? @"Eject Card" : @"Insert Card";
-            it.representedObject = [NSString stringWithFormat:@"%@=%d", in ? @"card-eject" : @"card-insert", slot + 1];
-        }
-    }
-}
 @end
 
 static NSMenuItem *add(NSMenu *m, NSString *title, NSString *action, NSString *key, NSEventModifierFlags mods) {
@@ -46,17 +34,6 @@ static NSMenuItem *add(NSMenu *m, NSString *title, NSString *action, NSString *k
     return it;
 }
 
-static NSMenu *card_menu(int slot) {
-    NSMenu *m = [[NSMenu alloc] initWithTitle:[NSString stringWithFormat:@"Card %d", slot]];
-    m.delegate = s_target;
-    add(m, @"Import Save Card…", [NSString stringWithFormat:@"card-import=%d", slot], nil, 0);
-    add(m, @"Export Save Card…", [NSString stringWithFormat:@"card-export=%d", slot], nil, 0);
-    [m addItem:NSMenuItem.separatorItem];
-    add(m, @"Eject Card", [NSString stringWithFormat:@"card-eject=%d", slot], nil, 0);   /* retitled by menuNeedsUpdate */
-    add(m, @"Delete Save…", [NSString stringWithFormat:@"card-delete=%d", slot], nil, 0);
-    return m;
-}
-
 void menu_init(void) {
     @autoreleasepool {
         s_target = [DestregaMenu new];
@@ -66,20 +43,17 @@ void menu_init(void) {
             NSEventModifierFlagCommand | NSEventModifierFlagShift);
         [file addItem:NSMenuItem.separatorItem];
 
-        /* Memory cards. Slot 1 is the default card (memcard1.mcd beside the data pack); slot 2
-         * starts empty. Further card items belong in this submenu. */
-        NSMenu *cards = [[NSMenu alloc] initWithTitle:@"Memory Card"];
-        add(cards, @"Show Memory Cards in Finder", @"reveal-cards", nil, 0);
-        [cards addItem:NSMenuItem.separatorItem];
-        for (int slot = 1; slot <= 2; slot++) {
-            NSMenuItem *sub = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Card %d", slot]
-                                                         action:nil keyEquivalent:@""];
-            sub.submenu = card_menu(slot);
-            [cards addItem:sub];
-        }
-        NSMenuItem *cardsItem = [[NSMenuItem alloc] initWithTitle:@"Memory Card" action:nil keyEquivalent:@""];
-        cardsItem.submenu = cards;
-        [file addItem:cardsItem];
+        /* Save Games: one slot in the UI (the runtime still has two; see main.c). Files exchanged
+         * here are standard PlayStation memory card images (.mcd). */
+        NSMenu *saves = [[NSMenu alloc] initWithTitle:@"Save Games"];
+        add(saves, @"Show Save Games in Finder", @"reveal-saves", nil, 0);
+        [saves addItem:NSMenuItem.separatorItem];
+        add(saves, @"Import Save Games…", @"save-import", nil, 0);
+        add(saves, @"Export Save Games…", @"save-export", nil, 0);
+        add(saves, @"Delete Save Game…", @"save-delete", nil, 0);
+        NSMenuItem *savesItem = [[NSMenuItem alloc] initWithTitle:@"Save Games" action:nil keyEquivalent:@""];
+        savesItem.submenu = saves;
+        [file addItem:savesItem];
 
         NSMenuItem *fileItem = [[NSMenuItem alloc] initWithTitle:@"File" action:nil keyEquivalent:@""];
         fileItem.submenu = file;

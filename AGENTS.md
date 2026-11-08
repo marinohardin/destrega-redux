@@ -181,23 +181,23 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   explanation; a raw 2352 `.iso` is fine), whole sectors, SLUS_007.32 CRC, and the ISO9660 volume size vs the
   file size (catches truncated copies).
 - **Show Game Files in Finder (Cmd+Shift+R)**: opens the folder of the pack in use (or the loose image).
-- **Memory Card** submenu: Show Memory Cards in Finder; per slot (Card 1 / Card 2): Import Save Card…
-  (validates 128 KiB + "MC" header + checksum, confirms, keeps `memcardN-backup-YYYYmmdd-HHMMSS.mcd`, copies in
-  place, re-attaches), Export Save Card…, Insert/Eject Card (slot 2 starts empty; Insert uses
-  `memcard2.mcd` beside the pack, creating a blank card), Delete Save… (the `BASLUS-00732*` file, confirmed).
+- **Save Games** submenu (the UI deliberately never says "memory card" except for the file type; one slot, card
+  slot 1; slot 2, `--memcard2` and `--no-memcard` stay in the runtime for development/tests): Show Save Games in
+  Finder; Import Save Games… (open dialog "PlayStation memory card image (.mcd)"; validates 128 KiB + "MC" header
+  + checksum, confirms, keeps `memcard1-backup-YYYYmmdd-HHMMSS.mcd`, copies in place, re-attaches); Export Save
+  Games… (writes a standard .mcd after flushing); Delete Save Game… (the `BASLUS-00732*` file, confirmed).
   Every swap flushes first and goes through `memcard_attach`, which closes open handles and raises the
   card-changed flag like a real swap (`memcard_mark_new` after a delete).
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
-  `load=FILE`, `reveal-game`, `reveal-cards`, `card-import=SLOT:FILE`, `card-export=SLOT:FILE`,
-  `card-eject=SLOT`, `card-insert=SLOT[:FILE]`, `card-delete=SLOT`. Headless: no dialogs (the file argument is
+  `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`. Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
-  unless `--data-dir` or `--memcardN` says where the cards are (never the user's real folder by accident).
+  unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
   Log lines start with `menu:`; errors with `menu: ERROR:`.
 - Tests: `tools/test_menu.sh` (in `run_tests.sh`): load from `.cue` and raw `.iso` into a scratch data dir
-  with state hash equal to a plain run on that pack, 9 rejection cases, card import with backup (the game
-  really loads the imported save: ROUND COUNT byte), export, eject/insert, delete, invalid cards. It rebuilds
+  with state hash equal to a plain run on that pack, 9 rejection cases, save import with backup (the game
+  really loads the imported save: ROUND COUNT byte), export, delete, invalid files. It rebuilds
   a disc image from the pack with `tools/pak_to_bin.py` when `Destrega/Destrega.cue` is absent.
-- Not done: Insert Card From File… (arbitrary path), saves other than the game's own file, Windows/Linux menus.
+- Not done: saves other than the game's own file, Windows/Linux menus.
 
 ## High-resolution rendering (`runtime/hires.[ch]`)
 

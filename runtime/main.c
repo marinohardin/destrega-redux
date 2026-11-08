@@ -619,8 +619,8 @@ static void usage(void) {
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
         "  --menu-action F:NAME[=ARG]  (testing) run a File-menu action on frame F: load=IMAGE, reveal-game,\n"
-        "                        reveal-cards, card-import=SLOT:FILE, card-export=SLOT:FILE, card-eject=SLOT,\n"
-        "                        card-insert=SLOT[:FILE], card-delete=SLOT (headless card actions need --data-dir)\n"
+        "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete\n"
+        "                        (save actions use card slot 1; headless needs --data-dir or --memcard1)\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
@@ -713,8 +713,6 @@ void frontend_menu_action(const char *name, const char *arg) {
     snprintf(a->name, sizeof a->name, "%s", name);
     snprintf(a->arg, sizeof a->arg, "%s", arg ? arg : "");
 }
-
-bool frontend_card_inserted(int slot) { return memcard_present(slot); }
 
 static void menu_alert(const char *msg) {
     rt_log("menu: ERROR: %s", msg);
@@ -831,25 +829,22 @@ static void action_reveal(bool cards) {
         const char *p = memcard_path(0);
         if (p) dir_of(p, dir, sizeof dir);
         else if (s_card_dir[0]) snprintf(dir, sizeof dir, "%s", s_card_dir);
-        else { menu_alert("No memory card location is known (try --memcard1 or --data-dir)."); return; }
+        else { menu_alert("No save location is known (try --memcard1 or --data-dir)."); return; }
         size_t l = strlen(dir);
         if (l > 1 && dir[l - 1] == '/') dir[l - 1] = 0;
     } else dir_of(s_disc_path ? s_disc_path : s_pak_path, dir, sizeof dir);
     SDL_CreateDirectory(dir);
-    rt_log("menu: show %s in file manager: %s", cards ? "memory cards" : "game files", dir);
+    rt_log("menu: show %s in file manager: %s", cards ? "save games" : "game files", dir);
     if (!s_headless) menu_reveal(dir);
 }
 
 /* ---- memory card actions ------------------------------------------------------------------- */
 
-/* "N" or "N:FILE" -> slot 0/1 and file ("" if none). */
+/* The menus expose a single save slot (card slot 1). ARG is an optional FILE. */
 static bool card_args(const char *arg, int *slot, const char **file) {
-    if (s_no_memcard) { menu_alert("Memory cards are disabled (--no-memcard)."); return false; }
-    int s = atoi(arg);
-    if (s < 1 || s > 2) { menu_alert("Memory card slot must be 1 or 2."); return false; }
-    *slot = s - 1;
-    const char *c = strchr(arg, ':');
-    *file = c ? c + 1 : "";
+    if (s_no_memcard) { menu_alert("Saving is disabled (--no-memcard)."); return false; }
+    *slot = 0;
+    *file = arg;
     return true;
 }
 
@@ -875,16 +870,16 @@ static void action_card_import(const char *arg) {
     int slot; const char *file;
     if (!card_args(arg, &slot, &file)) return;
     char src[2048], dest[2048];
-    static const SDL_DialogFileFilter filters[] = {{"Memory card image", "mcd;mcr;mc;bin;ps1;srm;vmp"}, {"All files", "*"}};
+    static const SDL_DialogFileFilter filters[] = {{"PlayStation memory card image (.mcd)", "mcd;mcr;mc;bin;ps1;srm;vmp"}, {"All files", "*"}};
     if (*file) snprintf(src, sizeof src, "%s", file);
     else if (s_headless || !menu_pick(false, filters, 2, NULL, src, sizeof src)) {
-        if (s_headless) menu_alert("card-import needs SLOT:FILE in headless mode");
+        if (s_headless) menu_alert("save-import needs FILE in headless mode");
         return;
     }
     const char *err = memcard_validate_file(src);
-    if (err) { rt_log("menu: card-import REJECTED"); menu_alert(err); return; }
-    if (!card_slot_path(slot, dest, sizeof dest)) { menu_alert("No card location (headless needs --data-dir or --memcardN)."); return; }
-    if (same_file(src, dest)) { menu_alert("That file is already the card in this slot."); return; }
+    if (err) { rt_log("menu: save-import REJECTED"); menu_alert(err); return; }
+    if (!card_slot_path(slot, dest, sizeof dest)) { menu_alert("No save location (headless needs --data-dir or --memcard1)."); return; }
+    if (same_file(src, dest)) { menu_alert("Those are already your current save games."); return; }
     memcard_flush();                                  /* the on-disk card is now current */
     char backup[2200] = "";
     if (file_exists(dest)) {
@@ -895,82 +890,59 @@ static void action_card_import(const char *arg) {
         if (l > 4 && !strcmp(base + l - 4, ".mcd")) base[l - 4] = 0;
         snprintf(backup, sizeof backup, "%s-backup-%s.mcd", base, stamp);
         char msg[4600];
-        snprintf(msg, sizeof msg, "Replace the memory card in slot %d with this file?\n\nYour current card is kept as a backup:\n%s", slot + 1, backup);
+        snprintf(msg, sizeof msg, "Replace your save games with the ones in this PlayStation memory card image (.mcd)?\n\nYour current save games are kept as a backup:\n%s", backup);
         if (!menu_confirm(msg, "Replace")) return;
-        if (!copy_file(dest, backup)) { menu_alert("Could not write the backup of your current card; nothing was changed."); return; }
+        if (!copy_file(dest, backup)) { menu_alert("Could not write the backup of your current save games; nothing was changed."); return; }
     }
-    if (!copy_file(src, dest)) { menu_alert("Could not write the card image (is the folder writable?)."); return; }
+    if (!copy_file(src, dest)) { menu_alert("Could not write the save games (is the folder writable?)."); return; }
     err = memcard_attach(slot, dest);                 /* reloads the file and raises the card-changed flag */
     if (err) { menu_alert(err); return; }
-    rt_log("menu: card-import OK slot %d <- %s (backup: %s)", slot + 1, src, *backup ? backup : "none");
+    rt_log("menu: save-import OK slot %d <- %s (backup: %s)", slot + 1, src, *backup ? backup : "none");
 }
 
 static void action_card_export(const char *arg) {
     int slot; const char *file;
     if (!card_args(arg, &slot, &file)) return;
-    if (!memcard_present(slot)) { menu_alert("No card is inserted in that slot."); return; }
+    if (!memcard_present(slot)) { menu_alert("There are no save games to export."); return; }
     char dst[2048];
     char def[2200];
-    snprintf(def, sizeof def, "%smemcard%d.mcd", s_card_dir, slot + 1);
-    static const SDL_DialogFileFilter filters[] = {{"Memory card image", "mcd"}};
+    snprintf(def, sizeof def, "%sDestrega-saves.mcd", s_card_dir);
+    static const SDL_DialogFileFilter filters[] = {{"PlayStation memory card image (.mcd)", "mcd"}};
     if (*file) snprintf(dst, sizeof dst, "%s", file);
     else if (s_headless || !menu_pick(true, filters, 1, def, dst, sizeof dst)) {
-        if (s_headless) menu_alert("card-export needs SLOT:FILE in headless mode");
+        if (s_headless) menu_alert("save-export needs FILE in headless mode");
         return;
     }
     const char *err = memcard_export(slot, dst);
     if (err) { menu_alert(err); return; }
-    rt_log("menu: card-export OK slot %d -> %s", slot + 1, dst);
-}
-
-static void action_card_eject(const char *arg) {
-    int slot; const char *file;
-    if (!card_args(arg, &slot, &file)) return;
-    if (!memcard_present(slot)) { menu_alert("No card is inserted in that slot."); return; }
-    memcard_flush();
-    memcard_attach(slot, NULL);
-    rt_log("menu: card-eject OK slot %d", slot + 1);
-}
-
-static void action_card_insert(const char *arg) {
-    int slot; const char *file;
-    if (!card_args(arg, &slot, &file)) return;
-    if (memcard_present(slot)) { menu_alert("A card is already inserted in that slot."); return; }
-    char path[2048];
-    if (*file) snprintf(path, sizeof path, "%s", file);
-    else if (!card_slot_path(slot, path, sizeof path)) { menu_alert("No card location (headless needs --data-dir or --memcardN)."); return; }
-    const char *err = memcard_attach(slot, path);     /* a missing file becomes a new blank card */
-    if (err) { menu_alert(err); return; }
-    rt_log("menu: card-insert OK slot %d = %s", slot + 1, path);
+    rt_log("menu: save-export OK slot %d -> %s", slot + 1, dst);
 }
 
 static void action_card_delete(const char *arg) {
     int slot; const char *file;
     if (!card_args(arg, &slot, &file)) return;
-    if (!memcard_present(slot)) { menu_alert("No card is inserted in that slot."); return; }
+    if (!memcard_present(slot)) { menu_alert("There are no save games to export."); return; }
     McDirEntry e;
     int cur = 0;
-    if (!memcard_dir_next(slot, "BASLUS-00732*", &cur, &e)) { menu_alert("This card has no Destrega save."); return; }
+    if (!memcard_dir_next(slot, "BASLUS-00732*", &cur, &e)) { menu_alert("There is no save game to delete."); return; }
     char msg[256];
-    snprintf(msg, sizeof msg, "Delete the Destrega save (%s) from the card in slot %d?\n\nThis cannot be undone. Use Export Save Card first if you want a copy.", e.name, slot + 1);
+    snprintf(msg, sizeof msg, "Delete your saved game?\n\nThis cannot be undone. Use Export Save Games first if you want a copy.");
     if (!menu_confirm(msg, "Delete")) return;
     memcard_flush();
     if (!memcard_erase(slot, e.name)) { menu_alert("Could not delete the save."); return; }
     memcard_flush();
     memcard_mark_new(slot);                           /* as if the card were pulled and re-inserted */
-    rt_log("menu: card-delete OK slot %d (%s)", slot + 1, e.name);
+    rt_log("menu: save-delete OK slot %d (%s)", slot + 1, e.name);
 }
 
 static void menu_run(const char *name, const char *arg) {
     rt_log("menu: action %s%s%s", name, *arg ? " " : "", arg);
     if (!strcmp(name, "load")) action_load(arg);
     else if (!strcmp(name, "reveal-game")) action_reveal(false);
-    else if (!strcmp(name, "reveal-cards")) action_reveal(true);
-    else if (!strcmp(name, "card-import")) action_card_import(arg);
-    else if (!strcmp(name, "card-export")) action_card_export(arg);
-    else if (!strcmp(name, "card-eject")) action_card_eject(arg);
-    else if (!strcmp(name, "card-insert")) action_card_insert(arg);
-    else if (!strcmp(name, "card-delete")) action_card_delete(arg);
+    else if (!strcmp(name, "reveal-saves")) action_reveal(true);
+    else if (!strcmp(name, "save-import")) action_card_import(arg);
+    else if (!strcmp(name, "save-export")) action_card_export(arg);
+    else if (!strcmp(name, "save-delete")) action_card_delete(arg);
     else rt_log("menu: unknown action %s", name);
 }
 
