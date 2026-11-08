@@ -9,6 +9,8 @@
 #include "overrides/override.h"
 #include "savestate.h"
 #include "smooth.h"
+#include "input.h"
+#include "settings.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -241,30 +243,26 @@ static void dump_vram(const char *path) {
     write_png(path, buf, 1024, 512);
 }
 
-/* ---- input ----------------------------------------------------------------------------- */
+/* ---- input ---------------------------------------------------------------------------------
+ * Host input -> pad masks lives in input.c (keyboard, controllers, bindings, press-to-bind). Here:
+ * the SDL event loop, the window's own keys (which never reach a pad) and the --press scripts. */
 
-enum { B_SELECT = 0, B_L3, B_R3, B_START, B_UP, B_RIGHT, B_DOWN, B_LEFT,
-       B_L2, B_R2, B_L1, B_R1, B_TRIANGLE, B_CIRCLE, B_CROSS, B_SQUARE };
+static bool s_host_input;   /* headless: --input-event given, so host input feeds the pads */
+static void window_settings_event(const SDL_Event *e);
 
-static int key_to_button(SDL_Keycode k) {
-    switch (k) {
-    case SDLK_UP: return B_UP; case SDLK_DOWN: return B_DOWN;
-    case SDLK_LEFT: return B_LEFT; case SDLK_RIGHT: return B_RIGHT;
-    case SDLK_Z: return B_CROSS; case SDLK_X: return B_CIRCLE;
-    case SDLK_A: return B_SQUARE; case SDLK_S: return B_TRIANGLE;
-    case SDLK_Q: return B_L1; case SDLK_W: return B_R1;
-    case SDLK_E: return B_L2; case SDLK_R: return B_R2;
-    case SDLK_RETURN: return B_START; case SDLK_BACKSPACE: case SDLK_RSHIFT: return B_SELECT;
-    }
-    return -1;
+/* --press / --press2 masks for the current frame (taps held 6 frames). */
+static u16 script_mask(const InputStep *sc, int n) {
+    u16 m = 0;
+    for (int i = 0; i < n; i++)
+        if (sc[i].frame <= s_frame && s_frame < sc[i].frame + 6) m |= sc[i].mask;
+    return m;
 }
 
-static u16 s_keys_down;   /* pressed bits (active high) */
-
-static void poll_input(void) {
+static void poll_events(void) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) exit(0);
+        if (input_capture_event(&e)) continue;   /* press-to-bind (Controls window) */
         if (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) {
             bool down = e.type == SDL_EVENT_KEY_DOWN;
             if (e.key.key == SDLK_ESCAPE && down) exit(0);
@@ -285,8 +283,6 @@ static void poll_input(void) {
                 char p[64]; snprintf(p, sizeof p, "shot_%06llu.png", (unsigned long long)s_frame);
                 frontend_screenshot(p);
             }
-            int b = key_to_button(e.key.key);
-            if (b >= 0) { if (down) s_keys_down |= 1u << b; else s_keys_down &= ~(1u << b); }
         }
         if (e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
             int pw = 0, ph = 0;
@@ -294,39 +290,25 @@ static void poll_input(void) {
             rt_log("fullscreen: %s, window %dx%d px", e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN
                    ? "entered" : "left", pw, ph);
         }
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED) SDL_OpenGamepad(e.gdevice.which);
+        window_settings_event(&e);
+        input_handle_event(&e);
     }
-    u16 pads[2] = {s_keys_down, 0};
-    /* gamepads: first -> port 1 (together with the keyboard), second -> port 2 */
-    int n = 0;
-    SDL_JoystickID *ids = SDL_GetGamepads(&n);
-    for (int k = 0; ids && k < n && k < 2; k++) {
-        SDL_Gamepad *g = SDL_GetGamepadFromID(ids[k]);
-        if (!g) continue;
-        static const struct { SDL_GamepadButton b; int bit; } map[] = {
-            {SDL_GAMEPAD_BUTTON_SOUTH, B_CROSS}, {SDL_GAMEPAD_BUTTON_EAST, B_CIRCLE},
-            {SDL_GAMEPAD_BUTTON_WEST, B_SQUARE}, {SDL_GAMEPAD_BUTTON_NORTH, B_TRIANGLE},
-            {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, B_L1}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, B_R1},
-            {SDL_GAMEPAD_BUTTON_START, B_START}, {SDL_GAMEPAD_BUTTON_BACK, B_SELECT},
-            {SDL_GAMEPAD_BUTTON_DPAD_UP, B_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, B_DOWN},
-            {SDL_GAMEPAD_BUTTON_DPAD_LEFT, B_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, B_RIGHT},
-        };
-        for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
-            if (SDL_GetGamepadButton(g, map[i].b)) pads[k] |= 1u << map[i].bit;
-        if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) pads[k] |= 1u << B_L2;
-        if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) pads[k] |= 1u << B_R2;
-        /* left stick as d-pad */
-        int ax = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX), ay = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY);
-        if (ax < -16000) pads[k] |= 1u << B_LEFT;
-        if (ax > 16000) pads[k] |= 1u << B_RIGHT;
-        if (ay < -16000) pads[k] |= 1u << B_UP;
-        if (ay > 16000) pads[k] |= 1u << B_DOWN;
-    }
-    SDL_free(ids);
-    for (int i = 0; i < s_script_n; i++)
-        if (s_script[i].frame <= s_frame && s_frame < s_script[i].frame + 6) pads[0] |= s_script[i].mask;
-    g_pad_buttons[0] = (u16)~pads[0];
-    g_pad_buttons[1] = (u16)~pads[1];
+}
+
+/* This frame's pads: host input (input.c) plus the --press scripts. */
+static void host_pads(void) {
+    u16 m[2];
+    input_frame(m);
+    m[0] |= script_mask(s_script, s_script_n);
+    m[1] |= script_mask(s_script2, s_script2_n);
+    g_pad_buttons[0] = (u16)~m[0];
+    g_pad_buttons[1] = (u16)~m[1];
+    input_log_frame(s_frame, m);
+}
+
+static void poll_input(void) {
+    poll_events();
+    host_pads();
 }
 
 /* ---- per-frame hook (called from the VBlank event) --------------------------------- */
@@ -630,16 +612,19 @@ void frontend_set_status(const char *st) {
 /* Exit after frame n (headless and windowed), e.g. at the end of a --replay. */
 void frontend_set_max_frames(u64 n) { if (!s_max_frames || n < s_max_frames) s_max_frames = n; }
 
-/* --press / --press2 scripts for the current frame (taps held 6 frames). */
+/* Headless pads: the --press / --press2 scripts only (pad 2 untouched without --press2), or, with
+ * --input-event, injected host events through the same path as a window's. */
 static void script_pads(void) {
-    u16 pad = 0;
-    for (int i = 0; i < s_script_n; i++)
-        if (s_script[i].frame <= s_frame && s_frame < s_script[i].frame + 6) pad |= s_script[i].mask;
-    g_pad_buttons[0] = (u16)~pad;
-    u16 pad2 = 0;
-    for (int i = 0; i < s_script2_n; i++)
-        if (s_script2[i].frame <= s_frame && s_frame < s_script2[i].frame + 6) pad2 |= s_script2[i].mask;
-    if (s_script2_n) g_pad_buttons[1] = (u16)~pad2;
+    if (s_host_input && !ss_resimulating()) {
+        input_inject(s_frame);
+        poll_events();
+        host_pads();
+        return;
+    }
+    u16 m[2] = { script_mask(s_script, s_script_n), script_mask(s_script2, s_script2_n) };
+    g_pad_buttons[0] = (u16)~m[0];
+    if (s_script2_n) g_pad_buttons[1] = (u16)~m[1];
+    input_log_frame(s_frame, m);
 }
 
 void frontend_vblank(void) {
@@ -673,6 +658,7 @@ void frontend_vblank(void) {
     }
     static s16 audio[2048 * 2];
     menu_script_and_poll();
+    settings_autosave(SDL_GetTicksNS());
     ws_apply();                            /* a View-menu switch takes effect this vblank */
     for (int i = 0; i < s_resize_n; i++)
         if (s_resizes[i].frame == s_frame) {
@@ -933,6 +919,82 @@ static void present_frame(void) {
     SDL_RenderPresent(s_ren);
 }
 
+/* ---- saved settings (settings.c; keys documented in AGENTS.md "Settings file") ---------------
+ * Display options and the window come from settings.ini unless given on the command line (a flag
+ * locks its key: used for this run, never written). View-menu changes, full screen and window
+ * resizes are stored as they happen; the file is written when something changed. */
+static const char *s_settings_arg;   /* --settings FILE */
+static bool s_no_settings;           /* --no-settings */
+static bool s_scale_given, s_max_scale_given, s_ws_given;
+static bool s_fs_start;              /* display.fullscreen = on */
+static bool s_renderer_pref_sw;      /* display.renderer = software (GPU device still made: View > Renderer) */
+
+static bool parse_wxh(const char *v, int *w, int *h, int lo, int hi) {
+    char *e;
+    long a = strtol(v, &e, 10), b = a;
+    if (*e == 'x' || *e == 'X') b = strtol(e + 1, &e, 10);
+    if (*e || a < lo || a > hi || b < lo || b > hi) return false;
+    *w = (int)a; *h = (int)b;
+    return true;
+}
+
+static void settings_save_at_exit(void) { settings_save(); }
+
+static void settings_apply(const char *dir) {
+    char path[2200];
+    if (s_settings_arg) snprintf(path, sizeof path, "%s", s_settings_arg);
+    else if (!s_headless && !s_no_settings) snprintf(path, sizeof path, "%ssettings.ini", dir);
+    else path[0] = 0;   /* headless: hermetic unless --settings */
+    settings_set_path(path[0] ? path : NULL);
+    if (s_scale_given) settings_lock("display", "scale");
+    if (s_max_scale_given) settings_lock("display", "max_scale");
+    if (s_ws_given) settings_lock("display", "widescreen");
+    if (s_renderer_given) settings_lock("display", "renderer");
+    if (s_win_set) settings_lock("display", "window");
+    if (path[0] && settings_load() >= 0) rt_log("settings: %s", path);
+    const char *v;
+    int a, b;
+    if (!s_scale_given && (v = settings_get("display", "scale"))) {
+        if (!strcmp(v, "auto")) s_opt_sx = s_opt_sy = -1;
+        else if (!strcmp(v, "off") || !strcmp(v, "0")) s_opt_sx = s_opt_sy = 0;
+        else if (parse_wxh(v, &a, &b, 1, 8)) { s_opt_sx = a; s_opt_sy = b; }
+        else rt_log("settings: display.scale: auto, off or N / NxM (1..8)");
+    }
+    if (!s_max_scale_given && (v = settings_get("display", "max_scale"))) {
+        if (parse_wxh(v, &a, &b, 1, 8)) { s_max_sx = a; s_max_sy = b; }
+        else rt_log("settings: display.max_scale: N or NxM (1..8)");
+    }
+    if (!s_ws_given) s_widescreen = settings_get_bool("display", "widescreen", s_widescreen);
+    if (!s_renderer_given && (v = settings_get("display", "renderer"))) s_renderer_pref_sw = !strcmp(v, "software");
+    if (!s_win_set && (v = settings_get("display", "window"))) {
+        if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
+    }
+    s_fs_start = !s_headless && settings_get_bool("display", "fullscreen", false);
+    input_init();
+    atexit(settings_save_at_exit);
+}
+
+/* View-menu state into the settings (after a menu action ran). */
+static void settings_note_view(const char *name) {
+    if (!strcmp(name, "widescreen")) settings_set_bool("display", "widescreen", s_ws_req);
+    else if (!strcmp(name, "renderer") && s_renderer != R_COMPARE) settings_set("display", "renderer", renderer_name(s_renderer));
+    else return;
+    settings_save();
+}
+
+static void window_settings_event(const SDL_Event *e) {
+    if (!s_win) return;
+    if (e->type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e->type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
+        settings_set_bool("display", "fullscreen", e->type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN);
+    else if (e->type == SDL_EVENT_WINDOW_RESIZED && !(SDL_GetWindowFlags(s_win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED))) {
+        int w = 0, h = 0;
+        SDL_GetWindowSize(s_win, &w, &h);
+        char v[32];
+        snprintf(v, sizeof v, "%dx%d", w, h);
+        if (w >= 320 && h >= 240) settings_set("display", "window", v);
+    }
+}
+
 /* ---- boot ---------------------------------------------------------------------------------- */
 
 static void usage(void) {
@@ -986,8 +1048,19 @@ static void usage(void) {
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete,\n"
         "                        widescreen[=on|off], renderer[=software|gpu|compare] (View menu;\n"
         "                        no argument = toggle), netplay-host=PORT[,DELAY],\n"
-        "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect (Netplay menu)\n"
+        "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect (Netplay menu),\n"
+        "                        controls, controls-bind=P1:cross=key:Z|pad:east, controls-device=P2:keyboard,\n"
+        "                        controls-stick=P1:on|off, controls-deadzone=P1:40, controls-reset=P1|P2|all,\n"
+        "                        controls-dump (Controls window)\n"
         "                        (save actions use card slot 1; headless needs --data-dir or --memcard1)\n"
+        "  --settings FILE       settings file to read and write (default: settings.ini next to the data\n"
+        "                        pack in a window; headless runs use none unless given this)\n"
+        "  --no-settings         windowed: do not read or write the settings file\n"
+        "  --no-widescreen       4:3 even if the settings file says widescreen\n"
+        "  --input-event F:EV,.. (testing) inject host input on frame F: key-down:NAME, key-up:NAME,\n"
+        "                        pad-add:N[:ps4|xbox], pad-remove:N, pad-down:N:BUTTON, pad-up:N:BUTTON,\n"
+        "                        pad-axis:N:AXIS:VALUE (virtual SDL controllers; see input.h)\n"
+        "  --input-log FILE      write 'frame pad1 pad2' (hex, active high) whenever a pad mask changes\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
@@ -1395,7 +1468,13 @@ static void menu_run(const char *name, const char *arg) {
                                 : !frontend_widescreen());
     else if (!strcmp(name, "menu-test"))    /* Windows menu bar test hook (menu.h): dump | click=PATH */
         menu_test(arg);
+    else if (!strcmp(name, "controls") || !strcmp(name, "settings")) {   /* Settings… / View > Controls… */
+        if (s_headless) rt_log("menu: controls: no window in headless mode");
+        else controls_open();
+    }
+    else if (!strncmp(name, "controls-", 9)) input_menu_action(name, arg);   /* input.c */
     else rt_log("menu: unknown action %s", name);
+    settings_note_view(name);
 }
 
 static void menu_script_and_poll(void) {
@@ -1476,11 +1555,11 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) {
-            char *e; s_opt_sx = (int)strtol(argv[++i], &e, 10);
+            char *e; s_opt_sx = (int)strtol(argv[++i], &e, 10); s_scale_given = true;
             s_opt_sy = (*e == 'x' || *e == 'X') ? (int)strtol(e + 1, NULL, 10) : s_opt_sx;
         }
         else if (!strcmp(argv[i], "--max-scale") && i + 1 < argc) {
-            char *e; s_max_sx = (int)strtol(argv[++i], &e, 10);
+            char *e; s_max_sx = (int)strtol(argv[++i], &e, 10); s_max_scale_given = true;
             s_max_sy = (*e == 'x' || *e == 'X') ? (int)strtol(e + 1, NULL, 10) : s_max_sx;
         }
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) {
@@ -1506,7 +1585,18 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "--pgxp: expected on, off or affine\n"); return 1; }
         }
         else if (!strcmp(argv[i], "--hires-verify")) s_verify = true;
-        else if (!strcmp(argv[i], "--widescreen")) s_widescreen = true;
+        else if (!strcmp(argv[i], "--widescreen")) s_widescreen = s_ws_given = true;
+        else if (!strcmp(argv[i], "--no-widescreen")) { s_widescreen = false; s_ws_given = true; }
+        else if (!strcmp(argv[i], "--settings") && i + 1 < argc) s_settings_arg = argv[++i];
+        else if (!strcmp(argv[i], "--no-settings")) s_no_settings = true;
+        else if (!strcmp(argv[i], "--input-event") && i + 1 < argc) {
+            if (!input_parse_events(argv[++i])) return 1;
+        }
+        else if (!strcmp(argv[i], "--input-log") && i + 1 < argc) {
+            FILE *f = fopen(argv[++i], "wb");
+            if (!f) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
+            input_set_log(f);
+        }
         else if (!strcmp(argv[i], "--ram-snap") && i + 1 < argc) s_ram_snap_dir = argv[++i];
         else if (!strcmp(argv[i], "--gameplay-trace") && i + 1 < argc) {
             s_gameplay = fopen(argv[++i], "wb");
@@ -1595,6 +1685,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "data pack written to %s\n", pak);
         return 0;
     }
+    settings_apply(s_card_dir);
+    if (s_headless && input_have_events()) {   /* --input-event: SDL's event queue and virtual controllers */
+        if (!SDL_Init(SDL_INIT_GAMEPAD)) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
+        s_host_input = true;
+    }
     if (s_widescreen && !s_win_set) { s_win_w = 1280; s_win_h = 720; }
     if (!s_headless) create_window();
     const char *src = disc_path ? disc_path : pak;
@@ -1651,6 +1746,10 @@ int main(int argc, char **argv) {
             s_renderer = R_SOFTWARE;
         }
     }
+    if (s_renderer_pref_sw && s_renderer == R_GPU) {   /* settings: software, live switch stays possible */
+        s_renderer = R_SOFTWARE;
+        hires_set_backend(NULL, NULL);
+    }
     s_gpu_used = s_renderer != R_SOFTWARE;
     rt_log("hires: renderer %s", s_renderer == R_GPU ? "gpu" : s_renderer == R_COMPARE ? "compare" : "software");
     if (s_renderer == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
@@ -1677,6 +1776,7 @@ int main(int argc, char **argv) {
         s_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
         if (s_audio) SDL_ResumeAudioStreamDevice(s_audio);
         menu_init();   /* File menu; windowed only. Headless runs have no menus. */
+        if (s_fs_start) fullscreen_set(true);
     }
 
     memset(&g_cpu.r, 0, sizeof g_cpu.r);

@@ -84,6 +84,13 @@ Then run the build steps above (from the UCRT64 shell) and start the game with
 `SDL3.dll`, `zlib1.dll` and the GCC runtime DLLs from `C:\msys64\ucrt64\bin`
 next to `destrega.exe`.
 
+## Packaging and releases
+
+There are no downloadable playable builds: the game code in a build is translated from your own
+disc, so it cannot be redistributed. `tools/package_release.sh mac|win --personal` zips your own
+build for your own machines; CI only builds a non-playable stub. See `docs/RELEASES.md` for why,
+the options, and the macOS notarization steps. Third-party licences: `THIRD_PARTY_LICENSES.txt`.
+
 ## First launch
 
 The game asks for your disc image (`.cue` or `.bin`), checks it is the

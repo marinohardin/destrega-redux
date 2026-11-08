@@ -66,7 +66,8 @@ add_executable(destrega
   runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/memcard.c runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/gte.c runtime/pgxp.c runtime/spu.c runtime/xa.c runtime/mdec.c
   runtime/overrides/override.c runtime/overrides/collision.c runtime/menu_stub.c
   runtime/overrides/widescreen.c runtime/platform.c runtime/platform_net.c
-  runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c runtime/smooth.c)
+  runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c runtime/smooth.c
+  runtime/input.c runtime/settings.c)
 target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE} ${CMAKE_CURRENT_BINARY_DIR})
 # Emulation source identity for the netplay handshake (rule in tools/source_ident.py): the same
 # on every platform for the same sources.
@@ -90,15 +91,23 @@ endif()
 if(WIN32)
   # netplay UDP (net.c), local address list (platform.c), native menus (menu_win.c)
   target_link_libraries(destrega PRIVATE ws2_32 iphlpapi)
-  target_sources(destrega PRIVATE runtime/menu_win.c)
+  target_sources(destrega PRIVATE runtime/menu_win.c runtime/controls_win.c)
   # Embedded manifest (UTF-8 code page for file names) and a larger main-thread stack: the
   # recompiled code nests C calls like the game nests MIPS calls, and Windows' default 1 MiB
   # is far below the 8 MiB macOS and Linux give the main thread.
+  # plus the icon and version info (version from VERSION + git, regenerated every build but
+  # only rewritten when it changes).
   enable_language(RC)
+  add_custom_target(destrega_version
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/version.py rc-header
+            ${CMAKE_CURRENT_BINARY_DIR}/destrega_version.h
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/destrega_version.h
+    COMMENT "Version resource header" VERBATIM)
+  add_dependencies(destrega destrega_version)
   target_sources(destrega PRIVATE runtime/win/destrega.rc)
   set_source_files_properties(runtime/win/destrega.rc PROPERTIES
-    OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/runtime/win/destrega.manifest)
-  target_include_directories(destrega PRIVATE runtime/win)
+    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/runtime/win/destrega.manifest;${CMAKE_SOURCE_DIR}/runtime/win/destrega.ico;${CMAKE_CURRENT_BINARY_DIR}/destrega_version.h")
+  target_include_directories(destrega PRIVATE runtime/win ${CMAKE_CURRENT_BINARY_DIR})
   if(MSVC)
     target_link_options(destrega PRIVATE /STACK:16777216)
   else()
@@ -107,8 +116,8 @@ if(WIN32)
 endif()
 if(APPLE)
   # native File menu (Cocoa); menu_stub.c compiles to nothing on Apple
-  target_sources(destrega PRIVATE runtime/menu_mac.m)
-  set_source_files_properties(runtime/menu_mac.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall")
+  target_sources(destrega PRIVATE runtime/menu_mac.m runtime/controls_mac.m)
+  set_source_files_properties(runtime/menu_mac.m runtime/controls_mac.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall")
   target_link_libraries(destrega PRIVATE "-framework Cocoa")
 endif()
 
@@ -136,6 +145,15 @@ if(DESTREGA_TESTS)
     endif()
     add_test(NAME ${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
+  # input mapping + settings file (needs SDL for key names, not a display)
+  add_executable(test_input runtime/input.c runtime/settings.c runtime/platform.c runtime/tests/test_input.c)
+  target_include_directories(test_input PRIVATE runtime)
+  target_compile_options(test_input PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(test_input PRIVATE SDL3::SDL3)
+  if(UNIX)
+    target_link_libraries(test_input PRIVATE m)
+  endif()
+  add_test(NAME input COMMAND test_input WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   # SDL_GPU backend vs software on random command streams (needs a GPU device; exit 77 =
   # skipped when there is none, e.g. a CI runner without Vulkan)
   add_executable(test_hires_gpu runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c
@@ -159,11 +177,15 @@ endif()
 # the CLI/headless flags and tools/run_tests.sh.
 if(APPLE)
   option(DESTREGA_MACOS_APP "Build Destrega.app next to the destrega binary" ON)
-  set(DESTREGA_APP_VERSION "1.0" CACHE STRING "CFBundle version of Destrega.app")
+  set(DESTREGA_APP_VERSION "" CACHE STRING "CFBundleShortVersionString of Destrega.app (empty = tools/version.py: VERSION file + git)")
   set(DESTREGA_APP_ICON ${CMAKE_SOURCE_DIR}/assets/icon/destrega.png CACHE FILEPATH
       "App icon (PNG >= 512px or .icns)")
   set(DESTREGA_APP_SIGN "-" CACHE STRING "codesign identity for Destrega.app (- = ad-hoc)")
   if(DESTREGA_MACOS_APP)
+    set(_app_version_args "")
+    if(DESTREGA_APP_VERSION)
+      set(_app_version_args --version ${DESTREGA_APP_VERSION})
+    endif()
     set(APP_STAMP ${CMAKE_BINARY_DIR}/Destrega.app.stamp)
     add_custom_command(
       OUTPUT ${APP_STAMP}
@@ -171,10 +193,10 @@ if(APPLE)
               --bin $<TARGET_FILE:destrega>
               --out ${CMAKE_BINARY_DIR}/Destrega.app
               --icon ${DESTREGA_APP_ICON}
-              --version ${DESTREGA_APP_VERSION}
+              ${_app_version_args}
               --sign ${DESTREGA_APP_SIGN}
       COMMAND ${CMAKE_COMMAND} -E touch ${APP_STAMP}
-      DEPENDS destrega ${CMAKE_SOURCE_DIR}/tools/make_app.sh ${DESTREGA_APP_ICON}
+      DEPENDS destrega ${CMAKE_SOURCE_DIR}/tools/make_app.sh ${CMAKE_SOURCE_DIR}/tools/version.py ${CMAKE_SOURCE_DIR}/VERSION ${DESTREGA_APP_ICON}
       COMMENT "Bundling Destrega.app"
       VERBATIM)
     add_custom_target(destrega_app ALL DEPENDS ${APP_STAMP})

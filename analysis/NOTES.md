@@ -208,6 +208,16 @@ changes the fighter struct at the start of F+1).
 ## Input / hardware use
 
 - Pads: libpad drives SIO0 directly (not BIOS InitPAD). Memory cards: see "Memory card" below.
+- **The game only uses a digital pad** (verified: temporary SIO0 probe in `sio.c`, boot -> title ->
+  menus -> a fight, both ports). Every transfer is `01 42 00 ..` (poll); libpad never sends
+  `43` (config mode), `44` (set analog), `4D` (rumble mapping) or `45..4C`, so it never switches a
+  DualShock to analog and only the 16 digital button bits matter. The runtime answers as a digital
+  pad (ID 0x41) and maps the host's left stick to the D-pad.
+- From frame ~3034 (in a fight) port 0's poll carries `40 01` in the two bytes after the ID
+  exchange, where a DualShock in analog/config-unlocked mode would read motor values; a digital
+  pad ignores them. (likely: libpad's actuator buffer being sent, the game never enables the
+  motors through `4D`, so there is no rumble to emulate; guess: the values are a default
+  actuator table, not game intent). Port 1 was only probed in menus.
 - CD: libcd at register level; XA audio and the 5 STR movies live in `XADATA.BNS`.
 
 - **Netplay smoothness** (measured with `tools/netplay_smooth.py`, windowed, 60 Hz, on a VS
