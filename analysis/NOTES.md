@@ -359,6 +359,13 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
   `--pgxp off` at 2x2 and 4x6, 4:3 and 16:9). So every fight-frame primitive kind the game sends
   (list above) is covered by the GLSL port. The port learned nothing new about the game's own
   code; no addresses were added to `symbols.txt`.
+- Direct3D 12 renderer (DXIL from the same GLSL; verified under CrossOver 26, vkd3d over MoltenVK):
+  the full game at 4x6 16:9 `--pgxp off` gives 0 differing pixels against software over 500
+  compared frames (131 fight frames), and `--renderer gpu` 4x6 gives per-frame state hashes and
+  dumped frames byte-identical to Metal on macOS. Like the Vulkan port, nothing new about the
+  game's code; no `symbols.txt` change. Live switching between graphics APIs mid-fight (headless
+  and windowed, 9-14 switches) leaves the per-frame state hash equal to a run without switches:
+  `verified` that the renderer choice cannot reach emulated state.
 - Windows build under Wine (`tools/test_wine.sh`, MinGW GCC cross build, CrossOver 26):
   `verified` that the boot-to-fight state hash matches macOS for every frame (4000/4000, at 1x and
   at 4x6 widescreen) with `--no-interp`. So the IRQ path (libetc `setjmp` at 0x8009b8bc resumed at

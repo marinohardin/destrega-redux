@@ -94,7 +94,7 @@ static char s_card_dir[2048];          /* folder for default card images, "" or 
 static const char *s_disc_path;        /* positional image (dev use), else NULL */
 static bool s_data_dir_given;
 typedef struct { u64 frame; char name[24]; char arg[2048]; } MenuStep;
-static MenuStep s_menu_script[16];     /* --menu-action FRAME:NAME[=ARG] test hook */
+static MenuStep s_menu_script[64];     /* --menu-action FRAME:NAME[=ARG] test hook */
 static int s_menu_script_n;
 static void menu_script_and_poll(void);
 static const char *s_ram_dump;     /* --ram-dump FILE: main RAM at the end of a headless run */
@@ -108,11 +108,13 @@ static ResizeStep s_resizes[256];
 static int s_resize_n;
 static SDL_Texture *s_hitex;
 static int s_hitex_w, s_hitex_h;
-/* --renderer software|gpu|compare (see AGENTS.md "GPU renderer") */
+/* --renderer software|gpu|metal|vulkan|d3d12|compare (see AGENTS.md "GPU renderer"). The GPU
+ * backend's graphics API is hires_gpu_api(); --gpu-driver / --renderer API / settings choose it. */
 enum { R_SOFTWARE, R_GPU, R_COMPARE };
 static int s_renderer = R_SOFTWARE;
 static bool s_renderer_given;              /* --renderer on the command line */
-static bool s_gpu_ok;                      /* GPU backend initialised (live switching possible) */
+static int s_api_pref = -1;                /* settings display.renderer = metal|vulkan|d3d12 (windowed) */
+static SDL_GPUDevice *s_win_dev;           /* device of the window's GPU renderer (NULL: plain SDL renderer) */
 static bool s_gpu_used;                    /* the GPU backend ran at some point (stats) */
 static SDL_GPUTexture *s_gputex_src;       /* GPU texture wrapped by s_gputex */
 static SDL_Texture *s_gputex;
@@ -401,34 +403,179 @@ static void apply_window_size(int pw, int ph, bool simulated) {
     }
 }
 
-/* ---- runtime renderer switch (View > Renderer, --menu-action renderer=software|gpu) ----
- * Between frames: select the backend and reallocate the hi-res target at the current scale,
- * seeded from the 1x VRAM like a resize (hires_set_scale destroys the old backend's target).
- * Nothing emulated is touched. The SDL renderer stays (the GPU renderer presents both). */
-static const char *renderer_name(int r) { return r == R_GPU ? "gpu" : r == R_COMPARE ? "compare" : "software"; }
+/* ---- runtime renderer / graphics API switch (View > Renderer, --menu-action renderer=...) ----
+ * Between frames. Backend only (Software <-> GPU on the same API): select the backend and
+ * reallocate the hi-res target at the current scale, seeded from the 1x VRAM like a resize
+ * (hires_set_scale destroys the old backend's target). Another graphics API: the hi-res target
+ * is dropped, the GPU backend shut down, and the window's SDL renderer and its SDL_GPU device are
+ * rebuilt on the new API (headless: the backend's own device), then the target is reallocated
+ * and seeded the same way. If the new API cannot be started, the previous one is restored (or
+ * the Software renderer on whatever SDL renderer works). Nothing emulated is touched. */
+static const char *renderer_name(int r) {
+    if (r == R_COMPARE) return "compare";
+    if (r == R_GPU) return hires_gpu_api_name(hires_gpu_api());
+    return "software";
+}
 const char *frontend_renderer(void) { return renderer_name(s_renderer); }
-bool frontend_gpu_available(void) { return s_gpu_ok || s_headless; }
 
-static void renderer_switch(int r) {
-    if (r == s_renderer) return;
-    if (r != R_SOFTWARE && !s_gpu_ok) {
-        /* headless: create the backend's own device on first use; windowed: needs the GPU renderer */
-        if (s_headless) s_gpu_ok = hires_gpu_init(NULL);
-        if (!s_gpu_ok) { rt_log("hires: renderer %s unavailable; staying on %s", renderer_name(r), renderer_name(s_renderer)); return; }
+/* The platform's default API: the first of its list that is available here (-1: none). */
+static int default_api(void) {
+    int order[HGPU_NAPI];
+    const int n = hires_gpu_api_order(order);
+    for (int i = 0; i < n; i++)
+        if (order[i] == hires_gpu_api() || hires_gpu_api_probe(order[i])) return order[i];
+    return -1;
+}
+
+int frontend_graphics_apis(const char **names, const char **titles, int max) {
+    int order[HGPU_NAPI];
+    const int n = hires_gpu_api_order(order);
+    int k = 0;
+    for (int i = 0; i < n && k < max; i++, k++) {
+        names[k] = hires_gpu_api_name(order[i]);
+        titles[k] = hires_gpu_api_title(order[i]);
     }
+    return k;
+}
+
+bool frontend_renderer_available(const char *name) {
+    if (!strcmp(name, "software")) return true;
+    if (!strcmp(name, "gpu") || !strcmp(name, "compare")) return hires_gpu_api() >= 0 || default_api() >= 0;
+    const int a = hires_gpu_api_from_name(name);
+    return a >= 0 && hires_gpu_api_offered(a) && (a == hires_gpu_api() || hires_gpu_api_probe(a));
+}
+
+static void window_textures_drop(void) {
+    if (s_gputex) SDL_DestroyTexture(s_gputex);
+    if (s_hitex) SDL_DestroyTexture(s_hitex);
+    if (s_tex) SDL_DestroyTexture(s_tex);
+    s_gputex = s_hitex = s_tex = NULL;
+    s_gputex_src = NULL;
+    s_hitex_w = s_hitex_h = 0;
+}
+
+static void window_textures_make(void) {
+    s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 640, 512);
+    SDL_SetTextureScaleMode(s_tex, SDL_SCALEMODE_NEAREST);
+}
+
+/* Destroy the window's renderer, the GPU backend's resources and the renderer's device. */
+static void window_renderer_drop(void) {
+    window_textures_drop();
+    hires_gpu_shutdown();
+    if (s_ren) SDL_DestroyRenderer(s_ren);
+    s_ren = NULL;
+    if (s_win_dev) SDL_DestroyGPUDevice(s_win_dev);   /* an external device: the renderer leaves it */
+    s_win_dev = NULL;
+}
+
+/* The window's renderer on a new SDL_GPU device of `api`, with the GPU backend initialised on
+ * it. auto_pick: refuse a software rasterizer (WARP, llvmpipe, ...): the Software renderer is
+ * faster than those, and the API stays selectable by hand. */
+static bool window_renderer_on(int api, bool auto_pick) {
+    if (!hires_gpu_api_probe(api)) return false;
+    SDL_GPUDevice *dev = hires_gpu_create_device(api);
+    if (!dev) { hires_gpu_api_mark_failed(api); return false; }
+    SDL_Renderer *ren = SDL_CreateGPURenderer(dev, s_win);
+    if (!ren) {
+        rt_log("hires-gpu: %s: no window renderer: %s", hires_gpu_api_title(api), SDL_GetError());
+        SDL_DestroyGPUDevice(dev);
+        hires_gpu_api_mark_failed(api);
+        return false;
+    }
+    if (!hires_gpu_init(dev)) {
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyGPUDevice(dev);
+        hires_gpu_api_mark_failed(api);
+        return false;
+    }
+    if (auto_pick && hires_gpu_software_adapter()) {
+        rt_log("hires-gpu: %s runs on a software rasterizer here (%s); the Software renderer is used instead "
+               "(View > Renderer still offers it)", hires_gpu_api_title(api), hires_gpu_device_name());
+        hires_gpu_shutdown();
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyGPUDevice(dev);
+        return false;
+    }
+    s_ren = ren;
+    s_win_dev = dev;
+    return true;
+}
+
+/* Startup: `first` if >= 0 (strict: nothing else when the user forced it with --gpu-driver /
+ * --renderer API), else / then the platform's order. */
+static bool window_renderer_any(int first, bool strict) {
+    if (first >= 0) {
+        if (window_renderer_on(first, false)) return true;
+        if (strict) return false;
+        rt_log("hires-gpu: %s (from the settings) is not available; trying the default", hires_gpu_api_title(first));
+    }
+    int order[HGPU_NAPI];
+    const int n = hires_gpu_api_order(order);
+    for (int i = 0; i < n; i++)
+        if (order[i] != first && window_renderer_on(order[i], true)) return true;
+    return false;
+}
+
+/* Rebuild the GPU backend on `api` (the hi-res layer must not be using it). */
+static bool gpu_device_switch(int api) {
+    if (s_headless) {
+        hires_gpu_shutdown();   /* destroys its own device */
+        hires_gpu_set_driver(hires_gpu_api_name(api));
+        return hires_gpu_init(NULL);
+    }
+    window_renderer_drop();
+    return window_renderer_on(api, false);
+}
+
+static void backend_for(int r) {
     if (r == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
     else if (r == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
     else hires_set_backend(NULL, NULL);
-    if (!s_ssaa_chosen && !s_headless) hires_set_ssaa(r == R_GPU ? 2 : 1);   /* default follows the renderer */
+}
+
+/* api: the graphics API for R_GPU / R_COMPARE; -1 = the one in use, else the default */
+static void renderer_switch(int r, int api) {
+    const int cur = hires_gpu_api();
+    if (r != R_SOFTWARE && api < 0) api = cur >= 0 ? cur : default_api();
+    if (r != R_SOFTWARE && api < 0) { rt_log("hires: no graphics API available; staying on %s", renderer_name(s_renderer)); return; }
+    if (r == s_renderer && (r == R_SOFTWARE || api == cur)) return;
     int sx, sy;
-    bool on = hires_get_scale(&sx, &sy);
+    const bool on = hires_get_scale(&sx, &sy);
+    if (r != R_SOFTWARE && api != cur) {
+        if (!hires_gpu_api_offered(api) || !hires_gpu_api_probe(api)) {
+            rt_log("hires: %s is not %s; staying on %s", hires_gpu_api_title(api),
+                   hires_gpu_api_offered(api) ? "available on this computer" : "offered on this platform", renderer_name(s_renderer));
+            return;
+        }
+        const int old_r = s_renderer;
+        /* stop drawing with the GPU backend, then rebuild it on the new device */
+        hires_set_backend(NULL, NULL);
+        if (on) hires_set_scale(0, 0);
+        const u64 t0 = SDL_GetTicksNS();
+        if (gpu_device_switch(api))
+            rt_log("hires: graphics %s -> %s in %.1f ms", cur >= 0 ? hires_gpu_api_title(cur) : "none", hires_gpu_api_title(api),
+                   (double)(SDL_GetTicksNS() - t0) / 1e6);
+        else {
+            rt_log("hires: %s could not be started; back to %s", hires_gpu_api_title(api),
+                   cur >= 0 ? hires_gpu_api_title(cur) : "software");
+            if (cur >= 0 && gpu_device_switch(cur)) r = old_r;
+            else r = R_SOFTWARE;
+        }
+        if (!s_headless) {
+            if (!s_ren) s_ren = SDL_CreateRenderer(s_win, NULL);   /* the window always needs one */
+            if (!s_ren) { fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); exit(1); }
+            window_textures_make();
+        }
+        if (r != R_SOFTWARE && hires_gpu_api() < 0) r = R_SOFTWARE;
+    }
+    backend_for(r);
+    if (!s_ssaa_chosen && !s_headless) hires_set_ssaa(r == R_GPU ? 2 : 1);   /* default follows the renderer */
     if (on && !hires_set_scale(sx, sy)) {
-        rt_log("hires: renderer %s cannot allocate %dx%d; back to %s", renderer_name(r), sx, sy, renderer_name(s_renderer));
-        if (s_renderer == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
-        else if (s_renderer == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
-        else hires_set_backend(NULL, NULL);
+        rt_log("hires: renderer %s cannot allocate %dx%d; back to software", renderer_name(r), sx, sy);
+        r = R_SOFTWARE;
+        backend_for(r);
         hires_set_scale(sx, sy);
-        return;
     }
     rt_log("hires: renderer %s at frame %llu", renderer_name(r), (unsigned long long)s_frame);
     s_renderer = r;
@@ -894,15 +1041,16 @@ static void present_frame(void) {
     } else if (have) {
         /* true hi-res target: downsampled/filtered into the viewport, never an upsampled 1x image */
         const int ow = view_w(&hv), oh = view_h(&hv);   /* after the SSAA box filter */
+        /* Upload only if the displayed rows were drawn since the last upload (fights draw at
+         * 30 fps but present at 60), or the view/target/texture changed. */
+        static const void *up_pixels; static int up_stride, up_w, up_h; static u64 up_epoch; static bool up_ok;
         if (!s_hitex || s_hitex_w != ow || s_hitex_h != oh) {
             if (s_hitex) SDL_DestroyTexture(s_hitex);
             s_hitex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, ow, oh);
             if (s_hitex) SDL_SetTextureScaleMode(s_hitex, SDL_SCALEMODE_LINEAR);
             s_hitex_w = ow; s_hitex_h = oh;
+            up_ok = false;   /* a new texture (resize, or a new renderer after a graphics API switch) */
         }
-        /* Upload only if the displayed rows were drawn since the last upload (fights draw at
-         * 30 fps but present at 60), or the view/target changed. */
-        static const void *up_pixels; static int up_stride, up_w, up_h; static u64 up_epoch; static bool up_ok;
         const void *hpx = hv.pixels ? (const void *)hv.pixels : (const void *)hv.px32;
         bool same = up_ok && up_pixels == hpx && up_stride == hv.stride && up_w == hv.w &&
                     up_h == hv.h && up_epoch == hires_epoch();
@@ -977,7 +1125,15 @@ static void settings_apply(const char *dir) {
         else rt_log("settings: display.max_scale: N or NxM (1..8)");
     }
     if (!s_ws_given) s_widescreen = settings_get_bool("display", "widescreen", s_widescreen);
-    if (!s_renderer_given && (v = settings_get("display", "renderer"))) s_renderer_pref_sw = !strcmp(v, "software");
+    if (!s_renderer_given && (v = settings_get("display", "renderer"))) {
+        /* software | gpu (the platform default; older files) | metal | vulkan | d3d12 */
+        s_renderer_pref_sw = !strcmp(v, "software");
+        const int a = hires_gpu_api_from_name(v);
+        if (a >= 0 && hires_gpu_api_offered(a)) s_api_pref = a;
+        else if (a >= 0) rt_log("settings: display.renderer: %s is not offered on this platform; using the default", v);
+        else if (strcmp(v, "software") && strcmp(v, "gpu"))
+            rt_log("settings: display.renderer: software, gpu or a graphics API (metal, vulkan, d3d12)");
+    }
     if (!s_win_set && (v = settings_get("display", "window"))) {
         if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
     }
@@ -1265,7 +1421,7 @@ static void import_progress(void *ud, float frac) {
 static void restart_exec(bool netplay, const char *const *extra, int nextra) {
     char exe[4096];
     if (!menu_executable_path(exe, sizeof exe)) snprintf(exe, sizeof exe, "%s", s_argv[0]);
-    char **av = calloc((size_t)s_argc + (size_t)nextra + 2 * 16 + 2, sizeof *av);
+    char **av = calloc((size_t)s_argc + (size_t)nextra + 2 * (sizeof s_menu_script / sizeof s_menu_script[0]) + 2, sizeof *av);
     int n = 0;
     av[n++] = exe;
     for (int i = 1; i < s_argc; i++) {
@@ -1517,12 +1673,16 @@ static void menu_run(const char *name, const char *arg) {
         netplay_menu_join(host, port, delay);
     }
     else if (!strcmp(name, "netplay-disconnect")) netplay_menu_disconnect();
-    else if (!strcmp(name, "renderer")) {   /* View > Renderer; arg software|gpu|compare, none = toggle */
-        if (!strcmp(arg, "gpu")) renderer_switch(R_GPU);
-        else if (!strcmp(arg, "software")) renderer_switch(R_SOFTWARE);
-        else if (!strcmp(arg, "compare")) renderer_switch(R_COMPARE);
-        else if (!*arg) renderer_switch(s_renderer == R_SOFTWARE ? R_GPU : R_SOFTWARE);
-        else rt_log("menu: renderer: software, gpu or compare");
+    else if (!strcmp(name, "renderer")) {
+        /* View > Renderer; arg software | gpu (the platform default) | metal | vulkan | d3d12 |
+         * compare (keeps the API in use); none = toggle software <-> GPU */
+        const int a = hires_gpu_api_from_name(arg);
+        if (!strcmp(arg, "gpu")) renderer_switch(R_GPU, default_api());
+        else if (!strcmp(arg, "software")) renderer_switch(R_SOFTWARE, -1);
+        else if (!strcmp(arg, "compare")) renderer_switch(R_COMPARE, -1);
+        else if (a >= 0) renderer_switch(R_GPU, a);
+        else if (!*arg) renderer_switch(s_renderer == R_SOFTWARE ? R_GPU : R_SOFTWARE, -1);
+        else rt_log("menu: renderer: software, gpu, metal, vulkan, d3d12 or compare");
     }
     else if (!strcmp(name, "fullscreen"))   /* View > Enter/Exit Full Screen; arg on/off, none/toggle */
         fullscreen_set(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
@@ -1577,26 +1737,22 @@ static void create_window(void) {
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     s_ren = NULL;
     if (!s_renderer_given) s_renderer = R_GPU;   /* windowed default (falls back below) */
-    /* SDL's GPU renderer, whose device the hi-res backend draws with. Created whenever the GPU
-     * backend may be used, so View > Renderer can switch at any time; --renderer software
-     * forces the plain renderer (and software only). The device is the backend's choice
-     * (Metal/MSL or Vulkan/SPIR-V, --gpu-driver), so SDL never picks one it has no shaders for. */
+    /* SDL's GPU renderer on a device the hi-res backend draws with. Created whenever the GPU
+     * backend may be used; --renderer software forces the plain SDL renderer (View > Renderer
+     * can still switch to an API: that rebuilds the renderer). The API: --gpu-driver /
+     * --renderer API (only that one), else the settings' choice, else the platform's order
+     * (macOS Metal, Vulkan; Windows Direct3D 12, Vulkan; Linux Vulkan), first that works. */
     if (s_renderer != R_SOFTWARE || !s_renderer_given) {
-        SDL_GPUDevice *dev = hires_gpu_create_device();
-        s_ren = dev ? SDL_CreateGPURenderer(dev, s_win) : NULL;
-        if (dev && !s_ren) SDL_DestroyGPUDevice(dev);
-        s_gpu_ok = s_ren && hires_gpu_init(SDL_GetGPURendererDevice(s_ren));
-        if (!s_gpu_ok) {
-            rt_log("hires-gpu: GPU renderer unavailable (%s); using the software renderer", SDL_GetError());
-            if (s_ren) SDL_DestroyRenderer(s_ren);
-            s_ren = NULL;
+        const int forced = hires_gpu_driver();
+        if (!window_renderer_any(forced >= 0 ? forced : s_api_pref, forced >= 0)) {
+            rt_log("hires-gpu: GPU renderer unavailable; using the software renderer");
             s_renderer = R_SOFTWARE;
         }
     }
     if (!s_ren) s_ren = SDL_CreateRenderer(s_win, NULL);
+    if (!s_ren) { fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); exit(1); }
     SDL_SetRenderLogicalPresentation(s_ren, 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
-    s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 640, 512);
-    SDL_SetTextureScaleMode(s_tex, SDL_SCALEMODE_NEAREST);
+    window_textures_make();
 }
 
 int main(int argc, char **argv) {
@@ -1705,10 +1861,20 @@ int main(int argc, char **argv) {
             if (!strcmp(r, "software")) s_renderer = R_SOFTWARE;
             else if (!strcmp(r, "gpu")) s_renderer = R_GPU;
             else if (!strcmp(r, "compare")) s_renderer = R_COMPARE;
-            else { fprintf(stderr, "--renderer: software, gpu or compare\n"); return 1; }
+            else if (hires_gpu_api_from_name(r) >= 0) {   /* = gpu + --gpu-driver API */
+                if (!hires_gpu_set_driver(r)) { fprintf(stderr, "--renderer: %s is not offered on this platform\n", r); return 1; }
+                s_renderer = R_GPU;
+            }
+            else { fprintf(stderr, "--renderer: software, gpu, metal, vulkan, d3d12 or compare\n"); return 1; }
         }
         else if (!strcmp(argv[i], "--gpu-driver") && i + 1 < argc) {
-            if (!hires_gpu_set_driver(argv[++i])) { fprintf(stderr, "--gpu-driver: auto, metal or vulkan\n"); return 1; }
+            if (!hires_gpu_set_driver(argv[++i])) {
+                int o[HGPU_NAPI], n = hires_gpu_api_order(o);
+                fprintf(stderr, "--gpu-driver: auto");
+                for (int k = 0; k < n; k++) fprintf(stderr, ", %s", hires_gpu_api_name(o[k]));
+                fprintf(stderr, " (on this platform)\n");
+                return 1;
+            }
         }
         else if (!strcmp(argv[i], "--compare-every") && i + 1 < argc) s_compare_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--compare-max") && i + 1 < argc) s_compare_max = atof(argv[++i]);
@@ -1740,7 +1906,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--memcard1") && i + 1 < argc) s_memcard_path[0] = argv[++i];
         else if (!strcmp(argv[i], "--memcard2") && i + 1 < argc) s_memcard_path[1] = argv[++i];
         else if (!strcmp(argv[i], "--no-memcard")) s_no_memcard = true;
-        else if (!strcmp(argv[i], "--menu-action") && i + 1 < argc && s_menu_script_n < 16) {
+        else if (!strcmp(argv[i], "--menu-action") && i + 1 < argc) {
+            if (s_menu_script_n >= (int)(sizeof s_menu_script / sizeof s_menu_script[0])) { fprintf(stderr, "--menu-action: at most %d\n", (int)(sizeof s_menu_script / sizeof s_menu_script[0])); return 1; }
             char *s = argv[++i];
             MenuStep *m = &s_menu_script[s_menu_script_n++];
             m->frame = strtoull(s, &s, 0);
@@ -1836,8 +2003,8 @@ int main(int argc, char **argv) {
     widescreen_add_state_hook(pgxp_snapshot_save, pgxp_snapshot_restore);   /* shadow pass leaves PGXP alone */
     hires_set_threads(s_hires_threads);
     if (s_renderer != R_SOFTWARE) {
-        s_gpu_ok = hires_gpu_init(NULL);   /* headless: a device of its own; windowed: already done */
-        if (!s_gpu_ok) {
+        /* headless: a device of its own; windowed: already done (true if initialised) */
+        if (!hires_gpu_init(NULL)) {
             rt_log("hires-gpu: GPU renderer unavailable; using the software renderer");
             s_renderer = R_SOFTWARE;
         }
@@ -1853,7 +2020,7 @@ int main(int argc, char **argv) {
     /* default SSAA only while the render target costs no more than 4x6 (measured: 4x6 x2 = 8x12
      * took ~4x the GPU time, far over a 60 Hz frame); an explicit choice is never capped */
     hires_set_ssaa_cap(s_ssaa_chosen ? 0 : 24);
-    rt_log("hires: renderer %s", s_renderer == R_GPU ? "gpu" : s_renderer == R_COMPARE ? "compare" : "software");
+    rt_log("hires: renderer %s", renderer_name(s_renderer));
     if (s_renderer == R_GPU) hires_set_backend(hires_gpu_backend(), NULL);
     else if (s_renderer == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
     if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))

@@ -83,11 +83,12 @@ for t in gte gpu hires pgxp spu mdec memcard input; do
   printf '%-6s ' "$t"
   if wait "$pid"; then echo ok; else echo FAIL; tail build/tests/test_$t.log; fail=1; fi
 done
-# GPU backend vs software on random command streams: Metal (macOS) / the default driver, and
-# Vulkan (MoltenVK here, if the Vulkan loader is installed); exit 77 = no such device, skipped
+# GPU backend vs software on random command streams: the default API (Metal on macOS), Vulkan
+# (MoltenVK here, if the Vulkan loader is installed), Direct3D 12 (Windows only) and the live
+# API switch (shutdown + restart on every available API); exit 77 = no such device, skipped
 if [ "$(cat build/tests/hgpu.cc.rc)" != 0 ]; then echo "hires_gpu: COMPILE FAIL"; cat build/tests/hgpu.cc.log; fail=1
 else
-  for d in auto vulkan; do
+  for d in auto vulkan d3d12 switch; do
     printf '%-6s ' "gpu-$d"
     ./build/tests/test_hires_gpu $d > build/tests/test_hires_gpu_$d.log 2>&1; rc=$?
     if [ $rc = 0 ]; then echo ok; elif [ $rc = 77 ]; then echo "skipped ($(head -1 build/tests/test_hires_gpu_$d.log))"

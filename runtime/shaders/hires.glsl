@@ -1,7 +1,9 @@
-/* Vulkan (SPIR-V) shaders of the SDL_GPU hi-res backend: the same logic as the MSL source in
- * runtime/hires_gpu.c (keep the two in step; the software rasterizer in hires.c is the
- * reference both must match bit for bit). Compiled by tools/gen_spirv.py into
- * runtime/shaders/hires_spirv.h, one entry point per -D define:
+/* Vulkan (SPIR-V) and Direct3D 12 (DXIL) shaders of the SDL_GPU hi-res backend: the same logic
+ * as the MSL source in runtime/hires_gpu.c (keep the two in step; the software rasterizer in
+ * hires.c is the reference both must match bit for bit). Compiled by tools/gen_spirv.py into
+ * runtime/shaders/hires_spirv.h and by tools/gen_dxil.py (with -DPORTABLE_MUL, SPIRV-Cross to
+ * HLSL SM 6.0, DXC) into runtime/shaders/hires_dxil.h: regenerate both after an edit. One entry
+ * point per -D define:
  *   VS_PRIM / FS_PRIM      primitives into the B5G5R5A1 (15-bit) or RGBA8 (full-precision) target
  *   VS_FULL / FS_PRESENT   target -> RGBA8 presentation texture (SSAA box filter)
  *
@@ -66,6 +68,34 @@ void main()
 #if defined(FS_PRIM)
 /* ---- 64-bit integers as uvec2 (lo, hi) ------------------------------------------------- */
 uvec2 L(int a) { return uvec2(uint(a), a < 0 ? 0xFFFFFFFFu : 0u); }
+#if defined(PORTABLE_MUL)
+/* HLSL / DXIL build (tools/gen_dxil.py): SPIRV-Cross has no HLSL form of OpIAddCarry,
+ * OpISubBorrow, OpUMulExtended and OpSMulExtended, so the same results from 32-bit operations
+ * only (carry = wrapped sum below an operand; full product from 16-bit halves; the signed high
+ * word is the unsigned one minus b when a < 0 and minus a when b < 0). */
+uint pcarry_add(uint a, uint b, out uint c) { uint r = a + b; c = r < a ? 1u : 0u; return r; }
+uint pborrow_sub(uint a, uint b, out uint c) { c = a < b ? 1u : 0u; return a - b; }
+void pumul(uint a, uint b, out uint hi, out uint lo)
+{
+    uint al = a & 0xFFFFu, ah = a >> 16, bl = b & 0xFFFFu, bh = b >> 16;
+    uint ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+    uint mid = (ll >> 16) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+    lo = (mid << 16) | (ll & 0xFFFFu);
+    hi = hh + (lh >> 16) + (hl >> 16) + (mid >> 16);
+}
+void psmul(int a, int b, out int hi, out int lo)
+{
+    uint h, l;
+    pumul(uint(a), uint(b), h, l);
+    if (a < 0) h -= uint(b);
+    if (b < 0) h -= uint(a);
+    hi = int(h); lo = int(l);
+}
+#define uaddCarry pcarry_add
+#define usubBorrow pborrow_sub
+#define umulExtended pumul
+#define imulExtended psmul
+#endif
 uvec2 ladd(uvec2 a, uvec2 b) { uint c; uint lo = uaddCarry(a.x, b.x, c); return uvec2(lo, a.y + b.y + c); }
 uvec2 lsub(uvec2 a, uvec2 b) { uint c; uint lo = usubBorrow(a.x, b.x, c); return uvec2(lo, a.y - b.y - c); }
 uvec2 lneg(uvec2 a) { return lsub(uvec2(0u), a); }

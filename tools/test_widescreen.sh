@@ -30,6 +30,12 @@
 #     four widescreen switches (also while on) and two full-screen actions (headless: logged
 #     only): every switch applied, same checks as 1-3 and 6.
 #     ws46g: --widescreen on the GPU renderer at 4x6.
+#  8. wsapi: View > Renderer's graphics API switched live through every API this platform
+#     offers and Software (macOS: Metal, Vulkan = MoltenVK; Windows: Direct3D 12, Vulkan), with
+#     compare mode and two widescreen switches in between: every switch applied (each API
+#     switch rebuilds the backend on a new device and reseeds the target), same checks as 1-3
+#     and 6. Without a second API here (no MoltenVK) the API switches are logged as refused and
+#     only the hash checks count.
 # Usage: tools/test_widescreen.sh [frames]   (default 9000; needs build/cmake/destrega)
 cd "$(dirname "$0")/.."
 if [ "$1" != "--job" ]; then FRAMES=${1:-9000}; fi
@@ -50,7 +56,12 @@ fi
 
 mkdir -p $OUT
 rm -f $OUT/*.hash $OUT/*.trace $OUT/*.log $OUT/*.rc
-rm -rf $OUT/toggle $OUT/render; mkdir -p $OUT/toggle $OUT/render
+rm -rf $OUT/toggle $OUT/render $OUT/api; mkdir -p $OUT/toggle $OUT/render $OUT/api
+case "$(uname -s)" in   # this platform's graphics APIs, preferred first
+  Darwin) API1=metal; API2=vulkan ;;
+  MINGW*|MSYS*|CYGWIN*) API1=d3d12; API2=vulkan ;;
+  *) API1=vulkan; API2=vulkan ;;
+esac
 JOBS=${JOBS:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
 cat > $OUT/jobs.txt <<EOF
 ws46c --widescreen --scale 4x6 --window 1280x720 --hires-threads 3 --renderer compare --compare-every 10 --compare-max ${CMP_MAX_PGXP:-0.001}
@@ -63,6 +74,7 @@ off --scale 2 --hires-threads 0
 wsrender --scale 2 --window 1280x720 --hires-threads 0 --renderer software --menu-action 3800:renderer=gpu --menu-action 4200:widescreen=on --menu-action 4500:renderer=software --menu-action 5000:renderer=gpu --menu-action 5400:widescreen=off --menu-action 5800:renderer=software --menu-action 6300:widescreen=on --menu-action 6600:renderer=gpu --menu-action 7200:renderer --menu-action 7600:widescreen=off --menu-action 4100:fullscreen=on --menu-action 6900:fullscreen --dump build/widescreen/render --dump-every 50
 ws46g --widescreen --scale 4x6 --window 1280x720 --renderer gpu
 ws2c --widescreen --scale 2 --window 1280x720 --hires-threads 1 --pgxp off --renderer compare --compare-every 10 --compare-max 0
+wsapi --scale 2 --window 1280x720 --hires-threads 0 --renderer $API1 --menu-action 3800:renderer=$API2 --menu-action 4100:renderer=software --menu-action 4300:widescreen=on --menu-action 4500:renderer=$API1 --menu-action 4800:renderer=$API2 --menu-action 5100:renderer=compare --menu-action 5400:renderer=$API1 --menu-action 5700:renderer=software --menu-action 6000:renderer=$API2 --menu-action 6300:widescreen=off --menu-action 6600:renderer=gpu --dump build/widescreen/api --dump-every 50
 wstoggle --scale 2 --window 1280x720 --hires-threads 0 --menu-action 3900:widescreen=on --menu-action 4600:widescreen --widescreen-at 5300:1 --menu-action 6200:widescreen=off --menu-action 6900:widescreen --menu-action 8000:widescreen=off --dump build/widescreen/toggle --dump-every 50
 EOF
 START=$(date +%s)
@@ -70,7 +82,7 @@ xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
 ELAPSED=$(( $(date +%s) - START ))
 
 fail=0
-WS="ws2 ws2b ws46 wsresize ws1 wstoggle wsrender ws46g ws46c ws2c"
+WS="ws2 ws2b ws46 wsresize ws1 wstoggle wsrender wsapi ws46g ws46c ws2c"
 echo "widescreen: ran $(wc -l < $OUT/jobs.txt) runs of $FRAMES frames, $JOBS at a time, in ${ELAPSED}s"
 for n in off $WS; do
   rc=$(cat $OUT/$n.rc 2>/dev/null || echo missing)
@@ -108,10 +120,23 @@ grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 m
 python3 tools/check_ws_toggle.py $OUT/wstoggle.log $OUT/toggle 6 || fail=1
 python3 tools/check_ws_toggle.py $OUT/wsrender.log $OUT/render 4 > $OUT/wsrender.chk || fail=1
 sed 's/wstoggle/wsrender/' $OUT/wsrender.chk
-nr=$(grep -c "hires: renderer [a-z]* at frame" $OUT/wsrender.log)
-echo "widescreen: wsrender: $nr renderer switches applied: $(grep -h 'hires: renderer [a-z]* at frame' $OUT/wsrender.log | sed 's/.*renderer \([a-z]*\) at frame \([0-9]*\)/\1@\2/' | tr '\n' ' ')"
+nr=$(grep -c "hires: renderer [a-z0-9]* at frame" $OUT/wsrender.log)
+echo "widescreen: wsrender: $nr renderer switches applied: $(grep -h 'hires: renderer [a-z0-9]* at frame' $OUT/wsrender.log | sed 's/.*renderer \([a-z0-9]*\) at frame \([0-9]*\)/\1@\2/' | tr '\n' ' ')"
 [ "$nr" = 6 ] || { echo "widescreen: wsrender: expected 6 renderer switches"; fail=1; }
 nf=$(grep -c "fullscreen: o[nf]* at frame" $OUT/wsrender.log)
 [ "$nf" = 2 ] || { echo "widescreen: wsrender: expected 2 full-screen switches, got $nf"; fail=1; }
+python3 tools/check_ws_toggle.py $OUT/wsapi.log $OUT/api 2 > $OUT/wsapi.chk || fail=1
+sed 's/wstoggle/wsapi/' $OUT/wsapi.chk
+na=$(grep -c "hires: renderer [a-z0-9]* at frame" $OUT/wsapi.log)
+ng=$(grep -c "hires: graphics .* -> .* in [0-9.]* ms" $OUT/wsapi.log)
+echo "widescreen: wsapi: $na renderer switches, $ng of them to another graphics API: $(grep -h 'hires: renderer [a-z0-9]* at frame' $OUT/wsapi.log | sed 's/.*renderer \([a-z0-9]*\) at frame \([0-9]*\)/\1@\2/' | tr '\n' ' ')"
+grep -h "hires: graphics .* -> " $OUT/wsapi.log | sed 's/^\[ *[0-9]*\] /widescreen: wsapi: /' | head -8
+if [ "$API1" = "$API2" ] || grep -q "is not available on this computer" $OUT/wsapi.log; then
+  echo "widescreen: wsapi: only one graphics API here; API switches not counted"
+else
+  [ "$na" = 9 ] || { echo "widescreen: wsapi: expected 9 renderer switches"; fail=1; }
+  [ "$ng" = 6 ] || { echo "widescreen: wsapi: expected 6 graphics API switches"; fail=1; }
+  ! grep -q "could not be started" $OUT/wsapi.log || { echo "widescreen: wsapi: an API failed to start"; fail=1; }
+fi
 [ $fail = 0 ] || { echo "widescreen: FAIL"; exit 1; }
 echo "widescreen: gameplay and all emulated state identical with --widescreen; shadow pass + 16:9 presentation ok"

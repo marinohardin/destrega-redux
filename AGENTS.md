@@ -82,8 +82,9 @@ SDL **3.4+** (`SDL_CreateGPURenderer(device, window)`), zlib, Python 3 and the d
   made it receive nothing under Wine). `\` is a path separator on Windows (cue -> bin, folders).
   Native menus on macOS (`menu_mac.m`) and Windows (`menu_win.c`, see "Application menus"); Linux
   has none (`menu_stub.c`). Alt+Enter/F11 full screen and F9 widescreen work everywhere.
-- GPU renderer: Vulkan (SPIR-V) on both, the windowed default when a device exists, else software
-  (see "GPU renderer"). `--renderer` works everywhere; View > Renderer on macOS and Windows.
+- GPU renderer: Windows tries **Direct3D 12** (DXIL) first, then Vulkan (SPIR-V), then software;
+  Linux Vulkan, then software (see "GPU renderer", "Graphics APIs"). `--renderer` works everywhere;
+  View > Renderer on macOS and Windows.
 - **Cross-compiling the Windows exe** (macOS or Linux, MinGW-w64 GCC: Homebrew `mingw-w64`):
   `cmake -S . -B build/win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
   -DCMAKE_PREFIX_PATH=<prefix>` where `<prefix>` holds SDL3 and zlib built for
@@ -101,17 +102,22 @@ SDL **3.4+** (`SDL_CreateGPURenderer(device, window)`), zlib, Python 3 and the d
   `WINE=".../CrossOver-Hosted Application/wine" WINE_ARGS="--bottle destrega-test --no-gui"`, a
   dedicated bottle made with `cxbottle --bottle destrega-test --create --template win10_64`).
   Passes with CrossOver 26 (x86-64 under Rosetta): 4000/4000 frames identical at 1x and at 4x6 widescreen
-  with `--hires-threads 6` (Win32 worker pool), frames dumped at 4x6 byte-identical too. Windowed under CrossOver works with the software renderer; its SDL_GPU
+  with `--hires-threads 6` (Win32 worker pool), frames dumped at 4x6 byte-identical too. Under CrossOver the GPU renderer runs on **Direct3D 12**
+  (vkd3d over MoltenVK, adapter "AMD Compatibility Mode"): `--renderer gpu` at 4x6 gives the same
+  state hashes and byte-identical dumped frames as Metal on the Mac, and `--renderer compare` (4x6,
+  16:9, `--pgxp off`, 5000 frames, every 10th) 0 differing pixels in 500 frames on both. Its SDL_GPU
   Vulkan device (MoltenVK 1.2.10 via winevulkan) reports conformance version 0.0.0.0, and SDL
-  rejects non-conformant Vulkan drivers, so the GPU renderer falls back to software there.
+  rejects non-conformant Vulkan drivers, so Vulkan is refused there (greyed out in the menu).
   `--state-hash`/`--gameplay-trace` files are written in binary mode (LF) on every platform.
 - Not verified on a real Windows/Linux machine with the game: there is no disc in CI. CI
   (`.github/workflows/build.yml`) builds everything except the generated code: configure with
   `-DDESTREGA_STUB_GEN=ON` to link the runtime against `tools/ci/stub_gen` (empty function table,
   stubs that exit) and `-DDESTREGA_TESTS=ON` for the CTest unit tests; the executable then starts,
-  parses options and fails with "no data pack". Windows CI: MSYS2 CLANG64, no Vulkan driver (the
-  GPU test checks it is refused cleanly). Linux CI: gcc and clang, the GPU test on Mesa lavapipe
-  under Xvfb, and `tools/gen_spirv.py --check`.
+  parses options and fails with "no data pack". Windows CI: MSYS2 CLANG64, no Vulkan driver and
+  at most Microsoft's WARP for Direct3D 12 (the GPU tests run `d3d12`, `vulkan`, `switch`: each
+  passes or is refused cleanly, exit 77). Linux CI: gcc and clang, the GPU test on Mesa lavapipe
+  under Xvfb, `tools/gen_spirv.py --check`, `tools/gen_dxil.py --check-fresh` and (clang job)
+  `gen_dxil.py --check` with the official Linux DXC release downloaded.
 
 The main-exe REA export is `analysis/rea_list_procedures_main.json` (MCP
 `list_procedures`); a reusable REA snapshot is `analysis/SLUS_007.32.rea-snapshot`
@@ -533,7 +539,9 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   card-changed flag like a real swap (`memcard_mark_new` after a delete).
 - **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
   menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
-- **View > Renderer > Software / GPU**: action `renderer[=software|gpu]`, see "GPU renderer".
+- **View > Renderer**: the graphics APIs this platform offers (Metal, Vulkan on the Mac; Direct3D 12,
+  Vulkan on Windows), a separator, Software; radio check marks, unavailable APIs greyed out. Action
+  `renderer[=software|gpu|metal|vulkan|d3d12|compare]`, see "Graphics APIs".
 - **View > Texture Filtering** (Off (Sharp Pixels) / Bilinear / Smooth 2D Edges + Bilinear 3D),
   **View > Smooth Colours** (checkable) and **View > Anti-aliasing** (Off / 2x / 3x / 4x), Mac and
   Windows: actions `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`;
@@ -569,7 +577,7 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **Windows** (`menu_win.c`): a Win32 menu bar on SDL's window (`SDL_PROP_WINDOW_WIN32_HWND_POINTER`),
   same items and rules: **File** (Load Game Image…, Show Game Files in Explorer, Save Games > Show
   Save Games in Explorer / Import / Export / Delete, Exit), **View** (Widescreen (16:9) with check
-  mark, Renderer > Software / GPU, Enter / Exit Full Screen, Controls…), **Netplay** (Host Game…, Join Game…,
+  mark, Renderer > Direct3D 12 / Vulkan / Software, Enter / Exit Full Screen, Controls…), **Netplay** (Host Game…, Join Game…,
   Disconnect, status line). The window procedure is subclassed: `WM_COMMAND` queues the action,
   `WM_INITMENUPOPUP` updates check marks, titles, the status line and greys out refused items
   (`frontend_menu_action_allowed`, as `validateMenuItem` on the Mac). SDL sizes the window by its
@@ -645,7 +653,9 @@ INI-like (`[section]`, `key = value`, `#`/`;` comments, UTF-8 BOM skipped, bad l
 `settings: line N ignored` and dropped, never fatal), in the data directory (SDL pref path, same
 folder as `destrega.pak`; `--data-dir` moves it). Written atomically (temp file, fsync,
 `plat_replace_file`), 0.5 s after the last change and at exit. Keys:
-`[display]` scale, max_scale, widescreen, renderer (software|gpu), fullscreen, window (WxH points);
+`[display]` scale, max_scale, widescreen, renderer (software|gpu|metal|vulkan|d3d12; gpu = the
+platform's default API, as written by older builds; an API this platform does not offer is logged and
+ignored), fullscreen, window (WxH points);
 `[netplay]` port, delay, join_address; `[player1]` / `[player2]` device, device_name, stick,
 deadzone, `key.<button>`, `pad.<button>` (buttons: up down left right cross circle square triangle
 l1 r1 l2 r2 start select; empty = unbound; keys absent = default).
@@ -815,22 +825,43 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   15.2 with `on`. Tracking alone costs nothing measurable.
 ## GPU renderer (`runtime/hires_gpu.[ch]`, `--renderer gpu`)
 
-A second `HiresBackend` on SDL3's SDL_GPU: **Metal** (MSL source embedded in the C file) or
-**Vulkan** (SPIR-V, Windows/Linux, and macOS through MoltenVK). Same
+A second `HiresBackend` on SDL3's SDL_GPU: **Metal** (MSL source embedded in the C file),
+**Vulkan** (SPIR-V, Windows/Linux, and macOS through MoltenVK) or **Direct3D 12** (DXIL, Windows).
+Same
 contract as the software backend: commands in, target out, presentation only. It is
 **bit-identical to the software backend** at every scale tested (1x1, 2x3, 4x6, 8x8 over a
 7000-frame fight run) and to the 1x VRAM at 1x1 (with `--pgxp off`; for `on` see the PGXP
 section). Keep it that way: a rule change in `hires.c`
-needs the same change in **both** shaders (MSL in `hires_gpu.c`, GLSL in `runtime/shaders/hires.glsl`).
+needs the same change in **both** shader sources (MSL in `hires_gpu.c`, GLSL in
+`runtime/shaders/hires.glsl`, which produces both SPIR-V and DXIL: rerun both generators).
 The header comment of `hires_gpu.c` has the details.
 
-- **Shaders / drivers.** One backend, two shader sources selected by `SDL_GetGPUShaderFormats`:
-  MSL (Metal) as before, and `runtime/shaders/hires.glsl` (Vulkan GLSL 450, the same functions
-  line for line) compiled by `python3 tools/gen_spirv.py` (glslangValidator, `spirv-val`) into
-  the checked-in `runtime/shaders/hires_spirv.h` (generated bytecode, regenerate after editing
-  the GLSL; `--check` only compiles and validates, as CI does). No shader compiler is needed to
-  build. Not done: DXIL/D3D12 (the device is created with MSL|SPIR-V only, so SDL never picks
-  D3D12; a Windows machine without a Vulkan driver gets software).
+- **Shaders / drivers.** One backend, two shader sources, three bytecode formats picked by the
+  device's API: MSL (Metal) as before, and `runtime/shaders/hires.glsl` (Vulkan GLSL 450, the same
+  functions line for line) compiled by `python3 tools/gen_spirv.py` (glslangValidator, `spirv-val`)
+  into the checked-in `runtime/shaders/hires_spirv.h`, and by `python3 tools/gen_dxil.py` into
+  `runtime/shaders/hires_dxil.h` (both generated bytecode; regenerate both after editing the GLSL).
+  No shader compiler is needed to build.
+- **DXIL** (`gen_dxil.py`): GLSL -> SPIR-V (glslang, with `-DPORTABLE_MUL`) -> HLSL (SPIRV-Cross
+  `--hlsl --shader-model 60`, Homebrew `spirv-cross`) -> DXIL (Microsoft's DXC, `-Gis -O3`, debug
+  and reflection stripped, **signed**: D3D12 refuses unsigned DXIL; no Homebrew formula, take the
+  official release from github.com/microsoft/DirectXShaderCompiler: `DXC=` names the command, e.g.
+  `dxc.exe` under Wine, or the Linux build with `LD_LIBRARY_PATH` at its `lib`). Registers follow
+  SDL's D3D12 convention (GLSL `set` = HLSL space: vertex uniforms b0 space1, textures/samplers
+  t0-2/s0-2 space2, the storage buffer t3 space2, fragment uniforms b0 space3). SPIRV-Cross has no
+  HLSL form of `uaddCarry` / `usubBorrow` / `umulExtended` / `imulExtended`, so `PORTABLE_MUL`
+  replaces them with exact 32-bit code (16-bit halves; signed product = unsigned product minus the
+  sign corrections); the SPIR-V build keeps the builtins and its bytes did not change. The header
+  stores the GLSL's sha256: `gen_dxil.py --check-fresh` (no tools, CI) fails when the GLSL changed
+  without regenerating; `--check` compiles and verifies without writing (CI's Linux clang job,
+  with the downloaded Linux DXC). SDL's D3D12 driver needs shader model 6.0 and resource binding
+  tier 2 for DXIL. Int64 and signed division: the same emulation as Vulkan (`uvec2` pairs,
+  magnitudes). Edge rule: D3D12 fixes the top-left rule like Metal, so the hardware rasterizer is
+  used (not forced to the exact shader test as on Vulkan). Blend constants are the same
+  fixed-function setup. B5G5R5A1 render target: required as on the other APIs (supported by WARP
+  and vkd3d); if a D3D12 device lacked it the API is reported unavailable. A bit-exact fallback
+  would be an R8G8B8A8 target holding each 5-bit channel as c<<3 with the blend done in the shader
+  (not implemented).
 - **64-bit integers on Vulkan**: `shaderInt64` is an optional Vulkan feature and SDL_GPU does not
   enable it, so the GLSL keeps every 64-bit value as a `uvec2` (lo, hi) with exact wrapping
   add/sub/multiply (`uaddCarry`, `usubBorrow`, `umulExtended`, `imulExtended`: core SPIR-V). The
@@ -842,12 +873,35 @@ The header comment of `hires_gpu.c` has the details.
   on an edge (Metal/D3D use top-left, which the integer path relies on), so with SPIR-V every
   triangle takes the exact shader edge test (F_EDGE: the triangle grown by 1 px, or its bbox for
   slivers). `DESTREGA_GPU_EDGE=0|1` overrides it (experiments; on MoltenVK both give 0 diffs).
-- `--gpu-driver auto|metal|vulkan` (also for headless/compare): auto = Metal on macOS, Vulkan
-  elsewhere. On macOS `vulkan` loads MoltenVK through the Vulkan loader; SDL only searches the
+- `--gpu-driver auto|metal|vulkan|d3d12` (also for headless/compare): which API the GPU backend
+  uses; auto = the platform order (below). An API the platform does not offer is an error listing
+  the ones it does. On macOS `vulkan` loads MoltenVK through the Vulkan loader; SDL only searches the
   default library paths, so `hires_gpu.c` sets `SDL_VULKAN_LIBRARY` to Homebrew's
   `libvulkan.1.dylib` (`brew install vulkan-loader molten-vk`) unless already set. The windowed
   GPU renderer is created on the backend's own device (`hires_gpu_create_device` +
   `SDL_CreateGPURenderer(dev, win)`), so its driver is the one the shaders exist for.
+- **Graphics APIs** (`hires_gpu_api_*`, main.c "renderer" section). Order per platform: macOS
+  Metal, Vulkan (available only when MoltenVK loads); Windows Direct3D 12, Vulkan; Linux Vulkan;
+  Software always. Each API is probed once (`SDL_GPUSupportsShaderFormats`, cached; a device that
+  then fails to create or to init is marked failed with its reason in the log) and the menu greys
+  out what is unavailable (`frontend_renderer_available`). The windowed default walks the order and
+  skips software adapters (WARP, llvmpipe/lavapipe, SwiftShader: `hires_gpu_software_adapter`) in
+  favour of the next API or the software renderer; an explicit choice (menu, `--renderer API`,
+  settings) takes them. `--renderer software|gpu|metal|vulkan|d3d12|compare`: an API name is
+  `gpu` + `--gpu-driver API`; `gpu` is the platform default. Both flags keep working and combine
+  (`--renderer gpu --gpu-driver vulkan` = `--renderer vulkan`); the flag locks the setting.
+  The log line `hires-gpu: SDL_GPU device ready (API, driver, FMT shaders; device name)` says
+  what runs.
+- **Live API switch** (View > Renderer or `renderer=API`, between frames, also during netplay: it
+  is presentation-only): the hi-res backend is detached, the old target released, the windowed SDL
+  renderer and its textures destroyed (it does not own the external device), the backend shut
+  down (`hires_gpu_shutdown`: every pipeline, buffer, texture and fence released, GPU idle) and
+  the device destroyed; then a new device is created, the SDL GPU renderer recreated on it
+  (`SDL_Vulkan_CreateSurface` etc. do not recreate the window, so the Win32 menu bar stays), the
+  backend initialised and the target re-seeded from the 1x VRAM. If the new API fails, the old one
+  is restored, else software; the window always ends with a renderer. Log: `hires: graphics A -> B
+  in N ms` (Metal -> Vulkan 17-40 ms, Vulkan -> Metal ~3 ms on an M1 Pro under load). Headless runs
+  switch the backend's own device the same way.
 - Vulkan results (MoltenVK on Apple Silicon, 7000-frame fight, every 10th frame compared,
   `tools/test_vulkan.sh`): `--pgxp off` 0 differing pixels at 2x2 and 4x6, 4:3 and 16:9; `affine`
   0 at 4x6; `on` 24 (4:3) and 31 (16:9) pixels over 331 fight frames at 4x6 (Metal: 24 / 28; limit
@@ -855,18 +909,24 @@ The header comment of `hires_gpu.c` has the details.
   mode: all polygon/rect/line kinds, semi modes 1-3, texture windows, dither, fills, uploads,
   copies, plus PGXP packets; 1x1/2x2/3x2/4x6, with and without the guard band): 0 differing pixels
   on Metal and on MoltenVK; it found a deliberately broken edge rule at every scale. Not run on a
-  native Vulkan driver (NVIDIA/AMD/Intel) or D3D12: that, and the semi-transparency blend rounding
-  on other hardware (UNORM5 blending precision is implementation-defined), are unverified.
+  native Vulkan driver (NVIDIA/AMD/Intel) or a native D3D12 driver: that, and the semi-transparency
+  blend rounding on other hardware (UNORM5 blending precision is implementation-defined), are
+  unverified.
+- Direct3D 12 results (CrossOver 26: vkd3d over MoltenVK, no native driver): `test_hires_gpu d3d12`
+  114 cases, 0 differing pixels (PGXP perspective and every render-quality mode included);
+  `switch` 19 passed; full game `--renderer compare` 4x6 16:9 `--pgxp off` 0 differing pixels over
+  500 frames (131 fight frames); `--renderer gpu` 4x6 state hashes and dumped frames identical to
+  Metal on the Mac (`test_wine.sh`).
 
-- `--renderer software|gpu|compare`. Default: **gpu in a window** on every platform (if no device
-  with MSL or SPIR-V shaders and a B5G5R5A1 render target exists, or the SDL GPU renderer or the
+- `--renderer software|gpu|metal|vulkan|d3d12|compare`. Default: **gpu in a window** on every
+  platform (if no API in the platform order gives a device with a B5G5R5A1 render target, or the SDL GPU renderer or the
   backend cannot be created: `hires-gpu: GPU renderer unavailable ...` and software),
   software headless (the tests' reference). `--renderer software` forces software and the
-  plain SDL renderer (no live switch to GPU then). **View > Renderer > Software / GPU**
-  (radio check marks; menu action `renderer[=software|gpu|compare]`, no argument toggles)
-  switches at any time between frames: `hires_set_backend` + `hires_set_scale` at the current
-  scale, i.e. the old target is destroyed and the new one seeded from the 1x VRAM, as on a
-  resize. The window always uses SDL's GPU renderer, which presents either target. `compare` draws every command on both
+  plain SDL renderer (no live switch to GPU then). **View > Renderer** (API items + Software,
+  radio check marks; menu action `renderer[=software|gpu|metal|vulkan|d3d12|compare]`, no argument
+  toggles software / GPU) switches at any time between frames: `hires_set_backend` +
+  `hires_set_scale` at the current scale, i.e. the old target is destroyed and the new one seeded
+  from the 1x VRAM, as on a resize (an API change also replaces the device, see above). The window always uses SDL's GPU renderer, which presents either target. `compare` draws every command on both
   backends, presents the software one and every `--compare-every N` frames (default 30) reads
   both back: `hires-compare:` lines at exit (all / fight frames, pixels differing, by >1 step,
   mask-bit only, worst frame); `--compare-max PCT` exits 6 if a fight frame differs more.
@@ -896,8 +956,8 @@ The header comment of `hires_gpu.c` has the details.
   emu 1.3 ms + present 6.6 ms per frame.
 - Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
   mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
-  chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), no DXIL
-  (D3D12), no `--hires-threads` (n/a).
+  chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), no DXBC
+  (D3D12 shader model 5.1: devices without SM 6.0 get Vulkan or software), no `--hires-threads` (n/a).
 - Widescreen guard band: supported (`set_guard`): `s_ox` is negative with the default region
   at x = 0, so the clip rectangle's x is packed signed, the shader's 1x column uses floor
   division and the 32x32 tile masks are shifted by the guard width. Guard-band-only packets
@@ -927,8 +987,14 @@ The header comment of `hires_gpu.c` has the details.
   1x VRAM), `c1x1` and `c4x6` (compare vs software, `--pgxp off`, `CMP_MAX` default 0 %), and
   `cp4x6` (compare with `--pgxp on`, `CMP_MAX_PGXP` default 0.001 %). `g4x6` runs with PGXP on
   and must pass the `pgxp-check`.
-  `tools/test_widescreen.sh` adds `ws46g` (16:9 on the GPU) and `wsrender` (renderer and
-  widescreen switched back and forth mid-fight, state hash = 4:3 software run).
+  `tools/test_widescreen.sh` adds `ws46g` (16:9 on the GPU), `wsrender` (renderer and
+  widescreen switched back and forth mid-fight, state hash = 4:3 software run) and `wsapi` (the
+  same through every graphics API: Metal / Vulkan / Software / compare and back, 9 switches, 6 of
+  them device changes; same state hash).
+  `runtime/tests/test_hires_gpu.c` takes `auto|metal|vulkan|d3d12|switch` (an API this platform
+  does not offer or cannot create = exit 77, skipped); `switch` cycles every available API six
+  times (shutdown, new device, init, compare at 2x2 and 4x6 with and without the guard band), as
+  CTest `hires_gpu_switch`; `run_tests.sh` runs `auto vulkan d3d12 switch`.
 
 ## Render quality (`--tex-filter`, `--hires-colour`, `--ssaa`; View menu)
 
