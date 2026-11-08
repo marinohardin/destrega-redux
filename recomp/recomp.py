@@ -153,6 +153,13 @@ def main():
     # Overlays call into the main executable (jal) and pass main-code
     # pointers around as data; both must be recompiled entry points.
     ovl_refs = set()   # overlay-slot addresses referenced from any overlay (jal or data word)
+    # The main executable's own data also holds pointers into the overlay slots (the per-character
+    # function tables at 0x800b310c..: Rohzen's P2 overlay entry 0x8001a284 comes only from there,
+    # REA had merged it into the string data before it).
+    for a in range(main_img.base, main_img.end - 3, 4):
+        t = main_img.word(a)
+        if OVERLAY_SLOTS[0] <= t < OVERLAY_SLOTS[1] and t & 3 == 0:
+            ovl_refs.add(t)
     for name, load in overlay_list():
         oimg = Image('o', load, open(f'disc/{name}', 'rb').read())
         for a in range(oimg.base, oimg.end - 3, 4):

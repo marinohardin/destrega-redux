@@ -19,6 +19,14 @@
  * 128 KiB image is never overwritten). Passing NULL leaves the slot empty. */
 const char *memcard_attach(int port, const char *path);
 bool memcard_present(int port);
+/* Path of the image attached to `port` (NULL if empty). */
+const char *memcard_path(int port);
+/* Raise the card-changed flag again, as if the card had been pulled and re-inserted. */
+void memcard_mark_new(int port);
+/* NULL if `path` is a raw 128 KiB image with a valid "MC" header, else a user-facing message. */
+const char *memcard_validate_file(const char *path);
+/* Flush, then write a copy of the card's image to `dst`. NULL on success. */
+const char *memcard_export(int port, const char *dst);
 /* Write dirty cards to disk (temp file + rename). Cheap when nothing changed. */
 void memcard_flush(void);
 /* Make the next flushes no-ops (netplay / read-only use); in-memory state still updates. */

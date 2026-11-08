@@ -139,7 +139,23 @@ unhandled BIOS calls / black screen. Useful headless flags:
 Button mask bits (active high in `--press`): Select 0x1, Start 0x8, Up 0x10,
 Right 0x20, Down 0x40, Left 0x80, L2 0x100, R2 0x200, L1 0x400, R1 0x800,
 Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
+`--press2 F:MASK,...` is the same for pad 2 (VS mode waits for it). Presses are taps (held 6 frames).
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
+
+### Scenario library (`tools/scenarios.py`)
+
+Named, deterministic input scripts (a small DSL: `@1200 start down*2 cross/100`, see the file's
+docstring) that reach every VS stage (12), 1P battle with several characters, team battle, time
+attack, endurance, practice, story up to its first fight, and the option menu, with the frame range
+of interest (`key`) and automatic checks that each one arrived (the `--trace` CD log shows which
+overlay and which stage pack of `DATA.BNS` were loaded; plus a non-black key frame).
+`scenarios.py list | run NAME... | run --all | hires | record | raw "DSL" FRAMES`. Needs `disc/_listing.txt`
+(`tools/extract_disc.py`). To add one, append an `add(...)`/`add_vs(...)` call, run it, look at the key
+frame (`--keep`, `tools/contact_sheet.py`), then `scenarios.py record NAME` to store the fingerprint in
+`tools/scenario_expect.json`. A scenario that exposes a real bug is `xfail=` (the run must still fail
+that way) and the bug goes in `analysis/NOTES.md`. `run_tests.sh` runs all scenarios (`--no-interp`,
+`--verify-overrides`) and the hi-res determinism / `--hires-verify` check on the `hires`-tagged
+subset (every stage) concurrently with the rest; `SCENARIOS=0 tools/run_tests.sh` skips them.
 Headless runs ~200x real time (30k frames ≈ 13 s).
 
 ## Memory cards (`runtime/memcard.[ch]`, `bios.c`)
@@ -163,6 +179,41 @@ a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as 
   (a rolled-back frame must not leave files behind, and the two peers' cards differ). The hook is
   `memcard_set_write_protect(true)` (in-memory state keeps updating, flushing becomes a no-op);
   card state must also be part of any snapshot (`memcard_hash` shows what it covers).
+
+## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
+
+macOS gets a native **File** menu inserted after the app menu (SDL3 keeps building the standard
+app/Window menus; Quit still works). `menu_mac.m` (Cocoa, ARC, Apple only; `menu_stub.c` no-ops
+elsewhere) only builds items; each item calls `frontend_menu_action(NAME, ARG)` which **queues**. `main.c`
+runs the queue at the top of each VBlank (`menu_script_and_poll`), i.e. between frames on the main
+thread, so menus cannot disturb emulation. Headless runs never create menus.
+
+- **Load Game Image… (Cmd+O)**: native open dialog (SDL), `.cue/.bin/.iso`, then `import_image()` ->
+  `disc_import()` (the same code as the first-launch dialog and `--import`) into the data pack, then
+  `restart_process()` = clean re-exec (`DESTREGA_RESTARTED=1`, same argv minus `--menu-action` and any
+  positional image). Errors show a native alert and the game keeps running. `disc_import` parks the
+  running disc's module state while importing, so it is safe mid-game. Checks live in `disc.c`: wrong type,
+  raw sync pattern (a 2048-byte-sector `.iso` cannot hold the XA/FMV sectors and is refused with that
+  explanation; a raw 2352 `.iso` is fine), whole sectors, SLUS_007.32 CRC, and the ISO9660 volume size vs the
+  file size (catches truncated copies).
+- **Show Game Files in Finder (Cmd+Shift+R)**: opens the folder of the pack in use (or the loose image).
+- **Save Games** submenu (the UI deliberately never says "memory card" except for the file type; one slot, card
+  slot 1; slot 2, `--memcard2` and `--no-memcard` stay in the runtime for development/tests): Show Save Games in
+  Finder; Import Save Games… (open dialog "PlayStation memory card image (.mcd)"; validates 128 KiB + "MC" header
+  + checksum, confirms, keeps `memcard1-backup-YYYYmmdd-HHMMSS.mcd`, copies in place, re-attaches); Export Save
+  Games… (writes a standard .mcd after flushing); Delete Save Game… (the `BASLUS-00732*` file, confirmed).
+  Every swap flushes first and goes through `memcard_attach`, which closes open handles and raises the
+  card-changed flag like a real swap (`memcard_mark_new` after a delete).
+- Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
+  `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`. Headless: no dialogs (the file argument is
+  required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
+  unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
+  Log lines start with `menu:`; errors with `menu: ERROR:`.
+- Tests: `tools/test_menu.sh` (in `run_tests.sh`): load from `.cue` and raw `.iso` into a scratch data dir
+  with state hash equal to a plain run on that pack, 9 rejection cases, save import with backup (the game
+  really loads the imported save: ROUND COUNT byte), export, delete, invalid files. It rebuilds
+  a disc image from the pack with `tools/pak_to_bin.py` when `Destrega/Destrega.cue` is absent.
+- Not done: saves other than the game's own file, Windows/Linux menus.
 
 ## High-resolution rendering (`runtime/hires.[ch]`)
 
