@@ -334,6 +334,10 @@ hashing all emulated state per frame).
   switching off keeps it and only stops the shadow pass and the wide presentation.
   `--widescreen` is the startup state. Headless: `--menu-action F:widescreen[=on|off]` or
   `--widescreen-at F:0|1,...` (both used by `wstoggle` in the test script).
+- `stage_render` deliberately bypasses `override_call`: `--verify-overrides` cannot rewind the
+  scheduler, so interrupts/CD events inside the renderer (story scenes) gave false mismatches.
+  Story-mode EVENTOVL scenes use the same renderer and widen too (checked by hand: 15000 frames
+  of the `story` scenario, state hash identical to 4:3).
 - Host-side state that generated code mutates outside guest state (e.g. PGXP tags) must be
   registered with `widescreen_add_state_hook(save, restore)`, or the wide pass leaks into the
   real one.
