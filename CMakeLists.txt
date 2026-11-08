@@ -35,7 +35,7 @@ target_compile_options(gen PRIVATE -O1 -w -fno-strict-aliasing)
 
 add_executable(destrega
   runtime/main.c runtime/rt.c runtime/bus.c runtime/bios.c runtime/interp.c
-  runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/gpu.c runtime/hires.c runtime/gte.c runtime/pgxp.c runtime/spu.c runtime/xa.c runtime/mdec.c
+  runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/memcard.c runtime/gpu.c runtime/hires.c runtime/gte.c runtime/pgxp.c runtime/spu.c runtime/xa.c runtime/mdec.c
   runtime/overrides/override.c runtime/overrides/collision.c)
 target_include_directories(destrega PRIVATE runtime gen)
 target_compile_options(destrega PRIVATE -Wall -Wno-unused-function -fno-strict-aliasing)
