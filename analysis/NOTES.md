@@ -37,7 +37,8 @@ readable hit-detection override (PR #3).
 - Boot: Psy-Q crt0 (`800a44e8`) -> `main` (`8002b80c`). The whole game runs from `main`'s loop;
   modes (title, menus, fights, story events, options) are overlays loaded into two fixed slots
   (P1 `80010000`, P2 `8001a268`) by three loader functions (see `symbols.txt`). Which loader
-  handles which mode: **unconfirmed**.
+  handles which mode: **unconfirmed**. Observed from the CD log (verified): a fight loads `Mxxx.BIN` (P1)
+  then `Mxxx2.BIN` (P2); STORY loads `EVENT_SP.BIN` + `EVENTOVL.BIN`; OPTION loads `OPTOVL.BIN`.
 - Frame rate: fights update at 30 Hz by design (`frame_sync`, VSync(2)). (verified: see
   AGENTS.md). Menu/title update rate: not measured.
 - Fight call stack (verified, from guest stack dumps at the end of headless fights):
@@ -98,11 +99,85 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
 - Pads: libpad drives SIO0 directly (not BIOS InitPAD). Memory cards: see "Memory card" below.
 - CD: libcd at register level; XA audio and the 5 STR movies live in `XADATA.BNS`.
 
+## Menus, modes, characters, stages (found while building `tools/scenarios.py`)
+
+All verified by headless runs (dumps + `--trace` CD log), frame numbers are for the scripted boot
+(Start at 1200 skips the logo; the title menu is up by ~1300). Scripts are deterministic, so the
+frame numbers repeat exactly; they are not "game constants".
+
+- **Title menu**: a *circular* 8-item list with the cursor in the middle, starting on 1P BATTLE.
+  Down from there: STORY, VS, TEAM BATTLE, TIME ATTACK, ENDURANCE, PRACTICE, OPTION (then back to
+  1P BATTLE). Up x1 from the start is OPTION. One Down/Up per tap; Start confirms.
+- **Character select** (1P BATTLE, TIME ATTACK, ENDURANCE, PRACTICE, VS): ready ~250 frames after
+  confirming the title item. The cursor starts on Gradd (P1) / Celia (P2, VS only); Right cycles the
+  12 portraits: Gradd, Celia, Tieme, Anjie, Milena, Laon, Zauber, Rohzen, Falma, Doyle, Reyus,
+  Cougar (portrait labels as printed; the overlays are named differently, see below). Cross confirms.
+  MGENE/MSOLD overlays exist but there is no portrait for them (Soldier "Relics" is the first story
+  opponent; Gene is unreachable so far).
+- **VS needs pad 2**: after P1 confirms, the screen waits for pad 2 (the runtime's `--press2` feeds
+  it). Then a STAGE SELECT map appears (~110 frames after both confirmed); Right cycles 12 stages:
+  Hills, Cave, Villa, Canyon, Gate, Castle 1, Castle 2, Throne, Remains, Hamlet, Shrine, Fortress
+  (names as printed under the thumbnails). Cross starts the fight ~350 frames later (BGM XA read).
+  VS is the only mode that lets you choose the stage; every other stage can only be reached through
+  it (1P/Time Attack/Endurance pick opponent and stage themselves).
+- **Overlays per fight** (verified: `--trace` CD seeks mapped to the disc listing): P1's character is
+  `Mxxx.BIN`, P2's is `Mxxx2.BIN`. Portrait -> file stem: Gradd MGRAD, Celia MSEREA, Tieme MTEEM,
+  Anjie MANZEAL, Milena MMILENA, Zauber MZAUBER, Laon MLAON, Falma MFALMA, Doyle MDOIL, Reyus MREUS,
+  Cougar MKUGA, Rohzen MROSEN (all twelve seen loaded as P1 and 11 as P2; Rohzen as P2 in `vs_villa`).
+- **Stage data** lives in `DATA.BNS`: one ~49-sector pack per stage, read as two seeks at these sector
+  offsets (inside DATA.BNS): Hamlet 7756, Fortress 7861, Villa 7973, Remains 8096, Hills 8212,
+  Canyon 8329, Cave 8447, Gate 8580, Castle 1 8702, Castle 2 8831, Throne 8959, Shrine 9086 (second
+  seek +49). Character data is read below 7700, event/story data above 9200. This is the "which stage
+  is this" fingerprint the scenario checks use; no RAM address for stage/mode/character was looked for
+  (unknown).
+- **1P BATTLE / TIME ATTACK / ENDURANCE / PRACTICE**: after a character is confirmed with Cross the
+  game picks opponent and stage itself. The same character gets a *different opponent/stage depending
+  on the timing of the inputs* (Gradd met Milena on Villa in `fight_script.py`, Doyle on Villa in the
+  scenarios). `800e7560` (32-bit, also named in the widescreen work) looks like the game's RNG state: `--watch 800e7560`
+  on `1p_gradd` shows it set to 0xa9 at frame 167, then changing at the first Start (~1405), the cursor
+  moves and at the confirm (2157/2161) and every 2-4 frames once the fight loads. Likely (not traced to
+  the opponent selection code): the opponent/stage come from this RNG, so any change in boot timing
+  (anything that shifts when RNG calls happen) changes them. The scenarios therefore treat 1P / team /
+  time attack / endurance / practice as `loose`: P1's overlay must load and *some* known stage pack
+  must be read; only VS scenarios (stage chosen by input) and story (fixed) pin an exact fingerprint. Practice puts the player on
+  the Hills field vs Celia (MSEREA2) with TOTAL/DAMAGE counters; Time Attack and Endurance have a
+  countdown (55 -> ...) in the HUD.
+- **TEAM BATTLE**: one pad fills both 3-man teams (Cross to take a slot, Right to move on; 6 Crosses),
+  then STAGE SELECT, then "3 ON TEAM" fights.
+- **STORY** (NEW GAME at the first menu, Cross): fully automatic after Cross: FMV intro, then a text
+  crawl over a 3D hamlet (EVENT_SP.BIN + EVENTOVL.BIN loaded at ~6300), event scenes with 3D
+  characters (~9500-14000), "BATTLE 1 Gradd vs Relics" (~14300, MGRAD + MSOLD2, Hamlet pack 7756) and the
+  fight from ~14650. With no input Gradd loses and "CONTINUE?" appears ~16500.
+- **OPTION** loads `OPTOVL.BIN`: GAME OPTION, CONTROLLER, SOUND OPTION, RECORDS, MEMORY CARD, EXTRA, EXIT.
+  Circle backs out of a page. RECORDS shows the 1P-battle ranking; EXTRA has CHARACTER PROFILES / IN
+  GAME CONTROL / EXIT.
+
+## Overlay entry points (fixed bug, verified)
+
+The per-character function tables in the main exe's data (from `0x800b310c`, 4 pointers per character
+for each of P1/P2) point into the overlay slots, and `8004c1e8` calls them with `jalr`. Rohzen's P2
+overlay (`MROSEN2.BIN`) starts with 24 bytes of string data (`"...%d..."`) before its first function, so
+its entries are `8001a284 / a2b4 / a2e4 / a314` instead of the other characters' `8001a26c / a29c /
+a2cc / a2fc`. REA's procedure list had merged `8001a284` into a bogus function at `8001a268` that
+covers the string data, so it was never a recompiled entry: playing P2 Rohzen hit `dispatch: no
+recompiled function at 8001a284` (fatal with `--no-interp`, interpreter fallback otherwise).
+Fix (`recomp/recomp.py`): data words in the main executable that point into the overlay slots are now
+overlay seeds too (as already done for overlay data and `jal` targets). A static check over all P1/P2
+overlays, EVENT_SP/EVENTOVL and OPTOVL found no other function-looking referenced address that was
+not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset = address - slot base
+(the 4-byte header sits at the slot base itself, code is not shifted).
+
 ## Test coverage facts
 
-- `tools/fight_script.py` reaches: title -> 1P battle -> the temple stage (Gradd vs Milena), then
-  Celia's brick/green/crates stage from about frame 8000. It does not reach the canyon, castle,
-  catacomb or Tieme stages, story mode, VS mode or options. (verified: dumps)
+- `tools/scenarios.py` (22 scenarios, see its docstring and `tools/scenario_expect.json`): every VS
+  stage (12), 1P BATTLE x3 characters, TEAM BATTLE, TIME ATTACK, ENDURANCE, PRACTICE, STORY up to its
+  first fight, OPTION. Every character appears on both sides across the VS scenarios. `tools/fight_script.py` is the older single path used by the smoke test
+  and the determinism script.
+- Per-scenario check: exit status, no FATAL / dispatch miss / unhandled BIOS call / `--verify-overrides`
+  mismatch, expected overlay files loaded in order, recorded fingerprint (overlays + stage packs) equal,
+  VS scenarios read exactly their stage's pack, the fight BGM started before the key frame, the key
+  frame is not black/flat. The fingerprints were recorded after looking at the key frames
+  (`scenarios.py record`); if the game flow legitimately changes, re-record and re-look.
 
 ## Cleanup priority (readable C / overrides)
 
@@ -127,3 +202,10 @@ Done:
 - Purpose of the original port's extra seeds `800a8e28` and `800a9528`.
 - Does any gameplay code depend on the GTE results beyond the screen coordinates it draws
   with (e.g. on-screen tests that change behaviour)? Matters for widescreen and PGXP.
+- Which RAM address holds the mode / stage / character ids? Not searched (the scenarios fingerprint the
+  CD reads instead). `--watch ADDR` (8 slots, 32-bit) is the probe to use.
+- Where exactly are the 1P-battle opponent and stage chosen from the RNG (`800e7560`), and what is the
+  order for a normal run (stage 1 = Villa)?
+- Are Gene (`MGENE*.BIN`) and Soldier reachable outside STORY (cheat, unlock)? No portrait for them.
+- Story: the first fight is lost without input; the scenario stops at its start, so later events are
+  untested.
