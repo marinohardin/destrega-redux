@@ -24,6 +24,16 @@ tools/smoke_test.sh > build/smoke/out.txt 2>&1 &
 SMOKE=$!
 tools/test_hires_determinism.sh > build/hires/out.txt 2>&1 &
 HIRES=$!
+# 3. scenario library: every mode / stage / character path, --no-interp (SCENARIOS=0 to skip), and the
+#    hi-res determinism + 1x1 equivalence checks on the stage subset
+JOBS_SC=${JOBS_SC:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
+if [ "${SCENARIOS:-1}" != 0 ]; then
+  mkdir -p build/scenarios
+  python3 tools/scenarios.py run --all -j "$JOBS_SC" > build/scenarios/out.txt 2>&1 &
+  SCN=$!
+  python3 tools/scenarios.py hires -j "$JOBS_SC" > build/scenarios/hires_out.txt 2>&1 &
+  SCNH=$!
+fi
 
 wait %1 %2 %3 %4 %5 2>/dev/null
 fail=0
@@ -43,5 +53,11 @@ wait $SMOKE || { fail=1; echo "smoke: FAILED"; }
 cat build/smoke/out.txt
 wait $HIRES || { fail=1; echo "hires: FAILED"; }
 cat build/hires/out.txt
+if [ "${SCENARIOS:-1}" != 0 ]; then
+  wait $SCN || { fail=1; echo "scenarios: FAILED"; }
+  cat build/scenarios/out.txt
+  wait $SCNH || { fail=1; echo "scenarios hires: FAILED"; }
+  cat build/scenarios/hires_out.txt
+fi
 echo "tests: $(( $(date +%s) - START ))s wall clock, $([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail

@@ -1,0 +1,213 @@
+{
+ "1p_celia": {
+  "overlays": [
+   "MSEREA.BIN",
+   "MREUS2.BIN"
+  ],
+  "stage_sig": [
+   8580,
+   8629
+  ]
+ },
+ "1p_cougar": {
+  "overlays": [
+   "MKUGA.BIN",
+   "MMILENA2.BIN"
+  ],
+  "stage_sig": [
+   8580,
+   8629
+  ]
+ },
+ "1p_gradd": {
+  "overlays": [
+   "MGRAD.BIN",
+   "MDOIL2.BIN"
+  ],
+  "stage_sig": [
+   8580,
+   8629
+  ]
+ },
+ "endurance": {
+  "overlays": [
+   "MGRAD.BIN",
+   "MTEEM2.BIN"
+  ],
+  "stage_sig": [
+   9086,
+   9135
+  ]
+ },
+ "option": {
+  "overlays": [
+   "OPTOVL.BIN"
+  ],
+  "stage_sig": []
+ },
+ "practice": {
+  "overlays": [
+   "MGRAD.BIN",
+   "MSEREA2.BIN"
+  ],
+  "stage_sig": [
+   8212,
+   8261
+  ]
+ },
+ "story": {
+  "overlays": [
+   "EVENT_SP.BIN",
+   "EVENTOVL.BIN",
+   "MGRAD.BIN",
+   "MSOLD2.BIN"
+  ],
+  "stage_sig": [
+   7739,
+   7705,
+   7722,
+   7756,
+   7805
+  ]
+ },
+ "team": {
+  "overlays": [
+   "MSEREA.BIN",
+   "MTEEM2.BIN"
+  ],
+  "stage_sig": [
+   8212,
+   8261
+  ]
+ },
+ "time_attack": {
+  "overlays": [
+   "MGRAD.BIN",
+   "MREUS2.BIN"
+  ],
+  "stage_sig": [
+   8096,
+   8145
+  ]
+ },
+ "vs_canyon": {
+  "overlays": [
+   "MANZEAL.BIN",
+   "MFALMA2.BIN"
+  ],
+  "stage_sig": [
+   8329,
+   8378
+  ]
+ },
+ "vs_castle1": {
+  "overlays": [
+   "MLAON.BIN",
+   "MREUS2.BIN"
+  ],
+  "stage_sig": [
+   8702,
+   8751
+  ]
+ },
+ "vs_castle2": {
+  "overlays": [
+   "MZAUBER.BIN",
+   "MKUGA2.BIN"
+  ],
+  "stage_sig": [
+   8831,
+   8880
+  ]
+ },
+ "vs_cave": {
+  "overlays": [
+   "MSEREA.BIN",
+   "MZAUBER2.BIN"
+  ],
+  "stage_sig": [
+   8447,
+   8496
+  ]
+ },
+ "vs_fortress": {
+  "overlays": [
+   "MKUGA.BIN",
+   "MMILENA2.BIN"
+  ],
+  "stage_sig": [
+   7861,
+   7910
+  ]
+ },
+ "vs_gate": {
+  "overlays": [
+   "MMILENA.BIN",
+   "MDOIL2.BIN"
+  ],
+  "stage_sig": [
+   8580,
+   8629
+  ]
+ },
+ "vs_hamlet": {
+  "overlays": [
+   "MDOIL.BIN",
+   "MTEEM2.BIN"
+  ],
+  "stage_sig": [
+   7756,
+   7805
+  ]
+ },
+ "vs_hills": {
+  "overlays": [
+   "MGRAD.BIN",
+   "MLAON2.BIN"
+  ],
+  "stage_sig": [
+   8212,
+   8261
+  ]
+ },
+ "vs_remains": {
+  "overlays": [
+   "MFALMA.BIN",
+   "MSEREA2.BIN"
+  ],
+  "stage_sig": [
+   8096,
+   8145
+  ]
+ },
+ "vs_shrine": {
+  "overlays": [
+   "MREUS.BIN",
+   "MANZEAL2.BIN"
+  ],
+  "stage_sig": [
+   9086,
+   9135
+  ]
+ },
+ "vs_throne": {
+  "overlays": [
+   "MROSEN.BIN",
+   "MGRAD2.BIN"
+  ],
+  "stage_sig": [
+   8959,
+   9008
+  ]
+ },
+ "vs_villa": {
+  "overlays": [
+   "MTEEM.BIN",
+   "MSEREA2.BIN"
+  ],
+  "stage_sig": [
+   7973,
+   8022
+  ]
+ }
+}

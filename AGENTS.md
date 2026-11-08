@@ -139,7 +139,23 @@ unhandled BIOS calls / black screen. Useful headless flags:
 Button mask bits (active high in `--press`): Select 0x1, Start 0x8, Up 0x10,
 Right 0x20, Down 0x40, Left 0x80, L2 0x100, R2 0x200, L1 0x400, R1 0x800,
 Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
+`--press2 F:MASK,...` is the same for pad 2 (VS mode waits for it). Presses are taps (held 6 frames).
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
+
+### Scenario library (`tools/scenarios.py`)
+
+Named, deterministic input scripts (a small DSL: `@1200 start down*2 cross/100`, see the file's
+docstring) that reach every VS stage (12), 1P battle with several characters, team battle, time
+attack, endurance, practice, story up to its first fight, and the option menu, with the frame range
+of interest (`key`) and automatic checks that each one arrived (the `--trace` CD log shows which
+overlay and which stage pack of `DATA.BNS` were loaded; plus a non-black key frame).
+`scenarios.py list | run NAME... | run --all | hires | record | raw "DSL" FRAMES`. Needs `disc/_listing.txt`
+(`tools/extract_disc.py`). To add one, append an `add(...)`/`add_vs(...)` call, run it, look at the key
+frame (`--keep`, `tools/contact_sheet.py`), then `scenarios.py record NAME` to store the fingerprint in
+`tools/scenario_expect.json`. A scenario that exposes a real bug is `xfail=` (the run must still fail
+that way) and the bug goes in `analysis/NOTES.md`. `run_tests.sh` runs all scenarios (`--no-interp`,
+`--verify-overrides`) and the hi-res determinism / `--hires-verify` check on the `hires`-tagged
+subset (every stage) concurrently with the rest; `SCENARIOS=0 tools/run_tests.sh` skips them.
 Headless runs ~200x real time (30k frames ≈ 13 s).
 
 ## High-resolution rendering (`runtime/hires.[ch]`)
