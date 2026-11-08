@@ -933,9 +933,12 @@ static void usage(void) {
         "  --gameplay-trace FILE per frame: fighters' health/gauge/position, round time, wins, RNG seed\n"
         "  --ram-snap DIR        write raw guest RAM + scratchpad to DIR every --ram-snap-every N frames (100)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
-        "  --renderer R          hi-res renderer: software, gpu (SDL_GPU/Metal), or compare (default: gpu\n"
-        "                        in a macOS window, else software; View > Renderer switches at runtime)\n"
+        "  --renderer R          hi-res renderer: software, gpu (SDL_GPU: Metal or Vulkan), or compare\n"
+        "                        (default: gpu in a window when a device exists, else software; headless:\n"
+        "                        software; macOS View > Renderer switches at runtime)\n"
         "                        (software shown, gpu fed the same commands and compared to it)\n"
+        "  --gpu-driver D        SDL_GPU driver for gpu/compare: auto (Metal on macOS, else Vulkan),\n"
+        "                        metal or vulkan (macOS: MoltenVK via the Vulkan loader)\n"
         "  --compare-every N     compare mode: compare the targets every N frames (default 30)\n"
         "  --compare-max PCT     compare mode: exit non-zero if a fight frame differs in more than PCT%% of pixels\n"
         "  --widescreen          16:9 fights: wider stage culling + hi-res guard band (menus/FMV stay 4:3;\n"
@@ -1302,14 +1305,15 @@ static void create_window(void) {
     s_win = SDL_CreateWindow("Destrega (recompiled)", s_win_w, s_win_h,
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     s_ren = NULL;
-#ifdef __APPLE__
-    if (!s_renderer_given) s_renderer = R_GPU;   /* windowed default on macOS */
-#endif
+    if (!s_renderer_given) s_renderer = R_GPU;   /* windowed default (falls back below) */
     /* SDL's GPU renderer, whose device the hi-res backend draws with. Created whenever the GPU
      * backend may be used, so View > Renderer can switch at any time; --renderer software
-     * forces the plain renderer (and software only). */
+     * forces the plain renderer (and software only). The device is the backend's choice
+     * (Metal/MSL or Vulkan/SPIR-V, --gpu-driver), so SDL never picks one it has no shaders for. */
     if (s_renderer != R_SOFTWARE || !s_renderer_given) {
-        s_ren = SDL_CreateGPURenderer(NULL, s_win);
+        SDL_GPUDevice *dev = hires_gpu_create_device();
+        s_ren = dev ? SDL_CreateGPURenderer(dev, s_win) : NULL;
+        if (dev && !s_ren) SDL_DestroyGPUDevice(dev);
         s_gpu_ok = s_ren && hires_gpu_init(SDL_GetGPURendererDevice(s_ren));
         if (!s_gpu_ok) {
             rt_log("hires-gpu: GPU renderer unavailable (%s); using the software renderer", SDL_GetError());
@@ -1403,6 +1407,9 @@ int main(int argc, char **argv) {
             else if (!strcmp(r, "gpu")) s_renderer = R_GPU;
             else if (!strcmp(r, "compare")) s_renderer = R_COMPARE;
             else { fprintf(stderr, "--renderer: software, gpu or compare\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--gpu-driver") && i + 1 < argc) {
+            if (!hires_gpu_set_driver(argv[++i])) { fprintf(stderr, "--gpu-driver: auto, metal or vulkan\n"); return 1; }
         }
         else if (!strcmp(argv[i], "--compare-every") && i + 1 < argc) s_compare_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--compare-max") && i + 1 < argc) s_compare_max = atof(argv[++i]);

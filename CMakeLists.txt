@@ -112,6 +112,22 @@ if(DESTREGA_TESTS)
     endif()
     add_test(NAME ${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
+  # SDL_GPU backend vs software on random command streams (needs a GPU device; exit 77 =
+  # skipped when there is none, e.g. a CI runner without Vulkan)
+  add_executable(test_hires_gpu runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c
+                 runtime/platform.c runtime/tests/test_hires_gpu.c)
+  target_include_directories(test_hires_gpu PRIVATE runtime)
+  target_compile_options(test_hires_gpu PRIVATE -O2 -Wall)
+  target_link_libraries(test_hires_gpu PRIVATE SDL3::SDL3)
+  if(UNIX)
+    target_link_libraries(test_hires_gpu PRIVATE m)
+  endif()
+  add_test(NAME hires_gpu COMMAND test_hires_gpu auto WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(hires_gpu PROPERTIES SKIP_RETURN_CODE 77)
+  if(APPLE)   # MoltenVK, when the Vulkan loader is installed (Homebrew vulkan-loader + molten-vk)
+    add_test(NAME hires_gpu_vulkan COMMAND test_hires_gpu vulkan WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(hires_gpu_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 endif()
 
 # macOS: also wrap the binary in a self-contained Destrega.app (bundled SDL3,

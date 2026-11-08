@@ -1,0 +1,113 @@
+# Builds the runtime on Windows and Linux and runs the unit tests that need no game data.
+#
+# CI has no disc (game data is never in the repository), so there is no generated code
+# (gen/ comes from disc/SLUS_007.32). DESTREGA_STUB_GEN=ON links the runtime against
+# tools/ci/stub_gen instead: every runtime source compiles and the executable links and
+# starts (--help, "no data pack" error), but it cannot run the game. The tests:
+#   gte gpu hires pgxp spu mdec memcard   module unit tests (as in tools/run_tests.sh)
+#   hires_gpu                             GPU backend vs software on random command streams;
+#                                         Linux: Vulkan on Mesa lavapipe (software Vulkan) under
+#                                         Xvfb; Windows: no Vulkan driver on the runner, so the
+#                                         test checks the backend refuses cleanly (exit 77 = skip)
+#   shaders                               runtime/shaders/hires.glsl compiles and validates
+name: build
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SDL_VERSION: 3.4.18
+
+jobs:
+  windows:
+    name: Windows (MSYS2 CLANG64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-sdl3
+            mingw-w64-clang-x86_64-zlib
+      - name: Configure
+        run: |
+          pacman -Q mingw-w64-clang-x86_64-sdl3 mingw-w64-clang-x86_64-clang
+          cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DDESTREGA_STUB_GEN=ON -DDESTREGA_TESTS=ON
+      - name: Build
+        run: cmake --build build/ci -j4
+      - name: Unit tests
+        run: ctest --test-dir build/ci --output-on-failure -V
+      - name: Executable starts
+        run: |
+          ./build/ci/destrega.exe --help | head -3
+          set +e
+          ./build/ci/destrega.exe --headless --frames 10 --data-dir "$RUNNER_TEMP/nodata" > out.txt 2>&1
+          rc=$?
+          set -e
+          cat out.txt
+          test $rc = 1 && grep -q "no data pack" out.txt
+          ldd ./build/ci/destrega.exe | grep -iv "windows\\\\system32" || true
+
+  linux:
+    name: Linux (${{ matrix.cc }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [clang, gcc]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang zlib1g-dev pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev \
+            libxkbcommon-dev libwayland-dev libdecor-0-dev libegl-dev libgl-dev libasound2-dev libpulse-dev \
+            libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb glslang-tools spirv-tools
+      - name: Cache SDL3
+        id: sdl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/sdl3
+          key: sdl3-${{ env.SDL_VERSION }}-ubuntu-24.04
+      - name: Build SDL3 ${{ env.SDL_VERSION }}
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o sdl.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL3-$SDL_VERSION.tar.gz
+          tar xzf sdl.tar.gz
+          cmake -S SDL3-$SDL_VERSION -B sdlbuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/sdl3 -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build sdlbuild
+          cmake --install sdlbuild
+      - name: Shaders compile and validate
+        run: python3 tools/gen_spirv.py --check
+      - name: Configure
+        run: cmake -S . -B build/ci -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_PREFIX_PATH=$HOME/sdl3 -DDESTREGA_STUB_GEN=ON -DDESTREGA_TESTS=ON
+      - name: Build
+        run: cmake --build build/ci
+      - name: Vulkan devices
+        run: xvfb-run -a vulkaninfo --summary || true
+      - name: Unit tests (hires_gpu on Mesa lavapipe)
+        run: LD_LIBRARY_PATH=$HOME/sdl3/lib xvfb-run -a ctest --test-dir build/ci --output-on-failure -V
+      - name: Executable starts
+        run: |
+          export LD_LIBRARY_PATH=$HOME/sdl3/lib
+          ./build/ci/destrega --help | head -3
+          set +e
+          ./build/ci/destrega --headless --frames 10 --data-dir "$RUNNER_TEMP/nodata" > out.txt 2>&1
+          rc=$?
+          set -e
+          cat out.txt
+          test $rc = 1 && grep -q "no data pack" out.txt
