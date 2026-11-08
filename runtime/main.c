@@ -8,6 +8,7 @@
 #include "hires_gpu.h"
 #include "overrides/override.h"
 #include "savestate.h"
+#include "smooth.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,7 @@ static u32 s_wav_bytes;
 /* hi-res options (see hires.h / AGENTS.md) */
 static int s_opt_sx = -1, s_opt_sy = -1;   /* --scale N|NxM: -1 = auto from the window, 0 = off */
 static int s_max_sx = 4, s_max_sy = 6;     /* auto-scale caps per axis (see AGENTS.md) */
+static int s_gov_sx, s_gov_sy;             /* netplay scale governor caps, 0 = none (smooth.h) */
 static int s_win_w = 960, s_win_h = 720;   /* --window WxH (logical points) */
 static bool s_win_set;                     /* --window given */
 /* --widescreen (see AGENTS.md "Widescreen"): the hi-res target gets a guard band of WS_GUARD
@@ -401,14 +403,16 @@ static void apply_window_size(int pw, int ph, bool simulated) {
     if (d.enabled && !d.rgb24 && d.w > 0 && d.h > 0) { dw = d.w; dh = d.h; }
     int sx, sy, cx, cy;
     s_pres_w = pw; s_pres_h = ph;
+    int mx = s_gov_sx && s_gov_sx < s_max_sx ? s_gov_sx : s_max_sx;
+    int my = s_gov_sy && s_gov_sy < s_max_sy ? s_gov_sy : s_max_sy;
     if (s_widescreen) {
         /* sized for the widest presentation this window allows, so switching between 4:3
          * screens and 16:9 fights never reallocates the target */
         int e = ws_extra_for(pw, ph, dw, WS_GUARD);
         hires_pick_scale_ar(pw, ph, dw + 2 * e, dh, 4.0 / 3.0 * (dw + 2 * e) / dw,
-                            s_max_sx, s_max_sy, &sx, &sy);
+                            mx, my, &sx, &sy);
     } else
-        hires_pick_scale(pw, ph, dw, dh, s_max_sx, s_max_sy, &sx, &sy);
+        hires_pick_scale(pw, ph, dw, dh, mx, my, &sx, &sy);
     hires_get_scale(&cx, &cy);
     if (sx != cx || sy != cy) {
         rt_log("hires: window %dx%d, display %dx%d -> render scale %dx%d", pw, ph, dw, dh, sx, sy);
@@ -801,6 +805,8 @@ void frontend_vblank(void) {
     present_frame();
     u64 t_after_present = SDL_GetTicksNS();
     t_present += t_after_present - t_start;
+    smooth_present(t_after_present, t_prev_end ? t_after_present - t_prev_end : 0, s_frame);
+    if (smooth_scale_cap(&s_gov_sx, &s_gov_sy) && s_pres_w > 0) apply_window_size(s_pres_w, s_pres_h, false);
     if (t_prev_end) {
         int k = seg_of(s_frame);
         s_seg[k].frames++;
@@ -819,13 +825,17 @@ void frontend_vblank(void) {
 
     /* audio: keep ~3 frames queued */
     spu_render(audio, 735);
-    if (SDL_GetAudioStreamQueued(s_audio) < 735 * 4 * 6 && !s_fast)
+    int queued = SDL_GetAudioStreamQueued(s_audio);
+    bool repeat = false;
+    if (queued < 735 * 4 * 6 && !s_fast)
         SDL_PutAudioStreamData(s_audio, audio, 735 * 4);
     if (SDL_GetAudioStreamQueued(s_audio) < 735 * 4 * 2 && !s_fast) {
         /* the extra render advances the SPU: not allowed when emulation must be reproducible */
         if (!ss_deterministic_audio()) spu_render(audio, 367);
+        else repeat = true;
         SDL_PutAudioStreamData(s_audio, audio, 367 * 4);
     }
+    if (!s_fast) smooth_audio(queued > 0 ? (u32)queued : 0, 735 * 4, repeat);
 
     /* pacing to 60Hz */
     u64 now = SDL_GetTicksNS();
@@ -837,7 +847,7 @@ void frontend_vblank(void) {
     }
     if (s_fast) { s_next_tick_ns = now; t_prev_end = SDL_GetTicksNS(); return; }
     if (s_next_tick_ns == 0 || now > s_next_tick_ns + frame_ns * 4) s_next_tick_ns = now;
-    s_next_tick_ns += frame_ns;
+    s_next_tick_ns += frame_ns + netplay_pace_extra_ns();   /* + gradual netplay time sync */
     if (s_next_tick_ns > now) SDL_DelayNS(s_next_tick_ns - now);
     t_prev_end = SDL_GetTicksNS();
     t_sleep += t_prev_end - now;

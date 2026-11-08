@@ -375,6 +375,20 @@ uint64_t plat_mono_ns(void)
 void plat_sleep_us(uint64_t us)
 {
 #ifdef _WIN32
+    /* Sleep() rounds up to the system timer tick (15.6 ms unless someone raised the resolution):
+     * netplay's 0.5 ms waits would become 16 ms stalls. A high-resolution waitable timer
+     * (Windows 10 1803+) sleeps for what was asked; older systems fall back to Sleep(). */
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    static __thread HANDLE timer;
+    static __thread int tried;
+    if (!tried) { tried = 1; timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS); }
+    if (timer && us > 0) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(us * 10);   /* relative, 100 ns units */
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) { WaitForSingleObject(timer, INFINITE); return; }
+    }
     Sleep((DWORD)((us + 999) / 1000));
 #else
     struct timespec ts = { (time_t)(us / 1000000), (long)(us % 1000000) * 1000 };

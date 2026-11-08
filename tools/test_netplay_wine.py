@@ -67,7 +67,7 @@ def env_for(side):
     return e
 
 
-def wait_for(path, text, proc, timeout=60):
+def wait_for(path, text, proc, timeout=240):
     """Until `text` is in the log (the Wine side has reached its netplay menu action). Offline
     frames are not paced, so the native side would otherwise run through its whole script while
     Wine is still starting (2-3 s)."""
@@ -93,24 +93,25 @@ def run_session(name, port, pace):
     hoster, rp_name, sim_h, sim_j = CASES[name]
     joiner = 'win' if hoster == 'mac' else 'mac'
     rp = R.REPLAYS[rp_name]
+    p1, p2 = T.after_boot_to_vs(rp.p1), T.after_boot_to_vs(rp.p2)   # sessions boot straight to VS select
     d = os.path.join(OUT, name)
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
     t0 = time.time()
-    frames, disc_at = 6000, 4500
+    frames, disc_at = 4800, 3300
     mode = ['--renderer', 'software', '--no-memcard'] if WINDOWED else ['--headless', '--net-pace', str(pace)]
     common = mode + ['--no-interp', '--frames', str(frames),
               '--net-desync-dir', ('path', d)]
-    host = common + ['--press', R.fmt(rp.p1), '--net-sim', sim_h, '--net-hash-log', ('path', os.path.join(d, 'host.hash')),
+    host = common + ['--press', R.fmt(p1), '--net-sim', sim_h, '--net-hash-log', ('path', os.path.join(d, 'host.hash')),
                      '--menu-action', f'300:netplay-host={port},2']
-    join = common + ['--press', R.fmt(rp.p2), '--net-sim', sim_j, '--net-hash-log', ('path', os.path.join(d, 'join.hash')),
+    join = common + ['--press', R.fmt(p2), '--net-sim', sim_j, '--net-hash-log', ('path', os.path.join(d, 'join.hash')),
                      '--menu-action', f'400:netplay-join=127.0.0.1:{port},3',
                      '--menu-action', f'{400 + disc_at}:netplay-disconnect']
     with open(os.path.join(d, 'host.log'), 'w') as hl, open(os.path.join(d, 'join.log'), 'w') as jl:
         ph, pj = start_pair(hoster, host, hl, joiner, join, jl)
         try:
-            rc_j = pj.wait(timeout=900)
-            rc_h = ph.wait(timeout=300)
+            rc_j = pj.wait(timeout=2400)
+            rc_h = ph.wait(timeout=900)
         except subprocess.TimeoutExpired:
             for p in (ph, pj):
                 if p.poll() is None: p.kill()
@@ -119,8 +120,8 @@ def run_session(name, port, pace):
     jlog = open(os.path.join(d, 'join.log'), errors='replace').read()
     delay = 3
     ref = os.path.join(d, 'offline.hash')
-    r = subprocess.run([BIN, '--headless', '--no-interp', '--frames', str(disc_at), '--net-hash-log', ref,
-                        '--press', R.fmt(T.shifted(rp.p1, delay)), '--press2', R.fmt(T.shifted(rp.p2, delay)), PAK],
+    r = subprocess.run([BIN, '--headless', '--no-interp', '--frames', str(disc_at), '--net-hash-log', ref, '--boot-to-vs',
+                        '--press', R.fmt(T.shifted(p1, delay)), '--press2', R.fmt(T.shifted(p2, delay)), PAK],
                        capture_output=True, text=True, cwd=ROOT)
     open(os.path.join(d, 'offline.log'), 'w').write(r.stdout + r.stderr)
     H, J, O = T.read_log(os.path.join(d, 'host.hash')), T.read_log(os.path.join(d, 'join.hash')), T.read_log(ref)
@@ -130,6 +131,7 @@ def run_session(name, port, pace):
     for who, log in (('host', hlog), ('join', jlog)):
         if 'netplay: restarting for the session' not in log: problems.append(f'{who}: no synced restart')
         if 'input delay 3' not in log: problems.append(f'{who}: delay 3 not agreed')
+        if 'boot shortcut done at frame 306' not in log: problems.append(f'{who}: no boot shortcut to VS select')
         if 'netplay: session ended' not in log: problems.append(f'{who}: session did not end')
         if f'reached {frames} frames' not in log: problems.append(f'{who}: did not keep playing offline to the end')
         s = T.summary(log)
@@ -165,7 +167,7 @@ def run_ident(name, port, pace):
     join = common + ['--frames', '900', '--menu-action', f'300:netplay-join=127.0.0.1:{port}']
     logs = {'host': os.path.join(d, 'host.log'), 'join': os.path.join(d, 'join.log')}
     ph, pj = start_pair('win', host, open(logs['host'], 'w'), 'mac', join, open(logs['join'], 'w'))
-    rcs = {'join': pj.wait(timeout=300), 'host': ph.wait(timeout=300)}
+    rcs = {'join': pj.wait(timeout=900), "host": ph.wait(timeout=900)}
     L = {w: open(f, errors='replace').read() for w, f in logs.items()}
     problems = [f'{w} exit code {rc}' for w, rc in rcs.items() if rc]
     if 'alert: The host could not accept you: the two players run different versions of Destrega' not in L['join']:

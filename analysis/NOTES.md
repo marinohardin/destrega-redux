@@ -259,6 +259,18 @@ frame numbers repeat exactly; they are not "game constants".
   crawl over a 3D hamlet (EVENT_SP.BIN + EVENTOVL.BIN loaded at ~6300), event scenes with 3D
   characters (~9500-14000), "BATTLE 1 Gradd vs Relics" (~14300, MGRAD + MSOLD2, Hamlet pack 7756) and the
   fight from ~14650. With no input Gradd loses and "CONTINUE?" appears ~16500.
+- **Fastest power-on path to VS** (verified: headless dumps every 10-20 frames, `--boot-to-vs`, the
+  netplay boot shortcut `k_boot_vs` in netplay.c): with no memory card, Start is accepted from about
+  frame 200 while the KOEI logo fades in (presses at 20-140 do nothing); Start at 210 goes straight to
+  the title with its menu already up at ~220 (the intro FMV never starts). Down at 240 and 270 (one
+  item per tap, presses held 6 vblanks), Start at 300: the VS character select is on screen by ~380
+  (Gradd vs Celia, "0-0 DRAW 0"). The scripted path of `scenarios.py` (Start at 1200, Down x2, Start at
+  1480) reaches the same screen at ~1560, so the shortcut is 1180 vblanks (19.7 s) sooner. Start at
+  240 instead of 210 also works; a second Start on the title picks the highlighted item at once.
+- **After a VS match** (verified: `match_gradd_celia_hills` dumps, frames 7000-14000): after the
+  winner's animation the game returns by itself to the VS character select, keeping a win counter
+  under VS ("0-1 DRAW 0"); the next pick, stage select and fight follow as before. A rematch never
+  needs the title screen.
 - **OPTION** loads `OPTOVL.BIN`: GAME OPTION, CONTROLLER, SOUND OPTION, RECORDS, MEMORY CARD, EXTRA, EXIT.
   Circle backs out of a page. RECORDS shows the 1P-battle ranking; EXTRA has CHARACTER PROFILES / IN
   GAME CONTROL / EXIT.
