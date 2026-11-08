@@ -25,7 +25,7 @@
 
 #include "psx.h"
 
-typedef struct {
+typedef struct PgxpVert {
     u32 sxy;        /* the integer SXY word this vertex was produced as */
     float dx, dy;   /* precise screen position minus the integer SX / SY */
     float w;        /* view depth (the unclamped SZ), > 0 */
@@ -125,8 +125,6 @@ extern const u32 *g_pgxp_depth;
 extern u32 g_pgxp_batch;
 static inline void pgxp_new_batch(void) { g_pgxp_batch++; }
 const PgxpVert *pgxp_weld(u32 sxy, const PgxpVert *q);
-/* The value welded for `sxy` in this batch so far (NULL: none or integer); inserts nothing. */
-const PgxpVert *pgxp_weld_peek(u32 sxy);
 extern u64 g_pgxp_stat_welded, g_pgxp_stat_weld_int, g_pgxp_stat_weld_full;
 
 /* Diagnostics / regression check on the vertices actually sent to the hi-res target (after

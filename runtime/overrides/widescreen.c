@@ -33,6 +33,7 @@
 #include "gen_protos.h"
 #include "hires.h"
 #include "widescreen.h"
+#include "pgxp.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -64,11 +65,19 @@ typedef struct { int slot, off, n; u32 hash; } Pkt;   /* off/n: words in the own
 typedef struct {
     Pkt *p; int np, cap;
     u32 *w; int nw, wcap;
+    PgxpVert *v; int vcap;              /* PGXP: precise vertex per word (w = 0: none); wide pass */
 } PktList;
 
 static void list_clear(PktList *l) { l->np = 0; l->nw = 0; }
 
-static void list_add(PktList *l, int slot, u32 node)
+static void grow_v(PktList *l)
+{
+    if (l->vcap < l->wcap) { l->vcap = l->wcap; l->v = realloc(l->v, sizeof(PgxpVert) * (size_t)l->vcap); }
+}
+
+/* with_pv: also copy the precise vertex each word's PGXP tag points to (the pool entries are
+ * undone with the rest of the wide pass, so they are copied, not referenced) */
+static void list_add(PktList *l, int slot, u32 node, bool with_pv)
 {
     int n = (int)(ram32(node) >> 24);
     if (l->np == l->cap) { l->cap = l->cap ? l->cap * 2 : 4096; l->p = realloc(l->p, sizeof(Pkt) * (size_t)l->cap); }
@@ -82,13 +91,22 @@ static void list_add(PktList *l, int slot, u32 node)
         l->w[l->nw + i] = v;
         h = (h ^ v) * 16777619u;
     }
+    if (with_pv) {
+        grow_v(l);
+        for (int i = 0; i < n; i++) {
+            u32 a = node + 4 + 4 * (u32)i;
+            const PgxpVert *q = pgxp_lookup(g_pgxp_mem[pgxp_slot(a)], l->w[l->nw + i]);
+            if (q) l->v[l->nw + i] = *q;
+            else l->v[l->nw + i].w = 0;
+        }
+    }
     l->p[l->np++] = (Pkt){ slot, l->nw, n, h };
     l->nw += n;
 }
 
 /* Every packet chained from each of the OT_SLOTS slots, in chain (= draw) order. A chain ends
  * where it links back into the table (the next slot's entry) or at the terminator. */
-static bool collect(PktList *l, u32 base)
+static bool collect(PktList *l, u32 base, bool with_pv)
 {
     list_clear(l);
     const u32 lo = base, hi = base + 4 * OT_SLOTS;
@@ -98,7 +116,7 @@ static bool collect(PktList *l, u32 base)
         u32 node = ram32(lo + 4 * (u32)k) & 0xffffff;
         while (node != 0xffffff && !(node >= lo && node < hi)) {
             if (node >= RAM_SIZE || --budget < 0) return false;
-            list_add(l, k, node);
+            list_add(l, k, node, with_pv);
             node = ram32(node) & 0xffffff;
         }
     }
@@ -170,6 +188,7 @@ static void build_capture(Capture *c, u32 base)
                 e->w = realloc(e->w, sizeof(u32) * (size_t)e->wcap);
             }
             memcpy(e->w + e->nw, s_a.w + pa->off, sizeof(u32) * (size_t)pa->n);
+            if (g_pgxp) { grow_v(e); memcpy(e->v + e->nw, s_a.v + pa->off, sizeof(PgxpVert) * (size_t)pa->n); }
             if (c->first[k] < 0) c->first[k] = e->np;
             c->count[k]++;
             e->p[e->np++] = (Pkt){ k, e->nw, pa->n, pa->hash };
@@ -196,7 +215,14 @@ static void ll_hook(u32 node)
         s_used[i] = true;
         for (int j = 0; j < c->count[k]; j++) {
             const Pkt *p = &c->ex.p[c->first[k] + j];
-            gpu_shadow_packet(c->ex.w + p->off, p->n);
+            const PgxpVert *pv[256];
+            bool any = false;
+            for (int j = 0; j < p->n && j < 256; j++) {
+                const PgxpVert *q = g_pgxp && c->ex.v ? &c->ex.v[p->off + j] : 0;
+                pv[j] = q && q->w > 0 ? q : 0;
+                any |= pv[j] != 0;
+            }
+            gpu_shadow_packet(c->ex.w + p->off, p->n, any && p->n <= 256 ? pv : 0);
         }
     }
 }
@@ -246,7 +272,7 @@ static void stage_render(void)
     f_80044210_orig();
     g_widescreen_cull = 0;
     g_bus_sandbox = 0;
-    bool ok = g_bus_sandbox_hits == hits && collect(&s_a, base);
+    bool ok = g_bus_sandbox_hits == hits && collect(&s_a, base, g_pgxp);
     /* 3. restore, then the real pass */
     memcpy(g_ram, s_ram_bak, RAM_SIZE);
     memcpy(g_scratch, s_scr_bak, sizeof g_scratch);
@@ -258,7 +284,7 @@ static void stage_render(void)
     f_80044210_orig();
     u64 t2 = cpu_ns();
     /* 4. extras for this table */
-    ok = ok && collect(&s_b, base);
+    ok = ok && collect(&s_b, base, false);
     Capture *c = &s_cap[s_cap[0].base == base || !s_cap[0].valid ? 0 : 1];
     if (s_cap[1].valid && s_cap[1].base == base) c = &s_cap[1];
     s_passes++;

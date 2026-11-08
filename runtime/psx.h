@@ -124,7 +124,9 @@ void gte_write_ctrl(int reg, u32 v);  /* ctc2 */
 
 void gpu_init(void);
 void gpu_write_gp0(u32 v);
-void gpu_shadow_packet(const u32 *w, int n);   /* presentation-only packet (hi-res target only) */
+struct PgxpVert;
+/* presentation-only packet (hi-res target only); pv: optional precise vertex per word (PGXP) */
+void gpu_shadow_packet(const u32 *w, int n, const struct PgxpVert *const *pv);
 /* GP0 word with its PGXP precision tag (runtime/pgxp.h; 0 = none). */
 void gpu_write_gp0_tag(u32 v, u32 tag);
 void gpu_write_gp1(u32 v);

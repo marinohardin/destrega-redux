@@ -38,6 +38,7 @@ static bool s_mask_set, s_mask_check;
 static bool s_tex_disable_allowed;
 static u32 s_read_latch;
 static bool s_shadow;         /* executing a presentation-only packet (gpu_shadow_packet) */
+static const PgxpVert *const *s_shadow_pv;   /* its precise vertices per word (or NULL) */
 static int s_shadow_side;     /* shadow packets draw only into the guard band: 0 left, 1 right */
 #define SHADOW_SIDES (s_shadow ? 2 : 1)
 
@@ -478,6 +479,14 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
                 hv[i].x = vs[i]->x * 65536; hv[i].y = vs[i]->y * 65536;
                 hv[i].r = vs[i]->r; hv[i].g = vs[i]->g; hv[i].b = vs[i]->b;
                 hv[i].u = vs[i]->u; hv[i].v = vs[i]->v;
+                hv[i].w = 0;
+                /* the same precise positions as the in-area path below: a guard-band triangle
+                 * drawn at integer positions next to a precise neighbour opened a crack */
+                if (pv && pv[i].ok) {
+                    hv[i].x += (s32)lrintf(pv[i].dx * 65536.0f);
+                    hv[i].y += (s32)lrintf(pv[i].dy * 65536.0f);
+                    hv[i].w = pv[i].w;
+                }
             }
             for (s_shadow_side = 0; s_shadow_side < SHADOW_SIDES; s_shadow_side++) {
                 HiresPrim hp;
@@ -598,14 +607,14 @@ static void gp0_polygon(const u32 *w)
         if (gour && k > 0) color = w[i] & 0xFFFFFF;
         if (k == 0 || gour) i++;
         pv[k].ok = false;
-        if (want_pv && s_shadow) {
-            /* widescreen extra (integer words, no tags): take a precise position only where the
-             * real geometry already welded this word in the batch (closes seams at the 4:3
-             * edge); never inserts, so the real packets drawn after it are unaffected */
-            const PgxpVert *q = pgxp_weld_peek(w[i]);
-            if (q) { pv[k].dx = q->dx; pv[k].dy = q->dy; pv[k].w = q->w; pv[k].ok = true; any_pv = true; }
-        } else if (want_pv) {
-            const PgxpVert *q = pgxp_weld(w[i], pgxp_lookup(s_cmd_tag[i], w[i]));
+        if (want_pv) {
+            /* a widescreen extra brings the precise values the wide pass produced for its words
+             * (it has no tags) and is welded like any other packet, so a word it shares with the
+             * real geometry gets one position in the whole batch: no cracks at the 4:3 edge */
+            const PgxpVert *q0 = s_shadow ? (s_shadow_pv && s_shadow_pv[i] && s_shadow_pv[i]->sxy == w[i]
+                                             ? s_shadow_pv[i] : 0)
+                                          : pgxp_lookup(s_cmd_tag[i], w[i]);
+            const PgxpVert *q = pgxp_weld(w[i], q0);
             g_pgxp_stat_vtx++;
             pq[k] = q; pxy[k] = w[i];
             if (q) {
@@ -613,7 +622,7 @@ static void gp0_polygon(const u32 *w)
                 any_pv = true;
                 g_pgxp_stat_hit++;
             } else {
-                g_pgxp_stat_miss_stale += s_cmd_tag[i] != 0;
+                g_pgxp_stat_miss_stale += !s_shadow && s_cmd_tag[i] != 0;
                 g_pgxp_stat_miss_gte += g_pgxp_recent[pgxp_recent_slot(w[i])] == w[i];
             }
         }
@@ -645,7 +654,7 @@ static void gp0_polygon(const u32 *w)
     if (tex && raw) {
         for (int k = 0; k < n; k++) v[k].r = v[k].g = v[k].b = 0x80;
     }
-    if (want_pv && !s_shadow) {
+    if (want_pv) {
         pgxp_check_tri(pq, pxy);
         if (quad) pgxp_check_tri(pq + 1, pxy + 1);
     }
@@ -1026,7 +1035,7 @@ void gpu_write_gp0_tag(u32 v, u32 tag)
  * texture window, draw area, offset, mask bits, GPUSTAT) is restored afterwards, so the
  * emulated machine cannot observe it. Only polygons, rects, single lines and E1-E6 are
  * executed; fills, copies, transfers, polylines and anything else are skipped. */
-void gpu_shadow_packet(const u32 *w, int n)
+void gpu_shadow_packet(const u32 *w, int n, const PgxpVert *const *pv)
 {
     if (!g_hires) return;
     u32 stat = s_stat, drawmode = s_drawmode, texwin = s_texwin, area_tl = s_area_tl, area_br = s_area_br;
@@ -1041,7 +1050,7 @@ void gpu_shadow_packet(const u32 *w, int n)
         int len = gp0_len(cmd);
         if (i + len > n) break;
         switch (cmd >> 5) {
-        case 1: gp0_polygon(&w[i]); break;
+        case 1: s_shadow_pv = pv ? pv + i : 0; gp0_polygon(&w[i]); s_shadow_pv = 0; break;
         case 2: if (!(cmd & 0x08)) gp0_execute(&w[i]); break;
         case 3: gp0_rect(&w[i]); break;
         case 7: gp0_env(w[i]); break;

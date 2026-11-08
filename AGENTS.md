@@ -155,7 +155,8 @@ frame (`--keep`, `tools/contact_sheet.py`), then `scenarios.py record NAME` to s
 `tools/scenario_expect.json`. A scenario that exposes a real bug is `xfail=` (the run must still fail
 that way) and the bug goes in `analysis/NOTES.md`. `run_tests.sh` runs all scenarios (`--no-interp`,
 `--verify-overrides`) and the hi-res determinism / `--hires-verify` check on the `hires`-tagged
-subset (every stage) concurrently with the rest; `SCENARIOS=0 tools/run_tests.sh` skips them.
+subset (every stage; plus widescreen with PGXP on/off and the crack check `tools/check_ws_cracks.py`)
+concurrently with the rest; `SCENARIOS=0 tools/run_tests.sh` skips them.
 Headless runs ~200x real time (30k frames ≈ 13 s).
 
 ## Memory cards (`runtime/memcard.[ch]`, `bios.c`)
@@ -426,10 +427,21 @@ needs the same change in the shader. The header comment of `hires_gpu.c` has the
   10th: 24 (4:3) and 28 (16:9) differing pixels over 331 fight frames (`ws46c`, limit
   `CMP_MAX_PGXP`). With PGXP the wide pass is bracketed by `pgxp_snapshot_save/restore`
   (registered with `widescreen_add_state_hook` in `main.c`: tag tables copied, pool and
-  recent-word writes journalled and undone), so the real pass draws exactly what it would at
-  4:3 (`pgxp-check` counts identical). Extra (guard-band) packets carry no tags: a vertex gets a
-  precise position only if the real geometry already welded that SXY word in the batch
-  (`pgxp_weld_peek`, which inserts nothing), which closes seams at the 4:3 edge.
+  recent-word writes journalled and undone), so the wide pass leaves no trace in the real one.
+  Extra (guard-band) packets carry the precise vertices the wide pass produced: `collect()` copies
+  the pool entry each packet word's tag points to (before the restore undoes it), and
+  `gpu_shadow_packet(w, n, pv)` hands them to `gp0_polygon`, which welds them like any other
+  packet. So a word shared by an extra and real geometry gets one position in the whole batch.
+- **Pitfall (fixed):** `gpu.c` has a second hi-res path for triangles outside the 1x draw area
+  (all extras, and real ones beyond the edge). It built `HiresVtx` from the integer vertices only
+  (and left `w` unset), so those triangles were drawn at integer positions next to precise
+  neighbours: black diagonal cracks along shared edges in the guard band on every stage. Both
+  paths now apply the PGXP offsets. Regression check: `scenarios.py hires` also runs every stage
+  scenario with `--widescreen` at 2x3, PGXP on and off (same state hash, `pgxp-check` clean,
+  shadow triangles included) and `tools/check_ws_cracks.py` on the dumped fight frames: thin
+  black runs with lit pixels at both ends in the PGXP frame, lit everywhere within one 1x pixel
+  in the PGXP-off frame, grouped, at least 16 1x pixels long and not axis-aligned. Before the
+  fix it found 7..36 cracks per stage (7 frames each); after, 0 on all 13.
 - Tests: `tools/test_hires_determinism.sh` adds `g4x6` (state hash), `gverify1` (1x1 ==
   1x VRAM), `c1x1` and `c4x6` (compare vs software, `--pgxp off`, `CMP_MAX` default 0 %), and
   `cp4x6` (compare with `--pgxp on`, `CMP_MAX_PGXP` default 0.001 %). `g4x6` runs with PGXP on

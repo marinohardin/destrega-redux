@@ -57,16 +57,6 @@ const PgxpVert *pgxp_weld(u32 sxy, const PgxpVert *q)
     return 0;
 }
 
-const PgxpVert *pgxp_weld_peek(u32 sxy)
-{
-    u32 h = pgxp_recent_slot(sxy);
-    for (int k = 0; k < WELD_PROBE; k++, h = (h + 1) & ((1u << WELD_BITS) - 1)) {
-        if (s_weld[h].batch != g_pgxp_batch) return 0;
-        if (s_weld[h].sxy == sxy) return s_weld[h].have ? &s_weld[h].v : 0;
-    }
-    return 0;
-}
-
 void pgxp_check_tri(const PgxpVert *const q[3], const u32 sxy[3])
 {
     {   /* an SXY word sent at two different positions within one batch = a crack */
