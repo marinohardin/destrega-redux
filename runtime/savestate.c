@@ -159,6 +159,15 @@ bool ss_save(Snapshot *s) {
 }
 
 static int s_reseed_hires = 1;
+bool ss_restore_ex(const Snapshot *s, bool reseed_hires) {
+    int keep = s_reseed_hires;
+    s_reseed_hires = reseed_hires;
+    bool ok = ss_restore(s);
+    s_reseed_hires = keep;
+    return ok;
+}
+u64 ss_now_ns(void) { return now_ns(); }
+
 bool ss_restore(const Snapshot *s) {
     if (!ss_context_matches(s) || !ss_safe_point()) return false;
     u64 t0 = now_ns();
@@ -228,7 +237,9 @@ static struct { u64 rewinds, frames_cmp, mismatches, abandoned, inplace, inplace
 static bool s_resim;
 static int s_fail;
 
-bool ss_resimulating(void) { return s_resim; }
+static bool s_np_resim;   /* netplay rollback re-simulation (netplay.c) */
+bool ss_resimulating(void) { return s_resim || s_np_resim; }
+void ss_set_resim(bool on) { s_np_resim = on; }
 static bool s_det_audio;
 bool ss_deterministic_audio(void) { return s_det_audio || s_test_n || s_rw_every || s_inplace_every; }
 void ss_set_deterministic_audio(bool on) { s_det_audio = on; }
@@ -352,6 +363,12 @@ void replay_vblank_end(u64 frame);
 int replay_parse_arg(int argc, char **argv, int i);
 void replay_usage(void);
 void replay_finish(void);
+void netplay_vblank_begin(u64 frame);
+void netplay_vblank_end(u64 frame);
+int netplay_parse_arg(int argc, char **argv, int i);
+void netplay_usage(void);
+void netplay_finish(void);
+int netplay_failed(void);
 
 void ss_vblank_begin(void) {
     capture_ctx(&s_ctx);
@@ -359,7 +376,8 @@ void ss_vblank_begin(void) {
     u64 f = *s_frame + 1;
     if (s_test_n || s_rw_every) rewind_step(f);
     inplace_step(*s_frame + 1);
-    replay_vblank_begin(*s_frame + 1);
+    netplay_vblank_begin(*s_frame + 1);   /* may restore an older frame (rollback) */
+    replay_vblank_begin(*s_frame + 1);    /* (netplay records its timeline here for desync reports) */
     if (s_hash_path) record_final_hash(*s_frame + 1, ss_hash_all());
     if (s_hash_path && getenv("SS_DEBUG_MODULES") && (u64)atoll(getenv("SS_DEBUG_MODULES")) == *s_frame + 1) {
         u64 m[NMOD];
@@ -370,6 +388,7 @@ void ss_vblank_begin(void) {
 }
 
 void ss_vblank_end(void) {
+    netplay_vblank_end(*s_frame);
     replay_vblank_end(*s_frame);
 }
 
@@ -401,6 +420,8 @@ int ss_parse_arg(int argc, char **argv, int i) {
     if (!strcmp(a, "--savestate-inplace") && has) { s_inplace_every = strtoull(argv[i + 1], NULL, 0); return 2; }
     if (!strcmp(a, "--ss-hash") && has) { s_hash_path = argv[i + 1]; return 2; }
     if (!strcmp(a, "--ss-stats") && has) { s_point_stats = true; s_point_from = strtoull(argv[i + 1], NULL, 0); return 2; }
+    int k = netplay_parse_arg(argc, argv, i);
+    if (k) return k;
     return replay_parse_arg(argc, argv, i);
 }
 
@@ -412,9 +433,11 @@ void ss_usage(void) {
         "  --ss-hash FILE            per-frame complete emulated-state hash at exit\n"
         "  --ss-stats F              report vblank safe points / host contexts (from frame F) at exit\n");
     replay_usage();
+    netplay_usage();
 }
 
 void ss_finish(void) {
+    netplay_finish();
     replay_finish();
     if (s_st_save.n)
         fprintf(stderr, "savestate: %llu saves, avg %.3f ms, max %.3f ms, %.2f MB; %llu loads, avg %.3f ms, max %.3f ms\n",
@@ -455,4 +478,4 @@ void ss_finish(void) {
 }
 
 int replay_failed(void);
-int ss_failed(void) { return s_fail || replay_failed(); }
+int ss_failed(void) { return s_fail || replay_failed() || netplay_failed(); }

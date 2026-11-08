@@ -176,10 +176,11 @@ a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as 
 - Tests: `runtime/tests/test_memcard.c` (format, chained files, directory, erase, persistence,
   refusing bad images) and `tools/test_memcard.sh` (scripted save of a changed option from a fresh card, load in
   a new run, identical hashes and card files across identical runs).
-- **Rollback netplay (future, not implemented): card writes must be suppressed during netplay**
-  (a rolled-back frame must not leave files behind, and the two peers' cards differ). The hook is
-  `memcard_set_write_protect(true)` (in-memory state keeps updating, flushing becomes a no-op);
-  card state is part of every save state (`memcard_state_io`: images, changed flags, open files; a
+- **Netplay: no cards, nothing written.** A rolled-back frame must not leave files behind and the
+  two peers' cards differ, so `netplay.c` flushes, detaches both slots (`memcard_attach(p, NULL)`)
+  and sets `memcard_set_write_protect(true)` at the first vblank (before the game touches a card);
+  the game sees no card on either peer. The Save Games menu still works during netplay and would
+  desync the peers (not guarded). Card state is part of every save state (`memcard_state_io`: images, changed flags, open files; a
   load that changes an image marks it dirty).
 
 ## Save states (`runtime/savestate.[ch]`)
@@ -251,6 +252,71 @@ Complete snapshots of the emulated machine, taken and restored only at the frame
   values). If the change is intended (e.g. an emulation fix), `python3 tools/replays.py record
   [NAME...]`, check the summary it prints (KOs, rounds, matches) and commit the new `.dtr.gz` files
   with the reason in the commit message. Adding one: append an `add_vs(...)` / `add_1p(...)` call.
+
+## Rollback netplay (`runtime/netplay.c`, `runtime/net.[ch]`)
+
+GGPO-style rollback on top of save states, two peers, UDP. Command-line only so far.
+
+- `--host PORT` (player 1) / `--join HOST:PORT` (player 2). Each peer's own input is whatever its
+  frontend puts into pad 1 (keyboard, gamepad, `--press`); netplay writes both pads at the end of
+  every vblank (`netplay_vblank_end`, from `ss_vblank_end`). Handshake: the joiner sends hello until
+  the host answers; both check protocol version, disc identity (SLUS_007.32 CRC + sector count),
+  build identity (recompiled-function table hash) and equal `--net-delay` / `--net-window`, and
+  refuse otherwise. `--net-port` picks the joiner's local port.
+- **Frames are vblanks (60 Hz)**, not game updates: inputs, packets, delay and window are counted
+  in vblanks (the game polls the pad per vblank in menus, and fights only run every second one, so
+  60 Hz is the only clock that covers both). Local input sampled at the end of frame F is used for
+  F + delay (`--net-delay`, default 2, minimum 1). A missing remote input is predicted (its last
+  known value) up to `--net-window` vblanks (default 8 = 4 game updates = 133 ms) past the last
+  confirmed one; beyond that the peer waits.
+- **Rollback**: a received input that differs from the one used marks the frame; at the start of
+  the next vblank the newest snapshot at or before it whose host context matches is restored
+  (`ss_restore`, savestate.c rules) and the frames up to now are re-simulated with the corrected
+  inputs. Snapshots: one per vblank where restorable, a ring of 24. In fights only every second
+  vblank's context recurs, so a rollback waits up to 2 vblanks for one within 2 frames of the bad
+  frame (deeper restores re-simulate more). During re-simulation `ss_resimulating()` is true:
+  `frontend_vblank` only renders (and discards) the vblank's audio, nothing is presented or queued
+  to the audio device, hi-res rendering is off except for the last 3 re-simulated vblanks (so the
+  target holds the final frame), cards are detached anyway.
+- **Prediction only during a round** (`in_round`: `round_time` 800e379c advanced in the last 4
+  vblanks). Menus, intros, KO / win animations and loads run in lockstep (input delay only):
+  there the game leaves its loop at some point, and a misprediction found after the game left the
+  snapshot's host context cannot be rolled back. Without this gate the `match` test hit ~10
+  impossible rollbacks and desyncs at the end of each match (NOTES.md). An impossible rollback is
+  still counted and logged as a last resort; desync detection then reports what it caused.
+- **Time sync**: each packet carries the sender's frame and its frame advantage; the peer that is
+  ahead by >= 1 frame on average waits (at most 8 frames, once a second), like GGPO.
+- **Final frames and desync detection**: the state at the start of frame F is final once every
+  input before F is confirmed and was used. Each packet carries the newest final frame's gameplay
+  hash, its 16 field hashes (replay.c fields) and every 30 frames the complete state hash
+  (`--net-hash-every`). A mismatch is logged (`netplay: DESYNC at frame F`), counted (exit status 7)
+  and the first one writes `desync-F-host|join.txt` (both hashes, every field DIFFERS / same with the
+  local value, last agreeing frame, link stats) and `desync-F-host|join.dtr`, a replay file
+  (M2 format) of this peer's timeline: `destrega --headless --replay desync-F-join.dtr` re-runs the
+  confirmed inputs offline and, on the peer that went wrong, reports its first wrong frame.
+  `--net-desync-dir DIR` (default: cwd), `--net-desync-stop`, `--net-inject-desync F` (test fault).
+- **Readout**: once a second the window title shows ping (RTT), delay, fps, rollbacks/s, % of
+  vblanks predicted, % of time waiting, DESYNC; every 10 s the same line goes to stderr. Exit
+  summary: frames, predicted / mispredicted inputs, rollbacks (max depth, deferred, impossible),
+  re-simulated frames and cost, stalls, time-sync waits, packets, final frames, hashes checked.
+- **Transport** (`net.c`): non-blocking UDP over IPv4 (the host listens on IPv4 only), the host
+  answers whoever says hello first. Packets carry every unacknowledged input (up to 120 frames),
+  so loss only costs latency. `--net-sim LAT:JITTER:LOSS:REORDER[:SEED]` (ms, ms, %, %) delays /
+  drops / reorders this peer's sends (deterministic per seed) for tests. `--net-pace HZ` paces
+  headless runs; `--net-hash-log FILE` writes every final frame's hashes (also without netplay, for
+  an offline reference run); `--net-lockstep` never predicts.
+- Tests: `tools/test_netplay.py` (in `run_tests.sh`): six cases, each two headless processes over
+  loopback with seeded VS menu + random fight input (`replays.py` scripts), paced at 240 Hz (4x real
+  time, so the simulated latencies cover 4x as many frames): lan, wan (20 ms + 8 jitter, 1% loss, 2%
+  reorder), lossy (15+15 ms, 10% loss, 10% reorder), asym (35 / 5 ms), a full best-of-3 match with
+  delay 3, and an injected desync. Pass: both peers' final-frame hashes equal each other **and an
+  offline run of the same inputs shifted by the delay**, >= 95% of frames final, no desync, no
+  impossible rollback; the desync case must be detected and its two report replays must behave
+  (clean peer replays cleanly, faulty one diverges at the injected frame naming `p1.hp`).
+  `--pace 60` runs in real time. ~90 s.
+- Not done / not verified: a lobby or NAT traversal (direct UDP only), the UI beyond the title bar,
+  spectators, Windows (`net.c` has Winsock code, untested), the Save Games menu during netplay,
+  windowed-vs-windowed play by two people (tested: windowed host + headless joiner).
 
 ## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
 

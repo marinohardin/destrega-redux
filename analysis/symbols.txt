@@ -82,7 +82,7 @@
 800e3780  data   round_start_hp             likely    rea        s32 x2 (P1, P2): health carried into the next round; fight_match_loop copies them to fighter +0xc
 800e3788  data   round_wins                 verified  trace      s32 x2 (P1 at 800e3788, P2 at 800e378c): rounds won; +1 for the other fighter at each KO (incremented by round_timer_and_judge, rea), back to 0 after a fighter reaches 2 (match over; replays.py match_gradd_celia_hills)
 800e3794  data   game_mode                  guess     rea        compared with 1, 4, 5, 6, 10 by the round code; 1 seems to disable the time limit (practice?)
-800e379c  data   round_time                 verified  trace      u32 elapsed round time, +2 per 30 Hz update (= vblanks), frozen from the KO until the next round, 0 at round start; compared with limit * 60 (rea)
+800e379c  data   round_time                 verified  trace      u32 elapsed round time, +2 per 30 Hz update (= vblanks), frozen from the KO until the next round, 0 at round start; compared with limit * 60 (rea); netplay.c predicts remote input only while it advances (in_round), verified by tools/test_netplay.py "match"
 800e7560  data   rand_seed                  verified  code       rand()/srand() seed = the game RNG state; that it picks the 1P-battle opponent/stage is likely (NOTES.md, scenarios); also verified/trace: advances during fights, also with no input (CPU AI and round-end code)
 800ed4c8  data   camera_matrix              likely    rea        camera rotation + translation (MATRIX) loaded into the GTE by stage_render and the character renderers
 # --- memory card (libmcrd-style library at 0x800a4xxx-0x800a7xxx, game wrappers in main_05) ---

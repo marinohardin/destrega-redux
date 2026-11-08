@@ -327,6 +327,30 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
 - Cost (measured, Apple M-series, headless): 3.55 MB per snapshot (3.68 with a card), save avg
   0.08-0.15 ms (max 0.45), load avg 0.18-0.29 ms (max 0.9) incl. PGXP reset.
 
+## Rollback netplay: what the game allows (runtime/netplay.c)
+
+- **Restorable points in fights** (verified: `tools/test_netplay.py`, `NETPLAY_DEBUG=1`): the
+  VSync-wait vblank of each game update recurs with one host context, but the mid-update vblank
+  lands in one of ~20 contexts, some rare. Restoring at a mid-update vblank therefore often had to
+  go 10-20 frames back (max rollback depth 24 vblanks, 35 ms re-simulation); waiting up to 2 vblanks
+  for a context with a snapshot within 2 frames of the bad frame cut the max depth to 10 vblanks
+  (~12 ms) at the same latency.
+- **Loop exits break rollback** (verified: the `match` case without the round gate): after a match
+  ends (KO -> win animation -> next match), mispredictions made shortly before the game left its loop
+  were found when no snapshot with the new host context existed: 9 / 11 impossible rollbacks per
+  peer, then 500+ final-frame desyncs. Gating prediction on `round_time` advancing (it freezes from
+  the KO, verified/trace in "Fight state") removed all of them in every case; the fight loop keeps
+  running through the KO animation for much longer than the 8-vblank window, so predictions made
+  before the KO stay correctable (likely: no impossible rollback seen in 6 cases x 2 peers since).
+- A mispredicted input that the game ignored still changed the complete state hash while every
+  gameplay field stayed equal (seen in those desyncs: equal gameplay hashes, different state
+  hashes). Where the pad state lands in RAM (libpad / the game's own button buffers): guess, not
+  traced. It is why the full-state hash is part of the exchanged hashes.
+- **Re-simulation cost** (measured, Apple M-series): 1.1-1.5 ms per re-simulated vblank in fights
+  (fight emulation ~0.9 ms/vblank + a snapshot ~0.1 ms + restore once per rollback ~0.2 ms); avg
+  2.5-8 ms per rollback, max ~12 ms at 20 ms one-way latency with jitter. At 60 Hz that fits in a
+  frame with the default window of 8 vblanks.
+
 ## Cleanup priority (readable C / overrides)
 
 Highest value first. Move items to "done" with the PR that did them.

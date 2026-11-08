@@ -41,10 +41,13 @@ add_executable(destrega
   runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/memcard.c runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/gte.c runtime/pgxp.c runtime/spu.c runtime/xa.c runtime/mdec.c
   runtime/overrides/override.c runtime/overrides/collision.c runtime/menu_stub.c
   runtime/overrides/widescreen.c
-  runtime/savestate.c runtime/replay.c)
+  runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c)
 target_include_directories(destrega PRIVATE runtime gen)
 target_compile_options(destrega PRIVATE -Wall -Wno-unused-function -fno-strict-aliasing)
 target_link_libraries(destrega PRIVATE gen SDL3::SDL3 ZLIB::ZLIB m)
+if(WIN32)
+  target_link_libraries(destrega PRIVATE ws2_32)   # netplay UDP (net.c)
+endif()
 if(APPLE)
   # native File menu (Cocoa); menu_stub.c compiles to nothing on Apple
   target_sources(destrega PRIVATE runtime/menu_mac.m)

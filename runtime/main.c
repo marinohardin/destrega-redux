@@ -614,6 +614,14 @@ static void finish(void) {
     exit(rc);
 }
 
+/* Status text in the window title (netplay connection quality); headless: ignored. */
+void frontend_set_status(const char *st) {
+    if (!s_win) return;
+    char t[320];
+    snprintf(t, sizeof t, "Destrega (recompiled)%s%s", st && *st ? " - " : "", st ? st : "");
+    SDL_SetWindowTitle(s_win, t);
+}
+
 /* Exit after frame n (headless and windowed), e.g. at the end of a --replay. */
 void frontend_set_max_frames(u64 n) { if (!s_max_frames || n < s_max_frames) s_max_frames = n; }
 

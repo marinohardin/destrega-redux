@@ -120,6 +120,7 @@ void replay_disc_id(u32 *crc, u32 *sectors) {
 void frontend_set_max_frames(u64 n);   /* main.c */
 
 static const char *s_rec_path, *s_play_path;
+static bool s_rec_mem;   /* netplay: record in memory for desync reports (replay_write) */
 static u32 *s_in;        /* per frame: p1 | p2 << 16 (active high) */
 static Gp *s_gp;         /* per frame gameplay fields */
 static u64 *s_sh;        /* per frame complete state hash (0 = none) */
@@ -237,7 +238,7 @@ void replay_vblank_begin(u64 frame) {
         s_loaded = true;
         if (!load(s_play_path)) { s_fail = 1; s_play_done = true; frontend_set_max_frames(frame); return; }
     }
-    if (s_rec_path) {
+    if (s_rec_path || s_rec_mem) {
         grow(frame);
         Gp g;
         gameplay_sample(&g);
@@ -291,7 +292,7 @@ void replay_vblank_end(u64 frame) {
         g_pad_buttons[0] = (u16)~(v & 0xffff);
         g_pad_buttons[1] = (u16)~(v >> 16);
     }
-    if (s_rec_path) {
+    if (s_rec_path || s_rec_mem) {
         grow(frame);
         s_in[frame] = (u16)~g_pad_buttons[0] | (u32)(u16)~g_pad_buttons[1] << 16;
     }
@@ -299,9 +300,14 @@ void replay_vblank_end(u64 frame) {
 
 /* ---- writing ----------------------------------------------------------------------------- */
 
-static void write_recording(void) {
-    FILE *f = fopen(s_rec_path, "w");
-    if (!f) { fprintf(stderr, "replay: cannot write %s\n", s_rec_path); s_fail = 1; return; }
+/* Write the recording of frames 1..last (the current timeline: a rollback overwrites the frames
+ * it re-simulates) to path. */
+bool replay_write(const char *path, u64 last) {
+    if (!s_rec_path && !s_rec_mem) return false;
+    u64 keep = s_last;
+    if (last && last < s_last) s_last = last;
+    FILE *f = fopen(path, "w");
+    if (!f) { s_last = keep; return false; }
     u32 crc, sec;
     replay_disc_id(&crc, &sec);
     fprintf(f, "destrega-replay 1\n");
@@ -331,8 +337,27 @@ static void write_recording(void) {
         }
     }
     fclose(f);
+    s_last = keep;
+    return true;
+}
+
+static void write_recording(void) {
+    if (!replay_write(s_rec_path, 0)) { fprintf(stderr, "replay: cannot write %s\n", s_rec_path); s_fail = 1; return; }
     fprintf(stderr, "replay: recorded %llu frames to %s\n", (unsigned long long)s_last, s_rec_path);
 }
+
+void replay_record_in_memory(void) { s_rec_mem = true; }
+
+/* gameplay fields for netplay desync reports */
+int replay_field_count(void) { return G_N; }
+const char *replay_field_name(int k) { return s_gname[k]; }
+void replay_fields_now(u32 *val, u16 *hash) {
+    Gp g, h;
+    gameplay_sample(&g);
+    gp_hashed(&g, &h);
+    for (int k = 0; k < G_N; k++) { val[k] = g.v[k]; hash[k] = (u16)h.v[k]; }
+}
+void replay_field_str(int k, u32 v, char *b, size_t n) { fmt_field(b, n, k, v); }
 
 static bool s_finished;
 void replay_finish(void) {

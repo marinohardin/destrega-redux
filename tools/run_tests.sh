@@ -51,6 +51,9 @@ SAVST=$!
 # gameplay regression replays (tools/replays/*.dtr.gz): every frame's gameplay fields must match
 python3 tools/replays.py run -j 4 > build/replays.out 2>&1 &
 REPL=$!
+# rollback netplay: host + join over loopback with simulated latency / loss, against an offline run
+python3 tools/test_netplay.py -j 6 > build/netplay.out 2>&1 &
+NETP=$!
 
 wait %1 %2 %3 %4 %5 %6 %7 2>/dev/null
 fail=0
@@ -88,5 +91,7 @@ wait $SAVST || { fail=1; echo "savestate: FAILED"; }
 cat build/savestate.out
 wait $REPL || { fail=1; echo "replays: FAILED (a gameplay change? see AGENTS.md \"Replays\")"; }
 cat build/replays.out
+wait $NETP || { fail=1; echo "netplay: FAILED"; }
+cat build/netplay.out
 echo "tests: $(( $(date +%s) - START ))s wall clock, $([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail
