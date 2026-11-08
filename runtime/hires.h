@@ -6,11 +6,11 @@
  * at an integer multiple S of the 1x resolution. The target is never read by
  * the emulated machine (textures/CLUTs are fetched from the 1x VRAM).
  *
- * The renderer sits behind HiresBackend (command in -> target out) so a GPU
- * (Metal/SDL_GPU) backend can replace the software one later. Vertices carry
- * 16.16 fixed-point positions (in 1x pixel units): integers, or sub-pixel
- * positions from the GTE when PGXP tracking (runtime/pgxp.h) matched the vertex,
- * in which case `w` (view depth) is also set for perspective-correct texturing.
+ * The renderer sits behind HiresBackend (command in -> target out): the software
+ * rasterizer (hires.c, the reference and default) or the SDL_GPU backend (hires_gpu.c).
+ * Vertices carry 16.16 fixed-point positions (in 1x pixel units): integers, or sub-pixel
+ * positions from the GTE when PGXP tracking (runtime/pgxp.h) matched the vertex, in which
+ * case `w` (view depth) is also set for perspective-correct texturing.
  */
 #ifndef HIRES_H
 #define HIRES_H
@@ -55,6 +55,10 @@ typedef struct {
     int stride;          /* in pixels */
     int w, h;            /* in target pixels */
     int scale_x, scale_y;
+    /* GPU-resident view (GPU backend): pixels is NULL; gpu is the backend's target and
+     * (gx, gy) the view's top-left pixel in it. hires_read_view() gives CPU pixels. */
+    void *gpu;
+    int gx, gy;
 } HiresView;
 
 typedef struct HiresBackend {
@@ -70,11 +74,19 @@ typedef struct HiresBackend {
     void (*copy)(int sx, int sy, int dx, int dy, int w, int h, bool mask_check, bool mask_set);
     void (*put)(int x, int y, u16 v, bool mask_check, bool mask_set);   /* CPU->VRAM pixel */
     bool (*view)(int x, int y, int w, int h, HiresView *out);          /* 1x rect -> target */
+    bool (*read)(int x, int y, int w, int h, HiresView *out);          /* same, CPU pixels (readback) */
     void (*destroy)(void);
 } HiresBackend;
 
 /* Active backend; NULL = hi-res off. Defined in gpu.c, set by hires_set_scale(). */
 extern const HiresBackend *g_hires;
+
+/* Backend selection (takes effect on the next hires_set_scale that allocates). be = NULL:
+ * software. shadow != NULL: every command is also fed to shadow (same scales), for
+ * hires_compare(); views and presentation come from be. */
+void hires_set_backend(const HiresBackend *be, const HiresBackend *shadow);
+const HiresBackend *hires_software_backend(void);
+bool hires_get_dither(void);                  /* --hires-dither setting */
 
 /* ---- control (runtime/hires.c) ------------------------------------------- */
 
@@ -90,6 +102,7 @@ void hires_set_dither(bool enable);           /* dither at scale > 1 (default of
 /* Presentable view of the current display area, or false (24-bit display, display
  * not inside the target, hi-res off): present from 1x VRAM then. */
 bool hires_get_view(const GpuDisplay *d, HiresView *v);
+bool hires_read_view(const GpuDisplay *d, HiresView *v);   /* same with CPU pixels (GPU: readback) */
 /* Scales for a window of pw x ph physical pixels showing a dw x dh display: the 4:3 letterbox
  * viewport (vw x vh) is covered without ever upsampling on either axis,
  * sx = ceil(vw/dw), sy = ceil(vh/dh), each capped to 1..max_x / 1..max_y. */
@@ -118,11 +131,19 @@ void hires_get_uv_stats(HiresUvStats *st);
 /* Perspective-correct texturing of triangles whose vertices all carry w (default on; with it
  * off, w is ignored and texturing is affine). */
 void hires_set_perspective(bool enable);
-/* Triangles drawn, and those textured perspective-correctly. */
+bool hires_get_perspective(void);            /* for other backends: same setting */
+/* Triangles drawn, and those textured perspective-correctly (software backend; the GPU
+ * backend counts its own in HiresGpuStats). */
 void hires_get_persp_stats(u64 *tris, u64 *persp);
 
 /* Compare the target against the 1x VRAM region (meaningful at scale 1x1, where they must
  * be identical). Returns the number of differing pixels; reports the first one. */
 u32 hires_verify_1x(int *first_x, int *first_y);
+
+/* Compare the primary backend's target against the shadow's over the whole region.
+ * diff = pixels whose 15-bit value differs (mask bit ignored), diff_big = those where some
+ * channel differs by more than 1 (of 31); mask_diff = pixels where only bit 15 differs. */
+typedef struct { u64 pixels, diff, diff_big, mask_diff; int first_x, first_y; } HiresCompare;
+bool hires_compare(HiresCompare *c);
 
 #endif

@@ -17,6 +17,13 @@
 #     vertex > 1.5 px from its integer position (a false association).
 #  5. In every hi-res run >= 95% of the fight-window frames (frame >= 3700) must be presentable
 #     from the hi-res target rather than the 1x fallback.
+#  6. GPU renderer (--renderer gpu, runtime/hires_gpu.c): same state hash, 1x1 equivalence with
+#     the 1x VRAM, and image comparison against the software backend (--renderer compare draws
+#     both) at 1x1 and 4x6: no compared fight frame may differ in more than CMP_MAX % of pixels
+#     (default 0: the two backends are bit-identical with --pgxp off). With --pgxp on (cp4x6) the
+#     limit is CMP_MAX_PGXP (default 0.001 %): perspective u/v are double in hires.c and 2^-38
+#     fixed point on the GPU, which picks a different texel in a few pixels per frame (measured:
+#     29 pixels over 331 fight frames). Skipped with a note when SDL_GPU is unavailable.
 # The runs are independent processes and run concurrently (JOBS at a time, default: performance
 # cores). Usage: tools/test_hires_determinism.sh [frames]   (default 7000; needs build/cmake/destrega)
 cd "$(dirname "$0")/.."
@@ -39,17 +46,24 @@ mkdir -p $OUT
 rm -f $OUT/*.hash $OUT/*.log $OUT/*.rc
 JOBS=${JOBS:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
 FIGHT="--hires-min-fight 95"
+CMP_MAX=${CMP_MAX:-0}
+CMP_MAX_PGXP=${CMP_MAX_PGXP:-0.001}
 RESIZE="--max-scale 8 --resize 3000:640x480,3700:960x720,4300:1920x1440,4900:3840x2880,5400:480x360,5900:1920x1080,6400:1280x960,6800:2560x1920"
 # longest first so the pool stays busy
 cat > $OUT/jobs.txt <<EOF
 s8x8 --scale 8 --hires-threads 3 --pgxp on $FIGHT
 resize --scale 0 --hires-threads 3 --pgxp on $RESIZE $FIGHT
 s4x6 --scale 4x6 --hires-threads 3 --pgxp on $FIGHT
+cp4x6 --renderer compare --scale 4x6 --compare-every 10 --compare-max $CMP_MAX_PGXP --hires-threads 3 --pgxp on $FIGHT
 s4x4 --scale 4 --hires-threads 1 --pgxp affine $FIGHT
 verify1 --scale 1 --hires-verify --hires-threads 1 --pgxp off $FIGHT
 s2x3 --scale 2x3 --hires-threads 1 --pgxp on $FIGHT
 s2x2 --scale 2 --hires-threads 0 --pgxp off $FIGHT
 off --scale 0 --pgxp off
+g4x6 --renderer gpu --scale 4x6 --pgxp on $FIGHT
+gverify1 --renderer gpu --scale 1 --hires-verify --pgxp off $FIGHT
+c4x6 --renderer compare --scale 4x6 --compare-every 10 --compare-max $CMP_MAX --hires-threads 3 --pgxp off $FIGHT
+c1x1 --renderer compare --scale 1 --compare-every 10 --compare-max 0 --hires-threads 1 --pgxp off $FIGHT
 EOF
 START=$(date +%s)
 xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
@@ -57,7 +71,11 @@ ELAPSED=$(( $(date +%s) - START ))
 
 fail=0
 echo "hires: ran $(wc -l < $OUT/jobs.txt) runs of $FRAMES frames, $JOBS at a time, in ${ELAPSED}s"
-for n in off s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1; do
+GPU="g4x6 gverify1 c4x6 c1x1 cp4x6"
+if grep -q "GPU renderer unavailable" $OUT/g4x6.log; then
+  echo "hires: SDL_GPU unavailable, GPU renderer runs skipped"; GPU=""
+fi
+for n in off s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1 $GPU; do
   rc=$(cat $OUT/$n.rc 2>/dev/null || echo missing)
   if [ "$rc" != 0 ]; then echo "hires: $n: run FAILED (exit $rc)"; tail -5 $OUT/$n.log; fail=1; fi
 done
@@ -65,14 +83,14 @@ done
 lines=$(wc -l < $OUT/off.hash)
 [ "$lines" -ge "$FRAMES" ] || { echo "hires: FAIL (only $lines hashed frames)"; exit 1; }
 echo "hires: resize steps applied: $(grep -c 'render scale' $OUT/resize.log) ($(grep -o 'render scale [0-9x]*' $OUT/resize.log | sed 's/render scale //' | tr '\n' ' '))"
-for n in s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1; do
+for n in s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1 $GPU; do
   if cmp -s $OUT/off.hash $OUT/$n.hash; then echo "hires: state hash $n == off ($lines frames): ok"
   else echo "hires: state hash $n DIFFERS from off:"; diff $OUT/off.hash $OUT/$n.hash | head -3; fail=1; fi
   grep -h "hires-frames" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -h "hires-uv" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -q "hires-uv: [0-9]* textured samples, [0-9]* clamped to the 1x-sampled UV range, 0 out of range when fetched" $OUT/$n.log || { echo "hires: $n: UV out-of-range samples (or no UV report)"; fail=1; }
 done
-for n in s8x8 resize s4x6 s4x4 s2x3; do
+for n in s8x8 resize s4x6 s4x4 s2x3 $(echo "$GPU" | grep -o "g4x6\|cp4x6"); do
   grep -h "pgxp:" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -q "pgxp: [1-9][0-9]* of" $OUT/$n.log || { echo "hires: $n: no precise PGXP vertices"; fail=1; }
   grep -h "pgxp-check\|pgxp-weld" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
@@ -85,4 +103,13 @@ grep -q "hires-uv: [0-9]* textured samples, 0 clamped to the 1x-sampled" $OUT/ve
 grep -h "hires-verify" $OUT/verify1.log | sed 's/^\[ *[0-9]*\] /hires: verify1: /'
 [ $fail = 0 ] || exit 1
 grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/verify1.log || { echo "hires: 1x1 equivalence FAIL"; exit 1; }
+if [ -n "$GPU" ]; then
+  grep -h "hires-verify" $OUT/gverify1.log | sed 's/^\[ *[0-9]*\] /hires: gverify1: /'
+  grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/gverify1.log || { echo "hires: GPU 1x1 equivalence FAIL"; exit 1; }
+  for n in c1x1 c4x6 cp4x6; do
+    grep -h "hires-compare" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
+    grep -q "hires-compare: fight: [1-9][0-9]* frames compared" $OUT/$n.log || { echo "hires: $n: no fight frames compared"; exit 1; }
+  done
+  grep -h "hires-gpu:" $OUT/g4x6.log | sed 's/^\[ *[0-9]*\] /hires: g4x6: /'
+fi
 echo "hires: determinism + 1x1 equivalence + hi-res coverage of fight frames ok"

@@ -285,7 +285,7 @@ hashing all emulated state per frame).
   `tools/contact_sheet.py --cell WxH --cols N` tiles them; `tools/fight_script.py` prints a
   boot->fight `--press` script.
 - Tests: `runtime/tests/test_hires.c` (rasterizer vs hand-checked counts at several
-  Sx x Sy, including Sx != Sy; UV-bleed and 1x-sampled-range regressions; 0 vs 4 worker threads identical), `tools/test_hires_determinism.sh` (8 concurrent runs, some with worker threads: off,
+  Sx x Sy, including Sx != Sy; UV-bleed and 1x-sampled-range regressions; 0 vs 4 worker threads identical), `tools/test_hires_determinism.sh` (12 runs, 8 at a time, some with worker threads: off,
   2x2, 4x4, 8x8, 2x3, 4x6, a resize schedule with Sx != Sy, and the 1x1 equivalence run; all
   state hashes equal, >=95% of fight frames hi-res, 0 UV fetches outside the 1x-sampled range, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
   tests, `tools/smoke_test.sh` and the determinism script concurrently (~1.7 min).
@@ -342,6 +342,59 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   store; FIFO shift; perspective only with three depths; welding within and not across batches), and the determinism matrix runs
   `--pgxp on/affine` at several scales against a `--pgxp off`, hi-res-off reference.
 - For other backends (`HiresBackend`): `w` is optional; ignore it for affine texturing.
+- GPU renderer (`hires_gpu.c`, see its header): fractional positions are drawn with the exact
+  edge test, using the triangle grown by 1 px, or the bounding box for slivers. Perspective
+  u/v use 2^-38 fixed-point planes with an exact division. Results at 4x6 against software:
+  - `--pgxp off` and `affine`: 0 differing pixels;
+  - `on`: 29 pixels over 331 fight frames, texel choice where double and fixed point round
+    differently (test limit `CMP_MAX_PGXP`, 0.001 %).
+
+  GPU 4x6 fight on a loaded machine: 10.3 ms/frame with `--pgxp off`, 11.7 with `affine`,
+  15.2 with `on`. Tracking alone costs nothing measurable.
+## GPU renderer (`runtime/hires_gpu.[ch]`, `--renderer gpu`)
+
+A second `HiresBackend` on SDL3's SDL_GPU (Metal, MSL shaders embedded in the C file). Same
+contract as the software backend: commands in, target out, presentation only. It is
+**bit-identical to the software backend** at every scale tested (1x1, 2x3, 4x6, 8x8 over a
+7000-frame fight run) and to the 1x VRAM at 1x1 (with `--pgxp off`; for `on` see the PGXP
+section). Keep it that way: a rule change in `hires.c`
+needs the same change in the shader. The header comment of `hires_gpu.c` has the details.
+
+- `--renderer software|gpu|compare` (default software). `compare` draws every command on both
+  backends, presents the software one and every `--compare-every N` frames (default 30) reads
+  both back: `hires-compare:` lines at exit (all / fight frames, pixels differing, by >1 step,
+  mask-bit only, worst frame); `--compare-max PCT` exits 6 if a fight frame differs more.
+  Headless works (own device, needs `SDL_InitSubSystem(VIDEO)` with the default driver; the
+  `offscreen` driver has no GPU backend). Without Metal it logs `GPU renderer unavailable` and
+  uses software. Windowed it presents straight from the GPU texture (SDL GPU renderer +
+  `SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER`); readback only for `--dump`, `--hires-verify`
+  and compare (`HiresBackend.read`).
+- Exactness: target B5G5R5A1 (shader writes PS1 red into `.b` = the low 5 bits, so the download
+  is raw PS1 u16, alpha = mask bit). Attributes are the 1x plane equations evaluated as exact
+  rationals in 64-bit integers per pixel (Metal supports `long`). Semi modes are fixed-function
+  blends (B/2+F/2 via constant 0.5 and F/2-1/4; see the file comment for the one F=0 tie case).
+  Triangles with a vertex outside the target are drawn as their clipped bbox with an exact
+  edge test in the shader: GPU clipping produces inexact vertices that flip shared-edge
+  fill-rule ties (single-pixel diffs at 1x1).
+- The software backend's span-start evaluation was a `double` expression; for Sy=6 (1/6 is
+  inexact) it rounded exact-integer u/v down and picked neighbouring texels. It is now the same
+  exact rational floor as the shader (`EXACT_AT` in `hires.c`), which made the two agree.
+- Batching: per-primitive storage-buffer records, one draw per blend pipeline key per group;
+  a group closes when a primitive would be reordered against an earlier overlapping one of a
+  later key (32x32 1x-tile masks). Render passes break only for VRAM texture uploads, puts
+  and VRAM copies. One command buffer per view/readback, 2 frames in flight.
+  `hires-gpu:` at exit prints submits, passes/draws/prims per submit, uploads, copies.
+- Speed (headless fight, frames 3700-4500, machine heavily loaded): 4x6 software 34.6 vs GPU
+  11.1 ms/frame; 8x8 software 95.1 vs GPU 19.7 ms/frame (no hi-res: ~6 ms). Windowed 4x6 fight:
+  emu 1.3 ms + present 6.6 ms per frame.
+- Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
+  mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
+  chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), MSL only
+  (no SPIR-V/DXIL), no `--hires-threads` (n/a).
+- Tests: `tools/test_hires_determinism.sh` adds `g4x6` (state hash), `gverify1` (1x1 ==
+  1x VRAM), `c1x1` and `c4x6` (compare vs software, `--pgxp off`, `CMP_MAX` default 0 %), and
+  `cp4x6` (compare with `--pgxp on`, `CMP_MAX_PGXP` default 0.001 %). `g4x6` runs with PGXP on
+  and must pass the `pgxp-check`.
 
 ## Pitfalls
 

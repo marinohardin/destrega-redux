@@ -62,6 +62,12 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   colours; their colour gradient overshoots badly off the 1x sample grid (fixed in hires.c by
   clamping to the colour range the 1x draw produced). (verified: pixel probe)
 - About 21% of textured triangles cover no 1x pixel at all (mostly character-mesh slivers).
+- Command mix over a 7000-frame headless run (boot -> 1P battle -> fight, `tools/fight_script.py`;
+  verified: counted in the GPU backend work): ~3.69M triangles; semi-transparent ones by mode:
+  B/2+F/2 (mode 0) 0, B+F 57917, B-F 244204, B+F/4 4080, so subtractive blending dominates.
+  No primitive ever sets or checks the mask bit, and no lines are drawn. 37622 rects, 3549
+  fills, 3638 VRAM->VRAM copies (3547 with the source inside the framebuffer region), and
+  29.6M CPU->VRAM upload pixels (29.26M inside the framebuffer region, i.e. mostly FMV).
 
 ### GTE projection call sites (PGXP work)
 
@@ -97,6 +103,11 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   depth-ratio check). The weld is therefore keyed by word *and* similar depth (ratio <= 1.25).
   Single-site triangles spanning a depth ratio > 2 are legitimate (stage `80041c14` near the
   camera, w 830..1812 with clamped off-screen vertices), so the check flags only mixed-site ones.
+- GPU backend with PGXP (renderer facts, not game facts; verified by `--renderer compare`): the
+  fight geometry is 80% precise vertices, so 2.75M of the triangles in a 7000-frame run take
+  the shader's exact-coverage path instead of the GPU rasterizer (232K with `--pgxp off`).
+  Perspective u/v in float32 differed from hires.c's double in 12.5K pixels over the fight
+  frames; with 2^-38 fixed point that drops to 29.
 - PGXP never changed the per-frame state hash, i.e. no game code observes the precise values;
   this says nothing yet about whether gameplay depends on the *integer* GTE results (open
   question below).
