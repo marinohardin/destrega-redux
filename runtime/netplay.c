@@ -49,6 +49,7 @@ void frontend_restart_with(const char *const *args, int n);   /* main.c: clean r
 void menu_netplay_progress(const char *text);                  /* menu_mac.m / menu_stub.c */
 void replay_record_in_memory(void);        /* replay.c: desync reports are replay files */
 bool replay_write(const char *path, u64 last);
+u64 replay_last_frame(void);
 int replay_field_count(void);
 const char *replay_field_name(int k);
 void replay_fields_now(u32 *val, u16 *hash);
@@ -423,6 +424,7 @@ static u64 s_peer_hash_frame[RING], s_peer_gh[RING], s_peer_fh[RING];
 static u16 s_peer_fld[RING][NF];
 static u64 s_desyncs, s_hash_checked, s_first_desync;
 static void desync_report(u64 frame);   /* below */
+static u64 s_report_deferred;           /* a report waiting for the recording to reach its frame */
 
 static void check_hash(u64 f) {
     u32 s = slot(f);
@@ -731,6 +733,7 @@ static bool boot_vs_pads(u64 f) {
 void netplay_vblank_end(u64 f) {
     if (!o.on && o.boot_to_vs_offline) { boot_vs_pads(f); return; }
     if (!o.on || !s_started) return;
+    if (s_report_deferred && replay_last_frame() >= s_report_deferred) { u64 d = s_report_deferred; s_report_deferred = 0; desync_report(d); }
     bool resim = s_resim_until && f < s_resim_until;
     if (!resim) {
         /* local input sampled now is for frame f + delay */
@@ -785,6 +788,9 @@ static void status(u64 f) {
  * `destrega --headless --replay desync-FRAME-host.dtr` re-runs the inputs offline: on the peer
  * that went wrong it reports the first frame where its own timeline differs from a clean run. */
 static void desync_report(u64 frame) {
+    /* the hash check can run before this vblank's replay_vblank_begin recorded `frame` (depends on when
+     * the peer's packet arrived): wait one vblank so the report's replay file includes it */
+    if (frame > replay_last_frame()) { if (!s_report_deferred) s_report_deferred = frame; return; }
     s_desyncs++;
     u32 s = slot(frame);
     if (s_desyncs <= 3)

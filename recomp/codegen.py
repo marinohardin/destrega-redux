@@ -204,6 +204,7 @@ class FuncEmitter:
         name = self.name_of(f.entry)
         self.w(f'void {name}(void) {{')
         self.w(f'    FN_ENTER(0x{f.entry:08x});')
+        self.w(f'    COV_HIT({name});')
         self.w('    EVT_CHECK();')
         skip = set()
         prev_end = None

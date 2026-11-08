@@ -408,6 +408,8 @@ static void write_recording(void) {
 }
 
 void replay_record_in_memory(void) { s_rec_mem = true; }
+/* newest recorded frame (netplay defers a desync report until the recording holds its frame) */
+u64 replay_last_frame(void) { return (s_rec_path || s_rec_mem) ? s_last : ~0ull; }
 
 /* gameplay fields for netplay desync reports */
 int replay_field_count(void) { return G_N; }

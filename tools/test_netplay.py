@@ -35,6 +35,10 @@ CASES = {
     'asym':       ('vs_anjie_laon_canyon', 1, '35:5:2:0:7', '5:2:2:0:8', [], {}),
     'match':      ('match_gradd_celia_hills', 3, '25:10:3:5:9', '25:10:3:5:10', [], {}),
     'desync':     ('vs_tieme_rohzen_villa', 2, '10:4:0:0:11', '10:4:0:0:12', [], {'desync': True}),
+    # same fault with other link timings: the peer's hash packet reaches the faulty peer at different points of the
+    # vblank (regression: a report written before its frame was recorded had a replay file one frame short)
+    'desync_b':   ('vs_tieme_rohzen_villa', 2, '1:0:0:0:31', '1:0:0:0:32', [], {'desync': True}),
+    'desync_c':   ('vs_tieme_rohzen_villa', 1, '30:20:0:0:33', '2:1:0:0:34', [], {'desync': True}),
     # state-changing menu actions are refused during netplay, presentation-only ones run
     'menu':       ('vs_tieme_rohzen_villa', 2, '2:1:0:0:13', '2:1:0:0:14',
                    ['--menu-action', '1500:load=Destrega/Destrega.cue', '--menu-action', '1510:save-import=x.mcd',
@@ -97,6 +101,8 @@ def run_case(name, port, pace):
     if 'frames' in expect: rp = R.Replay(rp.name, rp.desc, rp.p1, rp.p2, expect['frames'])
     d = os.path.join(OUT, name)
     os.makedirs(d, exist_ok=True)
+    for f in os.listdir(d):
+        if f.startswith('desync-'): os.remove(os.path.join(d, f))
     t0 = time.time()
     common = [BIN, '--headless', '--no-interp', '--frames', str(rp.frames), '--net-delay', str(delay),
               '--net-pace', str(pace), '--net-desync-dir', d, '--net-full-boot'] + extra + os.environ.get('NETPLAY_EXTRA', '').split()
@@ -139,6 +145,9 @@ def run_case(name, port, pace):
             found = sorted(f for f in os.listdir(d) if f.startswith('desync-') and f.endswith(f'-{who}.dtr'))
             if not found: problems.append(f'no {who} desync report'); continue
             path = os.path.join(d, found[0])
+            nfr = int(re.search(r'desync-(\d+)-', found[0]).group(1))
+            hdr = [l for l in open(path) if l.startswith('frames ')]
+            if not hdr or int(hdr[0].split()[1]) < nfr: problems.append(f'{who} report replay file holds fewer frames than the reported frame {nfr}')
             r = subprocess.run([BIN, '--headless', '--no-interp', '--replay', path], capture_output=True, text=True, cwd=ROOT)
             log = r.stdout + r.stderr
             open(os.path.join(d, f'replay-{who}.log'), 'w').write(log)

@@ -61,6 +61,9 @@ INPT=$!
 # gameplay regression replays (tools/replays/*.dtr.gz): every frame's gameplay fields must match
 python3 tools/replays.py run -j 4 > build/replays.out 2>&1 &
 REPL=$!
+# windowed play is deterministic: two windowed runs and a headless one hash identically
+tools/test_windowed_determinism.sh > build/windowed.out 2>&1 &
+WIND=$!
 # rollback netplay: host + join over loopback with simulated latency / loss, against an offline run
 python3 tools/test_netplay.py -j 6 > build/netplay.out 2>&1 &
 NETP=$!
@@ -120,6 +123,8 @@ wait $INPT || { fail=1; echo "input: FAILED"; }
 cat build/input.out
 wait $REPL || { fail=1; echo "replays: FAILED (a gameplay change? see AGENTS.md \"Replays\")"; }
 cat build/replays.out
+wait $WIND || { fail=1; echo "windowed determinism: FAILED"; }
+cat build/windowed.out
 wait $NETP || { fail=1; echo "netplay: FAILED"; }
 cat build/netplay.out
 wait $NETW || { fail=1; echo "netplay (Mac <-> Windows under Wine): FAILED"; }

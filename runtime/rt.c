@@ -261,3 +261,21 @@ void cpu_state_io(StateIO *io) {
     SS_VAR(io, g_cpu.r); SS_VAR(io, g_cpu.hi); SS_VAR(io, g_cpu.lo); SS_VAR(io, g_cpu.pc);
     SS_VAR(io, g_cpu.cop0); SS_VAR(io, g_cpu.cycles); SS_VAR(io, g_cpu.next_event);
 }
+
+/* ---- function coverage (only in -DDESTREGA_COVERAGE builds) --------------------------- */
+#ifdef DESTREGA_COVERAGE
+static const char *s_cov_names[16384];
+static int s_cov_n;
+static void cov_dump(void) {
+    const char *path = getenv("DESTREGA_COVERAGE_OUT");
+    if (!path) return;
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    for (int i = 0; i < s_cov_n; i++) fprintf(f, "%s\n", s_cov_names[i]);
+    fclose(f);
+}
+void cov_first(const char *name) {
+    if (!s_cov_n) atexit(cov_dump);
+    if (s_cov_n < 16384) s_cov_names[s_cov_n++] = name;
+}
+#endif

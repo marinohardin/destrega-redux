@@ -29,7 +29,7 @@ the timing honest if the game flow ever changes.
 import argparse, concurrent.futures as cf, json, os, re, struct, subprocess, sys, time, zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, 'build/cmake/destrega')
+BIN = os.environ.get('DESTREGA_BIN', os.path.join(ROOT, 'build/cmake/destrega'))
 DEFAULT_GAP = 40
 
 BTN = {'select': 0x1, 'start': 0x8, 'up': 0x10, 'right': 0x20, 'down': 0x40, 'left': 0x80,
@@ -189,10 +189,20 @@ add('practice', f'{BOOT} {title_pick("practice")} +400 ' + 'cross/100 ' * 6, 400
 add('story', f'{BOOT} {title_pick("story")} +200 cross', 15600, 14900,
     'STORY: new game, FMV intro, text crawl, event scenes (EVENT_SP/EVENTOVL), first fight vs Relics',
     ('mode', 'story'), expect_files=['EVENT_SP.BIN', 'EVENTOVL.BIN', 'MGRAD.BIN', 'MSOLD2.BIN'], fight_from=14700)
+add('story_continue_yes', f'{BOOT} {title_pick("story")} +200 cross @16800 cross', 17700, 17400,
+    'STORY: Gradd loses the first fight, CONTINUE? YES -> BATTLE 1 again, the fight restarts',
+    ('mode', 'story'), expect_files=['EVENT_SP.BIN', 'EVENTOVL.BIN', 'MGRAD.BIN', 'MSOLD2.BIN'], fight_from=17200)
+add('story_game_over', f'{BOOT} {title_pick("story")} +200 cross @16800 right cross', 17700, 17000,
+    'STORY: Gradd loses the first fight, CONTINUE? NO -> GAME OVER, then the title screen',
+    ('mode', 'story'), expect_files=['EVENT_SP.BIN', 'EVENTOVL.BIN', 'MGRAD.BIN', 'MSOLD2.BIN'], fight_from=16800)
 add('option', f'{BOOT} {title_pick("option")} +300 ' +
     'cross/100 circle/100 down cross/100 circle/100 down cross/100 circle/100 down cross/100 circle/100 '
     'down*2 cross/100 circle/100 up*5 +100', 3600, 3000, 'OPTION menu and its sub-pages (OPTOVL)',
     ('mode',), expect_files=['OPTOVL.BIN'], fight_from=3000, min_lit=0.04, min_cols=10)
+add('option_game', f'{BOOT} {title_pick("option")} +300 cross/100 +100 down*2 right/60 +60 right/60 +60 down right/60 '
+    'down right/60 down right/60 down right/60 down cross/100 +60', 3100, 2700,
+    'GAME OPTION: ROUND TIME 60, HANDICAP ON, QUICK SELECT ON, LIFE RECOVER changed, then EXIT of the page',
+    ('mode',), expect_files=['OPTOVL.BIN'], fight_from=2700, min_lit=0.04, min_cols=10)
 
 
 # ---- running and checking -----------------------------------------------------------------------
@@ -259,7 +269,7 @@ def png_stats(path):
     return lit / (w * h), len(cols)
 
 
-def run_one(scn, outdir, extra=(), dump_every=100, trace=True, timeout=900, verify=True):
+def run_one(scn, outdir, extra=(), dump_every=100, trace=True, timeout=int(os.environ.get("SCN_TIMEOUT", "7200")), verify=True):
     os.makedirs(outdir, exist_ok=True)
     for f in os.listdir(outdir):
         if f.endswith('.png'): os.remove(os.path.join(outdir, f))
