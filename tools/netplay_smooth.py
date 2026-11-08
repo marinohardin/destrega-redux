@@ -10,7 +10,10 @@ Configurations (name: host side, join side, --net-sim each way, extra args host,
   mw_wide  the same with widescreen on the Wine side
 Wine settings as in tools/test_netplay_wine.py (WINE, WINE_ARGS, WIN_EXE, PAK).
 
-  netplay_smooth.py [CONFIG...] [--replay NAME] [--json FILE] [--extra "ARGS"]
+  netplay_smooth.py [CONFIG...] [--replay NAME] [--json FILE] [--extra="ARGS"]
+
+The old behaviour for a back-to-back comparison: --extra="--net-sync-hard --no-scale-governor".
+Load matters a lot: each run prints the load average; compare runs made one after the other.
 """
 import argparse, json, os, re, shutil, subprocess, sys, time
 

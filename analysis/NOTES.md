@@ -210,6 +210,29 @@ changes the fighter struct at the start of F+1).
 - Pads: libpad drives SIO0 directly (not BIOS InitPAD). Memory cards: see "Memory card" below.
 - CD: libcd at register level; XA audio and the 5 STR movies live in `XADATA.BNS`.
 
+- **Netplay smoothness** (measured with `tools/netplay_smooth.py`, windowed, 60 Hz, on a VS
+  replay's fight; this Mac was shared with other jobs, load average 130-340 on 10 CPUs, so absolute
+  numbers are poor and only back-to-back pairs compare). "Before" = `--net-sync-hard
+  --no-scale-governor` (the old behaviour), "after" = defaults:
+
+  | run | held > 1 vblank | interval p50 / p95 | audio underruns |
+  |---|---|---|---|
+  | Mac<->Mac clean, before / after | 54% / 20-21% | 30.7 / 84 -> 16.1 / 38 ms | 1276 -> 47 |
+  | Mac<->Mac 20+10 ms, 2% loss, before / after | 58% / 11-12% | 51 / 141 -> 17.0 / 28.5 ms | 1570 -> 3 |
+  | Mac<->Mac clean, new sync only (no governor) | 51-53% | 26-29 / 61-68 ms | ~1100 |
+  | Mac host <-> Wine joiner, before / after | 90% / 83% (Mac); 95% / 86% (Wine) | 106 / 264 -> 83 / 438 ms | ~2500 -> ~2100 |
+
+  What held the frames: almost entirely "slow host" (the frame's own work was over budget), not
+  rollbacks (re-simulation 4-11 ms avg, max 8-17 ms; a late frame from a rollback in 0-35 of ~2800)
+  and not time sync. Even an offline single window at render scale 4x6 with the GPU renderer held
+  48% of its frames under this load (2.3 ms/frame at 1x1), so the default hi-res scale is what does
+  not fit when the machine is busy; the scale governor (smooth.c) fixes that and is the main gain.
+  Gradual time sync removes the frames held by sync waits (9-12 -> 0 per run). Under Wine
+  (software renderer) the joiner stayed at 60-80 ms/frame even at 1x1 under this load: that part is
+  Wine/x86 emulation speed and the machine's load, not netplay; the Mac then waits for each late
+  input (stalls 220-340 s per run) whatever we do. Headless Wine runs ~1.3 ms/frame when the
+  machine is idle, so on an idle machine the Wine side should keep up at a low scale.
+
 ## Menus, modes, characters, stages (found while building `tools/scenarios.py`)
 
 All verified by headless runs (dumps + `--trace` CD log), frame numbers are for the scripted boot
