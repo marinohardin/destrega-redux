@@ -2,8 +2,8 @@
  * runtime/hires_gpu.c (keep the two in step; the software rasterizer in hires.c is the
  * reference both must match bit for bit). Compiled by tools/gen_spirv.py into
  * runtime/shaders/hires_spirv.h, one entry point per -D define:
- *   VS_PRIM / FS_PRIM      primitives into the B5G5R5A1 target
- *   VS_FULL / FS_PRESENT   target -> RGBA8 presentation texture
+ *   VS_PRIM / FS_PRIM      primitives into the B5G5R5A1 (15-bit) or RGBA8 (full-precision) target
+ *   VS_FULL / FS_PRESENT   target -> RGBA8 presentation texture (SSAA box filter)
  *
  * 64-bit integers: Vulkan only has them with the optional shaderInt64 feature (and SDL_GPU
  * does not enable it), so every 64-bit value is a uvec2 (x = low word, y = high word, two's
@@ -44,14 +44,22 @@ void main()
 #endif
 
 #if defined(FS_PRESENT)
+/* target -> RGBA8: n x n box average (SSAA, rounded; hires.c hires_view_to_rgba) of 8-bit channels */
 layout(set = 2, binding = 0) uniform sampler2D t_target;
-layout(std140, set = 3, binding = 0) uniform PU { int x, y, p0, p1; } pu;
+layout(std140, set = 3, binding = 0) uniform PU { int x, y, n, hp; } pu;
 layout(location = 0) out vec4 o_color;
 void main()
 {
-    vec4 v = texelFetch(t_target, ivec2(int(gl_FragCoord.x) + pu.x, int(gl_FragCoord.y) + pu.y), 0);
-    o_color = vec4(roundEven(v.b * 31.0) * 8.0 / 255.0, roundEven(v.g * 31.0) * 8.0 / 255.0,
-                   roundEven(v.r * 31.0) * 8.0 / 255.0, 1.0);
+    uvec3 s = uvec3(0u);
+    int bx = int(gl_FragCoord.x) * pu.n + pu.x, by = int(gl_FragCoord.y) * pu.n + pu.y;
+    for (int j = 0; j < pu.n; j++)
+        for (int i = 0; i < pu.n; i++) {
+            vec4 v = texelFetch(t_target, ivec2(bx + i, by + j), 0);
+            if (pu.hp != 0) s += uvec3(uint(roundEven(v.r * 255.0)), uint(roundEven(v.g * 255.0)), uint(roundEven(v.b * 255.0)));
+            else s += uvec3(uint(roundEven(v.b * 31.0)), uint(roundEven(v.g * 31.0)), uint(roundEven(v.r * 31.0))) * 8u;
+        }
+    uint nn = uint(pu.n * pu.n);
+    o_color = vec4(vec3((s + nn / 2u) / nn) / 255.0, 1.0);
 }
 #endif
 
@@ -144,22 +152,96 @@ uint tex_fetch(uint pi, uint depth, uint uu, uint vv)
     if (depth == 1u) { uint w = vram_at(tpx + (uu >> 1), row); uint idx = (w >> ((uu & 1u) * 8u)) & 0xFFu; return vram_at(cx + idx, cy); }
     return vram_at(tpx + uu, row);
 }
-/* PS1 pixel -> B5G5R5A1 output: the format stores .b in the low 5 bits, so PS1 red goes to .b */
-vec4 pack(uint c, int pass, int mode)
+/* Colours are uvec4 (r, g, b, mask bit) in output units: 5-bit channels for the B5G5R5A1 target,
+ * 8-bit for the full-precision RGBA8 one (hp). B5G5R5A1 stores .b in the low 5 bits, so PS1 red
+ * goes to .b there. Blend pass: B/2+F/2 as F/2 - 1/4 (0.5 constant dst factor), B+F/4 as floor(F/4). */
+vec4 pack4(uvec4 c, int pass, int mode, int hp)
 {
-    float r = float(c & 31u), g = float((c >> 5) & 31u), b = float((c >> 10) & 31u);
+    float r = float(c.x), g = float(c.y), b = float(c.z);
     if (pass == 1) {
         if (mode == 0) { r = r * 0.5 - 0.25; g = g * 0.5 - 0.25; b = b * 0.5 - 0.25; }
         else if (mode == 3) { r = floor(r * 0.25); g = floor(g * 0.25); b = floor(b * 0.25); }
     }
-    return vec4(b / 31.0, g / 31.0, r / 31.0, float(c >> 15));
+    if (hp != 0) return vec4(r / 255.0, g / 255.0, b / 255.0, float(c.w));
+    return vec4(b / 31.0, g / 31.0, r / 31.0, float(c.w));
 }
-uint unpack(vec4 t)
+/* a 15-bit PS1 pixel in output units (full precision: c << 3, the PS1's 8-bit scale) */
+uvec4 c15u(uint c, int hp)
 {
-    return uint(roundEven(t.b * 31.0)) | (uint(roundEven(t.g * 31.0)) << 5) | (uint(roundEven(t.r * 31.0)) << 10) |
-           (t.a > 0.5 ? 0x8000u : 0u);
+    uint s = hp != 0 ? 3u : 0u;
+    return uvec4((c & 31u) << s, ((c >> 5) & 31u) << s, ((c >> 10) & 31u) << s, (c >> 15) & 1u);
+}
+uvec4 unpack4(vec4 t, int hp)
+{
+    if (hp != 0)
+        return uvec4(uint(roundEven(t.r * 255.0)), uint(roundEven(t.g * 255.0)), uint(roundEven(t.b * 255.0)), t.a > 0.5 ? 1u : 0u);
+    return uvec4(uint(roundEven(t.b * 31.0)), uint(roundEven(t.g * 31.0)), uint(roundEven(t.r * 31.0)), t.a > 0.5 ? 1u : 0u);
 }
 int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+/* filtered texels (hires.c tex_combine / samp_bilinear / samp_xbr, bit for bit); result
+ * (r, g, b, stp) with 5.8 fixed-point channels */
+bool tcomb(uint t[5], uint w[5], int n, out ivec4 o)
+{
+    uint cov = 0u, sr = 0u, sg = 0u, sb = 0u, ss = 0u;
+    for (int k = 0; k < n; k++) {
+        if (t[k] == 0u || w[k] == 0u) continue;
+        cov += w[k]; sr += w[k] * (t[k] & 31u); sg += w[k] * ((t[k] >> 5) & 31u); sb += w[k] * ((t[k] >> 10) & 31u);
+        if ((t[k] & 0x8000u) != 0u) ss += w[k];
+    }
+    o = ivec4(0);
+    if (cov < 32768u) return false;
+    o = ivec4(int((sr * 256u + (cov >> 1)) / cov), int((sg * 256u + (cov >> 1)) / cov), int((sb * 256u + (cov >> 1)) / cov),
+              ss * 2u >= cov ? 1 : 0);
+    return true;
+}
+void clamp_axis(inout int i, inout int f, int lo, int hi) { if (i < lo) { i = lo; f = 0; } else if (i >= hi) { i = hi; f = 0; } }
+bool samp_filt(uint pi, uint depth, bool xbr, int iu, int fu, int iv, int fv, int ulo, int uhi, int vlo, int vhi,
+               int sx, int sy, out ivec4 o)
+{
+    uint t[5] = uint[5](0u, 0u, 0u, 0u, 0u), w[5] = uint[5](0u, 0u, 0u, 0u, 0u);
+    int n;
+    if (!xbr) {
+        int iu1 = iu < uhi ? iu + 1 : uhi, iv1 = iv < vhi ? iv + 1 : vhi;
+        t[0] = tex_fetch(pi, depth, uint(iu), uint(iv)); t[1] = tex_fetch(pi, depth, uint(iu1), uint(iv));
+        t[2] = tex_fetch(pi, depth, uint(iu), uint(iv1)); t[3] = tex_fetch(pi, depth, uint(iu1), uint(iv1));
+        w[0] = uint((256 - fu) * (256 - fv)); w[1] = uint(fu * (256 - fv)); w[2] = uint((256 - fu) * fv); w[3] = uint(fu * fv);
+        n = 4;
+    } else {
+        int ie = iu, dx = fu, je = iv, dy = fv;
+        if (fu >= 128) { ie = iu + 1; dx = fu - 256; }
+        if (fv >= 128) { je = iv + 1; dy = fv - 256; }
+        int hx = dx >= 0 ? 1 : -1, hy = dy >= 0 ? 1 : -1;
+        t[0] = tex_fetch(pi, depth, uint(ie), uint(je));
+        t[1] = tex_fetch(pi, depth, uint(min(max(ie + hx, ulo), uhi)), uint(je));
+        t[2] = tex_fetch(pi, depth, uint(ie), uint(min(max(je + hy, vlo), vhi)));
+        t[3] = tex_fetch(pi, depth, uint(min(max(ie - hx, ulo), uhi)), uint(je));
+        t[4] = tex_fetch(pi, depth, uint(ie), uint(min(max(je - hy, vlo), vhi)));
+        w[0] = 65536u; n = 2;
+        if (t[1] == t[2] && t[1] != t[0] && t[1] != t[3] && t[2] != t[4]) {
+            int d8 = abs(dx) + abs(dy) - 128, a = min(max(((d8 * (sx + sy)) >> 1) + 128, 0), 256);
+            w[0] = uint(256 - a) * 256u; w[1] = uint(a) * 256u;
+        }
+    }
+    return tcomb(t, w, n, o);
+}
+/* rect texel coordinate on one axis at hi-res pixel X (hires.c rect_axis): index and 1/256 fraction */
+ivec2 rect_axis(int t0, int d, int k0, int X, int s)
+{
+    int D = 2 * s, num = D * t0 + d * (2 * X + 1 - s - D * k0);
+    int q = floordiv(num, D);
+    return ivec2(q, ((num - q * D) * 256) / D);
+}
+/* sampled texel (5.8) modulated by the vertex colour, in output units (hires.c tex8_out15/32) */
+uvec4 tex_out(ivec4 t, int cr, int cg, int cb, bool raw, bool dith, int d, int hp)
+{
+    int r, g, b;
+    if (raw) { int s = hp != 0 ? 5 : 8; r = t.x >> s; g = t.y >> s; b = t.z >> s; }
+    else if (hp != 0) { r = min((t.x * cr) >> 12, 255); g = min((t.y * cg) >> 12, 255); b = min((t.z * cb) >> 12, 255); }
+    else if (dith) { r = clamp255(((t.x * cr) >> 12) + d) >> 3; g = clamp255(((t.y * cg) >> 12) + d) >> 3; b = clamp255(((t.z * cb) >> 12) + d) >> 3; }
+    else { r = min((t.x * cr) >> 15, 31); g = min((t.y * cg) >> 15, 31); b = min((t.z * cb) >> 15, 31); }
+    return uvec4(uint(r), uint(g), uint(b), uint(t.w));
+}
 
 /* hires.c's coverage rule, exactly: rows [ceil(Ya), ceil(Yc)), columns [ceil(xl), ceil(xr)) with
  * xl/xr on the long edge a-c and the short edge a-b (rows above Yb) or b-c; 16.16 hi-res coords */
@@ -248,13 +330,14 @@ void main()
     uint pi = v_prim;
     int X = int(gl_FragCoord.x) + u.ox, Y = int(gl_FragCoord.y) + u.oy;
     uint kf = prims[pi].kf, kind = kf & 15u;
+    int hp = u.p0;
     int x1 = floordiv(X, u.sx), y1 = Y / u.sy;
-    if (kind == 2u) { if (u.pass != 0) discard; o_color = pack(prims[pi].color & 0xFFFFu, 0, 0); return; }
-    if (kind == 6u) { o_color = pack(vram_at(uint(x1), uint(y1)), 0, 0); return; }
+    if (kind == 2u) { if (u.pass != 0) discard; o_color = pack4(c15u(prims[pi].color & 0xFFFFu, hp), 0, 0, hp); return; }
+    if (kind == 6u) { o_color = pack4(c15u(vram_at(uint(x1), uint(y1)), hp), 0, 0, hp); return; }
     if (kind == 4u) {
         uint w = texelFetch(t_put, ivec2(x1 - u.rx, y1 - u.ry), 0).r;
         if ((w & 0x10000u) == 0u) discard;
-        o_color = pack((w & 0xFFFFu) | ((kf & (1u << 18)) != 0u ? 0x8000u : 0u), 0, 0);
+        o_color = pack4(c15u((w & 0xFFFFu) | ((kf & (1u << 18)) != 0u ? 0x8000u : 0u), hp), 0, 0, hp);
         return;
     }
     if (kind == 3u) {
@@ -262,11 +345,12 @@ void main()
         uint a0 = prims[pi].aux0, a1 = prims[pi].aux1;
         int csx = int(a0 & 0xFFFFu), csy = int(a0 >> 16), cdx = int(a1 & 0xFFFFu), cdy = int(a1 >> 16);
         int scol = (csx + ((x1 - cdx) & 1023)) & 1023, srow = (csy + ((y1 - cdy) & 511)) & 511;
-        uint c;
+        uvec4 c;
         if (scol >= u.rx && scol < u.rx + u.rw && srow >= u.ry && srow < u.ry + u.rh)
-            c = unpack(texelFetch(t_tmp, ivec2(scol * u.sx + sb - u.ox, srow * u.sy + sa - u.oy), 0));
-        else c = vram_at(uint(scol), uint(srow));
-        o_color = pack(c | ((kf & (1u << 18)) != 0u ? 0x8000u : 0u), 0, 0);
+            c = unpack4(texelFetch(t_tmp, ivec2(scol * u.sx + sb - u.ox, srow * u.sy + sa - u.oy), 0), hp);
+        else c = c15u(vram_at(uint(scol), uint(srow)), hp);
+        if ((kf & (1u << 18)) != 0u) c.w = 1u;
+        o_color = pack4(c, 0, 0, hp);
         return;
     }
     int cx1 = int(prims[pi].clip0 << 16) >> 16, cy1 = int(prims[pi].clip0 >> 16);
@@ -274,10 +358,12 @@ void main()
     if (X < cx1 || X >= cx2 || Y < cy1 || Y >= cy2) discard;
     bool tex = (kf & (1u << 4)) != 0u, raw = (kf & (1u << 5)) != 0u, semi = (kf & (1u << 6)) != 0u;
     bool gour = (kf & (1u << 7)) != 0u, dith = (kf & (1u << 8)) != 0u;
+    bool filt = (kf & (3u << 22)) != 0u, xbr = (kf & (1u << 23)) != 0u;
     uint depth = (kf >> 9) & 3u;
     uint col = prims[pi].color;
     int cr = int(col & 255u), cg = int((col >> 8) & 255u), cb = int((col >> 16) & 255u);
     uint uu = 0u, vv = 0u;
+    int iu = 0, fu = 0, iv = 0, fv = 0, ulo = 0, uhi = 255, vlo = 0, vhi = 255;
     if (kind == 0u) {
         if ((kf & (1u << 19)) != 0u && !covered(pi, X, Y)) discard;
         int m = 2 * Y + 1 - u.sy, xs = span_start(pi, Y, cx1);
@@ -298,23 +384,29 @@ void main()
             cr = c3[0]; cg = c3[1]; cb = c3[2];
         }
         if (tex) {
-            int ui, vi;
+            uvec2 U, V;
             if ((kf & (1u << 21)) != 0u) {
                 int xe = span_end(pi, Y, cx2);
-                uvec2 U, V;
                 persp_uv(pi, xs, xe, X, Y, U, V);
-                ui = lint(lsar(U, 24)); vi = lint(lsar(V, 24));
             } else {
-                ui = lint(lsar(attr_span(pi, 3, xs, X, m, u.sx, u.sy), 24));
-                vi = lint(lsar(attr_span(pi, 4, xs, X, m, u.sx, u.sy), 24));
+                U = attr_span(pi, 3, xs, X, m, u.sx, u.sy);
+                V = attr_span(pi, 4, xs, X, m, u.sx, u.sy);
             }
-            if ((kf & (1u << 15)) != 0u) {
-                uint uvr = prims[pi].uvr;
-                int umin = int(uvr & 255u), umax = int((uvr >> 8) & 255u), vmin = int((uvr >> 16) & 255u), vmax = int(uvr >> 24);
-                ui = ui < umin ? umin : (ui > umax ? umax : ui);
-                vi = vi < vmin ? vmin : (vi > vmax ? vmax : vi);
+            uint uvr = prims[pi].uvr;
+            ulo = int(uvr & 255u); uhi = int((uvr >> 8) & 255u); vlo = int((uvr >> 16) & 255u); vhi = int(uvr >> 24);
+            if (filt) {   /* sample point without the +0.5 rounding bias, footprint inside the 1x-sampled range */
+                uvec2 su = lsub(U, L(8388608)), sv = lsub(V, L(8388608));
+                iu = lint(lsar(su, 24)); fu = int((su.x >> 16) & 255u);
+                iv = lint(lsar(sv, 24)); fv = int((sv.x >> 16) & 255u);
+                clamp_axis(iu, fu, ulo, uhi); clamp_axis(iv, fv, vlo, vhi);
+            } else {
+                int ui = lint(lsar(U, 24)), vi = lint(lsar(V, 24));
+                if ((kf & (1u << 15)) != 0u) {
+                    ui = ui < ulo ? ulo : (ui > uhi ? uhi : ui);
+                    vi = vi < vlo ? vlo : (vi > vhi ? vhi : vi);
+                }
+                uu = uint(ui); vv = uint(vi);
             }
-            uu = uint(ui); vv = uint(vi);
         }
     } else if (kind == 1u) {
         uint a0 = prims[pi].aux0, a1 = prims[pi].aux1;
@@ -322,32 +414,40 @@ void main()
         uint u0 = a1 & 255u, v0 = (a1 >> 8) & 255u;
         bool fx = (kf & (1u << 16)) != 0u, fy = (kf & (1u << 17)) != 0u;
         if (tex && fx) u0 |= 1u;
-        uu = (u0 + uint(fx ? x0 - x1 : x1 - x0)) & 255u;
-        vv = (v0 + uint(fy ? y0 - y1 : y1 - y0)) & 255u;
+        if (filt) {   /* range of the drawn columns / rows, signed 16-bit in cmin / cmax */
+            uint c0 = prims[pi].cmin, c1 = prims[pi].cmax;
+            ulo = int(c0 << 16) >> 16; vlo = int(c0) >> 16; uhi = int(c1 << 16) >> 16; vhi = int(c1) >> 16;
+            ivec2 a = rect_axis(int(u0), fx ? -1 : 1, x0, X, u.sx), b = rect_axis(int(v0), fy ? -1 : 1, y0, Y, u.sy);
+            iu = a.x; fu = a.y; iv = b.x; fv = b.y;
+            clamp_axis(iu, fu, ulo, uhi); clamp_axis(iv, fv, vlo, vhi);
+        } else {
+            uu = (u0 + uint(fx ? x0 - x1 : x1 - x0)) & 255u;
+            vv = (v0 + uint(fy ? y0 - y1 : y1 - y0)) & 255u;
+        }
     }
     int d = dith ? DITH[(y1 & 3) * 4 + (x1 & 3)] : 0;
-    uint outc;
+    uvec4 outc;
     bool blend;
     if (tex) {
-        uint t = tex_fetch(pi, depth, uu, vv);
-        if (t == 0u) discard;
-        if (raw) outc = t;
+        ivec4 t8;
+        if (filt) { if (!samp_filt(pi, depth, xbr, iu, fu, iv, fv, ulo, uhi, vlo, vhi, u.sx, u.sy, t8)) discard; }
         else {
-            int tr = int(t & 31u), tg = int((t >> 5) & 31u), tb = int((t >> 10) & 31u);
-            if (dith) { tr = clamp255(((tr * cr) >> 4) + d) >> 3; tg = clamp255(((tg * cg) >> 4) + d) >> 3; tb = clamp255(((tb * cb) >> 4) + d) >> 3; }
-            else { tr = min((tr * cr) >> 7, 31); tg = min((tg * cg) >> 7, 31); tb = min((tb * cb) >> 7, 31); }
-            outc = uint(tr) | (uint(tg) << 5) | (uint(tb) << 10) | (t & 0x8000u);
+            uint t = tex_fetch(pi, depth, uu, vv);
+            if (t == 0u) discard;
+            t8 = ivec4(int(t & 31u) << 8, int((t >> 5) & 31u) << 8, int((t >> 10) & 31u) << 8, int(t >> 15));
         }
-        blend = semi && (t & 0x8000u) != 0u;
+        outc = tex_out(t8, cr, cg, cb, raw, dith, d, hp);
+        blend = semi && t8.w != 0;
     } else {
         int r, g, b;
-        if (dith) { r = clamp255(cr + d) >> 3; g = clamp255(cg + d) >> 3; b = clamp255(cb + d) >> 3; }
+        if (hp != 0) { r = cr; g = cg; b = cb; }
+        else if (dith) { r = clamp255(cr + d) >> 3; g = clamp255(cg + d) >> 3; b = clamp255(cb + d) >> 3; }
         else { r = cr >> 3; g = cg >> 3; b = cb >> 3; }
-        outc = uint(r) | (uint(g) << 5) | (uint(b) << 10);
+        outc = uvec4(uint(r), uint(g), uint(b), 0u);
         blend = semi;
     }
     if (blend != (u.pass == 1)) discard;
-    if ((kf & (1u << 13)) != 0u) outc |= 0x8000u;
-    o_color = pack(outc, u.pass, u.mode);
+    if ((kf & (1u << 13)) != 0u) outc.w = 1u;
+    o_color = pack4(outc, u.pass, u.mode, hp);
 }
 #endif

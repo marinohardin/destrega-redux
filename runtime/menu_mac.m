@@ -54,6 +54,9 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
         item.title = frontend_fullscreen() ? @"Exit Full Screen" : @"Enter Full Screen";
     if ([a isEqual:@"widescreen"])
         item.state = frontend_widescreen() ? NSControlStateValueOn : NSControlStateValueOff;
+    bool vchk;
+    if (a && frontend_view_checked(a.UTF8String, &vchk))
+        item.state = vchk ? NSControlStateValueOn : NSControlStateValueOff;
     if ([a hasPrefix:@"renderer="]) {
         NSString *r = [a substringFromIndex:9];
         item.state = [r isEqualToString:@(frontend_renderer())] ? NSControlStateValueOn : NSControlStateValueOff;
@@ -221,15 +224,36 @@ void menu_init(void) {
         renItem.submenu = ren;
         [view insertItem:renItem atIndex:1];
 
+        /* render quality (presentation only; each switch reseeds the hi-res target like a resize) */
+        NSMenu *tf = [[NSMenu alloc] initWithTitle:@"Texture Filtering"];
+        add(tf, @"Off (Sharp Pixels)", @"tex-filter=nearest", nil, 0);
+        add(tf, @"Bilinear", @"tex-filter=bilinear", nil, 0);
+        add(tf, @"Smooth 2D Edges + Bilinear 3D", @"tex-filter=xbr", nil, 0);
+        NSMenuItem *tfItem = [[NSMenuItem alloc] initWithTitle:@"Texture Filtering" action:nil keyEquivalent:@""];
+        tfItem.submenu = tf;
+        [view insertItem:tfItem atIndex:2];
+        NSMenuItem *sc = [[NSMenuItem alloc] initWithTitle:@"Smooth Colours" action:@selector(fire:) keyEquivalent:@""];
+        sc.target = s_target;
+        sc.representedObject = @"smooth-colours";
+        [view insertItem:sc atIndex:3];
+        NSMenu *aa = [[NSMenu alloc] initWithTitle:@"Anti-aliasing"];
+        add(aa, @"Off", @"ssaa=1", nil, 0);
+        add(aa, @"2x", @"ssaa=2", nil, 0);
+        add(aa, @"3x", @"ssaa=3", nil, 0);
+        add(aa, @"4x", @"ssaa=4", nil, 0);
+        NSMenuItem *aaItem = [[NSMenuItem alloc] initWithTitle:@"Anti-aliasing" action:nil keyEquivalent:@""];
+        aaItem.submenu = aa;
+        [view insertItem:aaItem atIndex:4];
+
         /* Enter / Exit Full Screen (title follows the state; also Alt+Enter and F11, handled in
          * main.c's event loop so they work on every platform) */
-        [view insertItem:NSMenuItem.separatorItem atIndex:2];
+        [view insertItem:NSMenuItem.separatorItem atIndex:5];
         NSMenuItem *fs = [[NSMenuItem alloc] initWithTitle:@"Enter Full Screen" action:@selector(fire:)
                                               keyEquivalent:@"f"];
         fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         fs.target = s_target;
         fs.representedObject = @"fullscreen";
-        [view insertItem:fs atIndex:3];
+        [view insertItem:fs atIndex:6];
 
         /* Netplay: play against someone on another computer (rollback netplay, netplay.c) */
         NSMenu *np = [[NSMenu alloc] initWithTitle:@"Netplay"];

@@ -103,6 +103,20 @@ static void poly(bool small)
     }
 }
 
+/* a 2D sprite quad: screen-aligned, u/v advancing exactly one texel per pixel (hires_tri_is_2d),
+ * so the xbr filter takes its 2D path on polygons too */
+static void poly2d(void)
+{
+    bool semi = (rnd() & 3) == 0, raw = rnd() & 1;
+    int depth = rr(0, 2), w = rr(4, 90), h = rr(4, 90), x = rr(-60, 520), y = rr(-60, 470);
+    int u0 = rr(0, 255 - w), v0 = rr(0, 255 - h);
+    gp0(((0x2Cu | (semi ? 0x02u : 0) | (raw ? 0x01u : 0)) << 24) | rgb());
+    gp0(xy(x, y));         gp0((u32)u0 | ((u32)v0 << 8) | (clut() << 16));
+    gp0(xy(x + w, y));     gp0((u32)(u0 + w) | ((u32)v0 << 8) | (tpage(depth, rr(1, 3)) << 16));
+    gp0(xy(x, y + h));     gp0((u32)u0 | ((u32)(v0 + h) << 8));
+    gp0(xy(x + w, y + h)); gp0((u32)(u0 + w) | ((u32)(v0 + h) << 8));
+}
+
 static void rect(void)
 {
     bool tex = rnd() & 1, semi = (rnd() & 3) == 0, raw = tex && (rnd() & 1);
@@ -175,14 +189,23 @@ static bool setup(int sx, int sy, int guard)
     return true;
 }
 
+/* render-quality modes: texture filter, full-precision colour, SSAA factor */
+typedef struct { int filter; bool full; int ssaa; const char *name; } Mode;
+static const Mode MODE_DEFAULT = { HIRES_TEX_NEAREST, false, 1, "" };
+static Mode s_mode = { HIRES_TEX_NEAREST, false, 1, "" };
+
 static void run_scale(int sx, int sy, int guard, int n)
 {
     char what[64];
-    snprintf(what, sizeof what, "%dx%d%s random", sx, sy, guard ? " guard" : "");
+    snprintf(what, sizeof what, "%dx%d%s random%s%s", sx, sy, guard ? " guard" : "", s_mode.name[0] ? " " : "", s_mode.name);
+    hires_set_tex_filter(s_mode.filter);
+    hires_set_colour(s_mode.full);
+    hires_set_ssaa(s_mode.ssaa);
     if (!setup(sx, sy, guard)) { CHECK(0, "%s: cannot allocate", what); return; }
     for (int i = 0; i < n; i++) {
-        int k = rr(0, 9);
-        if (k < 6) poly(k < 4);
+        int k = rr(0, 10);
+        if (k == 10) poly2d();
+        else if (k < 6) poly(k < 4);
         else if (k < 8) rect();
         else if (k == 8) line();
         else misc();
@@ -247,6 +270,26 @@ int main(int argc, char **argv)
     /* perspective: double vs fixed point may pick the neighbouring texel at exact ties */
     run_pgxp(2, 2, true, 600, 200);
     run_pgxp(4, 6, true, 600, 1200);
+    /* every render-quality mode alone and combined: exact as well */
+    static const Mode modes[] = {
+        { HIRES_TEX_BILINEAR, false, 1, "bilinear" }, { HIRES_TEX_XBR, false, 1, "xbr" },
+        { HIRES_TEX_NEAREST, true, 1, "full" },       { HIRES_TEX_NEAREST, false, 2, "ssaa2" },
+        { HIRES_TEX_XBR, true, 1, "xbr full" },       { HIRES_TEX_BILINEAR, true, 2, "bilinear full ssaa2" },
+    };
+    static const int msc[][2] = { { 1, 1 }, { 2, 2 }, { 3, 2 }, { 4, 6 } };
+    for (size_t m = 0; m < sizeof modes / sizeof modes[0]; m++) {
+        s_mode = modes[m];
+        for (size_t i = 0; i < sizeof msc / sizeof msc[0]; i++) {
+            if (s_mode.ssaa > 1 && msc[i][0] * msc[i][1] > 8) continue;   /* 4x6 x2 = 8x12: slow, covered by 4x4 */
+            run_scale(msc[i][0], msc[i][1], 0, 1200);
+            run_scale(msc[i][0], msc[i][1], 88, 1200);
+        }
+    }
+    s_mode = modes[5];   /* the windowed defaults at a large scale */
+    s_mode.filter = HIRES_TEX_XBR; s_mode.name = "xbr full ssaa2";
+    run_scale(2, 3, 88, 1200);
+    s_mode = MODE_DEFAULT;
+    hires_set_tex_filter(HIRES_TEX_NEAREST); hires_set_colour(false); hires_set_ssaa(1);
     printf("test_hires_gpu: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

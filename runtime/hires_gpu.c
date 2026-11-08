@@ -22,6 +22,11 @@
  *   nearest, which gives floor((B+F)/2) for F > 0. A channel with F = 0 over an odd B is a
  *   rounding tie and rounds to even (off by one when B/2 rounds up); mode 0 is not used by
  *   Destrega (counted in a fight).
+ * Full-precision colour (hires_set_colour, AGENTS.md "Render quality"): R8G8B8A8_UNORM target
+ * with the same blends in 8-bit units (a second pipeline set, s_pipe[1]; FragU.p0 = hp), PS1
+ * red in .r. Texture filters (F_BILIN, F_XBR) and the SSAA box filter of the present pass are
+ * the integer formulas of hires.c line for line (tex_combine, samp_bilinear, samp_xbr,
+ * rect_axis, hires_view_to_rgba), so the two backends stay bit-identical in every mode.
  * Mask check uses the destination alpha in the blend equation (ONE_MINUS_DST_ALPHA), exact
  * for opaque, B+F, B-F and B+F/4; with B/2+F/2 the masked pixel is halved (not used by the game,
  * which never sets or checks the mask bit).
@@ -93,6 +98,8 @@ enum { K_TRI = 0, K_RECT, K_FILL, K_COPY, K_PUT, K_LINEPX, K_SEED };
 #define F_EDGE (1u << 19)       /* triangle drawn as its bounding box; the shader tests coverage */
 #define F_LONGLEFT (1u << 20)
 #define F_PERSP (1u << 21)      /* PGXP: perspective-correct u/v from the pf planes */
+#define F_BILIN (1u << 22)      /* texture filter: bilinear (hires.c samp_bilinear) */
+#define F_XBR (1u << 23)        /* texture filter: 2D edge-aware (hires.c samp_xbr) */
 
 /* pipeline keys: 0 opaque, 1..4 semi-transparency mode 0..3; +5 = with mask check */
 #define NKEYS 10
@@ -143,17 +150,79 @@ static const char s_msl[] =
 "  if (depth == 0u) { uint w = vram_at(vr, tpx + (u >> 2), row); uint idx = (w >> ((u & 3u) * 4u)) & 0xFu; return uint(vr.read(uint2((cx + idx) & 1023u, cy)).r); }\n"
 "  if (depth == 1u) { uint w = vram_at(vr, tpx + (u >> 1), row); uint idx = (w >> ((u & 1u) * 8u)) & 0xFFu; return uint(vr.read(uint2((cx + idx) & 1023u, cy)).r); }\n"
 "  return vram_at(vr, tpx + u, row); }\n"
-/* PS1 pixel -> B5G5R5A1 output: the format stores .b in the low 5 bits, so PS1 red goes to .b */
-"static inline float4 pack(uint c, int pass, int mode) {\n"
-"  float r = float(c & 31u), g = float((c >> 5) & 31u), b = float((c >> 10) & 31u);\n"
+/* Colours are uint4 (r, g, b, mask bit) in output units: 5-bit channels for the B5G5R5A1 target,
+ * 8-bit for the full-precision RGBA8 one (hp). B5G5R5A1 stores .b in the low 5 bits, so PS1 red
+ * goes to .b there. Blend pass (fixed-function semi-transparency): B/2+F/2 as F/2 - 1/4 with a 0.5
+ * constant dst factor, B+F/4 as floor(F/4), in the units of the target. */
+"static inline float4 pack4(uint4 c, int pass, int mode, int hp) {\n"
+"  float r = float(c.x), g = float(c.y), b = float(c.z);\n"
 "  if (pass == 1) {\n"
 "    if (mode == 0) { r = r * 0.5 - 0.25; g = g * 0.5 - 0.25; b = b * 0.5 - 0.25; }\n"
 "    else if (mode == 3) { r = floor(r * 0.25); g = floor(g * 0.25); b = floor(b * 0.25); }\n"
 "  }\n"
-"  return float4(b / 31.0, g / 31.0, r / 31.0, float(c >> 15)); }\n"
-"static inline uint unpack(float4 t) {\n"
-"  return uint(rint(t.b * 31.0)) | (uint(rint(t.g * 31.0)) << 5) | (uint(rint(t.r * 31.0)) << 10) | (t.a > 0.5 ? 0x8000u : 0u); }\n"
+"  if (hp != 0) return float4(r / 255.0, g / 255.0, b / 255.0, float(c.w));\n"
+"  return float4(b / 31.0, g / 31.0, r / 31.0, float(c.w)); }\n"
+/* a 15-bit PS1 pixel in output units (full precision: c << 3, the PS1's 8-bit scale) */
+"static inline uint4 c15u(uint c, int hp) {\n"
+"  uint s = hp != 0 ? 3u : 0u;\n"
+"  return uint4((c & 31u) << s, ((c >> 5) & 31u) << s, ((c >> 10) & 31u) << s, (c >> 15) & 1u); }\n"
+"static inline uint4 unpack4(float4 t, int hp) {\n"
+"  if (hp != 0) return uint4(uint(rint(t.r * 255.0)), uint(rint(t.g * 255.0)), uint(rint(t.b * 255.0)), t.a > 0.5 ? 1u : 0u);\n"
+"  return uint4(uint(rint(t.b * 31.0)), uint(rint(t.g * 31.0)), uint(rint(t.r * 31.0)), t.a > 0.5 ? 1u : 0u); }\n"
 "static inline int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }\n"
+/* filtered texels (hires.c tex_combine / samp_bilinear / samp_xbr, bit for bit): CLUT-looked-up
+ * texels combined with integer weights summing to 65536; 0000 = transparent (no colour, the rest
+ * renormalised; under half opaque weight = transparent); semi-transparency bit by weighted
+ * majority. Result (r, g, b, stp) with 5.8 fixed-point channels. */
+"static inline bool tcomb(thread const uint *t, thread const uint *w, int n, thread int4 &o) {\n"
+"  uint cov = 0u, sr = 0u, sg = 0u, sb = 0u, ss = 0u;\n"
+"  for (int k = 0; k < n; k++) {\n"
+"    if (t[k] == 0u || w[k] == 0u) continue;\n"
+"    cov += w[k]; sr += w[k] * (t[k] & 31u); sg += w[k] * ((t[k] >> 5) & 31u); sb += w[k] * ((t[k] >> 10) & 31u);\n"
+"    if ((t[k] & 0x8000u) != 0u) ss += w[k]; }\n"
+"  if (cov < 32768u) return false;\n"
+"  o = int4(int((sr * 256u + (cov >> 1)) / cov), int((sg * 256u + (cov >> 1)) / cov), int((sb * 256u + (cov >> 1)) / cov), ss * 2u >= cov ? 1 : 0);\n"
+"  return true; }\n"
+"static inline void clamp_axis(thread int &i, thread int &f, int lo, int hi) { if (i < lo) { i = lo; f = 0; } else if (i >= hi) { i = hi; f = 0; } }\n"
+"static inline bool samp_filt(texture2d<ushort> vr, device const Prim &p, uint depth, bool xbr, int iu, int fu, int iv, int fv,\n"
+"    int ulo, int uhi, int vlo, int vhi, int sx, int sy, thread int4 &o) {\n"
+"  uint t[5] = { 0u, 0u, 0u, 0u, 0u }; uint w[5] = { 0u, 0u, 0u, 0u, 0u }; int n;\n"
+"  if (!xbr) {\n"
+"    int iu1 = iu < uhi ? iu + 1 : uhi, iv1 = iv < vhi ? iv + 1 : vhi;\n"
+"    t[0] = tex_fetch(vr, p, depth, uint(iu), uint(iv)); t[1] = tex_fetch(vr, p, depth, uint(iu1), uint(iv));\n"
+"    t[2] = tex_fetch(vr, p, depth, uint(iu), uint(iv1)); t[3] = tex_fetch(vr, p, depth, uint(iu1), uint(iv1));\n"
+"    w[0] = uint((256 - fu) * (256 - fv)); w[1] = uint(fu * (256 - fv)); w[2] = uint((256 - fu) * fv); w[3] = uint(fu * fv);\n"
+"    n = 4;\n"
+"  } else {\n"
+"    int ie = iu, dx = fu, je = iv, dy = fv;\n"
+"    if (fu >= 128) { ie = iu + 1; dx = fu - 256; }\n"
+"    if (fv >= 128) { je = iv + 1; dy = fv - 256; }\n"
+"    int hx = dx >= 0 ? 1 : -1, hy = dy >= 0 ? 1 : -1;\n"
+"    t[0] = tex_fetch(vr, p, depth, uint(ie), uint(je));\n"
+"    t[1] = tex_fetch(vr, p, depth, uint(min(max(ie + hx, ulo), uhi)), uint(je));\n"
+"    t[2] = tex_fetch(vr, p, depth, uint(ie), uint(min(max(je + hy, vlo), vhi)));\n"
+"    t[3] = tex_fetch(vr, p, depth, uint(min(max(ie - hx, ulo), uhi)), uint(je));\n"
+"    t[4] = tex_fetch(vr, p, depth, uint(ie), uint(min(max(je - hy, vlo), vhi)));\n"
+"    w[0] = 65536u; n = 2;\n"
+"    if (t[1] == t[2] && t[1] != t[0] && t[1] != t[3] && t[2] != t[4]) {\n"
+"      int d8 = abs(dx) + abs(dy) - 128, a = min(max(((d8 * (sx + sy)) >> 1) + 128, 0), 256);\n"
+"      w[0] = uint(256 - a) * 256u; w[1] = uint(a) * 256u; }\n"
+"  }\n"
+"  return tcomb(t, w, n, o); }\n"
+/* rect texel coordinate on one axis at hi-res pixel X (hires.c rect_axis): index and 1/256 fraction */
+"static inline int2 rect_axis(int t0, int d, int k0, int X, int s) {\n"
+"  int D = 2 * s, num = D * t0 + d * (2 * X + 1 - s - D * k0);\n"
+"  int q = num / D;\n"
+"  if (num % D != 0 && num < 0) q -= 1;\n"
+"  return int2(q, ((num - q * D) * 256) / D); }\n"
+/* sampled texel (5.8) modulated by the vertex colour, in output units (hires.c tex8_out15/32) */
+"static inline uint4 tex_out(int4 t, int cr, int cg, int cb, bool raw, bool dith, int d, int hp) {\n"
+"  int r, g, b;\n"
+"  if (raw) { int s = hp != 0 ? 5 : 8; r = t.x >> s; g = t.y >> s; b = t.z >> s; }\n"
+"  else if (hp != 0) { r = min((t.x * cr) >> 12, 255); g = min((t.y * cg) >> 12, 255); b = min((t.z * cb) >> 12, 255); }\n"
+"  else if (dith) { r = clamp255(((t.x * cr) >> 12) + d) >> 3; g = clamp255(((t.y * cg) >> 12) + d) >> 3; b = clamp255(((t.z * cb) >> 12) + d) >> 3; }\n"
+"  else { r = min((t.x * cr) >> 15, 31); g = min((t.y * cg) >> 15, 31); b = min((t.z * cb) >> 15, 31); }\n"
+"  return uint4(uint(r), uint(g), uint(b), uint(t.w)); }\n"
 /* hires.c's coverage rule, exactly: rows [ceil(Ya), ceil(Yc)), columns [ceil(xl), ceil(xr)) with
  * xl/xr on the long edge a-c and the short edge a-b (rows above Yb) or b-c; 16.16 hi-res coords */
 "static inline bool edge_right_of(long X16, long Y16, long px, long py, long qx, long qy) {\n"
@@ -222,29 +291,33 @@ static const char s_msl[] =
 "  device const Prim &p = prims[in.prim];\n"
 "  int X = int(in.pos.x) + u.ox, Y = int(in.pos.y) + u.oy;\n"
 "  uint kf = p.kf, kind = kf & 15u;\n"
+"  int hp = u.p0;\n"
 "  int x1 = (X >= 0 ? X : X - u.sx + 1) / u.sx, y1 = Y / u.sy;\n"
-"  if (kind == 2u) { if (u.pass != 0) discard_fragment(); return pack(p.color & 0xFFFFu, 0, 0); }\n"
-"  if (kind == 6u) return pack(vram_at(vram, uint(x1), uint(y1)), 0, 0);\n"
+"  if (kind == 2u) { if (u.pass != 0) discard_fragment(); return pack4(c15u(p.color & 0xFFFFu, hp), 0, 0, hp); }\n"
+"  if (kind == 6u) return pack4(c15u(vram_at(vram, uint(x1), uint(y1)), hp), 0, 0, hp);\n"
 "  if (kind == 4u) {\n"
 "    uint w = putt.read(uint2(uint(x1 - u.rx), uint(y1 - u.ry))).r;\n"
 "    if ((w & 0x10000u) == 0u) discard_fragment();\n"
-"    return pack((w & 0xFFFFu) | ((kf & (1u << 18)) ? 0x8000u : 0u), 0, 0); }\n"
+"    return pack4(c15u((w & 0xFFFFu) | ((kf & (1u << 18)) ? 0x8000u : 0u), hp), 0, 0, hp); }\n"
 "  if (kind == 3u) {\n"
 "    int sb = X - x1 * u.sx, sa = Y - y1 * u.sy;\n"
 "    int sx = int(p.aux0 & 0xFFFFu), sy = int(p.aux0 >> 16), dx = int(p.aux1 & 0xFFFFu), dy = int(p.aux1 >> 16);\n"
 "    int scol = (sx + ((x1 - dx) & 1023)) & 1023, srow = (sy + ((y1 - dy) & 511)) & 511;\n"
-"    uint c;\n"
+"    uint4 c;\n"
 "    if (scol >= u.rx && scol < u.rx + u.rw && srow >= u.ry && srow < u.ry + u.rh)\n"
-"      c = unpack(tmp.read(uint2(uint(scol * u.sx + sb - u.ox), uint(srow * u.sy + sa - u.oy))));\n"
-"    else c = vram_at(vram, uint(scol), uint(srow));\n"
-"    return pack(c | ((kf & (1u << 18)) ? 0x8000u : 0u), 0, 0); }\n"
+"      c = unpack4(tmp.read(uint2(uint(scol * u.sx + sb - u.ox), uint(srow * u.sy + sa - u.oy))), hp);\n"
+"    else c = c15u(vram_at(vram, uint(scol), uint(srow)), hp);\n"
+"    if ((kf & (1u << 18)) != 0u) c.w = 1u;\n"
+"    return pack4(c, 0, 0, hp); }\n"
 "  int cx1 = int(p.clip0 << 16) >> 16, cy1 = int(p.clip0 >> 16), cx2 = int(p.clip1 << 16) >> 16, cy2 = int(p.clip1 >> 16);\n"
 "  if (X < cx1 || X >= cx2 || Y < cy1 || Y >= cy2) discard_fragment();\n"
 "  bool tex = (kf & (1u << 4)) != 0u, raw = (kf & (1u << 5)) != 0u, semi = (kf & (1u << 6)) != 0u;\n"
 "  bool gour = (kf & (1u << 7)) != 0u, dith = (kf & (1u << 8)) != 0u;\n"
+"  bool filt = (kf & (3u << 22)) != 0u, xbr = (kf & (1u << 23)) != 0u;\n"
 "  uint depth = (kf >> 9) & 3u;\n"
 "  int cr = int(p.color & 255u), cg = int((p.color >> 8) & 255u), cb = int((p.color >> 16) & 255u);\n"
 "  uint uu = 0u, vv = 0u;\n"
+"  int iu = 0, fu = 0, iv = 0, fv = 0, ulo = 0, uhi = 255, vlo = 0, vhi = 255;\n"
 "  if (kind == 0u) {\n"
 "    if ((kf & (1u << 19)) != 0u && !covered(p, X, Y)) discard_fragment();\n"
 "    long m = long(2 * Y + 1 - u.sy), xs = span_start(p, Y, cx1), lX = long(X), lsx = long(u.sx), lsy = long(u.sy);\n"
@@ -260,57 +333,80 @@ static const char s_msl[] =
 "      cr = c3[0]; cg = c3[1]; cb = c3[2];\n"
 "    }\n"
 "    if (tex) {\n"
-"      int ui, vi;\n"
+"      long U, V;\n"
 "      if ((kf & (1u << 21)) != 0u) {\n"
 "        long xe = span_end(p, Y, cx2);\n"
 "        long2 uv = persp_uv(p, xs, xe, lX, Y);\n"
-"        ui = int(uv.x >> 24); vi = int(uv.y >> 24);\n"
-"      } else { ui = int(attr_span(p, 3, xs, lX, m, lsx, lsy) >> 24); vi = int(attr_span(p, 4, xs, lX, m, lsx, lsy) >> 24); }\n"
-"      if ((kf & (1u << 15)) != 0u) {\n"
-"        int umin = int(p.uvr & 255u), umax = int((p.uvr >> 8) & 255u), vmin = int((p.uvr >> 16) & 255u), vmax = int(p.uvr >> 24);\n"
-"        ui = ui < umin ? umin : (ui > umax ? umax : ui);\n"
-"        vi = vi < vmin ? vmin : (vi > vmax ? vmax : vi);\n"
+"        U = uv.x; V = uv.y;\n"
+"      } else { U = attr_span(p, 3, xs, lX, m, lsx, lsy); V = attr_span(p, 4, xs, lX, m, lsx, lsy); }\n"
+"      ulo = int(p.uvr & 255u); uhi = int((p.uvr >> 8) & 255u); vlo = int((p.uvr >> 16) & 255u); vhi = int(p.uvr >> 24);\n"
+"      if (filt) {\n"   /* sample point without the +0.5 rounding bias, footprint inside the 1x-sampled range */
+"        long su = U - 8388608, sv = V - 8388608;\n"
+"        iu = int(su >> 24); fu = int((su >> 16) & 255); iv = int(sv >> 24); fv = int((sv >> 16) & 255);\n"
+"        clamp_axis(iu, fu, ulo, uhi); clamp_axis(iv, fv, vlo, vhi);\n"
+"      } else {\n"
+"        int ui = int(U >> 24), vi = int(V >> 24);\n"
+"        if ((kf & (1u << 15)) != 0u) {\n"
+"          ui = ui < ulo ? ulo : (ui > uhi ? uhi : ui);\n"
+"          vi = vi < vlo ? vlo : (vi > vhi ? vhi : vi);\n"
+"        }\n"
+"        uu = uint(ui); vv = uint(vi);\n"
 "      }\n"
-"      uu = uint(ui); vv = uint(vi);\n"
 "    }\n"
 "  } else if (kind == 1u) {\n"
 "    int x0 = int(p.aux0 << 16) >> 16, y0 = int(p.aux0) >> 16;\n"
 "    uint u0 = p.aux1 & 255u, v0 = (p.aux1 >> 8) & 255u;\n"
 "    bool fx = (kf & (1u << 16)) != 0u, fy = (kf & (1u << 17)) != 0u;\n"
 "    if (tex && fx) u0 |= 1u;\n"
-"    uu = (u0 + uint(fx ? x0 - x1 : x1 - x0)) & 255u;\n"
-"    vv = (v0 + uint(fy ? y0 - y1 : y1 - y0)) & 255u;\n"
+"    if (filt) {\n"   /* range of the drawn columns / rows, signed 16-bit in cmin / cmax */
+"      ulo = int(p.cmin << 16) >> 16; vlo = int(p.cmin) >> 16; uhi = int(p.cmax << 16) >> 16; vhi = int(p.cmax) >> 16;\n"
+"      int2 a = rect_axis(int(u0), fx ? -1 : 1, x0, X, u.sx), b = rect_axis(int(v0), fy ? -1 : 1, y0, Y, u.sy);\n"
+"      iu = a.x; fu = a.y; iv = b.x; fv = b.y;\n"
+"      clamp_axis(iu, fu, ulo, uhi); clamp_axis(iv, fv, vlo, vhi);\n"
+"    } else {\n"
+"      uu = (u0 + uint(fx ? x0 - x1 : x1 - x0)) & 255u;\n"
+"      vv = (v0 + uint(fy ? y0 - y1 : y1 - y0)) & 255u;\n"
+"    }\n"
 "  }\n"
 "  int d = dith ? DITH[(y1 & 3) * 4 + (x1 & 3)] : 0;\n"
-"  uint outc; bool blend;\n"
+"  uint4 outc; bool blend;\n"
 "  if (tex) {\n"
-"    uint t = tex_fetch(vram, p, depth, uu, vv);\n"
-"    if (t == 0u) discard_fragment();\n"
-"    if (raw) outc = t;\n"
+"    int4 t8;\n"
+"    if (filt) { if (!samp_filt(vram, p, depth, xbr, iu, fu, iv, fv, ulo, uhi, vlo, vhi, u.sx, u.sy, t8)) discard_fragment(); }\n"
 "    else {\n"
-"      int tr = int(t & 31u), tg = int((t >> 5) & 31u), tb = int((t >> 10) & 31u);\n"
-"      if (dith) { tr = clamp255(((tr * cr) >> 4) + d) >> 3; tg = clamp255(((tg * cg) >> 4) + d) >> 3; tb = clamp255(((tb * cb) >> 4) + d) >> 3; }\n"
-"      else { tr = min((tr * cr) >> 7, 31); tg = min((tg * cg) >> 7, 31); tb = min((tb * cb) >> 7, 31); }\n"
-"      outc = uint(tr) | (uint(tg) << 5) | (uint(tb) << 10) | (t & 0x8000u);\n"
+"      uint t = tex_fetch(vram, p, depth, uu, vv);\n"
+"      if (t == 0u) discard_fragment();\n"
+"      t8 = int4(int(t & 31u) << 8, int((t >> 5) & 31u) << 8, int((t >> 10) & 31u) << 8, int(t >> 15));\n"
 "    }\n"
-"    blend = semi && (t & 0x8000u) != 0u;\n"
+"    outc = tex_out(t8, cr, cg, cb, raw, dith, d, hp);\n"
+"    blend = semi && t8.w != 0;\n"
 "  } else {\n"
 "    int r, g, b;\n"
-"    if (dith) { r = clamp255(cr + d) >> 3; g = clamp255(cg + d) >> 3; b = clamp255(cb + d) >> 3; }\n"
+"    if (hp != 0) { r = cr; g = cg; b = cb; }\n"
+"    else if (dith) { r = clamp255(cr + d) >> 3; g = clamp255(cg + d) >> 3; b = clamp255(cb + d) >> 3; }\n"
 "    else { r = cr >> 3; g = cg >> 3; b = cb >> 3; }\n"
-"    outc = uint(r) | (uint(g) << 5) | (uint(b) << 10);\n"
+"    outc = uint4(uint(r), uint(g), uint(b), 0u);\n"
 "    blend = semi;\n"
 "  }\n"
 "  if (blend != (u.pass == 1)) discard_fragment();\n"
-"  if ((kf & (1u << 13)) != 0u) outc |= 0x8000u;\n"
-"  return pack(outc, u.pass, u.mode); }\n"
+"  if ((kf & (1u << 13)) != 0u) outc.w = 1u;\n"
+"  return pack4(outc, u.pass, u.mode, hp); }\n"
 "struct PO { float4 pos [[position]]; };\n"
 "vertex PO vs_full(uint vid [[vertex_id]]) {\n"
 "  PO o; o.pos = float4(vid == 1u ? 3.0 : -1.0, vid == 2u ? 3.0 : -1.0, 0.0, 1.0); return o; }\n"
-"struct PU { int x, y, p0, p1; };\n"
+/* target -> RGBA8: n x n box average (SSAA, rounded; hires.c hires_view_to_rgba) of 8-bit channels */
+"struct PU { int x, y, n, hp; };\n"
 "fragment float4 fs_present(PO in [[stage_in]], constant PU &u [[buffer(0)]], texture2d<float> t [[texture(0)]]) {\n"
-"  float4 v = t.read(uint2(uint(int(in.pos.x) + u.x), uint(int(in.pos.y) + u.y)));\n"
-"  return float4(rint(v.b * 31.0) * 8.0 / 255.0, rint(v.g * 31.0) * 8.0 / 255.0, rint(v.r * 31.0) * 8.0 / 255.0, 1.0); }\n";
+"  uint3 s = uint3(0u);\n"
+"  int bx = int(in.pos.x) * u.n + u.x, by = int(in.pos.y) * u.n + u.y;\n"
+"  for (int j = 0; j < u.n; j++)\n"
+"    for (int i = 0; i < u.n; i++) {\n"
+"      float4 v = t.read(uint2(uint(bx + i), uint(by + j)));\n"
+"      if (u.hp != 0) s += uint3(uint(rint(v.r * 255.0)), uint(rint(v.g * 255.0)), uint(rint(v.b * 255.0)));\n"
+"      else s += uint3(uint(rint(v.b * 31.0)), uint(rint(v.g * 31.0)), uint(rint(v.r * 31.0))) * 8u;\n"
+"    }\n"
+"  uint nn = uint(u.n * u.n);\n"
+"  return float4(float3((s + nn / 2u) / nn) / 255.0, 1.0); }\n";
 
 /* ---- small dynamic arrays --------------------------------------------------------- */
 
@@ -336,7 +432,7 @@ typedef struct { int type, key; u32 first, count; int x, y, w, h; size_t off; } 
 /* ---- state -------------------------------------------------------------------------- */
 
 static SDL_GPUDevice *s_dev;
-static SDL_GPUGraphicsPipeline *s_pipe[NKEYS], *s_present_pipe;
+static SDL_GPUGraphicsPipeline *s_pipe[2][NKEYS], *s_present_pipe;   /* [hp][key] */
 static SDL_GPUSampler *s_samp;
 static SDL_GPUTexture *s_vramtex, *s_target, *s_temp, *s_puttex, *s_present;
 static int s_pw, s_ph;
@@ -354,6 +450,8 @@ static char s_driver[16];   /* requested SDL_GPU driver, "" = auto */
 static const u16 *s_vram;
 static int s_Sx, s_Sy, s_rx, s_ry, s_rw, s_rh, s_tw, s_th, s_ox, s_oy;
 static int s_gx, s_pend_gx;   /* guard band in use / for the next configure() */
+static int s_hp;              /* target format: 0 = B5G5R5A1 (15-bit), 1 = R8G8B8A8 (full precision) */
+static int s_ssaa_present = 1; /* box filter of the present pass (the view's ssaa) */
 /* Allocated target size: the next powers of two above s_tw x s_th, so the pixel <-> NDC
  * transform is exact. With 480*Sy rows it rounds; vertices then land ~1e-5 px off pixel
  * centres, which Apple GPUs resolve, breaking fill-rule ties on shared edges. */
@@ -371,7 +469,7 @@ static u32 *s_put;         /* CPU->VRAM pixels pending for the target (region co
 static int s_put_n, s_pbx0, s_pby0, s_pbx1, s_pby1;
 static bool s_put_mc, s_put_ms;
 
-static u16 *s_rb;          /* readback pixels */
+static void *s_rb;         /* readback pixels (u16 or u32 per pixel, by s_hp) */
 static size_t s_rb_cap;
 static bool s_dirty_present = true;
 
@@ -585,7 +683,8 @@ static inline void guard_clip(HiresPrim *p)
     if (p->clip_x2 == s_rx + s_rw - 1) p->clip_x2 = s_rx + s_rw - 1 + s_gx;
 }
 
-static inline bool dither_on(const HiresPrim *p) { return p->dither && ((s_Sx == 1 && s_Sy == 1) || hires_get_dither()); }
+/* never in full precision (same as hires.c) */
+static inline bool dither_on(const HiresPrim *p) { return p->dither && !s_hp && ((s_Sx == 1 && s_Sy == 1) || hires_get_dither()); }
 
 /* ---- CPU->VRAM pixels ------------------------------------------------------------------- */
 
@@ -729,9 +828,12 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
     u32 idx;
     GPrim *g = new_prim(&idx);
     const bool dith = dither_on(p);
+    const int filt = tex ? hires_get_tex_filter() : HIRES_TEX_NEAREST;
     g->kf = base_flags(p, K_TRI, tex) | (gour ? F_GOUR : 0) | (dith ? F_DITHER : 0) |
             (gour && p->has_cr ? F_C1X : 0) | ((Sx > 1 || Sy > 1 || precise) ? F_CLAMP : 0) |
             (persp ? F_PERSP : 0);
+    if (filt != HIRES_TEX_NEAREST)   /* the footprint always stays in the 1x-sampled range */
+        g->kf |= F_CLAMP | ((filt == HIRES_TEX_XBR && hires_tri_is_2d(vin)) ? F_XBR : F_BILIN);
     set_tex(g, p);
     set_clip(g, p);
     g->uvr = (u32)umin | ((u32)umax << 8) | ((u32)vmin << 16) | ((u32)vmax << 24);
@@ -857,11 +959,15 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
     if (xs >= xe || ys >= ye) return;
     int rxs = imax(xs, s_rx - s_gx), rxe = imin(xe, s_rx + s_rw + s_gx), rys = imax(ys, s_ry), rye = imin(ye, s_ry + s_rh);
     if (rxs < rxe && rys < rye) {
+        const bool filt = p->tex && hires_get_tex_filter() != HIRES_TEX_NEAREST;
+        int fr[4] = { 0, 0, 0, 0 };   /* filtered: footprint range (hires.c) */
+        if (filt) hires_rect_uv_range(p, x, y, w, h, u0, v0, fx, fy, &fr[0], &fr[1], &fr[2], &fr[3]);
         if (p->tex) {   /* u/v sampled over the drawn columns/rows, as the 1x rect samples them */
             int uu0 = (int)(u0 | (fx ? 1u : 0u)), du = fx ? -1 : 1, dv = fy ? -1 : 1;
             int ua = uu0 + du * (rxs - x), ub = uu0 + du * (rxe - 1 - x);
             int va = (int)v0 + dv * (rys - y), vb = (int)v0 + dv * (rye - 1 - y);
             int ulo = imin(ua, ub), uhi = imax(ua, ub), vlo = imin(va, vb), vhi = imax(va, vb);
+            if (filt) { ulo = imin(ulo, fr[0]); uhi = imax(uhi, fr[1]); vlo = imin(vlo, fr[2]); vhi = imax(vhi, fr[3]); }
             if (ulo < 0 || uhi > 255) { ulo = 0; uhi = 255; }
             if (vlo < 0 || vhi > 255) { vlo = 0; vhi = 255; }
             tex_need(p, ulo, uhi, vlo, vhi);
@@ -869,6 +975,11 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
         u32 idx;
         GPrim *gp = new_prim(&idx);
         gp->kf = base_flags(p, K_RECT, p->tex) | (fx ? F_FLIPX : 0) | (fy ? F_FLIPY : 0);
+        if (filt) {
+            gp->kf |= hires_get_tex_filter() == HIRES_TEX_XBR ? F_XBR : F_BILIN;
+            gp->cmin = ((u32)fr[0] & 0xFFFFu) | ((u32)fr[2] << 16);   /* signed 16-bit pairs */
+            gp->cmax = ((u32)fr[1] & 0xFFFFu) | ((u32)fr[3] << 16);
+        }
         set_tex(gp, p);
         set_clip(gp, p);
         gp->color = r | (g8 << 8) | (b << 16);
@@ -901,6 +1012,13 @@ static void line_px(const HiresPrim *p, u32 kf, int x, int y, int w, int h, u32 
     u64 m[8];
     tile_mask(x / s_Sx, y / s_Sy, (x + w - 1) / s_Sx, (y + h - 1) / s_Sy, m);
     group_add(keys, nk, v, 6, m);
+}
+
+static inline u32 lclamp(s32 v, u32 c0, u32 c1, int sh)
+{
+    const s32 a = (s32)((c0 >> sh) & 0xFF), b = (s32)((c1 >> sh) & 0xFF);
+    const s32 lo = a < b ? a : b, hi = a < b ? b : a;
+    return (u32)(v < lo ? lo : (v > hi ? hi : v));
 }
 
 static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, u32 c1)
@@ -944,7 +1062,9 @@ static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, 
     const int steps = kh + (Sa - 1);
     for (int i = 0; i <= steps; i++) {
         int x = (int)(xf >> 32), y = (int)(yf >> 32);
-        u32 cr = (u32)(r >> 12), cg = (u32)(g >> 12), cb = (u32)(b >> 12);
+        /* the Sa - 1 steps past the end extrapolate the gradient: keep it between the end
+         * colours (no-op at 1x1, where the line stops at the end; it used to wrap below 0) */
+        u32 cr = lclamp(r >> 12, c0, c1, 0), cg = lclamp(g >> 12, c0, c1, 8), cb = lclamp(b >> 12, c0, c1, 16);
         if (xmajor) line_px(p, kf, x, y - Sy / 2, 1, Sy, cr, cg, cb, keys, nk);
         else line_px(p, kf, x - Sx / 2, y, Sx, 1, cr, cg, cb, keys, nk);
         xf += sx; yf += sy;
@@ -1129,7 +1249,7 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
                 SDL_PushGPUVertexUniformData(cb, 0, vk, sizeof vk);
             }
             if (st->key != cur_key) {
-                SDL_BindGPUGraphicsPipeline(rp, s_pipe[st->key]);
+                SDL_BindGPUGraphicsPipeline(rp, s_pipe[s_hp][st->key]);
                 SDL_GPUBufferBinding vbb = { s_vbuf, 0 };
                 SDL_BindGPUVertexBuffers(rp, 0, &vbb, 1);
                 SDL_BindGPUFragmentStorageBuffers(rp, 0, &s_pbuf, 1);
@@ -1138,7 +1258,7 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
                 cur_key = st->key;
             }
             int k = st->key % 5;
-            FragU fu = { s_Sx, s_Sy, s_ox, s_oy, k ? 1 : 0, k ? k - 1 : 0, s_rx, s_ry, s_rw, s_rh, 0, 0 };
+            FragU fu = { s_Sx, s_Sy, s_ox, s_oy, k ? 1 : 0, k ? k - 1 : 0, s_rx, s_ry, s_rw, s_rh, s_hp, 0 };
             SDL_PushGPUFragmentUniformData(cb, 0, &fu, sizeof fu);
             SDL_DrawGPUPrimitives(rp, st->count, 1, st->first, 0);
             s_st.draws++;
@@ -1166,7 +1286,7 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
         SDL_BindGPUGraphicsPipeline(rp, s_present_pipe);
         SDL_GPUTextureSamplerBinding tsb = { s_target, s_samp };
         SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
-        const int pu[4] = { px, py, 0, 0 };
+        const int pu[4] = { px, py, s_ssaa_present, s_hp };
         SDL_PushGPUFragmentUniformData(cb, 0, pu, sizeof pu);
         SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
         SDL_EndGPURenderPass(rp);
@@ -1174,7 +1294,7 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
         s_st.passes++;
     }
     if (readback) {
-        const u32 bytes = (u32)rw * (u32)rh * 2;
+        const u32 bytes = (u32)rw * (u32)rh * (s_hp ? 4 : 2);
         s_down = ensure_tbuf(s_down, &s_down_cap, bytes, SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD);
         if (!cp) cp = SDL_BeginGPUCopyPass(cb);
         SDL_GPUTextureRegion src = { .texture = s_target, .x = (u32)rx, .y = (u32)ry, .w = (u32)rw, .h = (u32)rh, .d = 1 };
@@ -1189,11 +1309,11 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
     if (!f) { rt_log("hires-gpu: submit: %s", SDL_GetError()); return false; }
     if (readback) {
         wait_fence(&f);
-        size_t need = (size_t)rw * rh;
-        if (need > s_rb_cap) { free(s_rb); s_rb = malloc(need * 2); s_rb_cap = s_rb ? need : 0; }
-        const u16 *m = SDL_MapGPUTransferBuffer(s_dev, s_down, false);
+        const size_t need = (size_t)rw * rh * (s_hp ? 4 : 2);
+        if (need > s_rb_cap) { free(s_rb); s_rb = malloc(need); s_rb_cap = s_rb ? need : 0; }
+        const void *m = SDL_MapGPUTransferBuffer(s_dev, s_down, false);
         if (!m || !s_rb) return false;
-        memcpy(s_rb, m, need * 2);
+        memcpy(s_rb, m, need);
         SDL_UnmapGPUTransferBuffer(s_dev, s_down);
         return true;
     }
@@ -1242,7 +1362,7 @@ static void be_destroy(void)
 static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int rw, int rh)
 {
     if (!s_inited) return false;
-    if (sx < 1 || sx > HIRES_MAX_SCALE || sy < 1 || sy > HIRES_MAX_SCALE || rw <= 0 || rh <= 0 ||
+    if (sx < 1 || sx > HIRES_MAX_RENDER_SCALE || sy < 1 || sy > HIRES_MAX_RENDER_SCALE || rw <= 0 || rh <= 0 ||
         rx < 0 || ry < 0 || rx + rw > VRAM_W || ry + rh > VRAM_H)
         return false;
     if (s_ready) submit(false, 0, 0, 0, 0, false, 0, 0);
@@ -1253,7 +1373,8 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     s_gx = s_pend_gx;
     s_tw = (rw + 2 * s_gx) * sx; s_th = rh * sy;
     s_ox = (rx - s_gx) * sx; s_oy = ry * sy;
-    const SDL_GPUTextureFormat fmt = SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
+    s_hp = hires_target_fmt() == HIRES_FMT_RGBA8;
+    const SDL_GPUTextureFormat fmt = s_hp ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
     for (s_aw = 64; s_aw < s_tw; s_aw *= 2) {}
     for (s_ah = 64; s_ah < s_th; s_ah *= 2) {}
     s_target = make_tex(fmt, s_aw, s_ah, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
@@ -1299,6 +1420,9 @@ static bool view_rect(int x, int y, int w, int h, HiresView *out)
     if (!s_ready || w <= 0 || h <= 0) return false;
     if (x < s_rx - s_gx || y < s_ry || x + w > s_rx + s_rw + s_gx || y + h > s_ry + s_rh) return false;
     out->pixels = NULL;
+    out->px32 = NULL;
+    out->fmt = s_hp ? HIRES_FMT_RGBA8 : HIRES_FMT_15;
+    out->ssaa = 1;
     out->stride = 0;
     out->w = w * s_Sx;
     out->h = h * s_Sy;
@@ -1321,7 +1445,8 @@ static bool be_read(int x, int y, int w, int h, HiresView *out)
 {
     if (!view_rect(x, y, w, h, out)) return false;
     if (!submit(true, out->gx, out->gy, out->w, out->h, false, 0, 0)) return false;
-    out->pixels = s_rb;
+    out->pixels = s_hp ? NULL : (const u16 *)s_rb;
+    out->px32 = s_hp ? (const u32 *)s_rb : NULL;
     out->stride = out->w;
     out->gpu = NULL;
     return true;
@@ -1330,11 +1455,13 @@ static bool be_read(int x, int y, int w, int h, HiresView *out)
 SDL_GPUTexture *hires_gpu_present(const HiresView *v)
 {
     if (!s_ready || !v->gpu) return NULL;
-    if (!s_present || s_pw != v->w || s_ph != v->h) {
+    const int n = v->ssaa > 1 ? v->ssaa : 1, ow = v->w / n, oh = v->h / n;   /* SSAA box filter */
+    if (n != s_ssaa_present) { s_ssaa_present = n; s_dirty_present = true; }
+    if (!s_present || s_pw != ow || s_ph != oh) {
         if (s_present) SDL_ReleaseGPUTexture(s_dev, s_present);
-        s_present = make_tex(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, v->w, v->h,
+        s_present = make_tex(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, ow, oh,
                              SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
-        s_pw = v->w; s_ph = v->h;
+        s_pw = ow; s_ph = oh;
         s_dirty_present = true;
         if (!s_present) return NULL;
     }
@@ -1466,9 +1593,14 @@ bool hires_gpu_init(SDL_GPUDevice *dev)
         { .location = 0, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
         { .location = 1, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_UINT, .offset = 8 },
     };
-    for (int k = 0; k < NKEYS; k++) {
-        SDL_GPUColorTargetDescription cd = { .format = fmt };
-        blend_for_key(k, &cd.blend_state);
+    if (!SDL_GPUTextureSupportsFormat(dev, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, SDL_GPU_TEXTURETYPE_2D,
+                                      SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER)) {
+        rt_log("hires-gpu: RGBA8 render targets unsupported on this GPU");
+        return false;
+    }
+    for (int k = 0; k < 2 * NKEYS; k++) {
+        SDL_GPUColorTargetDescription cd = { .format = k >= NKEYS ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : fmt };
+        blend_for_key(k % NKEYS, &cd.blend_state);
         SDL_GPUGraphicsPipelineCreateInfo pi = {
             .vertex_shader = vs, .fragment_shader = fs,
             .vertex_input_state = { .vertex_buffer_descriptions = &vbd, .num_vertex_buffers = 1,
@@ -1477,8 +1609,8 @@ bool hires_gpu_init(SDL_GPUDevice *dev)
             .rasterizer_state = { .fill_mode = SDL_GPU_FILLMODE_FILL, .cull_mode = SDL_GPU_CULLMODE_NONE },
             .target_info = { .color_target_descriptions = &cd, .num_color_targets = 1 },
         };
-        s_pipe[k] = SDL_CreateGPUGraphicsPipeline(dev, &pi);
-        if (!s_pipe[k]) { rt_log("hires-gpu: pipeline %d: %s", k, SDL_GetError()); return false; }
+        s_pipe[k / NKEYS][k % NKEYS] = SDL_CreateGPUGraphicsPipeline(dev, &pi);
+        if (!s_pipe[k / NKEYS][k % NKEYS]) { rt_log("hires-gpu: pipeline %d: %s", k, SDL_GetError()); return false; }
     }
     {
         SDL_GPUColorTargetDescription cd = { .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM };

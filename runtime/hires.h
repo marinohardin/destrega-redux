@@ -17,7 +17,8 @@
 
 #include "psx.h"
 
-#define HIRES_MAX_SCALE 8
+#define HIRES_MAX_SCALE 8          /* per-axis base scale (--scale, --max-scale, auto) */
+#define HIRES_MAX_RENDER_SCALE 16  /* per-axis render scale = base scale x SSAA factor */
 
 typedef struct {
     s32 x, y;         /* 1x pixel units, 16.16 fixed point; drawing offset already applied */
@@ -49,12 +50,21 @@ typedef struct {
     int cr_min[3], cr_max[3];
 } HiresPrim;
 
+/* Target pixel formats (hires_set_colour): 15-bit PS1 colour (the 1x VRAM format, bit 15 =
+ * mask bit), or full precision: one u32 per pixel, R | G << 8 | B << 16 | A << 24 with 8-bit
+ * channels on the PS1's 8-bit colour scale (a 15-bit value c is c << 3) and A = 0xFF for the
+ * mask bit, 0 otherwise (the byte order of an RGBA8 texture). */
+enum { HIRES_FMT_15 = 0, HIRES_FMT_RGBA8 = 1 };
+
 /* A rectangle of the render target, as presented. */
 typedef struct {
-    const u16 *pixels;   /* 15-bit PS1 pixels (bit 15 = mask bit) */
+    const u16 *pixels;   /* HIRES_FMT_15: 15-bit PS1 pixels (bit 15 = mask bit); else NULL */
+    const u32 *px32;     /* HIRES_FMT_RGBA8: full-precision pixels; else NULL */
+    int fmt;             /* HIRES_FMT_* */
     int stride;          /* in pixels */
     int w, h;            /* in target pixels */
-    int scale_x, scale_y;
+    int scale_x, scale_y;   /* render scale (base scale x ssaa) */
+    int ssaa;            /* supersampling: present each ssaa x ssaa block as its box average */
     /* GPU-resident view (GPU backend): pixels is NULL; gpu is the backend's target and
      * (gx, gy) the view's top-left pixel in it. hires_read_view() gives CPU pixels. */
     void *gpu;
@@ -161,15 +171,67 @@ bool hires_get_perspective(void);            /* for other backends: same setting
 /* Triangles drawn, and those textured perspective-correctly (software backend; the GPU
  * backend counts its own in HiresGpuStats). */
 void hires_get_persp_stats(u64 *tris, u64 *persp);
+/* software backend, texture filter on: textured triangles filtered / of them drawn with the 2D
+ * (xbr) rule / textured rects filtered */
+void hires_get_filter_stats(u64 *tris, u64 *tris_2d, u64 *rects);
 
-/* Compare the target against the 1x VRAM region (meaningful at scale 1x1, where they must
- * be identical). Returns the number of differing pixels; reports the first one. */
+/* ---- render quality (presentation only; AGENTS.md "Render quality") --------------------------
+ * Plain global settings with getters/setters (a settings layer may persist them). The colour
+ * format and SSAA take effect when the target is next allocated (hires_reconfigure() does that
+ * now, seeded from the 1x VRAM like a resize); the texture filter applies from the next
+ * primitive on. */
+enum { HIRES_TEX_NEAREST = 0, HIRES_TEX_BILINEAR = 1, HIRES_TEX_XBR = 2 };
+/* nearest: PS1 texel blocks (default; the bit-exact tests). bilinear: every textured primitive
+ * filtered bilinearly. xbr: 2D primitives (rects, and polygons mapped 1:1 and axis-aligned
+ * without PGXP depth: HUD, text, menus, sprites) get an edge-aware xBR-style corner rule, 3D
+ * polygons bilinear. Filtering acts on CLUT-looked-up colours, renormalises over opaque texels
+ * (0000 = transparent; under 50 % opaque weight = transparent), takes the semi-transparency bit
+ * by weighted majority and keeps the whole footprint inside the 1x-sampled UV range. */
+void hires_set_tex_filter(int mode);
+int hires_get_tex_filter(void);
+const char *hires_tex_filter_name(int mode);    /* "nearest", "bilinear", "xbr" */
+int hires_tex_filter_from_name(const char *s);  /* -1 if unknown */
+/* xbr mode: is this triangle 2D (no PGXP depth, u/v gradients exactly +-1 / 0 per 1x pixel)? */
+bool hires_tri_is_2d(const HiresVtx v[3]);
+/* Filtered rects: unwrapped u/v range of the columns / rows the rect draws inside p's draw area
+ * (the footprint clamp range). */
+void hires_rect_uv_range(const HiresPrim *p, int x, int y, int w, int h, u32 u0, u32 v0, bool fx, bool fy,
+                         int *ulo, int *uhi, int *vlo, int *vhi);
+/* Full-precision colour: HIRES_FMT_RGBA8 target (false = 15-bit, the default). */
+void hires_set_colour(bool full);
+bool hires_get_colour(void);
+/* Supersampling factor 1..HIRES_MAX_SSAA (1 = off): the target is rendered at base scale x n per
+ * axis and presented as n x n box averages. The factor in use (hires_ssaa()) is lowered so the
+ * render scale stays <= HIRES_MAX_RENDER_SCALE per axis, each side <= HIRES_MAX_RENDER_DIM and
+ * the target <= HIRES_MAX_RENDER_PX pixels (guard band included). */
+#define HIRES_MAX_SSAA 4
+#define HIRES_MAX_RENDER_DIM 8192
+#define HIRES_MAX_RENDER_PX (34 * 1024 * 1024)
+void hires_set_ssaa(int n);
+int hires_get_ssaa(void);
+int hires_ssaa(void);
+/* Reallocate the target now at the same base scale (after a setting above changed). */
+bool hires_reconfigure(void);
+/* Render scale of the allocated target (base x ssaa); false when off. */
+bool hires_get_render_scale(int *sx, int *sy);
+/* Pixel format the next configure() must allocate (for backends). */
+int hires_target_fmt(void);
+/* Rows [y0, y1) of the view as presented: RGBA8 (R in the low byte, A = 0xFF), each pixel the
+ * rounded box average of a v->ssaa x v->ssaa block, so (v->w / ssaa) x (v->h / ssaa) pixels.
+ * Integer arithmetic, the same as the GPU backend's present pass. */
+void hires_view_to_rgba(const HiresView *v, u32 *dst, size_t dst_pitch_px, int y0, int y1);
+
+/* Compare the target against the 1x VRAM region (meaningful at render scale 1x1 with the 15-bit
+ * target, where they must be identical: hires_verify_possible()). Returns the number of
+ * differing pixels; reports the first one. */
 u32 hires_verify_1x(int *first_x, int *first_y);
+bool hires_verify_possible(void);
 
 /* Compare the primary backend's target against the shadow's over the whole region (and the
  * guard band, if any).
- * diff = pixels whose 15-bit value differs (mask bit ignored), diff_big = those where some
- * channel differs by more than 1 (of 31); mask_diff = pixels where only bit 15 differs. */
+ * diff = pixels whose colour differs (mask bit ignored), diff_big = those where some channel
+ * differs by more than one 15-bit step (1 of 31, or 8 of 255 in full precision); mask_diff =
+ * pixels where only the mask bit differs. */
 typedef struct { u64 pixels, diff, diff_big, mask_diff; int first_x, first_y; } HiresCompare;
 bool hires_compare(HiresCompare *c);
 
