@@ -30,6 +30,11 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
 /* check marks follow the state (requested state, so a click shows at once) */
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     NSString *a = item.representedObject;
+    if (a) {   /* greyed out while refused (netplay: game image and save games) */
+        NSRange r = [a rangeOfString:@"="];
+        NSString *name = r.location == NSNotFound ? a : [a substringToIndex:r.location];
+        if (!frontend_menu_action_allowed(name.UTF8String)) return NO;
+    }
     if ([a isEqual:@"fullscreen"])
         item.title = frontend_fullscreen() ? @"Exit Full Screen" : @"Enter Full Screen";
     if ([a isEqual:@"widescreen"])

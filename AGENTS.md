@@ -179,8 +179,8 @@ a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as 
 - **Netplay: no cards, nothing written.** A rolled-back frame must not leave files behind and the
   two peers' cards differ, so `netplay.c` flushes, detaches both slots (`memcard_attach(p, NULL)`)
   and sets `memcard_set_write_protect(true)` at the first vblank (before the game touches a card);
-  the game sees no card on either peer. The Save Games menu still works during netplay and would
-  desync the peers (not guarded). Card state is part of every save state (`memcard_state_io`: images, changed flags, open files; a
+  the game sees no card on either peer. The Save Games actions and Load Game Image are refused
+  during netplay (see "Rollback netplay"). Card state is part of every save state (`memcard_state_io`: images, changed flags, open files; a
   load that changes an image marks it dirty).
 
 ## Save states (`runtime/savestate.[ch]`)
@@ -305,18 +305,23 @@ GGPO-style rollback on top of save states, two peers, UDP. Command-line only so 
   drops / reorders this peer's sends (deterministic per seed) for tests. `--net-pace HZ` paces
   headless runs; `--net-hash-log FILE` writes every final frame's hashes (also without netplay, for
   an offline reference run); `--net-lockstep` never predicts.
-- Tests: `tools/test_netplay.py` (in `run_tests.sh`): six cases, each two headless processes over
+- Tests: `tools/test_netplay.py` (in `run_tests.sh`): seven cases, each two headless processes over
   loopback with seeded VS menu + random fight input (`replays.py` scripts), paced at 240 Hz (4x real
   time, so the simulated latencies cover 4x as many frames): lan, wan (20 ms + 8 jitter, 1% loss, 2%
   reorder), lossy (15+15 ms, 10% loss, 10% reorder), asym (35 / 5 ms), a full best-of-3 match with
-  delay 3, and an injected desync. Pass: both peers' final-frame hashes equal each other **and an
+  delay 3, an injected desync, and refused menu actions. Pass: both peers' final-frame hashes equal each other **and an
   offline run of the same inputs shifted by the delay**, >= 95% of frames final, no desync, no
   impossible rollback; the desync case must be detected and its two report replays must behave
   (clean peer replays cleanly, faulty one diverges at the injected frame naming `p1.hp`).
   `--pace 60` runs in real time. ~90 s.
+- **Menu actions during netplay**: `frontend_menu_action_allowed()` (main.c) refuses the ones that
+  change emulated state: `load`, `save-import`, `save-export` (it flushes the card first) and
+  `save-delete`. The Mac menu greys them out (`validateMenuItem`), `--menu-action` logs
+  `menu: REFUSED NAME: ...`. Presentation-only actions (renderer, widescreen, full screen, reveal
+  in Finder) still run. Test: the `menu` case of `test_netplay.py`.
 - Not done / not verified: a lobby or NAT traversal (direct UDP only), the UI beyond the title bar,
-  spectators, Windows (`net.c` has Winsock code, untested), the Save Games menu during netplay,
-  windowed-vs-windowed play by two people (tested: windowed host + headless joiner).
+  spectators, Windows (`net.c` has Winsock code, untested), the greyed-out Mac menu items (compiled,
+  not clicked), windowed-vs-windowed play by two people (tested: windowed host + headless joiner).
 
 ## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
 

@@ -1293,8 +1293,23 @@ static void action_card_delete(const char *arg) {
     rt_log("menu: save-delete OK slot %d (%s)", slot + 1, e.name);
 }
 
+/* During a netplay session both peers must emulate the same machine: actions that change emulated
+ * state (a new game image, the memory card) are refused; presentation-only ones stay allowed.
+ * Export only reads the card but flushes it first, so it is blocked too (netplay detaches cards). */
+bool netplay_active(void);   /* netplay.c */
+bool frontend_menu_action_allowed(const char *name) {
+    static const char *const blocked[] = { "load", "save-import", "save-export", "save-delete" };
+    if (!netplay_active()) return true;
+    for (size_t i = 0; i < sizeof blocked / sizeof *blocked; i++) if (!strcmp(name, blocked[i])) return false;
+    return true;
+}
+
 static void menu_run(const char *name, const char *arg) {
     rt_log("menu: action %s%s%s", name, *arg ? " " : "", arg);
+    if (!frontend_menu_action_allowed(name)) {
+        rt_log("menu: REFUSED %s: not available during a netplay session (it would desync the peers)", name);
+        return;
+    }
     if (!strcmp(name, "load")) action_load(arg);
     else if (!strcmp(name, "reveal-game")) action_reveal(false);
     else if (!strcmp(name, "reveal-saves")) action_reveal(true);

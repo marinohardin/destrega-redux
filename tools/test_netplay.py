@@ -35,6 +35,12 @@ CASES = {
     'asym':       ('vs_anjie_laon_canyon', 1, '35:5:2:0:7', '5:2:2:0:8', [], {}),
     'match':      ('match_gradd_celia_hills', 3, '25:10:3:5:9', '25:10:3:5:10', [], {}),
     'desync':     ('vs_tieme_rohzen_villa', 2, '10:4:0:0:11', '10:4:0:0:12', [], {'desync': True}),
+    # state-changing menu actions are refused during netplay, presentation-only ones run
+    'menu':       ('vs_tieme_rohzen_villa', 2, '2:1:0:0:13', '2:1:0:0:14',
+                   ['--menu-action', '1500:load=Destrega/Destrega.cue', '--menu-action', '1510:save-import=x.mcd',
+                    '--menu-action', '1520:save-export=build/netplay/menu/x.mcd', '--menu-action', '1530:save-delete',
+                    '--menu-action', '1540:widescreen=on', '--menu-action', '1550:reveal-saves'],
+                   {'frames': 2400, 'menu': True}),
 }
 
 
@@ -68,6 +74,7 @@ def read_log(path):
 def run_case(name, port, pace):
     rp_name, delay, sim_h, sim_j, extra, expect = CASES[name]
     rp = R.REPLAYS[rp_name]
+    if 'frames' in expect: rp = R.Replay(rp.name, rp.desc, rp.p1, rp.p2, expect['frames'])
     d = os.path.join(OUT, name)
     os.makedirs(d, exist_ok=True)
     t0 = time.time()
@@ -87,7 +94,8 @@ def run_case(name, port, pace):
     # offline reference: the same inputs, shifted by the input delay
     ref = os.path.join(d, 'offline.hash')
     off = [BIN, '--headless', '--no-interp', '--frames', str(rp.frames), '--net-hash-log', ref,
-           '--press', R.fmt(shifted(rp.p1, delay)), '--press2', R.fmt(shifted(rp.p2, delay))] + extra
+           '--press', R.fmt(shifted(rp.p1, delay)), '--press2', R.fmt(shifted(rp.p2, delay))] + \
+        ([] if expect.get('menu') else extra)   # the menu case's actions must not run offline (load restarts)
     r = subprocess.run(off, capture_output=True, text=True, cwd=ROOT)
     open(os.path.join(d, 'offline.log'), 'w').write(r.stdout + r.stderr)
     hlog = open(os.path.join(d, 'host.log')).read()
@@ -132,6 +140,14 @@ def run_case(name, port, pace):
     for s, who in ((sh, 'host'), (sj, 'join')):
         if s and s['desyncs']: problems.append(f'{who}: {int(s["desyncs"])} desyncs')
         if s and s['impossible'] and not expect.get('impossible_ok'): problems.append(f'{who}: {int(s["impossible"])} impossible rollbacks')
+    if expect.get('menu'):
+        for who, log in (('host', hlog), ('join', jlog)):
+            ref = re.findall(r'menu: REFUSED (\S+):', log)
+            if sorted(ref) != ['load', 'save-delete', 'save-export', 'save-import']:
+                problems.append(f'{who}: refused {ref}, expected load / save-import / save-export / save-delete')
+            if 'menu: REFUSED widescreen' in log or 'menu: REFUSED reveal' in log:
+                problems.append(f'{who}: refused a presentation-only action')
+            if 'restart' in log.lower() and 'menu: load' in log: problems.append(f'{who}: load ran')
     full = sum(1 for f in both if len(H[f]) > 1)
     dt = time.time() - t0
     msg = f'{len(both)} final frames equal on both peers and offline ({full} full-state hashes)'
