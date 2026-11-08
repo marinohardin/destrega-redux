@@ -128,7 +128,7 @@ P2 slot `0x8001a268` (`Mxxx2.BIN`, `EVENTOVL.BIN`). See `recomp/overlays.py`.
 - Pads: libpad drives **SIO0 directly** (`runtime/sio.c`), not BIOS InitPAD.
 - CD: libcd at register level (`runtime/cdrom.c`); BIOS leaves CD int-enable = 0x1f.
   XA audio + STR video (5 movies, file channel 1) live in `XADATA.BNS`.
-- Memory card: reported as **absent** (no saves yet).
+- Memory cards: `runtime/memcard.c` (+ BIOS HLE in `bios.c`), see "Memory cards" below.
 
 ## Verification
 
@@ -141,6 +141,28 @@ Right 0x20, Down 0x40, Left 0x80, L2 0x100, R2 0x200, L1 0x400, R1 0x800,
 Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
 Headless runs ~200x real time (30k frames ≈ 13 s).
+
+## Memory cards (`runtime/memcard.[ch]`, `bios.c`)
+
+Standard raw 128 KiB images (`.mcd`, same as common emulators; DexDrive/`.gme`-style headered files
+are refused, never overwritten). Two slots. The game uses the BIOS card API, not SIO0 (details in
+`analysis/NOTES.md`), so cards are emulated at BIOS level: `_card_info/_card_load/_card_write/_card_read`
+and the `bu00:`/`bu10:` file calls run on the in-memory image immediately; the SwCARD/HwCARD
+completion events are queued and delivered from `bios_irq_prologue` (interrupt context, so on
+a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as "no card".
+
+- Options: `--memcard1 PATH`, `--memcard2 PATH` (created formatted-empty if missing), `--no-memcard`.
+  Windowed default: `memcard1.mcd` next to `destrega.pak`, slot 2 empty. **Headless has no card
+  unless given one** so tests never see a user's saves.
+- The image is written atomically (temp file + rename) after each completed card operation and at exit.
+- `--state-hash` includes the card images and the changed flag; `--ram-dump FILE` writes RAM at exit.
+- Tests: `runtime/tests/test_memcard.c` (format, chained files, directory, erase, persistence,
+  refusing bad images) and `tools/test_memcard.sh` (scripted save of a changed option from a fresh card, load in
+  a new run, identical hashes and card files across identical runs).
+- **Rollback netplay (future, not implemented): card writes must be suppressed during netplay**
+  (a rolled-back frame must not leave files behind, and the two peers' cards differ). The hook is
+  `memcard_set_write_protect(true)` (in-memory state keeps updating, flushing becomes a no-op);
+  card state must also be part of any snapshot (`memcard_hash` shows what it covers).
 
 ## High-resolution rendering (`runtime/hires.[ch]`)
 
@@ -252,6 +274,14 @@ hashing all emulated state per frame).
   position of both fighters, round time, wins, RNG seed, fighter-struct hash), `--ram-snap DIR`
   / `--ram-snap-every N` (raw RAM dumps for diffing). The run summary prints
   `widescreen: N shadow passes, M extra stage packets, R rejected` and `widescreen-frames: ...`.
+- Runtime switch (`runtime/widescreen.h`): `frontend_set_widescreen(bool)` (temporary hotkey
+  F9; for a menu item) takes effect at the next vblank. The first switch-on allocates the guard
+  band (a hi-res reconfigure, like a resize); switching off keeps it and only stops the shadow
+  pass and the wide presentation. `--widescreen` is the startup state; headless
+  `--widescreen-at F:0|1,...` schedules switches (tested by `wstoggle` in the test script).
+- Host-side state that generated code mutates outside guest state (e.g. PGXP tags) must be
+  registered with `widescreen_add_state_hook(save, restore)`, or the wide pass leaks into the
+  real one.
 
 ## Pitfalls
 

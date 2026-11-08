@@ -23,14 +23,20 @@
  * Emulated state therefore never differs from a run without --widescreen; the full-state hash
  * test (tools/test_widescreen.sh) checks that. Costs: one extra renderer run and two 2 MB copies
  * per rendered fight frame.
+ *
+ * Host-side state the generated code keeps besides guest state (e.g. PGXP precision tags) is
+ * saved/restored around the wide pass through widescreen_add_state_hook() (widescreen.h).
+ * g_widescreen can change between frames (frontend_set_widescreen): the next stage_render then
+ * simply does or does not run the shadow pass.
  */
 #include "override.h"
 #include "gen_protos.h"
 #include "hires.h"
+#include "widescreen.h"
 #include <stdlib.h>
 #include <string.h>
 
-int g_widescreen;                       /* --widescreen (main.c) */
+int g_widescreen;                       /* shadow pass on (frontend_set_widescreen, main.c) */
 extern int g_widescreen_cull;           /* rt.c: WS_IMM() yields the widened bound */
 extern int g_bus_sandbox;               /* bus.c */
 extern u32 g_bus_sandbox_hits;
@@ -186,6 +192,23 @@ static void ll_hook(u32 node)
     }
 }
 
+/* ---- control -------------------------------------------------------------------------- */
+
+static struct { void (*save)(void); void (*restore)(void); } s_hooks[8];
+static int s_nhooks;
+
+void widescreen_add_state_hook(void (*save)(void), void (*restore)(void))
+{
+    if (s_nhooks < 8) { s_hooks[s_nhooks].save = save; s_hooks[s_nhooks].restore = restore; s_nhooks++; }
+    else rt_log("widescreen: too many state hooks");
+}
+
+void widescreen_enable(bool on)
+{
+    g_widescreen = on;
+    for (int i = 0; i < 2; i++) { s_cap[i].valid = false; s_used[i] = false; }
+}
+
 /* ---- the override ------------------------------------------------------------------- */
 
 static void stage_render(void)
@@ -204,6 +227,7 @@ static void stage_render(void)
     gte_save(&gte);
     memcpy(s_ram_bak, g_ram, RAM_SIZE);
     memcpy(s_scr_bak, g_scratch, sizeof g_scratch);
+    for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].save) s_hooks[i].save();
     /* 2. widened pass, sealed off from interrupts and hardware */
     const u32 hits = g_bus_sandbox_hits;
     g_cpu.next_event = ~0ull;
@@ -217,6 +241,7 @@ static void stage_render(void)
     memcpy(g_ram, s_ram_bak, RAM_SIZE);
     memcpy(g_scratch, s_scr_bak, sizeof g_scratch);
     gte_restore(&gte);
+    for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].restore) s_hooks[i].restore();
     g_cpu = cpu;
     g_depth = depth;
     f_80044210_orig();
@@ -237,7 +262,7 @@ void f_80044210(void) { override_call("stage_render", f_80044210_orig, stage_ren
 
 void widescreen_report(void)
 {
-    if (g_widescreen)
+    if (s_passes || g_widescreen)
         rt_log("widescreen: %llu shadow passes, %llu extra stage packets, %llu rejected",
                (unsigned long long)s_passes, (unsigned long long)s_extras, (unsigned long long)s_rejected);
 }

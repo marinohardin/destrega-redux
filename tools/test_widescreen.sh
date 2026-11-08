@@ -8,6 +8,8 @@
 #   ws46     --widescreen, 4x6, worker threads
 #   wsresize --widescreen, auto scale, window resized between 16:9, 4:3, 21:9 and 16:10 mid-fight
 #   ws1      --widescreen, 1x1 with --hires-verify (the 4:3 part of the target == 1x VRAM)
+#   wstoggle starts 4:3, switched on/off six times mid-fight (--widescreen-at; the same path as
+#            frontend_set_widescreen / F9), screenshots every 50 frames
 # Checks:
 #  1. per frame, the gameplay trace (both fighters' health, gauge and position, round time,
 #     round wins, RNG seed, a hash of both fighter structs; --gameplay-trace) equals off's;
@@ -15,7 +17,9 @@
 #     cycle counter; --state-hash) equals off's - i.e. nothing at all differs;
 #  3. the shadow pass ran, found extra stage packets and was never rejected;
 #  4. >= 80% of fight-window frames were presented wider than 4:3 in the 16:9 runs;
-#  5. 0 textured samples outside their clamp range; 1x1: 0 mismatching frames.
+#  5. 0 textured samples outside their clamp range; 1x1: 0 mismatching frames;
+#  6. wstoggle: presented wide only while switched on, and soon after every switch-on
+#     (tools/check_ws_toggle.py, from the log and the screenshots).
 # Usage: tools/test_widescreen.sh [frames]   (default 9000; needs build/cmake/destrega)
 cd "$(dirname "$0")/.."
 if [ "$1" != "--job" ]; then FRAMES=${1:-9000}; fi
@@ -36,6 +40,7 @@ fi
 
 mkdir -p $OUT
 rm -f $OUT/*.hash $OUT/*.trace $OUT/*.log $OUT/*.rc
+rm -rf $OUT/toggle; mkdir -p $OUT/toggle
 JOBS=${JOBS:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
 cat > $OUT/jobs.txt <<EOF
 ws46 --widescreen --scale 4x6 --window 1280x720 --hires-threads 3
@@ -44,13 +49,14 @@ ws2 --widescreen --scale 2 --window 1280x720 --hires-threads 1
 ws2b --widescreen --scale 2 --window 1280x720 --hires-threads 0
 ws1 --widescreen --scale 1 --window 1280x720 --hires-verify --hires-threads 0
 off --scale 2 --hires-threads 0
+wstoggle --scale 2 --window 1280x720 --hires-threads 0 --widescreen-at 3900:1,4600:0,5300:1,6200:0,6900:1,8000:0 --dump build/widescreen/toggle --dump-every 50
 EOF
 START=$(date +%s)
 xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
 ELAPSED=$(( $(date +%s) - START ))
 
 fail=0
-WS="ws2 ws2b ws46 wsresize ws1"
+WS="ws2 ws2b ws46 wsresize ws1 wstoggle"
 echo "widescreen: ran $(wc -l < $OUT/jobs.txt) runs of $FRAMES frames, $JOBS at a time, in ${ELAPSED}s"
 for n in off $WS; do
   rc=$(cat $OUT/$n.rc 2>/dev/null || echo missing)
@@ -82,5 +88,6 @@ grep -h "resize\|render scale" $OUT/wsresize.log | sed 's/^\[ *[0-9]*\] /widescr
 grep -h "hires-verify" $OUT/ws1.log | sed 's/^\[ *[0-9]*\] /widescreen: ws1: /'
 grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/ws1.log ||
   { echo "widescreen: ws1: the 4:3 part of the target differs from the 1x VRAM"; fail=1; }
+python3 tools/check_ws_toggle.py $OUT/wstoggle.log $OUT/toggle 6 || fail=1
 [ $fail = 0 ] || { echo "widescreen: FAIL"; exit 1; }
 echo "widescreen: gameplay and all emulated state identical with --widescreen; shadow pass + 16:9 presentation ok"

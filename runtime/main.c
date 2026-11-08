@@ -1,7 +1,9 @@
 /* Frontend: boot, SDL3 window/audio/input, headless test mode. */
 #include "recomp.h"
 #include "mdec.h"
+#include "memcard.h"
 #include "hires.h"
+#include "widescreen.h"
 #include "overrides/override.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -38,7 +40,12 @@ static bool s_win_set;                     /* --window given */
  * same amount (analysis/widescreen_cull.txt). Presented 16:9 (or the window aspect, if
  * narrower) while the stage is being drawn, 4:3 otherwise. */
 #define WS_GUARD 88
-static bool s_widescreen;
+static bool s_widescreen;                  /* active (shadow pass + wide presentation) */
+static bool s_ws_req;                      /* requested: --widescreen, frontend_set_widescreen() */
+static bool s_ws_used;                     /* was ever on (for the run summary) */
+typedef struct { u64 frame; bool on; } WsStep;
+static WsStep s_ws_steps[64];              /* --widescreen-at F:0|1,... (headless toggle schedule) */
+static int s_ws_step_n;
 static u64 s_ws_stage_frame;               /* last frame a widened culling bound was evaluated */
 static bool s_ws_stage;                    /* stage drawn within the last few frames */
 static int s_pres_w, s_pres_h;             /* window (physical pixels) presentation is laid out for */
@@ -62,6 +69,9 @@ static int seg_of(u64 frame) {
 static bool s_hires_dither;
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
+static const char *s_memcard_path[2];  /* --memcard1/2 */
+static bool s_no_memcard;
+static const char *s_ram_dump;     /* --ram-dump FILE: main RAM at the end of a headless run */
 static FILE *s_state_hash;         /* --state-hash FILE */
 static FILE *s_gameplay;           /* --gameplay-trace FILE */
 static u64 s_ws_wide[2];           /* widescreen: frames presented wider than 4:3 (all, fight window) */
@@ -226,6 +236,8 @@ static void poll_input(void) {
             bool down = e.type == SDL_EVENT_KEY_DOWN;
             if (e.key.key == SDLK_ESCAPE && down) exit(0);
             if (e.key.key == SDLK_TAB) s_fast = down;
+            if (e.key.key == SDLK_F9 && down && !e.key.repeat)   /* temporary, until the View menu */
+                frontend_set_widescreen(!frontend_widescreen());
             if (e.key.key == SDLK_F12 && down) {
                 char p[64]; snprintf(p, sizeof p, "shot_%06llu.png", (unsigned long long)s_frame);
                 frontend_screenshot(p);
@@ -290,6 +302,7 @@ static void write_state_hash(void) {
     for (int i = 0; i < 32; i++) misc[4 + i] = g_cpu.cop0[i];
     misc[36] = g_cpu.next_event;
     h = hash_mix(h, misc, sizeof misc);
+    h = memcard_hash(h);
     fprintf(s_state_hash, "%llu %016llx\n", (unsigned long long)s_frame, (unsigned long long)h);
 }
 
@@ -355,6 +368,28 @@ static void apply_window_size(int pw, int ph, bool simulated) {
     }
 }
 
+/* ---- runtime 4:3 / 16:9 switch ---- */
+
+void frontend_set_widescreen(bool on) { s_ws_req = on; }
+bool frontend_widescreen(void) { return s_ws_req; }
+
+/* Apply a requested switch; runs at the start of a vblank, i.e. between frames. */
+static void ws_apply(void) {
+    if (s_ws_req == s_widescreen) return;
+    s_widescreen = s_ws_req;
+    s_ws_used |= s_widescreen;
+    widescreen_enable(s_widescreen);
+    s_ws_stage = false;
+    s_ws_stage_frame = 0;
+    rt_log("widescreen: %s at frame %llu", s_widescreen ? "on" : "off", (unsigned long long)s_frame);
+    int cx, cy;
+    if (!s_widescreen || !hires_get_scale(&cx, &cy)) return;
+    /* first switch-on: allocate the guard band (kept from then on), re-pick an auto scale */
+    hires_set_guard(WS_GUARD);
+    if (s_opt_sx < 0 && s_pres_w > 0) apply_window_size(s_pres_w, s_pres_h, true);
+    if (hires_get_scale(&cx, &cy) && hires_guard() != WS_GUARD) hires_set_scale(cx, cy);
+}
+
 extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g_hires_stat_inline_jobs;
 static void finish(void) {
     void widescreen_report(void); widescreen_report();
@@ -362,7 +397,7 @@ static void finish(void) {
     if (s_state_hash) fclose(s_state_hash);
     if (s_gameplay) fclose(s_gameplay);
     int rc = 0;
-    if (s_widescreen)
+    if (s_ws_used)
         rt_log("widescreen-frames: %llu presented wider than 4:3 (%llu in fight window of %llu)",
                (unsigned long long)s_ws_wide[0], (unsigned long long)s_ws_wide[1],
                (unsigned long long)(s_hr_used[1] + s_hr_fallback[1]));
@@ -421,6 +456,9 @@ static void finish(void) {
 
 void frontend_vblank(void) {
     s_frame++;
+    for (int i = 0; i < s_ws_step_n; i++)
+        if (s_ws_steps[i].frame == s_frame) s_ws_req = s_ws_steps[i].on;
+    ws_apply();
     if (s_widescreen) {
         static u32 last_hits;
         if (g_ws_cull_hits != last_hits) s_ws_stage_frame = s_frame;
@@ -455,7 +493,12 @@ void frontend_vblank(void) {
             int f = s_frame >= s_fight_from;
             (used ? s_hr_used : s_hr_fallback)[0]++;
             if (f) (used ? s_hr_used : s_hr_fallback)[1]++;
-            if (used && ws_present_extra(&d) > 0) { s_ws_wide[0]++; if (f) s_ws_wide[1]++; }
+            bool wide = used && ws_present_extra(&d) > 0;
+            if (wide) { s_ws_wide[0]++; if (f) s_ws_wide[1]++; }
+            static bool was_wide;
+            if (wide != was_wide && (s_ws_step_n || g_trace))   /* checked by test_widescreen.sh */
+                rt_log("widescreen-present: frame %llu %s", (unsigned long long)s_frame, wide ? "wide" : "4:3");
+            was_wide = wide;
         }
     }
     {
@@ -536,6 +579,7 @@ void frontend_vblank(void) {
                 snprintf(p, sizeof p, "%s/frame_final.png", s_dump_dir);
                 frontend_screenshot(p);
             }
+            if (s_ram_dump) { FILE *rf = fopen(s_ram_dump, "wb"); if (rf) { fwrite(g_ram, 1, RAM_SIZE, rf); fclose(rf); } }
             if (s_wav) { wav_header(s_wav, s_wav_bytes); fclose(s_wav); }
             rt_log("headless: reached %llu frames", (unsigned long long)s_frame);
             void rt_dump_stack(void); rt_dump_stack();
@@ -677,12 +721,19 @@ static void usage(void) {
         "  --hires-min-fight P   exit non-zero unless P%% of fight frames were shown from the hi-res target\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
+        "  --ram-dump FILE       headless: write main RAM to FILE at the end\n"
+        "  --memcard1 PATH       memory card image for slot 1 (raw 128 KiB .mcd; created if missing)\n"
+        "  --memcard2 PATH       memory card image for slot 2 (default: empty slot)\n"
+        "  --no-memcard          no memory cards at all (the game cannot save)\n"
+        "                        (default: <data dir>/memcard1.mcd; headless runs: no card unless given)\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
         "  --gameplay-trace FILE per frame: fighters' health/gauge/position, round time, wins, RNG seed\n"
         "  --ram-snap DIR        write raw guest RAM + scratchpad to DIR every --ram-snap-every N frames (100)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
         "  --widescreen          16:9 fights: wider stage culling + hi-res guard band (menus/FMV stay 4:3;\n"
-        "                        needs hi-res; the window aspect picks 4:3..16:9; default window 1280x720)\n"
+        "                        needs hi-res; the window aspect picks 4:3..16:9; default window 1280x720;\n"
+        "                        F9 switches 4:3 / 16:9 at runtime)\n"
+        "  --widescreen-at F:0|1,...  headless: switch widescreen off/on at the given frames\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
@@ -825,6 +876,19 @@ int main(int argc, char **argv) {
                 if (*s == ',') s++;
             }
         }
+        else if (!strcmp(argv[i], "--widescreen-at") && i + 1 < argc) {
+            char *s = argv[++i];
+            while (*s && s_ws_step_n < 64) {
+                s_ws_steps[s_ws_step_n].frame = strtoull(s, &s, 0);
+                if (*s == ':') s++;
+                s_ws_steps[s_ws_step_n++].on = strtol(s, &s, 10) != 0;
+                if (*s == ',') s++;
+            }
+        }
+        else if (!strcmp(argv[i], "--ram-dump") && i + 1 < argc) s_ram_dump = argv[++i];
+        else if (!strcmp(argv[i], "--memcard1") && i + 1 < argc) s_memcard_path[0] = argv[++i];
+        else if (!strcmp(argv[i], "--memcard2") && i + 1 < argc) s_memcard_path[1] = argv[++i];
+        else if (!strcmp(argv[i], "--no-memcard")) s_no_memcard = true;
         else if (!strcmp(argv[i], "--import") && i + 1 < argc) import_path = argv[++i];
         else if (!strcmp(argv[i], "--data-dir") && i + 1 < argc) data_dir = argv[++i];
         else if (!strcmp(argv[i], "--help")) { usage(); return 0; }
@@ -837,6 +901,9 @@ int main(int argc, char **argv) {
     char *pref = data_dir ? NULL : SDL_GetPrefPath("", "Destrega");
     snprintf(pak, sizeof pak, "%s%sdestrega.pak", data_dir ? data_dir : (pref ? pref : "./"),
              data_dir ? "/" : "");
+    char default_card[2048];
+    snprintf(default_card, sizeof default_card, "%s%smemcard1.mcd",
+             data_dir ? data_dir : (pref ? pref : "./"), data_dir ? "/" : "");
     SDL_free(pref);
 
     if (import_path) {
@@ -864,9 +931,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (!s_no_memcard) {
+        /* Windowed play defaults to the user's card; headless runs only get a card when asked
+         * for, so tests never depend on whatever the user has saved. */
+        if (!s_memcard_path[0] && !s_headless) s_memcard_path[0] = default_card;
+        for (int p = 0; p < 2; p++) {
+            const char *err = memcard_attach(p, s_memcard_path[p]);
+            if (err) fprintf(stderr, "%s\n", err);
+            else if (s_memcard_path[p]) rt_log("memcard: slot %d = %s", p + 1, s_memcard_path[p]);
+        }
+        atexit(memcard_flush);
+    }
+
+    s_ws_req = s_widescreen;
+    s_ws_used = s_widescreen;
     if (s_widescreen) {
-        extern int g_widescreen;
-        g_widescreen = 1;
+        widescreen_enable(true);
         hires_set_guard(WS_GUARD);
         if (s_opt_sx == 0 || (s_headless && s_opt_sx < 0 && !s_resize_n))
             rt_log("widescreen: hi-res is off, so nothing beyond 4:3 can be shown");
