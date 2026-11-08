@@ -203,11 +203,66 @@ const char *disc_verify(void) {
 
 /* ---- import ------------------------------------------------------------------------ */
 
+/* Cheap structural checks on the file `disc_open` would read, so the user gets a precise message
+ * for the common wrong inputs instead of a generic one. */
+static const char *check_raw_image(const char *src) {
+    static const u8 sync[12] = {0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0};
+    char real[2048];
+    if (!resolve_cue(src, real, sizeof real))
+        return "Could not read the .cue file (expected a single MODE2/2352 data track).";
+    FILE *f = fopen(real, "rb");
+    if (!f) return "Could not open the disc image (for a .cue, the .bin it names must be next to it).";
+    u8 head[12];
+    size_t n = fread(head, 1, sizeof head, f);
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fclose(f);
+    if (size <= 0) return "That file is empty.";
+    if (n == sizeof head && !memcmp(head, PAK_MAGIC, 8)) return "That file is already a data pack.";
+    if (n < sizeof head || memcmp(head, sync, sizeof sync)) {
+        if (size % 2048 == 0)
+            return "This looks like a 2048-byte-sector .iso. Destrega streams its music and movies from "
+                   "CD-XA (mode 2 form 2) sectors, which an .iso cannot hold, so it cannot run from one. "
+                   "Use a raw 2352-byte-sector image: the .bin (or the .cue that names it).";
+        return "That is not a raw MODE2/2352 disc image (expected a .bin, a .cue or a raw-sector .iso).";
+    }
+    if (size % SECTOR)
+        return "That disc image is damaged or truncated (its size is not a whole number of 2352-byte sectors).";
+    return NULL;
+}
+
+typedef struct {
+    FILE *f; bool pak; u32 sectors; u64 *offsets; u32 blocks; u8 *cache, *zbuf; u32 cache_block;
+} DiscState;
+
+/* The import uses the same module state as the running game's disc. Park the game's state while
+ * importing (the "Load Game Image" menu runs inside a live session) and put it back afterwards. */
+static const char *disc_import_inner(const char *src, const char *pak_path, DiscProgressFn progress, void *ud);
 const char *disc_import(const char *src, const char *pak_path, DiscProgressFn progress, void *ud) {
+    DiscState keep = { s_f, s_pak, s_sectors, s_offsets, s_blocks, s_cache, s_zbuf, s_cache_block };
+    s_f = NULL; s_pak = false; s_sectors = 0; s_offsets = NULL; s_blocks = 0;
+    s_cache = s_zbuf = NULL; s_cache_block = 0xffffffffu;
+    const char *err = disc_import_inner(src, pak_path, progress, ud);
+    disc_close();
+    s_f = keep.f; s_pak = keep.pak; s_sectors = keep.sectors; s_offsets = keep.offsets;
+    s_blocks = keep.blocks; s_cache = keep.cache; s_zbuf = keep.zbuf; s_cache_block = keep.cache_block;
+    return err;
+}
+
+static const char *disc_import_inner(const char *src, const char *pak_path, DiscProgressFn progress, void *ud) {
+    const char *pre = check_raw_image(src);
+    if (pre) return pre;
     if (!disc_open(src)) return "Could not open the disc image (expected a MODE2/2352 .bin or a .cue).";
     if (s_pak) { disc_close(); return "That file is already a data pack."; }
     const char *err = disc_verify();
     if (err) { disc_close(); return err; }
+    {   /* the ISO9660 volume must fit in the file: catches truncated copies of the real disc */
+        u8 pvd[SECTOR];
+        if (!disc_read_sector(16, pvd) || le32(pvd + 24 + 80) > s_sectors) {
+            disc_close();
+            return "This disc image is incomplete (shorter than the disc it describes). Re-dump or re-copy it.";
+        }
+    }
 
     char tmp[2048];
     snprintf(tmp, sizeof tmp, "%s.tmp", pak_path);
