@@ -128,7 +128,7 @@ P2 slot `0x8001a268` (`Mxxx2.BIN`, `EVENTOVL.BIN`). See `recomp/overlays.py`.
 - Pads: libpad drives **SIO0 directly** (`runtime/sio.c`), not BIOS InitPAD.
 - CD: libcd at register level (`runtime/cdrom.c`); BIOS leaves CD int-enable = 0x1f.
   XA audio + STR video (5 movies, file channel 1) live in `XADATA.BNS`.
-- Memory card: reported as **absent** (no saves yet).
+- Memory cards: `runtime/memcard.c` (+ BIOS HLE in `bios.c`), see "Memory cards" below.
 
 ## Verification
 
@@ -141,6 +141,63 @@ Right 0x20, Down 0x40, Left 0x80, L2 0x100, R2 0x200, L1 0x400, R1 0x800,
 Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
 Headless runs ~200x real time (30k frames ≈ 13 s).
+
+## Memory cards (`runtime/memcard.[ch]`, `bios.c`)
+
+Standard raw 128 KiB images (`.mcd`, same as common emulators; DexDrive/`.gme`-style headered files
+are refused, never overwritten). Two slots. The game uses the BIOS card API, not SIO0 (details in
+`analysis/NOTES.md`), so cards are emulated at BIOS level: `_card_info/_card_load/_card_write/_card_read`
+and the `bu00:`/`bu10:` file calls run on the in-memory image immediately; the SwCARD/HwCARD
+completion events are queued and delivered from `bios_irq_prologue` (interrupt context, so on
+a vblank or other IRQ) ~60k cycles per sector later. SIO0 still answers 0x81 as "no card".
+
+- Options: `--memcard1 PATH`, `--memcard2 PATH` (created formatted-empty if missing), `--no-memcard`.
+  Windowed default: `memcard1.mcd` next to `destrega.pak`, slot 2 empty. **Headless has no card
+  unless given one** so tests never see a user's saves.
+- The image is written atomically (temp file + rename) after each completed card operation and at exit.
+- `--state-hash` includes the card images and the changed flag; `--ram-dump FILE` writes RAM at exit.
+- Tests: `runtime/tests/test_memcard.c` (format, chained files, directory, erase, persistence,
+  refusing bad images) and `tools/test_memcard.sh` (scripted save of a changed option from a fresh card, load in
+  a new run, identical hashes and card files across identical runs).
+- **Rollback netplay (future, not implemented): card writes must be suppressed during netplay**
+  (a rolled-back frame must not leave files behind, and the two peers' cards differ). The hook is
+  `memcard_set_write_protect(true)` (in-memory state keeps updating, flushing becomes a no-op);
+  card state must also be part of any snapshot (`memcard_hash` shows what it covers).
+
+## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_stub.c`, `main.c`)
+
+macOS gets a native **File** menu inserted after the app menu (SDL3 keeps building the standard
+app/Window menus; Quit still works). `menu_mac.m` (Cocoa, ARC, Apple only; `menu_stub.c` no-ops
+elsewhere) only builds items; each item calls `frontend_menu_action(NAME, ARG)` which **queues**. `main.c`
+runs the queue at the top of each VBlank (`menu_script_and_poll`), i.e. between frames on the main
+thread, so menus cannot disturb emulation. Headless runs never create menus.
+
+- **Load Game Image… (Cmd+O)**: native open dialog (SDL), `.cue/.bin/.iso`, then `import_image()` ->
+  `disc_import()` (the same code as the first-launch dialog and `--import`) into the data pack, then
+  `restart_process()` = clean re-exec (`DESTREGA_RESTARTED=1`, same argv minus `--menu-action` and any
+  positional image). Errors show a native alert and the game keeps running. `disc_import` parks the
+  running disc's module state while importing, so it is safe mid-game. Checks live in `disc.c`: wrong type,
+  raw sync pattern (a 2048-byte-sector `.iso` cannot hold the XA/FMV sectors and is refused with that
+  explanation; a raw 2352 `.iso` is fine), whole sectors, SLUS_007.32 CRC, and the ISO9660 volume size vs the
+  file size (catches truncated copies).
+- **Show Game Files in Finder (Cmd+Shift+R)**: opens the folder of the pack in use (or the loose image).
+- **Save Games** submenu (the UI deliberately never says "memory card" except for the file type; one slot, card
+  slot 1; slot 2, `--memcard2` and `--no-memcard` stay in the runtime for development/tests): Show Save Games in
+  Finder; Import Save Games… (open dialog "PlayStation memory card image (.mcd)"; validates 128 KiB + "MC" header
+  + checksum, confirms, keeps `memcard1-backup-YYYYmmdd-HHMMSS.mcd`, copies in place, re-attaches); Export Save
+  Games… (writes a standard .mcd after flushing); Delete Save Game… (the `BASLUS-00732*` file, confirmed).
+  Every swap flushes first and goes through `memcard_attach`, which closes open handles and raises the
+  card-changed flag like a real swap (`memcard_mark_new` after a delete).
+- Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
+  `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`. Headless: no dialogs (the file argument is
+  required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
+  unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
+  Log lines start with `menu:`; errors with `menu: ERROR:`.
+- Tests: `tools/test_menu.sh` (in `run_tests.sh`): load from `.cue` and raw `.iso` into a scratch data dir
+  with state hash equal to a plain run on that pack, 9 rejection cases, save import with backup (the game
+  really loads the imported save: ROUND COUNT byte), export, delete, invalid files. It rebuilds
+  a disc image from the pack with `tools/pak_to_bin.py` when `Destrega/Destrega.cue` is absent.
+- Not done: saves other than the game's own file, Windows/Linux menus.
 
 ## High-resolution rendering (`runtime/hires.[ch]`)
 

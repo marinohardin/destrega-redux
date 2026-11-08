@@ -68,6 +68,31 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   fills, 3638 VRAM->VRAM copies (3547 with the source inside the framebuffer region), and
   29.6M CPU->VRAM upload pixels (29.26M inside the framebuffer region, i.e. mostly FMV).
 
+## Memory card
+
+- Access path (verified: trace): never SIO0. A libmcrd-style library (`800a4xxx`-`800a7xxx`) calls
+  the BIOS: InitCARD/StartCARD, `_card_info` (A0:ab), `_card_load` (A0:ac), `_card_write`
+  (B0:4e, only to clear the changed flag), `_new_card` (B0:50) and the `bu00:` file calls
+  open/lseek/read/write/close/firstfile/nextfile/erase/format (B0:32..45). Reads and writes are
+  asynchronous (open mode bit 0x8000): the call returns 0 and the BIOS later posts SwCARD
+  (f4000001) and HwCARD (f0000011) events (IOE 0004, ERROR 8000, TIMOUT 0100, NEW 2000) that
+  the library receives through callbacks it registered at `800a6518..65a4`. One 128-byte sector
+  per event, so a save of N sectors takes ~N frames. The library also walks the kernel DCB table
+  (words at 0x150/0x154) looking for device "bu"; HLE must provide it (bios.c).
+- What it saves (verified): MEMORY CARD > SAVE writes one 1-block file `BASLUS-00732DESTREGA`
+  (8192 bytes, standard `SC` icon header; title in Shift-JIS "DESTREGA: TRY STORY MODE" for a
+  fresh game, other titles "NEXT SCENE" / "STORY MODE CLEARED" exist in the message table). Data
+  starts at file offset 0x200 (1 checksum byte, then the option block: ROUND COUNT verified at
+  +8; story/unlock progress is presumably in the rest, unverified). The game also reads the first
+  6 sectors at boot (frame ~100) and applies them to the live option block `800bee64` without
+  any menu action; MEMORY CARD > LOAD re-reads. AUTO SAVE ON/OFF is a menu item (not exercised).
+- Startup sequence with a card: `_card_info` -> NEW, `_new_card`+write sector 63 (accept),
+  `_card_load`, `firstfile`, `_card_info`, `_card_load`. Real cards report NEW until the first
+  write; the runtime models that flag (memcard.c).
+- Not exercised yet: second slot, FORMAT flow, full card, unformatted/corrupt cards, deleting.
+  Unformatted card = ERROR event on `_card_load`; the game's messages for these are in the table
+  at `800b5474`. (guess: untested in game)
+
 ## Collision
 
 - Stage collision is a separate list of polygons (up to 4 vertices, precomputed 4.12 normal),
@@ -76,8 +101,7 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
 
 ## Input / hardware use
 
-- Pads: libpad drives SIO0 directly (not BIOS InitPAD). Memory card is reported absent, so the
-  game never saves. (verified: runtime)
+- Pads: libpad drives SIO0 directly (not BIOS InitPAD). Memory cards: see "Memory card" below.
 - CD: libcd at register level; XA audio and the 5 STR movies live in `XADATA.BNS`.
 
 ## Test coverage facts

@@ -1,6 +1,8 @@
 /* Frontend: boot, SDL3 window/audio/input, headless test mode. */
 #include "recomp.h"
 #include "mdec.h"
+#include "memcard.h"
+#include "menu.h"
 #include "hires.h"
 #include "hires_gpu.h"
 #include "overrides/override.h"
@@ -8,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <limits.h>
 #include <zlib.h>
 
 void bus_init(void);
@@ -53,6 +58,19 @@ static int seg_of(u64 frame) {
 static bool s_hires_dither;
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
+static const char *s_memcard_path[2];  /* --memcard1/2 */
+static bool s_no_memcard;
+/* menu state (see "Application menus" below) */
+static int s_argc; static char **s_argv;
+static char s_pak_path[2048];          /* data pack in use / to create */
+static char s_card_dir[2048];          /* folder for default card images, "" or ends with '/' */
+static const char *s_disc_path;        /* positional image (dev use), else NULL */
+static bool s_data_dir_given;
+typedef struct { u64 frame; char name[24]; char arg[2048]; } MenuStep;
+static MenuStep s_menu_script[16];     /* --menu-action FRAME:NAME[=ARG] test hook */
+static int s_menu_script_n;
+static void menu_script_and_poll(void);
+static const char *s_ram_dump;     /* --ram-dump FILE: main RAM at the end of a headless run */
 static FILE *s_state_hash;         /* --state-hash FILE */
 typedef struct { u64 frame; int w, h; } ResizeStep;
 static ResizeStep s_resizes[256];
@@ -284,6 +302,7 @@ static void write_state_hash(void) {
     for (int i = 0; i < 32; i++) misc[4 + i] = g_cpu.cop0[i];
     misc[36] = g_cpu.next_event;
     h = hash_mix(h, misc, sizeof misc);
+    h = memcard_hash(h);
     fprintf(s_state_hash, "%llu %016llx\n", (unsigned long long)s_frame, (unsigned long long)h);
 }
 
@@ -403,6 +422,7 @@ void frontend_vblank(void) {
         s_last_vb_ns = now;
     }
     static s16 audio[2048 * 2];
+    menu_script_and_poll();
     for (int i = 0; i < s_resize_n; i++)
         if (s_resizes[i].frame == s_frame) {
             rt_log("resize %dx%d", s_resizes[i].w, s_resizes[i].h);
@@ -508,6 +528,7 @@ void frontend_vblank(void) {
                 snprintf(p, sizeof p, "%s/frame_final.png", s_dump_dir);
                 frontend_screenshot(p);
             }
+            if (s_ram_dump) { FILE *rf = fopen(s_ram_dump, "wb"); if (rf) { fwrite(g_ram, 1, RAM_SIZE, rf); fclose(rf); } }
             if (s_wav) { wav_header(s_wav, s_wav_bytes); fclose(s_wav); }
             rt_log("headless: reached %llu frames", (unsigned long long)s_frame);
             void rt_dump_stack(void); rt_dump_stack();
@@ -661,12 +682,20 @@ static void usage(void) {
         "  --hires-min-fight P   exit non-zero unless P%% of fight frames were shown from the hi-res target\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
+        "  --ram-dump FILE       headless: write main RAM to FILE at the end\n"
+        "  --memcard1 PATH       memory card image for slot 1 (raw 128 KiB .mcd; created if missing)\n"
+        "  --memcard2 PATH       memory card image for slot 2 (default: empty slot)\n"
+        "  --no-memcard          no memory cards at all (the game cannot save)\n"
+        "                        (default: <data dir>/memcard1.mcd; headless runs: no card unless given)\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
         "  --renderer R          hi-res renderer: software (default), gpu (SDL_GPU/Metal), or compare\n"
         "                        (software shown, gpu fed the same commands and compared to it)\n"
         "  --compare-every N     compare mode: compare the targets every N frames (default 30)\n"
         "  --compare-max PCT     compare mode: exit non-zero if a fight frame differs in more than PCT%% of pixels\n"
+        "  --menu-action F:NAME[=ARG]  (testing) run a File-menu action on frame F: load=IMAGE, reveal-game,\n"
+        "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete\n"
+        "                        (save actions use card slot 1; headless needs --data-dir or --memcard1)\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
@@ -702,6 +731,21 @@ static void cli_progress(void *ud, float frac) {
     if (frac >= 1) fputc('\n', stderr);
 }
 
+/* The one place a disc image becomes a data pack, for first launch and File > Load Game Image:
+ * checks the file type, then disc_import() (which validates the disc itself). */
+static const char *import_image(const char *path, const char *pak, DiscProgressFn progress) {
+    const char *dot = strrchr(path, '.');
+    static const char *ok[] = {".cue", ".bin", ".iso"};
+    bool good = false;
+    for (int i = 0; dot && i < 3; i++) {
+        const char *a = dot, *b = ok[i];
+        while (*a && *b && (*a | 32) == *b) a++, b++;
+        if (!*a && !*b) good = true;
+    }
+    if (!good) return "Unsupported file type. Choose the disc image of the North American release: a .cue, a .bin, or a raw 2352-byte-sector .iso.";
+    return disc_import(path, pak, progress, NULL);
+}
+
 /* Windowed first launch: ask for the user's own disc image and import it.
  * Returns true once `pak` exists. */
 static bool gui_import(const char *pak) {
@@ -709,7 +753,7 @@ static bool gui_import(const char *pak) {
         "Destrega needs your own copy of the game (North American release, SLUS-00732).\n\n"
         "Select your disc image (.cue or .bin). It is converted once into a private data pack; "
         "afterwards the original image is no longer needed.", s_win);
-    static const SDL_DialogFileFilter filters[] = {{"PlayStation disc image", "cue;bin"}};
+    static const SDL_DialogFileFilter filters[] = {{"PlayStation disc image", "cue;bin;iso"}};
     for (;;) {
         s_pick_state = 0;
         SDL_ShowOpenFileDialog(pick_cb, NULL, s_win, filters, 1, NULL, false);
@@ -718,13 +762,272 @@ static bool gui_import(const char *pak) {
             if (SDL_WaitEventTimeout(&e, 50) && e.type == SDL_EVENT_QUIT) return false;
         }
         if (s_pick_state < 0) return false;
-        const char *err = disc_import(s_pick, pak, draw_progress, NULL);
+        const char *err = import_image(s_pick, pak, draw_progress);
         if (!err) {
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Destrega",
                 "Import complete. You can now delete or move the original disc image.", s_win);
             return true;
         }
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Destrega", err, s_win);
+    }
+}
+
+/* ---- Application menus (File menu; native on macOS, see menu.h) ------------------------------
+ * Menu items and the --menu-action test hook both go through frontend_menu_action(), which only
+ * queues; menu_script_and_poll() runs the queue at the top of each VBlank, i.e. between frames on
+ * the main thread. Headless runs never create menus, but run the same handlers (no dialogs: file
+ * arguments are required, confirmations are auto-accepted and logged). */
+
+typedef struct { char name[24]; char arg[2048]; } MenuAction;
+static MenuAction s_menu_q[8];
+static int s_menu_q_n;
+
+void frontend_menu_action(const char *name, const char *arg) {
+    if (s_menu_q_n >= 8) return;
+    MenuAction *a = &s_menu_q[s_menu_q_n++];
+    snprintf(a->name, sizeof a->name, "%s", name);
+    snprintf(a->arg, sizeof a->arg, "%s", arg ? arg : "");
+}
+
+static void menu_alert(const char *msg) {
+    rt_log("menu: ERROR: %s", msg);
+    if (!s_headless) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Destrega", msg, s_win);
+}
+
+static bool menu_confirm(const char *msg, const char *yes) {
+    if (s_headless) { rt_log("menu: confirm \"%s\" -> %s (headless: automatic)", msg, yes); return true; }
+    const SDL_MessageBoxButtonData b[] = {
+        {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Cancel"},
+        {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, yes}};
+    SDL_MessageBoxData d = {SDL_MESSAGEBOX_WARNING, s_win, "Destrega", msg, 2, b, NULL};
+    int hit = 0;
+    return SDL_ShowMessageBox(&d, &hit) && hit == 1;
+}
+
+/* Blocking native open/save dialog (windowed only). */
+static bool menu_pick(bool save, const SDL_DialogFileFilter *f, int nf, const char *def, char *out, size_t n) {
+    s_pick_state = 0;
+    if (save) SDL_ShowSaveFileDialog(pick_cb, NULL, s_win, f, nf, def);
+    else SDL_ShowOpenFileDialog(pick_cb, NULL, s_win, f, nf, def, false);
+    while (s_pick_state == 0) {
+        SDL_Event e;
+        if (SDL_WaitEventTimeout(&e, 50) && e.type == SDL_EVENT_QUIT) exit(0);
+    }
+    if (s_pick_state < 0) return false;
+    snprintf(out, n, "%s", s_pick);
+    return true;
+}
+
+static bool file_exists(const char *p) { SDL_PathInfo i; return SDL_GetPathInfo(p, &i); }
+
+static bool same_file(const char *a, const char *b) {
+    if (!strcmp(a, b)) return true;
+#ifndef _WIN32
+    char ra[PATH_MAX], rb[PATH_MAX];
+    return realpath(a, ra) && realpath(b, rb) && !strcmp(ra, rb);
+#else
+    return false;
+#endif
+}
+
+static bool copy_file(const char *src, const char *dst) {
+    char tmp[2100];
+    snprintf(tmp, sizeof tmp, "%s.tmp", dst);
+    FILE *i = fopen(src, "rb"), *o = i ? fopen(tmp, "wb") : NULL;
+    bool ok = i && o;
+    char buf[65536];
+    size_t k;
+    while (ok && (k = fread(buf, 1, sizeof buf, i)) > 0) ok = fwrite(buf, 1, k, o) == k;
+    if (i) fclose(i);
+    if (o) ok = fclose(o) == 0 && ok;
+    if (ok) ok = rename(tmp, dst) == 0;
+    if (!ok) remove(tmp);
+    return ok;
+}
+
+static void dir_of(const char *path, char *out, size_t n) {
+    snprintf(out, n, "%s", path);
+    char *sl = strrchr(out, '/');
+    if (sl && sl != out) *sl = 0;
+    else if (!sl) snprintf(out, n, ".");
+}
+
+static void import_progress(void *ud, float frac) {
+    (void)ud;
+    if (!s_headless) draw_progress(NULL, frac);
+}
+
+/* After a new data pack is in place: re-exec the process (a clean machine, never a half-reset one). */
+static void restart_process(void) {
+    char exe[PATH_MAX];
+    if (!menu_executable_path(exe, sizeof exe)) snprintf(exe, sizeof exe, "%s", s_argv[0]);
+    char **av = calloc((size_t)s_argc + 2, sizeof *av);
+    int n = 0;
+    av[n++] = exe;
+    for (int i = 1; i < s_argc; i++) {
+        if (!strcmp(s_argv[i], "--menu-action") && i + 1 < s_argc) { i++; continue; }
+        if (s_disc_path && s_argv[i] == s_disc_path) continue;   /* run from the new pack instead */
+        av[n++] = s_argv[i];
+    }
+    rt_log("menu: restarting on the new data pack");
+    memcard_flush();
+    if (s_state_hash) fflush(s_state_hash);
+    fflush(NULL);
+    setenv("DESTREGA_RESTARTED", "1", 1);
+    if (!s_headless) { if (s_audio) SDL_DestroyAudioStream(s_audio); SDL_Quit(); }
+    execv(exe, av);
+    fprintf(stderr, "menu: ERROR: cannot restart (%s)\n", exe);
+    exit(1);
+}
+
+static void action_load(const char *arg) {
+    char path[2048];
+    static const SDL_DialogFileFilter filters[] = {{"PlayStation disc image", "cue;bin;iso"}};
+    if (*arg) snprintf(path, sizeof path, "%s", arg);
+    else if (s_headless || !menu_pick(false, filters, 1, NULL, path, sizeof path)) {
+        if (s_headless) menu_alert("load needs an image path in headless mode (load=FILE)");
+        return;
+    }
+    rt_log("menu: load game image %s", path);
+    memcard_flush();
+    if (!s_headless) SDL_SetRenderLogicalPresentation(s_ren, 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+    const char *err = import_image(path, s_pak_path, import_progress);
+    if (!s_headless) SDL_SetRenderLogicalPresentation(s_ren, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+    if (err) { rt_log("menu: load REJECTED"); menu_alert(err); return; }
+    rt_log("menu: load OK (%s)", s_pak_path);
+    restart_process();
+}
+
+static void action_reveal(bool cards) {
+    char dir[2048];
+    if (cards) {
+        const char *p = memcard_path(0);
+        if (p) dir_of(p, dir, sizeof dir);
+        else if (s_card_dir[0]) snprintf(dir, sizeof dir, "%s", s_card_dir);
+        else { menu_alert("No save location is known (try --memcard1 or --data-dir)."); return; }
+        size_t l = strlen(dir);
+        if (l > 1 && dir[l - 1] == '/') dir[l - 1] = 0;
+    } else dir_of(s_disc_path ? s_disc_path : s_pak_path, dir, sizeof dir);
+    SDL_CreateDirectory(dir);
+    rt_log("menu: show %s in file manager: %s", cards ? "save games" : "game files", dir);
+    if (!s_headless) menu_reveal(dir);
+}
+
+/* ---- memory card actions ------------------------------------------------------------------- */
+
+/* The menus expose a single save slot (card slot 1). ARG is an optional FILE. */
+static bool card_args(const char *arg, int *slot, const char **file) {
+    if (s_no_memcard) { menu_alert("Saving is disabled (--no-memcard)."); return false; }
+    *slot = 0;
+    *file = arg;
+    return true;
+}
+
+/* Where slot `slot`'s card image lives: the attached one, --memcardN, or the default beside the pack.
+ * Headless runs never fall back to the user's real data folder. */
+static bool card_slot_path(int slot, char *out, size_t n) {
+    const char *p = memcard_path(slot);
+    if (!p) p = s_memcard_path[slot];
+    if (p) { snprintf(out, n, "%s", p); return true; }
+    if (s_headless && !s_data_dir_given) return false;
+    snprintf(out, n, "%smemcard%d.mcd", s_card_dir, slot + 1);
+    return true;
+}
+
+static void card_stamp(char *out, size_t n) {
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(out, n, "%Y%m%d-%H%M%S", &tm);
+}
+
+static void action_card_import(const char *arg) {
+    int slot; const char *file;
+    if (!card_args(arg, &slot, &file)) return;
+    char src[2048], dest[2048];
+    static const SDL_DialogFileFilter filters[] = {{"PlayStation memory card image (.mcd)", "mcd;mcr;mc;bin;ps1;srm;vmp"}, {"All files", "*"}};
+    if (*file) snprintf(src, sizeof src, "%s", file);
+    else if (s_headless || !menu_pick(false, filters, 2, NULL, src, sizeof src)) {
+        if (s_headless) menu_alert("save-import needs FILE in headless mode");
+        return;
+    }
+    const char *err = memcard_validate_file(src);
+    if (err) { rt_log("menu: save-import REJECTED"); menu_alert(err); return; }
+    if (!card_slot_path(slot, dest, sizeof dest)) { menu_alert("No save location (headless needs --data-dir or --memcard1)."); return; }
+    if (same_file(src, dest)) { menu_alert("Those are already your current save games."); return; }
+    memcard_flush();                                  /* the on-disk card is now current */
+    char backup[2200] = "";
+    if (file_exists(dest)) {
+        char stamp[32], base[2100];
+        card_stamp(stamp, sizeof stamp);
+        snprintf(base, sizeof base, "%s", dest);
+        size_t l = strlen(base);
+        if (l > 4 && !strcmp(base + l - 4, ".mcd")) base[l - 4] = 0;
+        snprintf(backup, sizeof backup, "%s-backup-%s.mcd", base, stamp);
+        char msg[4600];
+        snprintf(msg, sizeof msg, "Replace your save games with the ones in this PlayStation memory card image (.mcd)?\n\nYour current save games are kept as a backup:\n%s", backup);
+        if (!menu_confirm(msg, "Replace")) return;
+        if (!copy_file(dest, backup)) { menu_alert("Could not write the backup of your current save games; nothing was changed."); return; }
+    }
+    if (!copy_file(src, dest)) { menu_alert("Could not write the save games (is the folder writable?)."); return; }
+    err = memcard_attach(slot, dest);                 /* reloads the file and raises the card-changed flag */
+    if (err) { menu_alert(err); return; }
+    rt_log("menu: save-import OK slot %d <- %s (backup: %s)", slot + 1, src, *backup ? backup : "none");
+}
+
+static void action_card_export(const char *arg) {
+    int slot; const char *file;
+    if (!card_args(arg, &slot, &file)) return;
+    if (!memcard_present(slot)) { menu_alert("There are no save games to export."); return; }
+    char dst[2048];
+    char def[2200];
+    snprintf(def, sizeof def, "%sDestrega-saves.mcd", s_card_dir);
+    static const SDL_DialogFileFilter filters[] = {{"PlayStation memory card image (.mcd)", "mcd"}};
+    if (*file) snprintf(dst, sizeof dst, "%s", file);
+    else if (s_headless || !menu_pick(true, filters, 1, def, dst, sizeof dst)) {
+        if (s_headless) menu_alert("save-export needs FILE in headless mode");
+        return;
+    }
+    const char *err = memcard_export(slot, dst);
+    if (err) { menu_alert(err); return; }
+    rt_log("menu: save-export OK slot %d -> %s", slot + 1, dst);
+}
+
+static void action_card_delete(const char *arg) {
+    int slot; const char *file;
+    if (!card_args(arg, &slot, &file)) return;
+    if (!memcard_present(slot)) { menu_alert("There are no save games to export."); return; }
+    McDirEntry e;
+    int cur = 0;
+    if (!memcard_dir_next(slot, "BASLUS-00732*", &cur, &e)) { menu_alert("There is no save game to delete."); return; }
+    char msg[256];
+    snprintf(msg, sizeof msg, "Delete your saved game?\n\nThis cannot be undone. Use Export Save Games first if you want a copy.");
+    if (!menu_confirm(msg, "Delete")) return;
+    memcard_flush();
+    if (!memcard_erase(slot, e.name)) { menu_alert("Could not delete the save."); return; }
+    memcard_flush();
+    memcard_mark_new(slot);                           /* as if the card were pulled and re-inserted */
+    rt_log("menu: save-delete OK slot %d (%s)", slot + 1, e.name);
+}
+
+static void menu_run(const char *name, const char *arg) {
+    rt_log("menu: action %s%s%s", name, *arg ? " " : "", arg);
+    if (!strcmp(name, "load")) action_load(arg);
+    else if (!strcmp(name, "reveal-game")) action_reveal(false);
+    else if (!strcmp(name, "reveal-saves")) action_reveal(true);
+    else if (!strcmp(name, "save-import")) action_card_import(arg);
+    else if (!strcmp(name, "save-export")) action_card_export(arg);
+    else if (!strcmp(name, "save-delete")) action_card_delete(arg);
+    else rt_log("menu: unknown action %s", name);
+}
+
+static void menu_script_and_poll(void) {
+    for (int i = 0; i < s_menu_script_n; i++)
+        if (s_menu_script[i].frame == s_frame) frontend_menu_action(s_menu_script[i].name, s_menu_script[i].arg);
+    while (s_menu_q_n) {
+        MenuAction a = s_menu_q[0];
+        memmove(s_menu_q, s_menu_q + 1, (size_t)(--s_menu_q_n) * sizeof a);
+        menu_run(a.name, a.arg);
     }
 }
 
@@ -753,6 +1056,7 @@ static void create_window(void) {
 
 int main(int argc, char **argv) {
     const char *disc_path = NULL, *import_path = NULL, *data_dir = NULL;
+    s_argc = argc; s_argv = argv;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--headless")) s_headless = true;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) s_max_frames = strtoull(argv[++i], 0, 0);
@@ -821,6 +1125,19 @@ int main(int argc, char **argv) {
                 if (*s == ',') s++;
             }
         }
+        else if (!strcmp(argv[i], "--ram-dump") && i + 1 < argc) s_ram_dump = argv[++i];
+        else if (!strcmp(argv[i], "--memcard1") && i + 1 < argc) s_memcard_path[0] = argv[++i];
+        else if (!strcmp(argv[i], "--memcard2") && i + 1 < argc) s_memcard_path[1] = argv[++i];
+        else if (!strcmp(argv[i], "--no-memcard")) s_no_memcard = true;
+        else if (!strcmp(argv[i], "--menu-action") && i + 1 < argc && s_menu_script_n < 16) {
+            char *s = argv[++i];
+            MenuStep *m = &s_menu_script[s_menu_script_n++];
+            m->frame = strtoull(s, &s, 0);
+            if (*s == ':') s++;
+            const char *eq = strchr(s, '=');
+            snprintf(m->name, sizeof m->name, "%.*s", (int)(eq ? eq - s : (long)strlen(s)), s);
+            snprintf(m->arg, sizeof m->arg, "%s", eq ? eq + 1 : "");
+        }
         else if (!strcmp(argv[i], "--import") && i + 1 < argc) import_path = argv[++i];
         else if (!strcmp(argv[i], "--data-dir") && i + 1 < argc) data_dir = argv[++i];
         else if (!strcmp(argv[i], "--help")) { usage(); return 0; }
@@ -833,7 +1150,18 @@ int main(int argc, char **argv) {
     char *pref = data_dir ? NULL : SDL_GetPrefPath("", "Destrega");
     snprintf(pak, sizeof pak, "%s%sdestrega.pak", data_dir ? data_dir : (pref ? pref : "./"),
              data_dir ? "/" : "");
+    char default_card[2048];
+    snprintf(default_card, sizeof default_card, "%s%smemcard1.mcd",
+             data_dir ? data_dir : (pref ? pref : "./"), data_dir ? "/" : "");
+    snprintf(s_pak_path, sizeof s_pak_path, "%s", pak);
+    snprintf(s_card_dir, sizeof s_card_dir, "%s%s", data_dir ? data_dir : (pref ? pref : "./"), data_dir ? "/" : "");
+    s_data_dir_given = data_dir != NULL;
+    s_disc_path = disc_path;
     SDL_free(pref);
+    if (getenv("DESTREGA_RESTARTED")) {
+        unsetenv("DESTREGA_RESTARTED");
+        fprintf(stderr, "menu: restarted on the new data pack\n");
+    }
 
     if (import_path) {
         const char *err = disc_import(import_path, pak, cli_progress, NULL);
@@ -857,6 +1185,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s\n", verr);
         if (!s_headless) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Destrega", verr, s_win);
         return 1;
+    }
+
+    if (!s_no_memcard) {
+        /* Windowed play defaults to the user's card; headless runs only get a card when asked
+         * for, so tests never depend on whatever the user has saved. */
+        if (!s_memcard_path[0] && !s_headless) s_memcard_path[0] = default_card;
+        for (int p = 0; p < 2; p++) {
+            const char *err = memcard_attach(p, s_memcard_path[p]);
+            if (err) fprintf(stderr, "%s\n", err);
+            else if (s_memcard_path[p]) rt_log("memcard: slot %d = %s", p + 1, s_memcard_path[p]);
+        }
+        atexit(memcard_flush);
     }
 
     bus_init();
@@ -891,6 +1231,7 @@ int main(int argc, char **argv) {
         SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, 44100};
         s_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
         if (s_audio) SDL_ResumeAudioStreamDevice(s_audio);
+        menu_init();   /* File menu; windowed only. Headless runs have no menus. */
     }
 
     memset(&g_cpu.r, 0, sizeof g_cpu.r);
