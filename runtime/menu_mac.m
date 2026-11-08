@@ -1,5 +1,5 @@
 /* macOS menu bar: File menu (game image, game files, save games) and View menu (widescreen,
- * renderer).
+ * renderer, full screen).
  * SDL3 builds the standard application/Window menus itself (and a View menu only for
  * fullscreen-capable windows); this inserts File after the app menu and adds to SDL's View menu,
  * or creates one after File.
@@ -30,6 +30,8 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
 /* check marks follow the state (requested state, so a click shows at once) */
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     NSString *a = item.representedObject;
+    if ([a isEqual:@"fullscreen"])
+        item.title = frontend_fullscreen() ? @"Exit Full Screen" : @"Enter Full Screen";
     if ([a isEqual:@"widescreen"])
         item.state = frontend_widescreen() ? NSControlStateValueOn : NSControlStateValueOff;
     if ([a hasPrefix:@"renderer="]) {
@@ -86,8 +88,14 @@ void menu_init(void) {
             NSMenuItem *viewItem = [[NSMenuItem alloc] initWithTitle:@"View" action:nil keyEquivalent:@""];
             viewItem.submenu = view;
             [bar insertItem:viewItem atIndex:[bar indexOfItem:fileItem] + 1];
-        } else if (view.numberOfItems > 0)
-            [view insertItem:NSMenuItem.separatorItem atIndex:0];
+        } else {
+            /* SDL's own "Toggle Full Screen" calls -[NSWindow toggleFullScreen:] directly; ours
+             * below goes through the queued action (SDL_SetWindowFullscreen) instead */
+            for (NSMenuItem *it in [view.itemArray copy])
+                if (it.action == @selector(toggleFullScreen:)) [view removeItem:it];
+            while (view.numberOfItems > 0 && view.itemArray[0].isSeparatorItem) [view removeItemAtIndex:0];
+            if (view.numberOfItems > 0) [view insertItem:NSMenuItem.separatorItem atIndex:0];
+        }
         NSMenuItem *ws = [[NSMenuItem alloc] initWithTitle:@"Widescreen (16:9)" action:@selector(fire:)
                                               keyEquivalent:@""];
         ws.target = s_target;
@@ -101,6 +109,16 @@ void menu_init(void) {
         NSMenuItem *renItem = [[NSMenuItem alloc] initWithTitle:@"Renderer" action:nil keyEquivalent:@""];
         renItem.submenu = ren;
         [view insertItem:renItem atIndex:1];
+
+        /* Enter / Exit Full Screen (title follows the state; also Alt+Enter and F11, handled in
+         * main.c's event loop so they work on every platform) */
+        [view insertItem:NSMenuItem.separatorItem atIndex:2];
+        NSMenuItem *fs = [[NSMenuItem alloc] initWithTitle:@"Enter Full Screen" action:@selector(fire:)
+                                              keyEquivalent:@"f"];
+        fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+        fs.target = s_target;
+        fs.representedObject = @"fullscreen";
+        [view insertItem:fs atIndex:3];
     }
 }
 

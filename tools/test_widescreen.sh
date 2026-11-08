@@ -24,7 +24,8 @@
 #  6. wstoggle: presented wide only while switched on, and soon after every switch-on
 #     (tools/check_ws_toggle.py, from the log and the screenshots);
 #  7. wsrender: View > Renderer switched software <-> gpu six times mid-fight, interleaved with
-#     four widescreen switches (also while on): every switch applied, same checks as 1-3 and 6.
+#     four widescreen switches (also while on) and two full-screen actions (headless: logged
+#     only): every switch applied, same checks as 1-3 and 6.
 #     ws46g: --widescreen on the GPU renderer at 4x6.
 # Usage: tools/test_widescreen.sh [frames]   (default 9000; needs build/cmake/destrega)
 cd "$(dirname "$0")/.."
@@ -55,7 +56,7 @@ ws2 --widescreen --scale 2 --window 1280x720 --hires-threads 1
 ws2b --widescreen --scale 2 --window 1280x720 --hires-threads 0
 ws1 --widescreen --scale 1 --window 1280x720 --hires-verify --hires-threads 0
 off --scale 2 --hires-threads 0
-wsrender --scale 2 --window 1280x720 --hires-threads 0 --renderer software --menu-action 3800:renderer=gpu --menu-action 4200:widescreen=on --menu-action 4500:renderer=software --menu-action 5000:renderer=gpu --menu-action 5400:widescreen=off --menu-action 5800:renderer=software --menu-action 6300:widescreen=on --menu-action 6600:renderer=gpu --menu-action 7200:renderer --menu-action 7600:widescreen=off --dump build/widescreen/render --dump-every 50
+wsrender --scale 2 --window 1280x720 --hires-threads 0 --renderer software --menu-action 3800:renderer=gpu --menu-action 4200:widescreen=on --menu-action 4500:renderer=software --menu-action 5000:renderer=gpu --menu-action 5400:widescreen=off --menu-action 5800:renderer=software --menu-action 6300:widescreen=on --menu-action 6600:renderer=gpu --menu-action 7200:renderer --menu-action 7600:widescreen=off --menu-action 4100:fullscreen=on --menu-action 6900:fullscreen --dump build/widescreen/render --dump-every 50
 ws46g --widescreen --scale 4x6 --window 1280x720 --renderer gpu
 wstoggle --scale 2 --window 1280x720 --hires-threads 0 --menu-action 3900:widescreen=on --menu-action 4600:widescreen --widescreen-at 5300:1 --menu-action 6200:widescreen=off --menu-action 6900:widescreen --menu-action 8000:widescreen=off --dump build/widescreen/toggle --dump-every 50
 EOF
@@ -102,5 +103,7 @@ sed 's/wstoggle/wsrender/' $OUT/wsrender.chk
 nr=$(grep -c "hires: renderer [a-z]* at frame" $OUT/wsrender.log)
 echo "widescreen: wsrender: $nr renderer switches applied: $(grep -h 'hires: renderer [a-z]* at frame' $OUT/wsrender.log | sed 's/.*renderer \([a-z]*\) at frame \([0-9]*\)/\1@\2/' | tr '\n' ' ')"
 [ "$nr" = 6 ] || { echo "widescreen: wsrender: expected 6 renderer switches"; fail=1; }
+nf=$(grep -c "fullscreen: o[nf]* at frame" $OUT/wsrender.log)
+[ "$nf" = 2 ] || { echo "widescreen: wsrender: expected 2 full-screen switches, got $nf"; fail=1; }
 [ $fail = 0 ] || { echo "widescreen: FAIL"; exit 1; }
 echo "widescreen: gameplay and all emulated state identical with --widescreen; shadow pass + 16:9 presentation ok"

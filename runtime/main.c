@@ -266,12 +266,28 @@ static void poll_input(void) {
             if (e.key.key == SDLK_TAB) s_fast = down;
             if (e.key.key == SDLK_F9 && down && !e.key.repeat)   /* = View > Widescreen (16:9) */
                 frontend_menu_action("widescreen", NULL);
+            /* full screen: Alt+Enter, F11, and Ctrl+Cmd+F on macOS (= View > Enter Full Screen).
+             * Handled here so it works on every platform; the Enter of Alt+Enter is not START. */
+            SDL_Keymod mod = e.key.mod;
+            bool fs_key = e.key.key == SDLK_F11 ||
+                          (e.key.key == SDLK_RETURN && (mod & SDL_KMOD_ALT)) ||
+                          (e.key.key == SDLK_F && (mod & SDL_KMOD_GUI) && (mod & SDL_KMOD_CTRL));
+            if (fs_key) {
+                if (down && !e.key.repeat) frontend_menu_action("fullscreen", NULL);
+                continue;
+            }
             if (e.key.key == SDLK_F12 && down) {
                 char p[64]; snprintf(p, sizeof p, "shot_%06llu.png", (unsigned long long)s_frame);
                 frontend_screenshot(p);
             }
             int b = key_to_button(e.key.key);
             if (b >= 0) { if (down) s_keys_down |= 1u << b; else s_keys_down &= ~(1u << b); }
+        }
+        if (e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(s_win, &pw, &ph);   /* the auto scale follows in present_frame */
+            rt_log("fullscreen: %s, window %dx%d px", e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN
+                   ? "entered" : "left", pw, ph);
         }
         if (e.type == SDL_EVENT_GAMEPAD_ADDED) SDL_OpenGamepad(e.gdevice.which);
     }
@@ -433,6 +449,29 @@ static void renderer_switch(int r) {
 
 void frontend_set_widescreen(bool on) { s_ws_req = on; }
 bool frontend_widescreen(void) { return s_ws_req; }
+
+/* ---- full screen (Alt+Enter / F11 / Ctrl+Cmd+F, View > Enter Full Screen,
+ * --menu-action fullscreen[=on|off|toggle]) ----
+ * SDL_SetWindowFullscreen with the desktop mode (no mode change); on macOS that is a native
+ * full-screen Space. SDL keeps the windowed size and position and restores them on exit. The
+ * hi-res auto scale follows the new pixel size in present_frame like any resize. Headless runs
+ * have no window and only log. */
+static bool s_fs_headless;
+bool frontend_fullscreen(void) {
+    if (!s_win) return s_fs_headless;
+    return (SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN) != 0;
+}
+static void fullscreen_set(bool on) {
+    if (!s_win) {
+        s_fs_headless = on;
+        rt_log("fullscreen: %s at frame %llu (headless: no window)", on ? "on" : "off",
+               (unsigned long long)s_frame);
+        return;
+    }
+    if (on == frontend_fullscreen()) return;
+    if (!SDL_SetWindowFullscreen(s_win, on)) rt_log("fullscreen: %s", SDL_GetError());
+    else rt_log("fullscreen: %s at frame %llu", on ? "on" : "off", (unsigned long long)s_frame);
+}
 
 /* Apply a requested switch; runs at the start of a vblank, i.e. between frames. */
 static void ws_apply(void) {
@@ -963,6 +1002,11 @@ static int s_menu_q_n;
 
 void frontend_menu_action(const char *name, const char *arg) {
     if (s_menu_q_n >= 8) return;
+    /* one full-screen toggle per frame: on macOS Ctrl+Cmd+F can arrive both as the menu key
+     * equivalent and as an SDL key event */
+    if (!strcmp(name, "fullscreen") && !arg)
+        for (int i = 0; i < s_menu_q_n; i++)
+            if (!strcmp(s_menu_q[i].name, "fullscreen") && !s_menu_q[i].arg[0]) return;
     MenuAction *a = &s_menu_q[s_menu_q_n++];
     snprintf(a->name, sizeof a->name, "%s", name);
     snprintf(a->arg, sizeof a->arg, "%s", arg ? arg : "");
@@ -1204,6 +1248,10 @@ static void menu_run(const char *name, const char *arg) {
         else if (!*arg) renderer_switch(s_renderer == R_SOFTWARE ? R_GPU : R_SOFTWARE);
         else rt_log("menu: renderer: software, gpu or compare");
     }
+    else if (!strcmp(name, "fullscreen"))   /* View > Enter/Exit Full Screen; arg on/off, none/toggle */
+        fullscreen_set(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
+                       : !strcmp(arg, "off") || !strcmp(arg, "0") ? false
+                       : !frontend_fullscreen());
     else if (!strcmp(name, "widescreen"))   /* View > Widescreen (16:9); arg on/off, none = toggle */
         frontend_set_widescreen(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
                                 : !strcmp(arg, "off") || !strcmp(arg, "0") ? false
