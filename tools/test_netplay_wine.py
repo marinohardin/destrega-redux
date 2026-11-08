@@ -98,7 +98,7 @@ def run_session(name, port, pace):
     os.makedirs(d)
     t0 = time.time()
     frames, disc_at = 6000, 4500
-    mode = ['--renderer', 'software', '--no-memcard'] if WINDOWED else ['--headless', '--net-pace', str(pace)]
+    mode = ['--renderer', 'software', '--no-memcard', '--no-settings'] if WINDOWED else ['--headless', '--net-pace', str(pace)]
     common = mode + ['--no-interp', '--frames', str(frames),
               '--net-desync-dir', ('path', d)]
     host = common + ['--press', R.fmt(rp.p1), '--net-sim', sim_h, '--net-hash-log', ('path', os.path.join(d, 'host.hash')),
