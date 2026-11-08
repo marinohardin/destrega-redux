@@ -1,4 +1,5 @@
-/* SDL_GPU (Metal) high-resolution backend (see hires_gpu.c, AGENTS.md "GPU renderer"). */
+/* SDL_GPU high-resolution backend: Metal (MSL) or Vulkan (SPIR-V); see hires_gpu.c,
+ * AGENTS.md "GPU renderer". */
 #ifndef HIRES_GPU_H
 #define HIRES_GPU_H
 
@@ -7,8 +8,15 @@
 typedef struct SDL_GPUDevice SDL_GPUDevice;
 typedef struct SDL_GPUTexture SDL_GPUTexture;
 
+/* SDL_GPU driver to ask for: NULL/"auto" (Metal on macOS, Vulkan elsewhere), "metal" or
+ * "vulkan" (--gpu-driver). Call before hires_gpu_create_device / hires_gpu_init. */
+bool hires_gpu_set_driver(const char *name);
+/* A device that takes the shader formats this backend has (MSL, SPIR-V) on the chosen
+ * driver, for the windowed GPU renderer (SDL_CreateGPURenderer). NULL if there is none. */
+SDL_GPUDevice *hires_gpu_create_device(void);
 /* Create the backend's pipelines on `dev` (the windowed GPU renderer's device), or on a
- * device of its own when dev is NULL (headless). False if SDL_GPU / MSL is unavailable. */
+ * device of its own when dev is NULL (headless). False if SDL_GPU, a driver with MSL or
+ * SPIR-V shaders, or a B5G5R5A1 render target is unavailable. */
 bool hires_gpu_init(SDL_GPUDevice *dev);
 const HiresBackend *hires_gpu_backend(void);
 /* Convert the view (from hires_get_view on this backend) into an RGBA8888 texture of

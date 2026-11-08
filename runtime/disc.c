@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include "platform.h"
 
 #define SECTOR 2352
 #define BLOCK_SECTORS 16
@@ -78,8 +79,8 @@ static bool resolve_cue(const char *path, char *out, size_t outsz) {
     }
     fclose(f);
     if (!file[0] || !mode2) return false;
-    const char *slash = strrchr(path, '/');
-    if (file[0] == '/' || !slash) snprintf(out, outsz, "%s", file);
+    const char *slash = plat_last_sep(path);
+    if (plat_is_absolute(file) || !slash) snprintf(out, outsz, "%s", file);
     else snprintf(out, outsz, "%.*s/%s", (int)(slash - path), path, file);
     return true;
 }
@@ -303,6 +304,6 @@ static const char *disc_import_inner(const char *src, const char *pak_path, Disc
     /* re-open and verify before committing */
     if (!disc_open(tmp) || disc_verify()) { disc_close(); remove(tmp); return "The new data pack failed verification."; }
     disc_close();
-    if (rename(tmp, pak_path)) { remove(tmp); return "Could not move the data pack into place."; }
+    if (!plat_replace_file(tmp, pak_path)) { remove(tmp); return "Could not move the data pack into place."; }
     return NULL;
 }

@@ -12,8 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 #include <limits.h>
+#include "platform.h"
 #include <zlib.h>
 
 void bus_init(void);
@@ -342,7 +342,8 @@ static void write_state_hash(void) {
     h = hash_mix(h, g_scratch, sizeof g_scratch);
     h = hash_mix(h, gpu_vram(), 1024 * 512 * 2);
     size_t spu_n;
-    h = hash_mix(h, spu_ram_ptr(&spu_n), spu_n);
+    const u8 *spu = spu_ram_ptr(&spu_n);   /* separate statement: argument order is unspecified */
+    h = hash_mix(h, spu, spu_n);
     h = hash_mix(h, g_cpu.r, sizeof g_cpu.r);
     u64 misc[4 + 32 + 2] = { g_cpu.hi, g_cpu.lo, g_cpu.pc, g_cpu.cycles, 0 };
     for (int i = 0; i < 32; i++) misc[4 + i] = g_cpu.cop0[i];
@@ -933,9 +934,12 @@ static void usage(void) {
         "  --gameplay-trace FILE per frame: fighters' health/gauge/position, round time, wins, RNG seed\n"
         "  --ram-snap DIR        write raw guest RAM + scratchpad to DIR every --ram-snap-every N frames (100)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
-        "  --renderer R          hi-res renderer: software, gpu (SDL_GPU/Metal), or compare (default: gpu\n"
-        "                        in a macOS window, else software; View > Renderer switches at runtime)\n"
+        "  --renderer R          hi-res renderer: software, gpu (SDL_GPU: Metal or Vulkan), or compare\n"
+        "                        (default: gpu in a window when a device exists, else software; headless:\n"
+        "                        software; macOS View > Renderer switches at runtime)\n"
         "                        (software shown, gpu fed the same commands and compared to it)\n"
+        "  --gpu-driver D        SDL_GPU driver for gpu/compare: auto (Metal on macOS, else Vulkan),\n"
+        "                        metal or vulkan (macOS: MoltenVK via the Vulkan loader)\n"
         "  --compare-every N     compare mode: compare the targets every N frames (default 30)\n"
         "  --compare-max PCT     compare mode: exit non-zero if a fight frame differs in more than PCT%% of pixels\n"
         "  --widescreen          16:9 fights: wider stage culling + hi-res guard band (menus/FMV stay 4:3;\n"
@@ -1076,15 +1080,7 @@ static bool menu_pick(bool save, const SDL_DialogFileFilter *f, int nf, const ch
 
 static bool file_exists(const char *p) { SDL_PathInfo i; return SDL_GetPathInfo(p, &i); }
 
-static bool same_file(const char *a, const char *b) {
-    if (!strcmp(a, b)) return true;
-#ifndef _WIN32
-    char ra[PATH_MAX], rb[PATH_MAX];
-    return realpath(a, ra) && realpath(b, rb) && !strcmp(ra, rb);
-#else
-    return false;
-#endif
-}
+static bool same_file(const char *a, const char *b) { return plat_same_file(a, b); }
 
 static bool copy_file(const char *src, const char *dst) {
     char tmp[2100];
@@ -1096,14 +1092,14 @@ static bool copy_file(const char *src, const char *dst) {
     while (ok && (k = fread(buf, 1, sizeof buf, i)) > 0) ok = fwrite(buf, 1, k, o) == k;
     if (i) fclose(i);
     if (o) ok = fclose(o) == 0 && ok;
-    if (ok) ok = rename(tmp, dst) == 0;
+    if (ok) ok = plat_replace_file(tmp, dst);
     if (!ok) remove(tmp);
     return ok;
 }
 
 static void dir_of(const char *path, char *out, size_t n) {
     snprintf(out, n, "%s", path);
-    char *sl = strrchr(out, '/');
+    char *sl = (char *)plat_last_sep(out);
     if (sl && sl != out) *sl = 0;
     else if (!sl) snprintf(out, n, ".");
 }
@@ -1115,7 +1111,7 @@ static void import_progress(void *ud, float frac) {
 
 /* After a new data pack is in place: re-exec the process (a clean machine, never a half-reset one). */
 static void restart_process(void) {
-    char exe[PATH_MAX];
+    char exe[4096];
     if (!menu_executable_path(exe, sizeof exe)) snprintf(exe, sizeof exe, "%s", s_argv[0]);
     char **av = calloc((size_t)s_argc + 2, sizeof *av);
     int n = 0;
@@ -1129,9 +1125,9 @@ static void restart_process(void) {
     memcard_flush();
     if (s_state_hash) fflush(s_state_hash);
     fflush(NULL);
-    setenv("DESTREGA_RESTARTED", "1", 1);
+    plat_setenv("DESTREGA_RESTARTED", "1");
     if (!s_headless) { if (s_audio) SDL_DestroyAudioStream(s_audio); SDL_Quit(); }
-    execv(exe, av);
+    plat_exec(exe, av);
     fprintf(stderr, "menu: ERROR: cannot restart (%s)\n", exe);
     exit(1);
 }
@@ -1162,7 +1158,7 @@ static void action_reveal(bool cards) {
         else if (s_card_dir[0]) snprintf(dir, sizeof dir, "%s", s_card_dir);
         else { menu_alert("No save location is known (try --memcard1 or --data-dir)."); return; }
         size_t l = strlen(dir);
-        if (l > 1 && dir[l - 1] == '/') dir[l - 1] = 0;
+        if (l > 1 && plat_is_sep(dir[l - 1])) dir[l - 1] = 0;
     } else dir_of(s_disc_path ? s_disc_path : s_pak_path, dir, sizeof dir);
     SDL_CreateDirectory(dir);
     rt_log("menu: show %s in file manager: %s", cards ? "save games" : "game files", dir);
@@ -1193,7 +1189,7 @@ static bool card_slot_path(int slot, char *out, size_t n) {
 static void card_stamp(char *out, size_t n) {
     time_t t = time(NULL);
     struct tm tm;
-    localtime_r(&t, &tm);
+    plat_localtime(&t, &tm);
     strftime(out, n, "%Y%m%d-%H%M%S", &tm);
 }
 
@@ -1310,14 +1306,15 @@ static void create_window(void) {
     s_win = SDL_CreateWindow("Destrega (recompiled)", s_win_w, s_win_h,
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     s_ren = NULL;
-#ifdef __APPLE__
-    if (!s_renderer_given) s_renderer = R_GPU;   /* windowed default on macOS */
-#endif
+    if (!s_renderer_given) s_renderer = R_GPU;   /* windowed default (falls back below) */
     /* SDL's GPU renderer, whose device the hi-res backend draws with. Created whenever the GPU
      * backend may be used, so View > Renderer can switch at any time; --renderer software
-     * forces the plain renderer (and software only). */
+     * forces the plain renderer (and software only). The device is the backend's choice
+     * (Metal/MSL or Vulkan/SPIR-V, --gpu-driver), so SDL never picks one it has no shaders for. */
     if (s_renderer != R_SOFTWARE || !s_renderer_given) {
-        s_ren = SDL_CreateGPURenderer(NULL, s_win);
+        SDL_GPUDevice *dev = hires_gpu_create_device();
+        s_ren = dev ? SDL_CreateGPURenderer(dev, s_win) : NULL;
+        if (dev && !s_ren) SDL_DestroyGPUDevice(dev);
         s_gpu_ok = s_ren && hires_gpu_init(SDL_GetGPURendererDevice(s_ren));
         if (!s_gpu_ok) {
             rt_log("hires-gpu: GPU renderer unavailable (%s); using the software renderer", SDL_GetError());
@@ -1400,7 +1397,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--widescreen")) s_widescreen = true;
         else if (!strcmp(argv[i], "--ram-snap") && i + 1 < argc) s_ram_snap_dir = argv[++i];
         else if (!strcmp(argv[i], "--gameplay-trace") && i + 1 < argc) {
-            s_gameplay = fopen(argv[++i], "w");
+            s_gameplay = fopen(argv[++i], "wb");
             if (!s_gameplay) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
         }
         else if (!strcmp(argv[i], "--ram-snap-every") && i + 1 < argc) s_ram_snap_every = strtoull(argv[++i], 0, 0);
@@ -1412,10 +1409,13 @@ int main(int argc, char **argv) {
             else if (!strcmp(r, "compare")) s_renderer = R_COMPARE;
             else { fprintf(stderr, "--renderer: software, gpu or compare\n"); return 1; }
         }
+        else if (!strcmp(argv[i], "--gpu-driver") && i + 1 < argc) {
+            if (!hires_gpu_set_driver(argv[++i])) { fprintf(stderr, "--gpu-driver: auto, metal or vulkan\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--compare-every") && i + 1 < argc) s_compare_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--compare-max") && i + 1 < argc) s_compare_max = atof(argv[++i]);
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
-            s_state_hash = fopen(argv[++i], "w");
+            s_state_hash = fopen(argv[++i], "wb");
             if (!s_state_hash) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
         }
         else if (!strcmp(argv[i], "--resize") && i + 1 < argc) {
@@ -1472,7 +1472,7 @@ int main(int argc, char **argv) {
     s_disc_path = disc_path;
     SDL_free(pref);
     if (getenv("DESTREGA_RESTARTED")) {
-        unsetenv("DESTREGA_RESTARTED");
+        plat_unsetenv("DESTREGA_RESTARTED");
         fprintf(stderr, "menu: restarted on the new data pack\n");
     }
 

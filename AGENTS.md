@@ -53,6 +53,58 @@ Pillow, NumPy and macOS's Herculanum font). Never put game-derived art in the
 repo. Launching the bundle's binary from a non-GUI shell can stall in macOS's
 first-launch check; test it from Finder/`open`, or use the plain binary.
 
+### Windows and Linux
+
+Same CMake project; the compiler must be **clang or GCC** (the runtime uses `__int128`,
+`__builtin_*`, `always_inline`, inline `asm` hints; MSVC/clang-cl are not supported). Needs
+SDL **3.4+** (`SDL_CreateGPURenderer(device, window)`), zlib, Python 3 and the disc as on macOS.
+
+- **Windows**: MSYS2, environment **CLANG64** (`pacman -S mingw-w64-clang-x86_64-{clang,cmake,ninja,
+  pkgconf,python,sdl3,zlib}`), then the same `cmake -S . -B build/cmake -G Ninja && cmake --build
+  build/cmake` from the CLANG64 shell; run `build/cmake/destrega.exe` with `clang64/bin` (SDL3.dll,
+  zlib1.dll) on `PATH` or the DLLs copied next to it. Console-subsystem executable (logs on
+  stdout/stderr). `runtime/win/destrega.rc` embeds a manifest with the UTF-8 code page (fopen/rename
+  take the UTF-8 paths SDL gives, e.g. a non-ASCII user folder), and the main thread gets a 16 MiB
+  stack (`--stack`; Windows' default is 1 MiB, macOS/Linux give 8). Data pack and cards live in
+  `%APPDATA%\Destrega\` (SDL's pref path). Load Game Image restarts by `CreateProcess` + wait +
+  exit with the child's code (`plat_exec`), so a waiting caller sees the restarted run.
+- **Linux**: any distribution with SDL 3.4 (or build SDL from source, as CI does); data in
+  `~/.local/share/Destrega/`. GCC and clang both build the runtime; clang is the one tested on
+  the generated code.
+- Platform differences live in `runtime/platform.[ch]` (file replace via `MoveFileEx`, `fsync`/
+  `_commit`, `realpath`/`_fullpath`, `setenv`/`_putenv_s`, exec, executable path, thread CPU time,
+  performance-core count, and the hi-res worker pool's threads: pthreads or Win32 SRW locks +
+  condition variables). `\` is a path separator on Windows (cue -> bin, folders). Menus stay
+  Mac-only (`menu_stub.c`); Alt+Enter/F11 full screen and F9 widescreen work everywhere.
+- GPU renderer: Vulkan (SPIR-V) on both, the windowed default when a device exists, else software
+  (see "GPU renderer"). `--renderer` works everywhere; View > Renderer is Mac-only.
+- **Cross-compiling the Windows exe** (macOS or Linux, MinGW-w64 GCC: Homebrew `mingw-w64`):
+  `cmake -S . -B build/win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
+  -DCMAKE_PREFIX_PATH=<prefix>` where `<prefix>` holds SDL3 and zlib built for
+  `x86_64-w64-mingw32` (SDL's `SDL3-devel-*-mingw` release, or SDL/zlib from source configured
+  with the same toolchain file), then copy `<prefix>/bin/SDL3.dll` next to `build/win/destrega.exe`.
+  With MinGW GCC the exe links `-static` (GCC's `_Thread_local` uses emutls on libwinpthread),
+  so it needs only SDL3.dll plus the system UCRT. GCC builds the generated code fine (`__int128`
+  included); it evaluates function arguments in a different order than clang, which once broke
+  `--state-hash` (`f(p(&n), n)`: keep such calls in separate statements).
+- **Wine / CrossOver**: `tools/test_wine.sh` runs the same headless boot-to-fight (`--no-interp
+  --verify-overrides`) natively and under Wine and requires identical per-frame state hashes
+  and dumped frames (`WINE=` the wine command, `WINE_ARGS=` its options; CrossOver:
+  `WINE=".../CrossOver-Hosted Application/wine" WINE_ARGS="--bottle destrega-test --no-gui"`, a
+  dedicated bottle made with `cxbottle --bottle destrega-test --create --template win10_64`).
+  Passes with CrossOver 26 (x86-64 under Rosetta): 4000/4000 frames identical at 1x and at 4x6 widescreen
+  with `--hires-threads 6` (Win32 worker pool), frames dumped at 4x6 byte-identical too. Windowed under CrossOver works with the software renderer; its SDL_GPU
+  Vulkan device (MoltenVK 1.2.10 via winevulkan) reports conformance version 0.0.0.0, and SDL
+  rejects non-conformant Vulkan drivers, so the GPU renderer falls back to software there.
+  `--state-hash`/`--gameplay-trace` files are written in binary mode (LF) on every platform.
+- Not verified on a real Windows/Linux machine with the game: there is no disc in CI. CI
+  (`.github/workflows/build.yml`) builds everything except the generated code: configure with
+  `-DDESTREGA_STUB_GEN=ON` to link the runtime against `tools/ci/stub_gen` (empty function table,
+  stubs that exit) and `-DDESTREGA_TESTS=ON` for the CTest unit tests; the executable then starts,
+  parses options and fails with "no data pack". Windows CI: MSYS2 CLANG64, no Vulkan driver (the
+  GPU test checks it is refused cleanly). Linux CI: gcc and clang, the GPU test on Mesa lavapipe
+  under Xvfb, and `tools/gen_spirv.py --check`.
+
 The main-exe REA export is `analysis/rea_list_procedures_main.json` (MCP
 `list_procedures`); a reusable REA snapshot is `analysis/SLUS_007.32.rea-snapshot`
 (`open_binary` with `snapshot_path`). REA's Ghidra MIPS lane only admits
@@ -141,6 +193,13 @@ Right 0x20, Down 0x40, Left 0x80, L2 0x100, R2 0x200, L1 0x400, R1 0x800,
 Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
 `--press2 F:MASK,...` is the same for pad 2 (VS mode waits for it). Presses are taps (held 6 frames).
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
+
+GPU backend checks: `run_tests.sh` also builds `runtime/tests/test_hires_gpu.c` (GPU vs software
+on random command streams, no disc needed) and runs it on the default driver (`gpu-auto`, Metal
+on macOS) and on Vulkan (`gpu-vulkan`: MoltenVK; "skipped" when there is no Vulkan loader). The
+full-game Vulkan compare matrix is `tools/test_vulkan.sh` (a few minutes; not in run_tests.sh).
+CI (`.github/workflows/build.yml`, Windows + Linux, no disc) runs the module unit tests and
+`test_hires_gpu` through CTest; see "Windows and Linux".
 
 ### Scenario library (`tools/scenarios.py`)
 
@@ -372,15 +431,52 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   15.2 with `on`. Tracking alone costs nothing measurable.
 ## GPU renderer (`runtime/hires_gpu.[ch]`, `--renderer gpu`)
 
-A second `HiresBackend` on SDL3's SDL_GPU (Metal, MSL shaders embedded in the C file). Same
+A second `HiresBackend` on SDL3's SDL_GPU: **Metal** (MSL source embedded in the C file) or
+**Vulkan** (SPIR-V, Windows/Linux, and macOS through MoltenVK). Same
 contract as the software backend: commands in, target out, presentation only. It is
 **bit-identical to the software backend** at every scale tested (1x1, 2x3, 4x6, 8x8 over a
 7000-frame fight run) and to the 1x VRAM at 1x1 (with `--pgxp off`; for `on` see the PGXP
 section). Keep it that way: a rule change in `hires.c`
-needs the same change in the shader. The header comment of `hires_gpu.c` has the details.
+needs the same change in **both** shaders (MSL in `hires_gpu.c`, GLSL in `runtime/shaders/hires.glsl`).
+The header comment of `hires_gpu.c` has the details.
 
-- `--renderer software|gpu|compare`. Default: **gpu in a macOS window** (if the SDL GPU renderer
-  or the backend cannot be created: `hires-gpu: GPU renderer unavailable ...` and software),
+- **Shaders / drivers.** One backend, two shader sources selected by `SDL_GetGPUShaderFormats`:
+  MSL (Metal) as before, and `runtime/shaders/hires.glsl` (Vulkan GLSL 450, the same functions
+  line for line) compiled by `python3 tools/gen_spirv.py` (glslangValidator, `spirv-val`) into
+  the checked-in `runtime/shaders/hires_spirv.h` (generated bytecode, regenerate after editing
+  the GLSL; `--check` only compiles and validates, as CI does). No shader compiler is needed to
+  build. Not done: DXIL/D3D12 (the device is created with MSL|SPIR-V only, so SDL never picks
+  D3D12; a Windows machine without a Vulkan driver gets software).
+- **64-bit integers on Vulkan**: `shaderInt64` is an optional Vulkan feature and SDL_GPU does not
+  enable it, so the GLSL keeps every 64-bit value as a `uvec2` (lo, hi) with exact wrapping
+  add/sub/multiply (`uaddCarry`, `usubBorrow`, `umulExtended`, `imulExtended`: core SPIR-V). The
+  three 64-bit divisions of the MSL are exact without a divide: the plane-equation fraction is split
+  off into a 0/1 carry test, span edges and the perspective division use a float estimate corrected
+  by integer multiplies, `(U1-U0)/n` (n <= 8) is a 16-bit long division. Signed 32-bit `/` and `%`
+  on negative values are avoided too (GLSL leaves them loose): `floordiv`/`tdiv` work on magnitudes.
+- **Edge rule on Vulkan**: Vulkan does not fix the rasterizer's tie-break for pixel centres exactly
+  on an edge (Metal/D3D use top-left, which the integer path relies on), so with SPIR-V every
+  triangle takes the exact shader edge test (F_EDGE: the triangle grown by 1 px, or its bbox for
+  slivers). `DESTREGA_GPU_EDGE=0|1` overrides it (experiments; on MoltenVK both give 0 diffs).
+- `--gpu-driver auto|metal|vulkan` (also for headless/compare): auto = Metal on macOS, Vulkan
+  elsewhere. On macOS `vulkan` loads MoltenVK through the Vulkan loader; SDL only searches the
+  default library paths, so `hires_gpu.c` sets `SDL_VULKAN_LIBRARY` to Homebrew's
+  `libvulkan.1.dylib` (`brew install vulkan-loader molten-vk`) unless already set. The windowed
+  GPU renderer is created on the backend's own device (`hires_gpu_create_device` +
+  `SDL_CreateGPURenderer(dev, win)`), so its driver is the one the shaders exist for.
+- Vulkan results (MoltenVK on Apple Silicon, 7000-frame fight, every 10th frame compared,
+  `tools/test_vulkan.sh`): `--pgxp off` 0 differing pixels at 2x2 and 4x6, 4:3 and 16:9; `affine`
+  0 at 4x6; `on` 24 (4:3) and 31 (16:9) pixels over 331 fight frames at 4x6 (Metal: 24 / 28; limit
+  `CMP_MAX_PGXP`). `runtime/tests/test_hires_gpu.c` (random GP0 streams through gpu.c in compare
+  mode: all polygon/rect/line kinds, semi modes 1-3, texture windows, dither, fills, uploads,
+  copies, plus PGXP packets; 1x1/2x2/3x2/4x6, with and without the guard band): 0 differing pixels
+  on Metal and on MoltenVK; it found a deliberately broken edge rule at every scale. Not run on a
+  native Vulkan driver (NVIDIA/AMD/Intel) or D3D12: that, and the semi-transparency blend rounding
+  on other hardware (UNORM5 blending precision is implementation-defined), are unverified.
+
+- `--renderer software|gpu|compare`. Default: **gpu in a window** on every platform (if no device
+  with MSL or SPIR-V shaders and a B5G5R5A1 render target exists, or the SDL GPU renderer or the
+  backend cannot be created: `hires-gpu: GPU renderer unavailable ...` and software),
   software headless (the tests' reference). `--renderer software` forces software and the
   plain SDL renderer (no live switch to GPU then). **View > Renderer > Software / GPU**
   (radio check marks; menu action `renderer[=software|gpu|compare]`, no argument toggles)
@@ -391,13 +487,13 @@ needs the same change in the shader. The header comment of `hires_gpu.c` has the
   both back: `hires-compare:` lines at exit (all / fight frames, pixels differing, by >1 step,
   mask-bit only, worst frame); `--compare-max PCT` exits 6 if a fight frame differs more.
   Headless works (own device, needs `SDL_InitSubSystem(VIDEO)` with the default driver; the
-  `offscreen` driver has no GPU backend). Without Metal it logs `GPU renderer unavailable` and
-  uses software. Windowed it presents straight from the GPU texture (SDL GPU renderer +
+  `offscreen` driver has no GPU backend). Without a usable device it logs `GPU renderer
+  unavailable` and uses software. Windowed it presents straight from the GPU texture (SDL GPU renderer +
   `SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER`); readback only for `--dump`, `--hires-verify`
   and compare (`HiresBackend.read`).
 - Exactness: target B5G5R5A1 (shader writes PS1 red into `.b` = the low 5 bits, so the download
   is raw PS1 u16, alpha = mask bit). Attributes are the 1x plane equations evaluated as exact
-  rationals in 64-bit integers per pixel (Metal supports `long`). Semi modes are fixed-function
+  rationals in 64-bit integers per pixel (Metal `long`; emulated with 32-bit pairs on Vulkan). Semi modes are fixed-function
   blends (B/2+F/2 via constant 0.5 and F/2-1/4; see the file comment for the one F=0 tie case).
   Triangles with a vertex outside the target are drawn as their clipped bbox with an exact
   edge test in the shader: GPU clipping produces inexact vertices that flip shared-edge
@@ -415,8 +511,8 @@ needs the same change in the shader. The header comment of `hires_gpu.c` has the
   emu 1.3 ms + present 6.6 ms per frame.
 - Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
   mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
-  chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), MSL only
-  (no SPIR-V/DXIL), no `--hires-threads` (n/a).
+  chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), no DXIL
+  (D3D12), no `--hires-threads` (n/a).
 - Widescreen guard band: supported (`set_guard`): `s_ox` is negative with the default region
   at x = 0, so the clip rectangle's x is packed signed, the shader's 1x column uses floor
   division and the 32x32 tile masks are shifted by the guard width. Guard-band-only packets

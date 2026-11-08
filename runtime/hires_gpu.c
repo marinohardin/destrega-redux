@@ -1,4 +1,10 @@
-/* SDL_GPU (Metal) high-resolution backend (see hires.h, AGENTS.md "GPU renderer").
+/* SDL_GPU high-resolution backend (see hires.h, AGENTS.md "GPU renderer").
+ *
+ * Shaders: MSL source below for Metal; SPIR-V for Vulkan from runtime/shaders/hires.glsl
+ * (compiled by tools/gen_spirv.py into shaders/hires_spirv.h). The two implement the same
+ * rules; the GLSL emulates 64-bit integers with 32-bit pairs (see its header). On Vulkan every
+ * triangle takes the exact edge test (F_EDGE, below): Vulkan does not fix the rasterizer's
+ * tie-break rule for pixel centres on an edge, Metal and D3D use top-left.
  *
  * Implements HiresBackend with the same rules as the software rasterizer in hires.c, which
  * stays the reference: same coverage (the scaled vertices are shifted by half a pixel so the
@@ -59,8 +65,10 @@
  *   vertex is precise, and clamped GTE vertices never have precise values (pgxp.c).
  */
 #include "hires_gpu.h"
+#include "shaders/hires_spirv.h"
 #include <SDL3/SDL.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -339,6 +347,9 @@ static u32 s_up_cap, s_down_cap;
 static SDL_GPUFence *s_fences[2];
 static int s_fence_i;
 static bool s_inited, s_ready;
+static bool s_spirv;        /* the device takes SPIR-V (Vulkan); else MSL (Metal) */
+static bool s_force_edge;   /* exact edge test for every triangle (Vulkan; DESTREGA_GPU_EDGE=0/1) */
+static char s_driver[16];   /* requested SDL_GPU driver, "" = auto */
 
 static const u16 *s_vram;
 static int s_Sx, s_Sy, s_rx, s_ry, s_rw, s_rh, s_tw, s_th, s_ox, s_oy;
@@ -768,7 +779,7 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
         if (v[i].x < 0 || v[i].y < 0 || v[i].x > (float)s_aw || v[i].y > (float)s_ah) inside = false;
     }
     bool cons = false;
-    if (frac) {   /* fractional vertices: grown triangle, else the bounding box; both edge-tested */
+    if (frac || s_force_edge) {   /* grown triangle, else the bounding box; both edge-tested */
         cons = inside && conservative_tri(v);
         inside = false;
     }
@@ -1350,6 +1361,16 @@ static SDL_GPUShader *make_shader(const char *entry, SDL_GPUShaderStage stage, u
     SDL_GPUShaderCreateInfo si = { .code = (const Uint8 *)s_msl, .code_size = sizeof s_msl - 1, .entrypoint = entry,
                                    .format = SDL_GPU_SHADERFORMAT_MSL, .stage = stage, .num_samplers = samplers,
                                    .num_storage_buffers = sbufs, .num_uniform_buffers = ubufs };
+    if (s_spirv) {   /* one SPIR-V module per entry point, each with entry "main" */
+        static const struct { const char *name; const unsigned char *code; size_t size; } spv[] = {
+            { "vs_prim", s_spv_vs_prim, sizeof s_spv_vs_prim }, { "fs_prim", s_spv_fs_prim, sizeof s_spv_fs_prim },
+            { "vs_full", s_spv_vs_full, sizeof s_spv_vs_full }, { "fs_present", s_spv_fs_present, sizeof s_spv_fs_present },
+        };
+        for (size_t i = 0; i < sizeof spv / sizeof spv[0]; i++)
+            if (!strcmp(spv[i].name, entry)) { si.code = spv[i].code; si.code_size = spv[i].size; }
+        si.entrypoint = "main";
+        si.format = SDL_GPU_SHADERFORMAT_SPIRV;
+    }
     SDL_GPUShader *s = SDL_CreateGPUShader(s_dev, &si);
     if (!s) rt_log("hires-gpu: shader %s: %s", entry, SDL_GetError());
     return s;
@@ -1376,19 +1397,57 @@ static void blend_for_key(int key, SDL_GPUColorTargetBlendState *b)
     }
 }
 
+bool hires_gpu_set_driver(const char *name)
+{
+    if (!name || !*name || !strcmp(name, "auto")) { s_driver[0] = 0; return true; }
+    if (strcmp(name, "metal") && strcmp(name, "vulkan")) return false;
+    snprintf(s_driver, sizeof s_driver, "%s", name);
+    return true;
+}
+
+SDL_GPUDevice *hires_gpu_create_device(void)
+{
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) {   /* SDL_GPU needs it (the offscreen driver has no GPU backend) */
+        if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { rt_log("hires-gpu: SDL video: %s", SDL_GetError()); return NULL; }
+    }
+#ifdef __APPLE__
+    /* Vulkan on macOS = MoltenVK through the Vulkan loader, which SDL only finds in the default
+     * library paths; point it at Homebrew's loader unless SDL_VULKAN_LIBRARY says otherwise. */
+    if (!strcmp(s_driver, "vulkan") && !SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
+        static const char *const libs[] = { "/opt/homebrew/lib/libvulkan.1.dylib", "/usr/local/lib/libvulkan.1.dylib" };
+        for (size_t i = 0; i < sizeof libs / sizeof libs[0]; i++) {
+            SDL_PathInfo pi;
+            if (SDL_GetPathInfo(libs[i], &pi)) { SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, libs[i]); break; }
+        }
+    }
+#endif
+    /* auto: MSL first on Apple (Metal), SPIR-V elsewhere (Vulkan); never D3D12 (no DXIL here) */
+    SDL_GPUShaderFormat fmts = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_SPIRV;
+    if (!strcmp(s_driver, "metal")) fmts = SDL_GPU_SHADERFORMAT_MSL;
+    if (!strcmp(s_driver, "vulkan")) fmts = SDL_GPU_SHADERFORMAT_SPIRV;
+    SDL_GPUDevice *dev = SDL_CreateGPUDevice(fmts, false, s_driver[0] ? s_driver : NULL);
+    if (!dev) rt_log("hires-gpu: no GPU device%s%s: %s", s_driver[0] ? " for driver " : "", s_driver, SDL_GetError());
+    return dev;
+}
+
 bool hires_gpu_init(SDL_GPUDevice *dev)
 {
     if (s_inited) return true;
     if (!dev) {
-        if (!SDL_WasInit(SDL_INIT_VIDEO)) {   /* SDL_GPU needs it (the offscreen driver has no GPU backend) */
-            if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { rt_log("hires-gpu: SDL video: %s", SDL_GetError()); return false; }
-        }
-        dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, false, NULL);
-        if (!dev) { rt_log("hires-gpu: no GPU device: %s", SDL_GetError()); return false; }
+        dev = hires_gpu_create_device();
+        if (!dev) return false;
     }
-    if (!(SDL_GetGPUShaderFormats(dev) & SDL_GPU_SHADERFORMAT_MSL)) {
-        rt_log("hires-gpu: device %s does not take MSL shaders (only Metal is supported)", SDL_GetGPUDeviceDriver(dev));
+    const SDL_GPUShaderFormat have = SDL_GetGPUShaderFormats(dev);
+    if (have & SDL_GPU_SHADERFORMAT_MSL) s_spirv = false;
+    else if (have & SDL_GPU_SHADERFORMAT_SPIRV) s_spirv = true;
+    else {
+        rt_log("hires-gpu: device %s takes neither MSL nor SPIR-V shaders", SDL_GetGPUDeviceDriver(dev));
         return false;
+    }
+    s_force_edge = s_spirv;
+    {
+        const char *e = SDL_getenv("DESTREGA_GPU_EDGE");   /* experiments: 1 = always, 0 = only when needed */
+        if (e && *e) s_force_edge = *e != '0';
     }
     s_dev = dev;
     const SDL_GPUTextureFormat fmt = SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
@@ -1445,6 +1504,7 @@ bool hires_gpu_init(SDL_GPUDevice *dev)
     s_vramtex = make_tex(SDL_GPU_TEXTUREFORMAT_R16_UINT, VRAM_W, VRAM_H, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     if (!s_samp || !s_vramtex) { rt_log("hires-gpu: %s", SDL_GetError()); return false; }
     s_inited = true;
-    rt_log("hires-gpu: SDL_GPU device ready (driver %s)", SDL_GetGPUDeviceDriver(dev));
+    rt_log("hires-gpu: SDL_GPU device ready (driver %s, %s shaders%s)", SDL_GetGPUDeviceDriver(dev),
+           s_spirv ? "SPIR-V" : "MSL", s_force_edge ? ", exact edge test on every triangle" : "");
     return true;
 }
