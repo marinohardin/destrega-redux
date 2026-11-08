@@ -109,6 +109,8 @@ static void wav_header(FILE *f, u32 bytes) {
 typedef struct { u64 frame; u16 mask; } InputStep;
 static InputStep s_script[16384];
 static int s_script_n;
+static InputStep s_script2[16384];   /* --press2: same format, for pad 2 */
+static int s_script2_n;
 
 /* ---- display conversion -------------------------------------------------------- */
 
@@ -582,6 +584,10 @@ void frontend_vblank(void) {
         for (int i = 0; i < s_script_n; i++)
             if (s_script[i].frame <= s_frame && s_frame < s_script[i].frame + 6) pad |= s_script[i].mask;
         g_pad_buttons[0] = (u16)~pad;
+        u16 pad2 = 0;
+        for (int i = 0; i < s_script2_n; i++)
+            if (s_script2[i].frame <= s_frame && s_frame < s_script2[i].frame + 6) pad2 |= s_script2[i].mask;
+        if (s_script2_n) g_pad_buttons[1] = (u16)~pad2;
         if (s_dump_dir && s_dump_every && s_frame % s_dump_every == 0) {
             char p[512];
             snprintf(p, sizeof p, "%s/frame_%06llu.png", s_dump_dir, (unsigned long long)s_frame);
@@ -726,6 +732,7 @@ static void usage(void) {
         "  --dump DIR            write screenshots to DIR (headless)\n"
         "  --dump-every N        screenshot every N frames\n"
         "  --press F:MASK,...    headless input script (MASK = hex PSX button bits, active high)\n"
+        "  --press2 F:MASK,...   same, for pad 2 (VS / team modes)\n"
         "  --wav FILE            record audio output (headless)\n"
         "  --scale N|NxM         internal render scale (horizontal x vertical): 0 = hi-res off, 1..8\n"
         "                        fixed (default: auto from the window size; headless: off)\n"
@@ -1127,6 +1134,15 @@ int main(int argc, char **argv) {
                 s_script[s_script_n].frame = strtoull(s, &s, 0);
                 if (*s == ':') s++;
                 s_script[s_script_n++].mask = (u16)strtoul(s, &s, 16);
+                if (*s == ',') s++;
+            }
+        }
+        else if (!strcmp(argv[i], "--press2") && i + 1 < argc) {
+            char *s = argv[++i];
+            while (*s && s_script2_n < 16384) {
+                s_script2[s_script2_n].frame = strtoull(s, &s, 0);
+                if (*s == ':') s++;
+                s_script2[s_script2_n++].mask = (u16)strtoul(s, &s, 16);
                 if (*s == ',') s++;
             }
         }
