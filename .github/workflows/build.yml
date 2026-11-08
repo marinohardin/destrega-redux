@@ -50,6 +50,14 @@ jobs:
         run: cmake --build build/ci -j4
       - name: Unit tests
         run: ctest --test-dir build/ci --output-on-failure -V
+      - name: GPU test on Mesa lavapipe (software Vulkan for Windows, if MSYS2 ships it)
+        run: |
+          pacman -S --noconfirm --needed mingw-w64-clang-x86_64-mesa mingw-w64-clang-x86_64-vulkan-loader || exit 0
+          icd=$(find /clang64 -iname '*lvp*icd*.json' | head -1)
+          if [ -z "$icd" ]; then echo "no lavapipe ICD in MSYS2's mesa; skipped"; pacman -Ql mingw-w64-clang-x86_64-mesa | grep -i vulkan || true; exit 0; fi
+          echo "lavapipe ICD: $icd"
+          export VK_DRIVER_FILES=$(cygpath -w "$icd")
+          ./build/ci/test_hires_gpu.exe vulkan
       - name: Executable starts
         run: |
           ./build/ci/destrega.exe --help | head -3
