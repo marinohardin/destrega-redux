@@ -27,6 +27,7 @@ static bool s_headless, s_fast;
 static u64 s_frame, s_max_frames;
 static const char *s_dump_dir;
 static int s_dump_every;
+static u64 s_dump_from;           /* --dump-from F: first frame written by --dump */
 static u64 s_next_tick_ns;
 static u32 s_rgba[640 * 512];
 static FILE *s_wav;
@@ -72,6 +73,7 @@ static int seg_of(u64 frame) {
     return k;
 }
 static bool s_hires_dither;
+static int s_pgxp = 2;              /* --pgxp: 0 off, 1 precise positions only (affine), 2 on */
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
 static const char *s_memcard_path[2];  /* --memcard1/2 */
@@ -521,6 +523,34 @@ static void finish(void) {
                (unsigned long long)s_verify_bad_frames);
         if (s_verify_bad_frames || !s_verify_fight) rc = 3;
     }
+    if (g_pgxp_stat_tris) {
+        rt_log("pgxp-check: %llu triangles with precise vertices; %llu with an on-screen vertex > 1.5 px from its integer, "
+               "%llu with depth ratio > 2, %llu using a value older than 2 frames, %llu split vertices",
+               (unsigned long long)g_pgxp_stat_tris, (unsigned long long)g_pgxp_stat_bad_d,
+               (unsigned long long)g_pgxp_stat_bad_w, (unsigned long long)g_pgxp_stat_old,
+               (unsigned long long)g_pgxp_stat_split);
+        rt_log("pgxp-weld: %llu vertex uses snapped to another precise value of the same word, %llu to the "
+               "integer, %llu table-full fallbacks",
+               (unsigned long long)g_pgxp_stat_welded, (unsigned long long)g_pgxp_stat_weld_int,
+               (unsigned long long)g_pgxp_stat_weld_full);
+    }
+    if (g_pgxp_stat_vtx) {
+        u64 tris, persp;
+        hires_get_persp_stats(&tris, &persp);
+        if (s_renderer == R_GPU) {
+            HiresGpuStats st;
+            hires_gpu_get_stats(&st);
+            tris = st.tris; persp = st.persp_tris;
+        }
+        rt_log("pgxp: %llu of %llu polygon vertices precise (%.1f%%), %llu GTE vertices tracked; "
+               "%llu of %llu hi-res triangles perspective-textured; misses: %llu stale tag, "
+               "%llu equal to a recent GTE result (association lost)",
+               (unsigned long long)g_pgxp_stat_hit, (unsigned long long)g_pgxp_stat_vtx,
+               100.0 * (double)g_pgxp_stat_hit / (double)g_pgxp_stat_vtx,
+               (unsigned long long)g_pgxp_stat_new, (unsigned long long)persp,
+               (unsigned long long)tris, (unsigned long long)g_pgxp_stat_miss_stale,
+               (unsigned long long)g_pgxp_stat_miss_gte);
+    }
     {
         HiresUvStats uv;
         hires_get_uv_stats(&uv);
@@ -716,7 +746,7 @@ void frontend_vblank(void) {
         for (int i = 0; i < s_script2_n; i++)
             if (s_script2[i].frame <= s_frame && s_frame < s_script2[i].frame + 6) pad2 |= s_script2[i].mask;
         if (s_script2_n) g_pad_buttons[1] = (u16)~pad2;
-        if (s_dump_dir && s_dump_every && s_frame % s_dump_every == 0) {
+        if (s_dump_dir && s_dump_every && s_frame >= s_dump_from && s_frame % s_dump_every == 0) {
             char p[512];
             snprintf(p, sizeof p, "%s/frame_%06llu.png", s_dump_dir, (unsigned long long)s_frame);
             frontend_screenshot(p);
@@ -878,6 +908,7 @@ static void usage(void) {
         "  --frames N            exit after N frames (headless)\n"
         "  --dump DIR            write screenshots to DIR (headless)\n"
         "  --dump-every N        screenshot every N frames\n"
+        "  --dump-from F         first frame --dump writes (default 0)\n"
         "  --press F:MASK,...    headless input script (MASK = hex PSX button bits, active high)\n"
         "  --press2 F:MASK,...   same, for pad 2 (VS / team modes)\n"
         "  --wav FILE            record audio output (headless)\n"
@@ -890,6 +921,8 @@ static void usage(void) {
         "  --fight-from F        first frame counted as 'fight' in the hi-res frame stats (default 3700)\n"
         "  --hires-min-fight P   exit non-zero unless P%% of fight frames were shown from the hi-res target\n"
         "  --hires-dither        keep PS1 dithering in the hi-res target at scale > 1\n"
+        "  --pgxp on|off|affine  sub-pixel GTE vertices + perspective-correct textures in the hi-res\n"
+        "                        target (default on; affine = precise positions, PS1 texture mapping)\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
         "  --ram-dump FILE       headless: write main RAM to FILE at the end\n"
         "  --memcard1 PATH       memory card image for slot 1 (raw 128 KiB .mcd; created if missing)\n"
@@ -1307,6 +1340,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) s_max_frames = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) s_dump_dir = argv[++i];
         else if (!strcmp(argv[i], "--dump-every") && i + 1 < argc) s_dump_every = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dump-from") && i + 1 < argc) s_dump_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--trace")) g_trace++;
         else if (!strcmp(argv[i], "--no-interp")) g_no_interp = 1;
         else if (!strcmp(argv[i], "--verify-overrides")) { g_verify_overrides = 1; atexit(override_report); }
@@ -1354,6 +1388,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fight-from") && i + 1 < argc) s_fight_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--hires-min-fight") && i + 1 < argc) s_hires_min_fight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hires-dither")) s_hires_dither = true;
+        else if (!strcmp(argv[i], "--pgxp-diag") && i + 1 < argc) g_pgxp_diag = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pgxp") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "on")) s_pgxp = 2;
+            else if (!strcmp(m, "off")) s_pgxp = 0;
+            else if (!strcmp(m, "affine")) s_pgxp = 1;
+            else { fprintf(stderr, "--pgxp: expected on, off or affine\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--hires-verify")) s_verify = true;
         else if (!strcmp(argv[i], "--widescreen")) s_widescreen = true;
         else if (!strcmp(argv[i], "--ram-snap") && i + 1 < argc) s_ram_snap_dir = argv[++i];
@@ -1484,6 +1526,10 @@ int main(int argc, char **argv) {
     gte_init();
     gpu_init();
     hires_set_dither(s_hires_dither);
+    g_pgxp = s_pgxp > 0;
+    { extern u32 g_callstack[1024]; extern u32 g_depth; g_pgxp_callstack = g_callstack; g_pgxp_depth = &g_depth; }
+    hires_set_perspective(s_pgxp == 2);
+    widescreen_add_state_hook(pgxp_snapshot_save, pgxp_snapshot_restore);   /* shadow pass leaves PGXP alone */
     hires_set_threads(s_hires_threads);
     if (s_renderer != R_SOFTWARE) {
         s_gpu_ok = hires_gpu_init(NULL);   /* headless: a device of its own; windowed: already done */

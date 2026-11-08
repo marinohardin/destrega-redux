@@ -10,7 +10,9 @@
  */
 #include "psx.h"
 #include "hires.h"
+#include "pgxp.h"
 #include <string.h>
+#include <math.h>
 
 #define VRAM_W 1024
 #define VRAM_H 512
@@ -50,6 +52,7 @@ static bool s_field;
 /* command FIFO */
 #define CMD_MAX 64
 static u32 s_cmd[CMD_MAX];
+static u32 s_cmd_tag[CMD_MAX];   /* PGXP precision tag of each word (presentation only) */
 static int s_cmd_len;
 static int s_cmd_need;
 
@@ -447,8 +450,12 @@ static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool sem
     }
 }
 
+/* Precise (PGXP) position of a polygon vertex for the hi-res target: offsets from the integer
+ * vertex and depth; ok = false means "use the integer vertex". */
+typedef struct { float dx, dy, w; bool ok; } PVtx;
+
 static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
-                     bool tex, bool raw, bool semi, bool gour)
+                     const PVtx *pv, bool tex, bool raw, bool semi, bool gour)
 {
     int minx = a->x, maxx = a->x, miny = a->y, maxy = a->y;
     if (b->x < minx) minx = b->x;
@@ -541,6 +548,12 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
             hv[i].x = vs[i]->x * 65536; hv[i].y = vs[i]->y * 65536;
             hv[i].r = vs[i]->r; hv[i].g = vs[i]->g; hv[i].b = vs[i]->b;
             hv[i].u = vs[i]->u; hv[i].v = vs[i]->v;
+            hv[i].w = 0;
+            if (pv && pv[i].ok) {
+                hv[i].x += (s32)lrintf(pv[i].dx * 65536.0f);
+                hv[i].y += (s32)lrintf(pv[i].dy * 65536.0f);
+                hv[i].w = pv[i].w;
+            }
         }
         g_hires->tri(&hp, hv);
     }
@@ -573,12 +586,37 @@ static void gp0_polygon(const u32 *w)
     bool raw = (cmd & 0x01) != 0;
     int n = quad ? 4 : 3;
     Vtx v[4];
+    PVtx pv[4];
+    const PgxpVert *pq[4] = { 0 };
+    u32 pxy[4] = { 0 };
+    bool any_pv = false;
+    const bool want_pv = g_hires && g_pgxp;
     int i = 0;
     u32 color = w[0] & 0xFFFFFF;
     u32 clut = 0;
     for (int k = 0; k < n; k++) {
         if (gour && k > 0) color = w[i] & 0xFFFFFF;
         if (k == 0 || gour) i++;
+        pv[k].ok = false;
+        if (want_pv && s_shadow) {
+            /* widescreen extra (integer words, no tags): take a precise position only where the
+             * real geometry already welded this word in the batch (closes seams at the 4:3
+             * edge); never inserts, so the real packets drawn after it are unaffected */
+            const PgxpVert *q = pgxp_weld_peek(w[i]);
+            if (q) { pv[k].dx = q->dx; pv[k].dy = q->dy; pv[k].w = q->w; pv[k].ok = true; any_pv = true; }
+        } else if (want_pv) {
+            const PgxpVert *q = pgxp_weld(w[i], pgxp_lookup(s_cmd_tag[i], w[i]));
+            g_pgxp_stat_vtx++;
+            pq[k] = q; pxy[k] = w[i];
+            if (q) {
+                pv[k].dx = q->dx; pv[k].dy = q->dy; pv[k].w = q->w; pv[k].ok = true;
+                any_pv = true;
+                g_pgxp_stat_hit++;
+            } else {
+                g_pgxp_stat_miss_stale += s_cmd_tag[i] != 0;
+                g_pgxp_stat_miss_gte += g_pgxp_recent[pgxp_recent_slot(w[i])] == w[i];
+            }
+        }
         u32 xy = w[i++];
         v[k].x = sext11((u32)(sext11(xy) + s_off_x));
         v[k].y = sext11((u32)(sext11(xy >> 16) + s_off_y));
@@ -607,8 +645,12 @@ static void gp0_polygon(const u32 *w)
     if (tex && raw) {
         for (int k = 0; k < n; k++) v[k].r = v[k].g = v[k].b = 0x80;
     }
-    draw_tri(&p, &v[0], &v[1], &v[2], tex, raw, semi, shaded);
-    if (quad) draw_tri(&p, &v[1], &v[2], &v[3], tex, raw, semi, shaded);
+    if (want_pv && !s_shadow) {
+        pgxp_check_tri(pq, pxy);
+        if (quad) pgxp_check_tri(pq + 1, pxy + 1);
+    }
+    draw_tri(&p, &v[0], &v[1], &v[2], any_pv ? &pv[0] : NULL, tex, raw, semi, shaded);
+    if (quad) draw_tri(&p, &v[1], &v[2], &v[3], any_pv ? &pv[1] : NULL, tex, raw, semi, shaded);
 }
 
 /* ---- rectangles --------------------------------------------------------- */
@@ -955,7 +997,9 @@ static void polyline_word(u32 v)
     s_pl_have_color = false;
 }
 
-void gpu_write_gp0(u32 v)
+void gpu_write_gp0(u32 v) { gpu_write_gp0_tag(v, 0); }
+
+void gpu_write_gp0_tag(u32 v, u32 tag)
 {
     if (s_mode == MODE_CPU2VRAM) {
         cpu2vram_word(v);
@@ -968,6 +1012,7 @@ void gpu_write_gp0(u32 v)
     if (s_cmd_len == 0) {
         s_cmd_need = gp0_len(v >> 24);
     }
+    s_cmd_tag[s_cmd_len] = tag;
     s_cmd[s_cmd_len++] = v;
     if (s_cmd_len >= s_cmd_need) {
         s_cmd_len = 0;
@@ -1139,6 +1184,8 @@ u32 gpu_read_stat(void)
 
 void gpu_vblank(void)
 {
+    g_pgxp_frame++;
+    pgxp_new_batch();
     if (interlaced()) s_field = !s_field;
 }
 

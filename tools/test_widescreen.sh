@@ -10,6 +10,9 @@
 #   ws1      --widescreen, 1x1 with --hires-verify (the 4:3 part of the target == 1x VRAM)
 #   wsrender starts on the software renderer and 4:3, switches renderer and widescreen mid-fight
 #   ws46g    --widescreen, 4x6, --renderer gpu
+#   ws2c     --widescreen, 2x2, --renderer compare --pgxp off: GPU == software, guard band included
+#            (--compare-max 0: every compared frame identical)
+#   ws46c    --widescreen, 4x6, --renderer compare, PGXP on: within CMP_MAX_PGXP (0.001 %) per frame
 #   wstoggle starts 4:3, switched on/off six times mid-fight: five times through View >
 #            Widescreen (--menu-action widescreen[=on|off], the path the menu and F9 take), once
 #            via --widescreen-at; screenshots every 50 frames
@@ -50,6 +53,7 @@ rm -f $OUT/*.hash $OUT/*.trace $OUT/*.log $OUT/*.rc
 rm -rf $OUT/toggle $OUT/render; mkdir -p $OUT/toggle $OUT/render
 JOBS=${JOBS:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
 cat > $OUT/jobs.txt <<EOF
+ws46c --widescreen --scale 4x6 --window 1280x720 --hires-threads 3 --renderer compare --compare-every 10 --compare-max ${CMP_MAX_PGXP:-0.001}
 ws46 --widescreen --scale 4x6 --window 1280x720 --hires-threads 3
 wsresize --widescreen --max-scale 4x6 --hires-threads 1 --resize 2000:1280x720,4300:960x720,5200:2560x1080,6100:1440x900,7000:1920x1080
 ws2 --widescreen --scale 2 --window 1280x720 --hires-threads 1
@@ -58,6 +62,7 @@ ws1 --widescreen --scale 1 --window 1280x720 --hires-verify --hires-threads 0
 off --scale 2 --hires-threads 0
 wsrender --scale 2 --window 1280x720 --hires-threads 0 --renderer software --menu-action 3800:renderer=gpu --menu-action 4200:widescreen=on --menu-action 4500:renderer=software --menu-action 5000:renderer=gpu --menu-action 5400:widescreen=off --menu-action 5800:renderer=software --menu-action 6300:widescreen=on --menu-action 6600:renderer=gpu --menu-action 7200:renderer --menu-action 7600:widescreen=off --menu-action 4100:fullscreen=on --menu-action 6900:fullscreen --dump build/widescreen/render --dump-every 50
 ws46g --widescreen --scale 4x6 --window 1280x720 --renderer gpu
+ws2c --widescreen --scale 2 --window 1280x720 --hires-threads 1 --pgxp off --renderer compare --compare-every 10 --compare-max 0
 wstoggle --scale 2 --window 1280x720 --hires-threads 0 --menu-action 3900:widescreen=on --menu-action 4600:widescreen --widescreen-at 5300:1 --menu-action 6200:widescreen=off --menu-action 6900:widescreen --menu-action 8000:widescreen=off --dump build/widescreen/toggle --dump-every 50
 EOF
 START=$(date +%s)
@@ -65,7 +70,7 @@ xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
 ELAPSED=$(( $(date +%s) - START ))
 
 fail=0
-WS="ws2 ws2b ws46 wsresize ws1 wstoggle wsrender ws46g"
+WS="ws2 ws2b ws46 wsresize ws1 wstoggle wsrender ws46g ws46c ws2c"
 echo "widescreen: ran $(wc -l < $OUT/jobs.txt) runs of $FRAMES frames, $JOBS at a time, in ${ELAPSED}s"
 for n in off $WS; do
   rc=$(cat $OUT/$n.rc 2>/dev/null || echo missing)
@@ -94,6 +99,9 @@ for n in ws2 ws2b ws46 ws1 ws46g; do
   [ -n "$1" ] && [ $(( $1 * 100 )) -ge $(( $2 * 80 )) ] || { echo "widescreen: $n: < 80% of fight frames presented wide"; fail=1; }
 done
 grep -h "resize\|render scale" $OUT/wsresize.log | sed 's/^\[ *[0-9]*\] /widescreen: wsresize: /' | head -12
+for n in ws2c ws46c; do
+  grep -h "hires-compare: fight" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /widescreen: $n: /"
+done
 grep -h "hires-verify" $OUT/ws1.log | sed 's/^\[ *[0-9]*\] /widescreen: ws1: /'
 grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/ws1.log ||
   { echo "widescreen: ws1: the 4:3 part of the target differs from the 1x VRAM"; fail=1; }

@@ -207,8 +207,20 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **View > Widescreen (16:9)** (checkable; added to SDL's View menu if it has one, else a new
   menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
 - **View > Renderer > Software / GPU**: action `renderer[=software|gpu]`, see "GPU renderer".
+- **Full screen** on every platform from the SDL event loop in `main.c` (so not a Cocoa-only
+  feature): **Alt+Enter** and **F11**, plus **Ctrl+Cmd+F** on macOS, queue the action
+  `fullscreen` (`=on|off`, none = toggle; one toggle per frame, because Ctrl+Cmd+F can arrive both
+  as the menu key equivalent and as an SDL key event). These keys never reach the pad (the Enter
+  of Alt+Enter is not START). macOS: **View > Enter Full Screen / Exit Full Screen** (title
+  follows the state, Ctrl+Cmd+F; replaces SDL's own "Toggle Full Screen" item, which called
+  `-[NSWindow toggleFullScreen:]` behind SDL's back). `SDL_SetWindowFullscreen` uses the desktop
+  mode (a native full-screen Space on macOS); SDL keeps and restores the windowed size and
+  position. The hi-res auto scale follows the new pixel size in `present_frame` like any resize
+  (widescreen and both renderers included); the log shows `fullscreen: entered/left, window WxH
+  px` and the new `render scale`. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
-  `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`. Headless: no dialogs (the file argument is
+  `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
+  `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`. Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
   unless `--data-dir` or `--memcard1` says where the cards are (never the user's real folder by accident).
   Log lines start with `menu:`; errors with `menu: ERROR:`.
@@ -234,7 +246,7 @@ hashing all emulated state per frame).
   bit-identical to the 1x VRAM region (`--hires-verify`).
 - Coverage = 1x geometry scaled by Sx/Sy (a w*h rect covers exactly Sx*w x Sy*h pixels).
   Colour/u/v come from the 1x plane equations at each hi-res pixel centre. Vertices are
-  16.16 fixed point in 1x units (integers today) so GTE sub-pixel precision can be fed later.
+  16.16 fixed point in 1x units: integers, or sub-pixel GTE positions with PGXP (below).
 - UV clamp: a hi-res pixel centre can lie outside the polygon (texture minified by more than
   ~1.3 texel per pixel, and always near the right/bottom edges), so interpolated u/v are clamped
   before the texture-window mask, otherwise the lookup reads a neighbouring texture in VRAM
@@ -293,12 +305,77 @@ hashing all emulated state per frame).
   state hashes equal, >=95% of fight frames hi-res, 0 UV fetches outside the 1x-sampled range, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
   tests, `tools/smoke_test.sh` and the determinism script concurrently (~1.7 min).
 
+## PGXP: sub-pixel vertices and perspective-correct textures (`runtime/pgxp.[ch]`)
+
+Presentation-only, like hi-res. Removes the vertex wobble and affine texture warping in the
+hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x VRAM.
+
+- `gte.c` RTPS/RTPT also compute the projection without the integer steps (`pgxp_project`:
+  H / unrounded SZ instead of UNR on the integer SZ3, unsaturated MAC1/2) and store
+  {integer SXY word, dx, dy, depth} in a ring pool; the tag (pool index) rides in a 3-entry FIFO
+  next to SXY0..2. No value when SX/SY/SZ/IR were clamped or the two differ by >= 4 px.
+- Tags follow the word: `codegen.py` emits `pgxp_lw/sw/mov/mfc2/mtc2/lwc2/swc2` hooks
+  (register moves = `addu/or rd, rs, $zero`, `addiu rt, rs, 0`); `interp.c` mirrors all but
+  moves. Shadow tags: one per CPU register, per RAM/scratchpad word, plus an I/O sink slot that
+  carries an SW to the GP0 port. GPU DMA (block and linked list), the GP0 port and BIOS GPU_cw
+  pass each word's tag to `gpu_write_gp0_tag`. A tag is used only if the pool entry's integer
+  word still equals the GP0 word (`pgxp_lookup`), so stale tags (ALU ops, sh/sb rewrites,
+  ring reuse) just fall back to the integer vertex. No invalidation anywhere.
+- **Welding (required, see NOTES.md "GTE projection call sites")**: the character meshes rely on
+  integer snapping. Vertices of different primitives that are meant to meet (hair/face/limb
+  pieces) are distinct GTE results that only coincide after rounding to the same SXY word; drawn
+  at their own precise positions they separate by up to 1 px: cracks, torn shoulders, back
+  geometry and a dark smear showing through the face. So within one batch (one GPU linked-list
+  DMA, or one vblank) every use of an SXY word gets one position: the first precise value seen
+  for it, or the integer if it was first sent without one (`pgxp_weld`). Vertices on different
+  integer pixels stay independent, so the stage and the character outlines remain wobble-free.
+  A precise value whose W differs by more than 1.25x is another mesh on the same pixel (stage
+  vertex w=9073 vs character vertex w=3065 on one word) and is welded separately, keeping its W.
+- `gpu.c` adds the offsets to polygon vertices for `g_hires` only (`HiresVtx.x/y` 16.16 plus
+  `HiresVtx.w`, 0 = none). Lines and rects (2D sprites, HUD, text) are untouched.
+- `hires.c`: a textured triangle with `w` on all three vertices is textured perspective-
+  correctly (q = 1/w, u*q, v*q planes; exact every 8 hi-res pixels, linear in between);
+  otherwise affine as before. Equal `w` on all three (walls facing the camera) takes the affine
+  path, which is the same mapping: with q constant, exact texel-boundary ties are common and the
+  double (software) and 2^-38 fixed-point (GPU) planes rounded them differently (whole rows one
+  texel apart; 52K pixels in a 16:9 4x6 compare run before, 28 after). The UV clamp to the 1x-sampled range stays: perspective u/v inside
+  the triangle are a convex combination of the vertex u/v, so the clamp only acts at the edges /
+  outside, as for affine; it is also applied at 1x1 when a triangle has precise vertices
+  (samples are off the 1x grid there too). The gouraud colour clamp is unchanged (colours stay
+  affine).
+- Option `--pgxp on|off|affine` (default on; `affine` = precise positions, PS1 texture mapping).
+  Off = previous output exactly (tracking disabled, `w` = 0). The hooks are guarded by
+  `g_pgxp`. At 1x1 with PGXP on, `--hires-verify` reports mismatches by design (vertices leave
+  the integer grid); equivalence is tested with `--pgxp off`.
+- Run summary: `pgxp-check:` (vertices actually drawn: on-screen vertices > 1.5 px from their
+  integer, depth ratio > 2 inside a triangle between vertices from different GTE call sites,
+  values older than 2 vblanks, and "split" = an SXY word at a similar depth drawn at two
+  positions in one batch, i.e. a crack; all must be 0, the determinism script and the s23
+  scenario check it), `pgxp-weld:` (uses snapped), `--pgxp-diag N` logs up to N offenders with the GTE
+  call site, `--dump-from F` limits `--dump` to frames >= F. `pgxp: H of N polygon vertices
+  precise, ... misses: S stale tag, G equal to a recent GTE result` (G estimates GTE vertices whose association was lost; the rest of the
+  misses are CPU-computed 2D polygons). Fight at 4x6: see the PR / NOTES.md for numbers.
+- Tests: `runtime/tests/test_pgxp.c` (GTE registers bit-identical on/off; GTE -> register ->
+  RAM -> lw -> move -> sw -> GP0 path; dropped after sh rewrite, stale register, untracked
+  store; FIFO shift; perspective only with three depths; welding within and not across batches), and the determinism matrix runs
+  `--pgxp on/affine` at several scales against a `--pgxp off`, hi-res-off reference.
+- For other backends (`HiresBackend`): `w` is optional; ignore it for affine texturing.
+- GPU renderer (`hires_gpu.c`, see its header): fractional positions are drawn with the exact
+  edge test, using the triangle grown by 1 px, or the bounding box for slivers. Perspective
+  u/v use 2^-38 fixed-point planes with an exact division. Results at 4x6 against software:
+  - `--pgxp off` and `affine`: 0 differing pixels;
+  - `on`: 29 pixels over 331 fight frames, texel choice where double and fixed point round
+    differently (test limit `CMP_MAX_PGXP`, 0.001 %).
+
+  GPU 4x6 fight on a loaded machine: 10.3 ms/frame with `--pgxp off`, 11.7 with `affine`,
+  15.2 with `on`. Tracking alone costs nothing measurable.
 ## GPU renderer (`runtime/hires_gpu.[ch]`, `--renderer gpu`)
 
 A second `HiresBackend` on SDL3's SDL_GPU (Metal, MSL shaders embedded in the C file). Same
 contract as the software backend: commands in, target out, presentation only. It is
 **bit-identical to the software backend** at every scale tested (1x1, 2x3, 4x6, 8x8 over a
-7000-frame fight run) and to the 1x VRAM at 1x1. Keep it that way: a rule change in `hires.c`
+7000-frame fight run) and to the 1x VRAM at 1x1 (with `--pgxp off`; for `on` see the PGXP
+section). Keep it that way: a rule change in `hires.c`
 needs the same change in the shader. The header comment of `hires_gpu.c` has the details.
 
 - `--renderer software|gpu|compare`. Default: **gpu in a macOS window** (if the SDL GPU renderer
@@ -344,10 +421,19 @@ needs the same change in the shader. The header comment of `hires_gpu.c` has the
   division and the 32x32 tile masks are shifted by the guard width. Guard-band-only packets
   (`g_hires_shadow`, set by gpu.c around `gpu_shadow_packet`) do not mark VRAM blocks dirty
   (they never touch VRAM; marking them caused re-uploads and 10x the render passes).
-  `--renderer compare` compares the guard band too: 0 differing pixels at 2x2 and 4x6, 4:3
-  and 16:9.
+  `--renderer compare` compares the guard band too. `--pgxp off`: 0 differing pixels at 2x2,
+  4:3 and 16:9 (6000 frames; `ws2c` in `test_widescreen.sh`). PGXP on, 4x6, 7000 frames, every
+  10th: 24 (4:3) and 28 (16:9) differing pixels over 331 fight frames (`ws46c`, limit
+  `CMP_MAX_PGXP`). With PGXP the wide pass is bracketed by `pgxp_snapshot_save/restore`
+  (registered with `widescreen_add_state_hook` in `main.c`: tag tables copied, pool and
+  recent-word writes journalled and undone), so the real pass draws exactly what it would at
+  4:3 (`pgxp-check` counts identical). Extra (guard-band) packets carry no tags: a vertex gets a
+  precise position only if the real geometry already welded that SXY word in the batch
+  (`pgxp_weld_peek`, which inserts nothing), which closes seams at the 4:3 edge.
 - Tests: `tools/test_hires_determinism.sh` adds `g4x6` (state hash), `gverify1` (1x1 ==
-  1x VRAM), `c1x1` and `c4x6` (compare vs software, `CMP_MAX` default 0 %);
+  1x VRAM), `c1x1` and `c4x6` (compare vs software, `--pgxp off`, `CMP_MAX` default 0 %), and
+  `cp4x6` (compare with `--pgxp on`, `CMP_MAX_PGXP` default 0.001 %). `g4x6` runs with PGXP on
+  and must pass the `pgxp-check`.
   `tools/test_widescreen.sh` adds `ws46g` (16:9 on the GPU) and `wsrender` (renderer and
   widescreen switched back and forth mid-fight, state hash = 4:3 software run).
 

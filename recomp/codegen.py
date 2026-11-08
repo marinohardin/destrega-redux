@@ -81,6 +81,11 @@ class FuncEmitter:
             return f'op_div({rs}, {rt});'
         if o == 'divu':
             return f'op_divu({rs}, {rt});'
+        if o in ('add', 'addu', 'or') and i.rd and (i.rs == 0 or i.rt == 0):
+            # register move: carry the PGXP precision tag (runtime/pgxp.h)
+            src = i.rt if i.rs == 0 else i.rs
+            return setr(i.rd, f'{rs} + {rt}' if o != 'or' else f'{rs} | {rt}') + \
+                f' pgxp_mov({i.rd}, {src});'
         if o in ('add', 'addu'):
             return setr(i.rd, f'{rs} + {rt}')
         if o in ('sub', 'subu'):
@@ -97,6 +102,8 @@ class FuncEmitter:
             return setr(i.rd, f'(s32){rs} < (s32){rt}')
         if o == 'sltu':
             return setr(i.rd, f'{rs} < {rt}')
+        if o in ('addi', 'addiu') and imm == 0 and i.rt:
+            return setr(i.rt, f'{rs} + {imm}') + f' pgxp_mov({i.rt}, {i.rs});'
         if o in ('addi', 'addiu'):
             return setr(i.rt, f'{rs} + {imm}')
         if o == 'slti':
@@ -124,7 +131,9 @@ class FuncEmitter:
         if o == 'lhu':
             return setr(i.rt, f'mem_r16({ea})')
         if o == 'lw':
-            return setr(i.rt, f'mem_r32({ea})')
+            if i.rt == 0:
+                return setr(i.rt, f'mem_r32({ea})')
+            return f'{{ u32 a_ = {ea}; R{i.rt} = mem_r32(a_); pgxp_lw({i.rt}, a_); }}'
         if o == 'lwl':
             return setr(i.rt, f'op_lwl({rt}, {ea})') if i.rt else ''
         if o == 'lwr':
@@ -134,21 +143,23 @@ class FuncEmitter:
         if o == 'sh':
             return f'mem_w16({ea}, {rt});'
         if o == 'sw':
-            return f'mem_w32({ea}, {rt});'
+            return f'{{ u32 a_ = {ea}; pgxp_sw(a_, {i.rt}); mem_w32(a_, {rt}); }}'
         if o == 'swl':
             return f'op_swl({rt}, {ea});'
         if o == 'swr':
             return f'op_swr({rt}, {ea});'
         if o == 'lwc2':
-            return f'gte_write_data({i.rt}, mem_r32({ea}));'
+            return f'{{ u32 a_ = {ea}; gte_write_data({i.rt}, mem_r32(a_)); pgxp_lwc2({i.rt}, a_); }}'
         if o == 'swc2':
-            return f'mem_w32({ea}, gte_read_data({i.rt}));'
+            return f'{{ u32 a_ = {ea}; pgxp_swc2(a_, {i.rt}); mem_w32(a_, gte_read_data({i.rt})); }}'
         if o == 'mfc2':
-            return setr(i.rt, f'gte_read_data({i.rd})')
+            if i.rt == 0:
+                return setr(i.rt, f'gte_read_data({i.rd})')
+            return setr(i.rt, f'gte_read_data({i.rd})') + f' pgxp_mfc2({i.rt}, {i.rd});'
         if o == 'cfc2':
             return setr(i.rt, f'gte_read_ctrl({i.rd})')
         if o == 'mtc2':
-            return f'gte_write_data({i.rd}, {rt});'
+            return f'gte_write_data({i.rd}, {rt}); pgxp_mtc2({i.rd}, {i.rt});'
         if o == 'ctc2':
             return f'gte_write_ctrl({i.rd}, {rt});'
         if o == 'cop2':

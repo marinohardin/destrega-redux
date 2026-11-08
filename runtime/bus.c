@@ -1,6 +1,7 @@
 /* Memory map, interrupt controller, DMA controller, root counters, scheduler. */
 #include "psx.h"
 #include "mdec.h"
+#include "pgxp.h"
 
 u32 sio_read(u32 off, int size);
 void sio_write(u32 off, u32 v, int size);
@@ -242,14 +243,17 @@ static void dma_run(int ch) {
         break;
     case 2: /* GPU */
         if (sync == 2) {
+            pgxp_new_batch();   /* PGXP welding scope: one ordering-table DMA */
             u32 a = madr, guard = 0;
             cost = 0;
             for (;;) {
                 if (g_gpu_ll_hook) g_gpu_ll_hook(a & 0x1ffffc);   /* presentation only */
                 u32 hdr = *(u32 *)(g_ram + (a & 0x1ffffc));
                 u32 n = hdr >> 24;
-                for (u32 i = 0; i < n; i++)
-                    gpu_write_gp0(*(u32 *)(g_ram + ((a + 4 + i * 4) & 0x1ffffc)));
+                for (u32 i = 0; i < n; i++) {
+                    u32 wa = (a + 4 + i * 4) & 0x1ffffc;
+                    gpu_write_gp0_tag(*(u32 *)(g_ram + wa), g_pgxp_mem[wa >> 2]);
+                }
                 cost += n + 1;
                 if ((hdr & 0x800000) || ++guard > 0x40000) break;
                 a = hdr & 0x1ffffc;
@@ -261,7 +265,7 @@ static void dma_run(int ch) {
                 *(u32 *)(g_ram + madr) = gpu_read_data();
         } else {
             for (u32 i = 0; i < words; i++, madr = (madr + step) & 0x1ffffc)
-                gpu_write_gp0(*(u32 *)(g_ram + madr));
+                gpu_write_gp0_tag(*(u32 *)(g_ram + madr), g_pgxp_mem[madr >> 2]);
         }
         break;
     case 3: /* CDROM */
@@ -392,7 +396,7 @@ static void io_write(u32 p, u32 v, int size) {
         if (size >= 2) cdrom_write8(off - 0x800 + 1, (u8)(v >> 8));
         return;
     }
-    if (off == 0x810) { gpu_write_gp0(v); return; }
+    if (off == 0x810) { gpu_write_gp0_tag(v, size == 4 ? g_pgxp_mem[PGXP_IO_SLOT] : 0); return; }
     if (off == 0x814) {
         if ((v >> 24) == 0x05) g_flips++;
         gpu_write_gp1(v);

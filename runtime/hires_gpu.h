@@ -18,7 +18,7 @@ SDL_GPUTexture *hires_gpu_present(const HiresView *v);
 
 /* Counters since start: submitted command buffers, render passes, draw calls,
  * primitives, VRAM-texture uploads (texels), target copies (VRAM->VRAM copy ops). */
-typedef struct { unsigned long long submits, passes, draws, prims, edge_tris, vram_up_texels, tcopies, readbacks; } HiresGpuStats;
+typedef struct { unsigned long long submits, passes, draws, prims, edge_tris, vram_up_texels, tcopies, readbacks, tris, persp_tris; } HiresGpuStats;
 void hires_gpu_get_stats(HiresGpuStats *st);
 
 #endif
