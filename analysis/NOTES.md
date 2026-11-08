@@ -133,7 +133,13 @@ frame numbers repeat exactly; they are not "game constants".
 - **1P BATTLE / TIME ATTACK / ENDURANCE / PRACTICE**: after a character is confirmed with Cross the
   game picks opponent and stage itself. The same character gets a *different opponent/stage depending
   on the timing of the inputs* (Gradd met Milena on Villa in `fight_script.py`, Doyle on Villa in the
-  scenarios). Guess: the opponent comes from an RNG seeded by elapsed time. Practice puts the player on
+  scenarios). `800e7560` (32-bit, also named in the widescreen work) looks like the game's RNG state: `--watch 800e7560`
+  on `1p_gradd` shows it set to 0xa9 at frame 167, then changing at the first Start (~1405), the cursor
+  moves and at the confirm (2157/2161) and every 2-4 frames once the fight loads. Likely (not traced to
+  the opponent selection code): the opponent/stage come from this RNG, so any change in boot timing
+  (anything that shifts when RNG calls happen) changes them. The scenarios therefore treat 1P / team /
+  time attack / endurance / practice as `loose`: P1's overlay must load and *some* known stage pack
+  must be read; only VS scenarios (stage chosen by input) and story (fixed) pin an exact fingerprint. Practice puts the player on
   the Hills field vs Celia (MSEREA2) with TOTAL/DAMAGE counters; Time Attack and Endurance have a
   countdown (55 -> ...) in the HUD.
 - **TEAM BATTLE**: one pad fills both 3-man teams (Cross to take a slot, Right to move on; 6 Crosses),
@@ -198,8 +204,8 @@ Done:
   with (e.g. on-screen tests that change behaviour)? Matters for widescreen and PGXP.
 - Which RAM address holds the mode / stage / character ids? Not searched (the scenarios fingerprint the
   CD reads instead). `--watch ADDR` (8 slots, 32-bit) is the probe to use.
-- Why do 1P-battle opponent and stage differ with input timing (RNG seeded by time?) and what chooses
-  them in the first place?
+- Where exactly are the 1P-battle opponent and stage chosen from the RNG (`800e7560`), and what is the
+  order for a normal run (stage 1 = Villa)?
 - Are Gene (`MGENE*.BIN`) and Soldier reachable outside STORY (cheat, unlock)? No portrait for them.
 - Story: the first fight is lost without input; the scenario stops at its start, so later events are
   untested.
