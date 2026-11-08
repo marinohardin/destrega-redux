@@ -57,7 +57,15 @@ jobs:
           if [ -z "$icd" ]; then echo "no lavapipe ICD in MSYS2's mesa; skipped"; pacman -Ql mingw-w64-clang-x86_64-mesa | grep -i vulkan || true; exit 0; fi
           echo "lavapipe ICD: $icd"
           export VK_DRIVER_FILES=$(cygpath -w "$icd")
+          # MSYS2's loader is libvulkan-1.dll; SDL looks for vulkan-1.dll
+          lib=$(ls /clang64/bin/*vulkan-1.dll | head -1)
+          echo "Vulkan loader: $lib"
+          export SDL_VULKAN_LIBRARY=$(cygpath -w "$lib")
+          set +e
           ./build/ci/test_hires_gpu.exe vulkan
+          rc=$?
+          if [ $rc = 77 ]; then echo "lavapipe not usable by SDL_GPU here; skipped"; exit 0; fi
+          exit $rc
       - name: Executable starts
         run: |
           ./build/ci/destrega.exe --help | head -3
