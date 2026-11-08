@@ -94,11 +94,19 @@ if(WIN32)
   # Embedded manifest (UTF-8 code page for file names) and a larger main-thread stack: the
   # recompiled code nests C calls like the game nests MIPS calls, and Windows' default 1 MiB
   # is far below the 8 MiB macOS and Linux give the main thread.
+  # plus the icon and version info (version from VERSION + git, regenerated every build but
+  # only rewritten when it changes).
   enable_language(RC)
+  add_custom_target(destrega_version
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/version.py rc-header
+            ${CMAKE_CURRENT_BINARY_DIR}/destrega_version.h
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/destrega_version.h
+    COMMENT "Version resource header" VERBATIM)
+  add_dependencies(destrega destrega_version)
   target_sources(destrega PRIVATE runtime/win/destrega.rc)
   set_source_files_properties(runtime/win/destrega.rc PROPERTIES
-    OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/runtime/win/destrega.manifest)
-  target_include_directories(destrega PRIVATE runtime/win)
+    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/runtime/win/destrega.manifest;${CMAKE_SOURCE_DIR}/runtime/win/destrega.ico;${CMAKE_CURRENT_BINARY_DIR}/destrega_version.h")
+  target_include_directories(destrega PRIVATE runtime/win ${CMAKE_CURRENT_BINARY_DIR})
   if(MSVC)
     target_link_options(destrega PRIVATE /STACK:16777216)
   else()
@@ -159,11 +167,15 @@ endif()
 # the CLI/headless flags and tools/run_tests.sh.
 if(APPLE)
   option(DESTREGA_MACOS_APP "Build Destrega.app next to the destrega binary" ON)
-  set(DESTREGA_APP_VERSION "1.0" CACHE STRING "CFBundle version of Destrega.app")
+  set(DESTREGA_APP_VERSION "" CACHE STRING "CFBundleShortVersionString of Destrega.app (empty = tools/version.py: VERSION file + git)")
   set(DESTREGA_APP_ICON ${CMAKE_SOURCE_DIR}/assets/icon/destrega.png CACHE FILEPATH
       "App icon (PNG >= 512px or .icns)")
   set(DESTREGA_APP_SIGN "-" CACHE STRING "codesign identity for Destrega.app (- = ad-hoc)")
   if(DESTREGA_MACOS_APP)
+    set(_app_version_args "")
+    if(DESTREGA_APP_VERSION)
+      set(_app_version_args --version ${DESTREGA_APP_VERSION})
+    endif()
     set(APP_STAMP ${CMAKE_BINARY_DIR}/Destrega.app.stamp)
     add_custom_command(
       OUTPUT ${APP_STAMP}
@@ -171,10 +183,10 @@ if(APPLE)
               --bin $<TARGET_FILE:destrega>
               --out ${CMAKE_BINARY_DIR}/Destrega.app
               --icon ${DESTREGA_APP_ICON}
-              --version ${DESTREGA_APP_VERSION}
+              ${_app_version_args}
               --sign ${DESTREGA_APP_SIGN}
       COMMAND ${CMAKE_COMMAND} -E touch ${APP_STAMP}
-      DEPENDS destrega ${CMAKE_SOURCE_DIR}/tools/make_app.sh ${DESTREGA_APP_ICON}
+      DEPENDS destrega ${CMAKE_SOURCE_DIR}/tools/make_app.sh ${CMAKE_SOURCE_DIR}/tools/version.py ${CMAKE_SOURCE_DIR}/VERSION ${DESTREGA_APP_ICON}
       COMMENT "Bundling Destrega.app"
       VERBATIM)
     add_custom_target(destrega_app ALL DEPENDS ${APP_STAMP})
