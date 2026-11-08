@@ -5,7 +5,43 @@
   ],
   "stage_sig": []
  },
+ "option_game": {
+  "overlays": [
+   "OPTOVL.BIN"
+  ],
+  "stage_sig": []
+ },
  "story": {
+  "overlays": [
+   "EVENT_SP.BIN",
+   "EVENTOVL.BIN",
+   "MGRAD.BIN",
+   "MSOLD2.BIN"
+  ],
+  "stage_sig": [
+   7739,
+   7705,
+   7722,
+   7756,
+   7805
+  ]
+ },
+ "story_continue_yes": {
+  "overlays": [
+   "EVENT_SP.BIN",
+   "EVENTOVL.BIN",
+   "MGRAD.BIN",
+   "MSOLD2.BIN"
+  ],
+  "stage_sig": [
+   7739,
+   7705,
+   7722,
+   7756,
+   7805
+  ]
+ },
+ "story_game_over": {
   "overlays": [
    "EVENT_SP.BIN",
    "EVENTOVL.BIN",

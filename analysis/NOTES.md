@@ -120,7 +120,7 @@ Verified by trace over the recorded replays (`tools/replays.py`, 6 fights incl. 
 match): health is 200 at each round start and hits 0 exactly at the KO; the other fighter's
 `round_wins` goes +1 at that KO and both reset to 0 after a fighter reaches 2 wins (match over);
 `round_time` goes +2 per update and freezes from the KO to the next round; the gauge stays in
-0..1800 and drops sharply ~30 times per 3000 random fight frames (magic spends; likely). The rest of
+0..1800 and drops sharply ~30 times per 3000 random fight frames (attack costs, see "Gauge and command inputs"). The rest of
 the fighter struct (0x1dc bytes) is covered by the replays' struct hashes but not mapped.
 Rollback-relevant: gameplay state reacts to pad input within one frame (an edited input at frame F
 changes the fighter struct at the start of F+1).
@@ -263,6 +263,49 @@ frame numbers repeat exactly; they are not "game constants".
   Circle backs out of a page. RECORDS shows the 1P-battle ranking; EXTRA has CHARACTER PROFILES / IN
   GAME CONTROL / EXIT.
 
+## Gauge, command inputs, options and the round timer (found while widening the replays)
+
+All from headless traces (`tools/movelab.py`, the `practice_*` / `timeout_*` replays); P1 on the left
+facing right, `f` = Right, `b` = Left.
+
+- **The fighter's "gauge" (+0xe) is an attack-energy meter, not (only) a magic gauge.** It refills 6 per
+  vblank up to 1800 and every attack input that starts an attack takes ~588 off in one update
+  (600 less the refill, so three attacks from full). Seen for Gradd: Square, Triangle, Circle with any
+  direction (f / b / d / u), quarter circles (qcf / qcb) and dragon-punch motions with Square, Triangle
+  or Circle all spent ~588 (and hurt the dummy 6..39 hp); Cross alone, shoulder buttons, button pairs
+  spent nothing. An attack pressed with less than ~600 left does nothing. (verified: movelab probe on
+  Gradd; whether other characters are the same is likely, the 12 `practice_*` replays have gauge drops
+  of 33..39 per battery.) This replaces the earlier reading "drops ~30 times = magic spends".
+- Motion inputs are read at 30 Hz updates; 6-vblank steps (the replay generator's tap length) work
+  for qcf / qcb / dp / hcf. A battery of 84 inputs (taps, direction + button, qcf, qcb, dp, double
+  taps, holds, button pairs) shows Gradd reaching 19 distinct animation pointers (struct +0x114) before
+  the match ended; each attack button has its own entry and qcf / qcb / dp + Square add new ones, the
+  directions alone do not (likely: the match ended after ~35 inputs, so Circle / pairs were not seen in
+  that run; the practice replays run the whole battery on every character but no per-character move
+  list was extracted). Specials / magic that need more than the battery (e.g. gauge-full or
+  button-pair combos) were **not identified**: unknown.
+- Fighter struct fields seen moving with inputs (guess, one character): +0x20 holds a latch of the
+  pressed face buttons (16 Cross, 32 Square, 64 Triangle, 128 Circle); +0x114 / +0x138 (two copies) point
+  to the current animation / move data in the character overlay's data (20 distinct values in 17000
+  frames of the battery; 0 when the fighter is not in a fight); +0x34 a second pointer (6 values);
+  +0x158 an attack class 1/2/4 (Triangle 1, Square 2, Circle 4); +0x188 a counter during attacks.
+- **PRACTICE** (title item 7, character select as the other modes): the fight is up ~2700 frames after
+  the title Start, 4:3 Hills vs a Celia dummy (`MSEREA2.BIN`) that stands at the far side and **refills to
+  200 hp**, no KO, `round_time` keeps counting (verified: 12 practice replays, 0 KOs in ~7000 frames
+  of attacks). Cheapest way to exercise a character's code for thousands of frames.
+- **GAME OPTION page** (OPTION > first item): rows GAME LEVEL (NORMAL), ROUND COUNT (2), ROUND TIME
+  (NO LIMIT), HANDICAP (OFF), QUICK SELECT (OFF), LIFE RECOVER (TIME), DEFAULT, EXIT. Right changes a
+  value (ROUND TIME: NO LIMIT -> 30 -> 60 -> 99). `time_limit_setting` (800e344c) is 3 for NO LIMIT
+  (the default; a VS fight never times out) and 0 / 1 / 2 for 30 / 60 / 99 s (verified with `--watch`).
+  Circle leaves a page, then the title cursor sits on OPTION (VS is Down x3 from there).
+- **Round timer** (verified, `timeout_*` replays): `round_time` counts +1 per vblank and the round ends
+  at 1800 for a 30 s limit. The fighter with more hp wins the round on time (`round_wins` 1,0 / 0,1);
+  **equal hp is a draw and both fighters get a round win** (1,1); with 2 rounds to win a second draw ends
+  the match 2,2 (draw match); the next round starts after ~200 frames. hp and gauge reset each round.
+- **Story**: with no input Gradd loses the first fight and `CONTINUE ?` (YES / NO) appears ~16700.
+  YES -> "BATTLE 1" again and the fight restarts (~17300); NO (Right, Cross) -> GAME OVER, then the
+  title, the logo and the intro FMV again (verified: `story_continue_yes`, `story_game_over`).
+
 ## Overlay entry points (fixed bug, verified)
 
 The per-character function tables in the main exe's data (from `0x800b310c`, 4 pointers per character
@@ -280,9 +323,9 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
 
 ## Test coverage facts
 
-- `tools/scenarios.py` (22 scenarios, see its docstring and `tools/scenario_expect.json`): every VS
+- `tools/scenarios.py` (24 scenarios, see its docstring and `tools/scenario_expect.json`): every VS
   stage (12), 1P BATTLE x3 characters, TEAM BATTLE, TIME ATTACK, ENDURANCE, PRACTICE, STORY up to its
-  first fight, OPTION. Every character appears on both sides across the VS scenarios. `tools/fight_script.py` is the older single path used by the smoke test
+  first fight, CONTINUE? YES / NO (GAME OVER), OPTION and the changed GAME OPTION page. Every character appears on both sides across the VS scenarios. `tools/fight_script.py` is the older single path used by the smoke test
   and the determinism script.
 - Per-scenario check: exit status, no FATAL / dispatch miss / unhandled BIOS call / `--verify-overrides`
   mismatch, expected overlay files loaded in order, recorded fingerprint (overlays + stage packs) equal,
@@ -301,6 +344,37 @@ not recompiled. Scenario `vs_villa` (Tieme vs Rohzen P2) covers it. File offset 
   0x8009b924 on every interrupt, `ReturnFromException` = C `longjmp` through recompiled frames)
   works with MinGW's setjmp/longjmp on Win64. It also shows that GCC-compiled generated code
   behaves the same as clang-compiled code.
+
+## Gameplay coverage (`tools/coverage.py`)
+
+Measured with the coverage build (`coverage.py build`, then `run`: all 24 scenarios + all 30 replays incl. the
+heavy story one), one counter per recompiled function (first execution recorded).
+
+- **Replays** (30 files, 1.6 MB): characters: every one of the 12 is P1 in a `practice_*` replay running the
+  84-input command battery (~10k frames each) and appears in 3..7 VS / 1P replays (Gradd and Celia the
+  most; each of the 12 also on the P2 side: the P2 overlays `Mxxx2.BIN` are separate code); stages: all 12
+  (Hills 4, Villa 2, the rest 1 each, plus one scenario each); modes: VS, 1P battle vs CPU (Reyus), PRACTICE
+  (12), story (win of the first fight and the scenes after it), options (round time / handicap / life
+  recover / round count). Outcomes: KO round wins and a decided best-of-3 (Gradd-Celia), time-out round
+  win for P1 and for P2, draw on time (round_wins 1,1; match 2,2), gauge spending in every replay.
+- **Scenarios** add: team battle, time attack, endurance, option sub-pages, GAME OPTION changes, story
+  CONTINUE? YES and NO -> GAME OVER.
+- **Functions executed: 1425 of 2070 (68.8%)** across everything above: main exe 968 / 1323; each
+  character overlay (P1 and P2 side) 12..21 of 20..28 (e.g. MGRAD 19/22, MSEREA 15/23, MANZEAL 13/20),
+  OPTOVL 34/44, EVENT_SP 9/21, EVENTOVL 12/22, **MSOLD 0/22 and MGENE 0/24 and MGENE2 0/24** (Soldier and
+  Gene are not selectable; MSOLD2 is the story opponent, 21/22). `coverage.py report -v` lists the
+  never-run functions per image. What they are is unknown: the same 5..9 functions per character are
+  missing in most overlays, so they are probably things the battery cannot trigger (specials needing a
+  full gauge or a combo, win / lose poses, throws, story-only moves) - guess.
+- **Not covered** (honest list): per-character special / magic moves were *not* individually identified
+  (only the generic battery runs), memory-card save / load screens in the game, team battle fights,
+  CONTINUE? in modes other than story, endings / credits, the rest of the story after the first
+  scenes, TIME ATTACK / ENDURANCE beyond their first fight, VS with ROUND COUNT 1, 99 s / NO LIMIT
+  time-outs, Gene / Soldier as playable fighters, Gradd as P2 beyond one 1500-frame random fight.
+- Test runtime (the machine had load averages 100-370 from other work, so wall times are unreliable):
+  default replay set 29 replays, 255k frames, heavy `--all` +26k (story); headless runs are ~200x real
+  time when idle (30k frames ~ 13 s), i.e. ~110 s CPU for the default set, ~30 s wall on 10 idle cores
+  (estimate: not measured idle). Measured under load 100-370: the whole `coverage.py run` took ~40 min.
 
 ## Save states and the snapshot-safe point (runtime/savestate.c)
 

@@ -54,6 +54,14 @@
 extern u32 g_callstack[1024];
 extern u32 g_depth;
 #define FN_ENTER(a) (g_callstack[g_depth++ & 1023] = (a))
+/* Coverage build (-DDESTREGA_COVERAGE=ON, tools/coverage.py): each generated function records
+ * its name the first time it runs; the names are appended to $DESTREGA_COVERAGE_OUT at exit. */
+#ifdef DESTREGA_COVERAGE
+void cov_first(const char *name);
+#define COV_HIT(n) do { static unsigned char h_; if (!h_) { h_ = 1; cov_first(#n); } } while (0)
+#else
+#define COV_HIT(n) ((void)0)
+#endif
 #define FN_RET() do { g_depth--; return; } while (0)
 /* Widescreen culling patch points (analysis/widescreen_cull.txt): the original immediate
  * unless --widescreen widened the stage renderer's screen-space culling. g_ws_cull_hits

@@ -276,9 +276,8 @@ Complete snapshots of the emulated machine, taken and restored only at the frame
 - Cost: ~3.6 MB per snapshot; save ~0.1 ms, load ~0.2 ms average (< 1 ms max).
 - Re-simulated frames (`ss_resimulating()`): `frontend_vblank` only advances the SPU (735 samples)
   and the `--press` script; no presentation, audio output, dumps or per-frame logs.
-  `ss_deterministic_audio()`: windowed runs render exactly 735 SPU samples per vblank (no extra
-  underrun render, which advanced the SPU depending on host timing) when recording / replaying /
-  testing.
+  Windowed runs render exactly 735 SPU samples per vblank, always (see "Windowed determinism" below);
+  `ss_deterministic_audio()` is now only informational.
 - Options: `--savestate-test N:M,...` (save at N, restore at the first frame >= M with the same
   context, re-run; every frame's complete state hash must equal the first pass; a point whose
   context does not recur is retried later), `--savestate-rewind E:D` (the same every E frames for
@@ -290,6 +289,23 @@ Complete snapshots of the emulated machine, taken and restored only at the frame
   hashes, `--state-hash` and card file must equal a plain run's; in-place round trips) and
   `scenarios.py savestate` (every scenario with rewinds every 41 frames + round trips every 13:
   `--state-hash` and complete state hash equal to a plain run). Both run in `tools/run_tests.sh`.
+
+### Windowed determinism
+
+Emulated state never depends on host timing, windowed or headless. The only thing that used to:
+`frontend_vblank` rendered an extra 367 SPU samples whenever the host audio queue ran low, so two
+windowed runs with identical input diverged at frame ~189 (audio device timing). Now the SPU advances
+735 samples per vblank unconditionally; an underrun (queue < 2 blocks) is covered on the **host** side
+by queueing a faded copy of the tail of the block just rendered (nothing is rendered, no state is
+touched), the stream starts with two blocks of silence, and a block is dropped when 6 are queued.
+`audio: N host-side underrun pads in F frames` is printed at exit (and per 600 frames with the fps
+line). Other host-time readers (checked): `SDL_GetTicksNS` / `plat_mono_ns` only feed pacing and
+statistics (main.c, savestate.c, net.c packet timers; netplay timing decides when a frame runs, never
+its content), no `time()`/`rand()` reaches the guest (the RTC and `rand` are the guest's own), the
+hi-res worker pool and the GPU renderer are presentation only (state hashes proven equal in
+`test_hires_determinism.sh`), `s_fast` (Tab) only skips audio. `tools/test_windowed_determinism.sh`
+(in `run_tests.sh`): two real windowed runs plus a headless one from boot into a fight, per-frame
+`--state-hash` files byte-identical (needs a window and an audio device; ~80 s).
 
 ## Replays: gameplay regression tests (`runtime/replay.c`, `tools/replays.py`)
 
@@ -307,18 +323,34 @@ Complete snapshots of the emulated machine, taken and restored only at the frame
   exit status 7. A differing complete state hash with equal gameplay fields is a warning
   (`--replay-strict` makes it fatal). Get the expected values by replaying with the old build and
   `--gameplay-trace`.
-- Library (`tools/replays/*.dtr.gz`, `replays.py list`): a full best-of-3 VS match (Gradd vs Celia,
-  Hills), four VS fights with other characters / stages (Tieme-Rohzen Villa, Milena-Cougar
-  Fortress, Zauber-Doyle Throne, Anjie-Laon Canyon) and a 1P battle against the CPU (Reyus), all
-  with seeded random input on both pads (taps, chords, motions, charges, walks, jumps): KOs, round
-  wins, a decided match, ~30 gauge spends per fight. `replays.py run` also replays three of them
-  with `--savestate-rewind`, hi-res + widescreen and 4x4 / PGXP off (must still match) and checks
-  that an edited input is reported as a divergence. ~45 s on 10 cores; in `tools/run_tests.sh`.
+- Library (`tools/replays/*.dtr.gz`, `replays.py list`): see "Coverage" for the matrix. Random-input
+  fights (seeded taps, chords, motions, charges, walks, jumps on both pads: KOs, round wins, a decided
+  match): Gradd-Celia best-of-3 on Hills, and 11 more VS fights so all 12 stages are covered, plus a
+  1P battle against the CPU. **`practice_<char>` (12)**: PRACTICE mode, the character performs the
+  whole command battery of `tools/movelab.py` (84 inputs: taps, direction + button, qcf / qcb / dp,
+  double taps, holds, button pairs, 80 frames apart), so every character's attack code runs.
+  **Options and timer** (`timeout_*`, `opts_*`): GAME OPTION changed through the menu (ROUND TIME 30 s):
+  both idle = two draws on time (round_wins 1,1 then 2,2), P1 / P2 ahead = won on time;
+  handicap / life recover / round count changed. **`story_win_first_fight`** (heavy, 26k frames): story mode
+  through the intro, wins the first fight with random input, SAVE DATA? NO and the next event scenes. `replays.py run` runs the default set; `--all` adds the heavy ones.
+  `run` also replays three with `--savestate-rewind`, hi-res + widescreen and 4x4 / PGXP off (must still
+  match) and checks that an edited input is reported as a divergence. Runtime: see "Coverage".
 - **Re-recording (only for an intentional gameplay change)**: a failing replay means emulated
   gameplay changed. Find out why first (`replays.py trace NAME OUT` with both builds and compare the
   values). If the change is intended (e.g. an emulation fix), `python3 tools/replays.py record
   [NAME...]`, check the summary it prints (KOs, rounds, matches) and commit the new `.dtr.gz` files
   with the reason in the commit message. Adding one: append an `add_vs(...)` / `add_1p(...)` call.
+
+## Coverage (`tools/coverage.py`, `tools/movelab.py`)
+
+- `coverage.py matrix`: characters / stages / modes covered by replays and scenarios (static). 
+- `coverage.py build` / `run` / `report [-v]`: a build with `-DDESTREGA_COVERAGE=ON` (`build/cov`,
+  `COV_HIT(name)` at the top of every generated function, first-hit flag + name list written to
+  `$DESTREGA_COVERAGE_OUT` at exit; zero cost in the normal build) runs all scenarios and replays
+  (`DESTREGA_BIN` selects the binary in `scenarios.py` / `replays.py`) and lists recompiled functions
+  never executed, per image. Numbers: analysis/NOTES.md "Gameplay coverage".
+- `movelab.py probe|map CHAR`: experiments with command inputs against an idle P2 (gauge spend, damage,
+  animation pointers; `DESTREGA_STRUCT_TRACE=1` adds both fighter structs to `--gameplay-trace`).
 
 ## Rollback netplay (`runtime/netplay.c`, `runtime/net.[ch]`)
 
@@ -454,9 +486,8 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   not paced, so the script starts the Wine peer first and the native one once Wine is hosting /
   joining (Wine needs 2-3 s to start). ~3.5 min. `--windowed` runs both peers windowed at 60 Hz
   with real audio output (slow under Wine, not in `run_tests.sh`; alerts are logged instead of
-  shown with `DESTREGA_TEST_NO_ALERTS=1`): the check that the windowed audio top-up stays off in a
-  session (`ss_deterministic_audio()`, set by `netplay.c start()` on every platform, which a
-  menu-started session also runs after its restart).
+  shown with `DESTREGA_TEST_NO_ALERTS=1`): the check that a windowed session (menu-started too) stays in sync
+  with real audio output (the audio top-up that used to need `ss_deterministic_audio()` no longer exists).
 - Windows specifics: the menu restart is `plat_exec` = `CreateProcess` + wait + exit with the
   child's code, so the parent process stays alive meanwhile; its socket is closed before (and not
   inheritable), so the child can bind the same port.

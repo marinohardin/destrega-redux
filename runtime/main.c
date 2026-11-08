@@ -373,6 +373,15 @@ static void write_gameplay_trace(void) {
                 (s32)mem_r32(f[i] + 0xa8));
     fprintf(s_gameplay, " time=%u wins=%u,%u rng=%08x fighters=%08x\n", mem_r32(0x800e379c),
             mem_r32(0x800e3788), mem_r32(0x800e378c), mem_r32(0x800e7560), fh);
+    static int raw = -1;            /* DESTREGA_STRUCT_TRACE=1: also dump both structs (move lab) */
+    if (raw < 0) raw = getenv("DESTREGA_STRUCT_TRACE") != NULL;
+    if (raw) {
+        for (int i = 0; i < 2; i++) {
+            fprintf(s_gameplay, "S%d %llu", i + 1, (unsigned long long)s_frame);
+            for (u32 o = 0; o < FIGHTER_SIZE; o += 4) fprintf(s_gameplay, " %x", mem_r32(f[i] + o));
+            fputc('\n', s_gameplay);
+        }
+    }
 }
 
 /* Widescreen: guard-band columns per side to present for a pw x ph window showing a dw-wide
@@ -494,11 +503,13 @@ static void ws_apply(void) {
     if (hires_get_scale(&cx, &cy) && hires_guard() != WS_GUARD) hires_set_scale(cx, cy);
 }
 
+static u32 g_audio_underruns;   /* host-side underrun pads (statistics only, never read by emulation) */
 extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g_hires_stat_inline_jobs;
 static void finish(void) {
     ss_finish();   /* savestate / replay / netplay reports (savestate.c) */
     void widescreen_report(void); widescreen_report();
     if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
+    if (!s_headless) rt_log("audio: %u host-side underrun pads in %llu frames", g_audio_underruns, (unsigned long long)s_frame);
     if (s_state_hash) fclose(s_state_hash);
     if (s_gameplay) fclose(s_gameplay);
     int rc = 0;
@@ -755,7 +766,11 @@ void frontend_vblank(void) {
         extern u32 g_flips;
         static u32 last_flips;
         u64 now = SDL_GetTicksNS();
-        if (t0 && !s_headless) rt_log("frontend: %.1f fps", 600.0 * 1e9 / (double)(now - t0));
+        if (t0 && !s_headless) {
+            static u32 last_ur;
+            rt_log("frontend: %.1f fps, %u audio underrun pads", 600.0 * 1e9 / (double)(now - t0), g_audio_underruns - last_ur);
+            last_ur = g_audio_underruns;
+        }
         extern u64 g_irq_cycles;
         static u64 last_irq;
         if (g_trace) rt_log("game: %.1f updates per 60 vblanks, %.1f%% of CPU time in IRQ handlers",
@@ -817,14 +832,31 @@ void frontend_vblank(void) {
         finish();
     }
 
-    /* audio: keep ~3 frames queued */
+    /* Audio: the SPU advances exactly 735 samples per vblank, whatever the host does, so emulated
+     * state never depends on host timing. A block is dropped when the queue is already full, and
+     * an underrun (queue below two blocks) is covered on the HOST side by queueing a short
+     * cross-faded repeat of the tail of this block (no SPU render, no emulated state touched). */
     spu_render(audio, 735);
-    if (SDL_GetAudioStreamQueued(s_audio) < 735 * 4 * 6 && !s_fast)
-        SDL_PutAudioStreamData(s_audio, audio, 735 * 4);
-    if (SDL_GetAudioStreamQueued(s_audio) < 735 * 4 * 2 && !s_fast) {
-        /* the extra render advances the SPU: not allowed when emulation must be reproducible */
-        if (!ss_deterministic_audio()) spu_render(audio, 367);
-        SDL_PutAudioStreamData(s_audio, audio, 367 * 4);
+    if (!s_fast) {
+        static bool primed;
+        if (!primed) {   /* two blocks of silence of head start: the first frames may be slow */
+            static s16 silence[735 * 2];
+            SDL_PutAudioStreamData(s_audio, silence, 735 * 4);
+            SDL_PutAudioStreamData(s_audio, silence, 735 * 4);
+            primed = true;
+        }
+        int q = SDL_GetAudioStreamQueued(s_audio);
+        if (q < 735 * 4 * 6) SDL_PutAudioStreamData(s_audio, audio, 735 * 4);
+        if (q < 735 * 4 * 2) {
+            static s16 pad[367 * 2];
+            for (int i = 0; i < 367; i++) {            /* last 367 frames, fading out */
+                int k = 735 - 367 + i, w = 367 - i;
+                pad[i * 2] = (s16)((audio[k * 2] * w) / 367);
+                pad[i * 2 + 1] = (s16)((audio[k * 2 + 1] * w) / 367);
+            }
+            SDL_PutAudioStreamData(s_audio, pad, 367 * 4);
+            g_audio_underruns++;
+        }
     }
 
     /* pacing to 60Hz */

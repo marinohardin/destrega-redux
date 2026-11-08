@@ -26,6 +26,12 @@ option(DESTREGA_TESTS "Build the module unit tests as CTest targets" OFF)
 # game. Used by CI; the default is the real thing (gen/ from disc/SLUS_007.32).
 option(DESTREGA_STUB_GEN "Link against the CI stub instead of the recompiled game (no disc needed)" OFF)
 
+# Per-function execution coverage of the recompiled game (tools/coverage.py): slows nothing else down.
+option(DESTREGA_COVERAGE "Record which recompiled functions run (DESTREGA_COVERAGE_OUT)" OFF)
+if(DESTREGA_COVERAGE)
+  add_compile_definitions(DESTREGA_COVERAGE=1)
+endif()
+
 set(GEN_DIR ${CMAKE_SOURCE_DIR}/gen)
 
 if(DESTREGA_STUB_GEN)
