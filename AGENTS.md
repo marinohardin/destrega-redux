@@ -1045,11 +1045,13 @@ with every mode on). Options are plain global setters/getters in `hires.h`
 
 - **Defaults**: windowed = `xbr` filter, full-precision colour, and 2x SSAA when the GPU renderer
   is active (1 on software; switching the renderer moves the default along unless `--ssaa` or the
-  menu chose a value). The *default* SSAA is capped to a render target of at most 24 hi-res pixels
-  per 1x pixel (`hires_set_ssaa_cap(24)`: render Sx*Sy <= 24, i.e. never beyond 4x6), so it only
-  applies to small windows (base Sx*Sy <= 6 for 2x, e.g. 2x3) and is off at the usual 4x6; an explicit
-  `--ssaa N` or a menu choice is never capped (`hires_set_ssaa_cap(0)`). Reason: 2x SSAA on a 4x6
-  base (8x12, 23.6 M px) costs ~46 ms/frame on the GPU (below). Headless = nearest, 15-bit, no SSAA: every existing test and hash is
+  menu chose a value). In a window SSAA is always capped to a render target of at most 24 hi-res
+  pixels per 1x pixel (`ssaa_cap()` in main.c -> `hires_set_ssaa_cap(24)`: render Sx*Sy <= 24, i.e.
+  never beyond 4x6), whether it is the default, a menu choice or `display.ssaa` in settings.ini, so
+  it only applies to small windows (base Sx*Sy <= 6 for 2x, e.g. 2x3) and is off at the usual 4x6.
+  Only a headless `--ssaa N` is uncapped (tests). Reason: 2x SSAA on a 4x6 base (8x12) measured
+  49-87 ms/frame windowed (14 fps): a menu choice used to be uncapped and was saved, so one click
+  left every later launch a slideshow. Headless = nearest, 15-bit, no SSAA: every existing test and hash is
   unchanged. `--hires-verify` only runs where it is meaningful (1x1, 15-bit, nearest, no SSAA:
   `hires_verify_possible()`).
 - **Menus / actions** (Mac and Windows View menu; also `--menu-action`): Texture Filtering > Off
