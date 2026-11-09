@@ -12,6 +12,8 @@ static void no_game(const char *f)
     fprintf(stderr, "FATAL: %s: built with the CI stub instead of the recompiled game\n", f);
     exit(3);
 }
+void f_80036138_orig(void) { no_game(__func__); }
+void f_800363c8_orig(void) { no_game(__func__); }
 void f_80044210_orig(void) { no_game(__func__); }
 void f_800465a4_orig(void) { no_game(__func__); }
 void f_80044918(void) { no_game(__func__); }
