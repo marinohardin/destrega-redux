@@ -382,9 +382,12 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   `[netplay]`, see "Settings file"; the dialog lists this computer's IPv4
   addresses, `plat_local_ipv4`), Join Game… (address:port, remembered, and delay),
   Disconnect (enabled while a session or an attempt runs), and a disabled status line
-  (`netplay_status_text`: Not connected / Waiting for an opponent on port N / Connecting to X /
-  Connected to X, ping N ms / Desync at frame F). While hosting or connecting a small non-modal
-  panel says so with Cancel; the game keeps running offline. UI words: Netplay, Host Game, Join
+  (`netplay_status_text`: Not connected / Waiting for an opponent on port N (+ what the router
+  said, see "Automatic port forwarding") / Connecting to X / Connected to X, ping N ms / Desync at
+  frame F). While hosting or connecting a small non-modal panel says so with Cancel (hosting: the
+  home-network address and the router's answer, updated when it arrives); the game keeps running
+  offline. The Host dialog has a check box "Ask the router to open the port automatically"
+  (`[netplay] port_mapping`). UI words: Netplay, Host Game, Join
   Game, opponent (no console jargon). Menu actions (also `--menu-action`, every platform):
   `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`.
 - **Synchronised start = fresh boot on both sides.** The game is already running when someone
@@ -425,7 +428,8 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   (`recomp/*.py`) and its analysis inputs (seeds, overrides, procedure / overlay lists), line
   endings normalised. Left out: what only one platform compiles or what is presentation-only and
   proven not to reach emulated state (menus, `platform*.c|h`, `hires*.c|h`, shaders, Windows
-  resources, host input / settings / controls windows), plus tools / tests / docs. No compiler, OS or build type: the Mac (clang) and Windows
+  resources, host input / settings / controls windows, the host's router port mapping `portmap.c|h`),
+  plus tools / tests / docs. No compiler, OS or build type: the Mac (clang) and Windows
   (MinGW GCC) builds of the same commit have identical per-frame state hashes (`test_wine.sh`), so
   they emulate the same machine and must be allowed to play; any source change that could alter
   emulation is refused even if it looks harmless (both players update). The refusal is the
@@ -554,8 +558,66 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
 - Windows specifics: the menu restart is `plat_exec` = `CreateProcess` + wait + exit with the
   child's code, so the parent process stays alive meanwhile; its socket is closed before (and not
   inheritable), so the child can bind the same port.
-- Not done / not verified: NAT traversal or a server-assisted lobby (direct UDP only: the host
-  forwards the port over the internet), spectators, Linux menus (the actions work there), a real
+- **Automatic port forwarding for the host** (`runtime/portmap.[ch]`, gateway lookup
+  `plat_default_gateway_ipv4` in `platform_net.c`): when a player hosts (Host Game, and the
+  `--host` of the restarted session), a worker thread asks the router to forward the UDP port, in
+  this order: **PCP** (RFC 6887) and **NAT-PMP** (RFC 6886), UDP to the default gateway's port 5351
+  (PCP first; a NAT-PMP-only router answers it with "unsupported version"), then **UPnP IGD**
+  (SSDP M-SEARCH, the device description, SOAP `GetExternalIPAddress` / `AddPortMapping` /
+  `DeletePortMapping` on WANIPConnection:1/:2 or WANPPPConnection:1). The UPnP client is our own
+  (~300 lines in portmap.c), not miniupnpc: four actions of one service, no third-party code with
+  its own blocking timeouts on four build targets, no download of outside sources. Handled: URLBase
+  / relative control URLs, chunked replies, namespace prefixes, error 725 (only permanent leases:
+  retried with lease 0, logged, deleted at the end), 718 (port taken: `AddAnyPortMapping` on IGD v2,
+  else the next 4 ports). The joiner maps nothing (it sends first; its own router lets the replies
+  in). Every wait is a few seconds at most (PCP / NAT-PMP 250 ms doubling, 3 tries; HTTP 2 s connect,
+  3 s reply; SSDP 2 x 1.2 s) and checks for a cancel; the frame loop only reads the published result
+  (`portmap_tick` per vblank) and never blocks, except `portmap_finish` at exit (delete, at most 3 s).
+  Lease 3 h (`--net-portmap-lease S`), renewed at half the granted lifetime (a failed renewal is
+  retried after 15 s), deleted when hosting ends: Cancel / Disconnect, the opponent leaving or the
+  link dropping (`session_end`), the handshake failing, Load Game Image, exit (`netplay_finish`, plus
+  an `atexit`). **Restart into the session**: the mapping is kept, not re-made: `lobby_restart` calls
+  `portmap_keep_for_restart()`, which puts the mapping (protocol, ports, lease, PCP nonce, external
+  address, UPnP control URL / service / internal client) in `DESTREGA_PORTMAP_KEEP`; the old worker
+  stops without deleting (POSIX `execv` ends it anyway; on Windows the waiting parent's worker and
+  `atexit` see `keep` and leave it); the new process reads and clears the variable and renews that
+  same mapping first (PCP refuses a second mapping of the port with another nonce, so it must be the
+  same nonce), falling back to a fresh request.
+  What the host sees (panel, status line, log `portmap: ...`): "Asking your router to open port N
+  for the internet...", then "Your address for the opponent: A.B.C.D:PORT" (router's external
+  address + external port); an external address that is CGNAT (100.64/10), private or otherwise not
+  public: "Your internet provider doesn't allow incoming connections, so players outside your home
+  network probably can't join (...)"; explicit refusals: "Your router refused to open port N. Turn on
+  automatic port opening (UPnP or NAT-PMP) in the router's settings, or forward UDP port N ... by
+  hand."; nothing answered: "Your router didn't answer; you may need to forward UDP port N to this
+  computer by hand ...". Hosting continues in every case. Option `--net-portmap on|off` (locks the
+  setting), setting `[netplay] port_mapping` (default on; also the Host dialog's check box); off in
+  a window shows a hint to forward the port by hand. Not part of the build identity
+  (`tools/source_ident.py` excludes portmap.[ch]; this change altered only main.c / netplay.c among
+  covered files: the hooks).
+- **Port-mapping tests never touch a real router**: headless runs map nothing unless
+  `--net-portmap-gateway HOST:PORT` (PCP / NAT-PMP server) or `--net-portmap-upnp URL` (device
+  description; replaces SSDP) is given, and with either override only the overridden protocols are
+  tried (no gateway lookup, no multicast). `--net-portmap on` alone does nothing headless. So
+  `test_netplay.py`, `test_netplay_wine.py`, `test_menu.sh` etc. (headless, no overrides) never map.
+  `tools/fake_router.py`: PCP + NAT-PMP (one UDP port) and UPnP (HTTP, chunked description, SOAP),
+  127.0.0.1 only, modes ok / unsupported / refuse / silent / permanent, external address settable,
+  enforces the PCP nonce, records every request. `tools/test_portmap.py` (in `run_tests.sh`, ~1 min):
+  `natpmp`, `pcp`, `upnp` (map, renewals at a 2 s lease, delete on Cancel or at exit; `upnp` also
+  checks no UDP was sent), `upnp_permanent` (725 -> lease 0, no renewals, deleted at exit),
+  `refused`, `cgnat` (100.72.1.9), `noanswer` (all three silent: message after ~6 s of timeouts;
+  frame loop measured while the worker waits: 2554 frames, longest gap 127 ms with 10 games running
+  at once), `off`, `no_override` (headless `--net-portmap on` without overrides: nothing), `restart`
+  (menu session host + join: one PCP map, the restarted host renews it with the same nonce, one
+  delete after the opponent leaves). `--win` runs them with the Windows build under Wine as the host.
+  Unit test `runtime/tests/test_portmap.c` (CTest `portmap`): PCP / NAT-PMP packets, UPnP description
+  / SOAP / fault parsing, chunked HTTP, URL joining, address classes; prints the local default
+  gateway (routing table read only).
+- Not done / not verified: a real router (only the fake one: no PCP / NAT-PMP / UPnP packet of this
+  code has been sent to real hardware), the Host dialog check box and the panel's router line by hand
+  (compiled on both platforms), the Linux gateway lookup (compiled in CI only), IPv6 (PCP can map
+  IPv6, the host listens on IPv4 only); NAT traversal or a server-assisted lobby (direct UDP only: the
+  host's port is forwarded, automatically or by hand), spectators, Linux menus (the actions work there), a real
   Windows machine (only Wine), the Mac dialogs, panel and greyed-out items by hand (compiled; two
   windowed processes were driven through the same actions with `--menu-action`),
   windowed-vs-windowed play by two people.
@@ -706,7 +768,7 @@ folder as `destrega.pak`; `--data-dir` moves it). Written atomically (temp file,
 `[display]` scale, max_scale, widescreen, renderer (software|gpu|metal|vulkan|d3d12; gpu = the
 platform's default API, as written by older builds; an API this platform does not offer is logged and
 ignored), fullscreen, window (WxH points);
-`[netplay]` port, delay, join_address; `[player1]` / `[player2]` device, device_name, stick,
+`[netplay]` port, delay, join_address, port_mapping (on|off); `[player1]` / `[player2]` device, device_name, stick,
 deadzone, `key.<button>`, `pad.<button>` (buttons: up down left right cross circle square triangle
 l1 r1 l2 r2 start select; empty = unbound; keys absent = default).
 

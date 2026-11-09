@@ -282,19 +282,20 @@ static LRESULT CALLBACK form_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-/* Modal form: title, explanation, two labelled fields (values in/out, UTF-8), OK button text.
- * Returns true on OK. */
+/* Modal form: title, explanation, two labelled fields (values in/out, UTF-8), an optional check
+ * box (check = its label, *checked in/out), OK button text. Returns true on OK. */
 static bool form_run(const char *title, const char *text, const char *l1, char *v1, int w1,
-                     const char *l2, char *v2, const char *ok) {
+                     const char *l2, char *v2, const char *check, bool *checked, const char *ok) {
     ui_init();
     register_class(L"DestregaForm", form_proc);
-    wchar_t wt[128], wx[1024], wl1[64], wl2[64], wv1[256], wv2[64], wok[32];
+    wchar_t wt[128], wx[1024], wl1[64], wl2[64], wv1[256], wv2[64], wok[32], wck[128];
     to_w(title, wt, 128); to_w(text, wx, 1024); to_w(l1, wl1, 64); to_w(l2, wl2, 64);
+    to_w(check ? check : "", wck, 128);
     to_w(v1, wv1, 256); to_w(v2, wv2, 64); to_w(ok, wok, 32);
     const int W = 440, M = 14;
     int th = text_height(wx, W - 2 * M);
     int y = M + th + 10;
-    int H = y + 30 + 30 + 46;
+    int H = y + 30 + 30 + 46 + (check ? 28 : 0);
     RECT r = { 0, 0, px(W), px(H) };
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_DLGMODALFRAME;
     AdjustWindowRectEx(&r, style, FALSE, ex);
@@ -307,6 +308,12 @@ static bool form_run(const char *title, const char *text, const char *l1, char *
     y += 30;
     child(f, L"STATIC", wl2, SS_LEFT, M, y + 3, 110, 20, 0);
     HWND e2 = child(f, L"EDIT", wv2, WS_TABSTOP | ES_NUMBER, M + 115, y, 50, 24, 102);
+    HWND ck = NULL;
+    if (check) {
+        y += 32;
+        ck = child(f, L"BUTTON", wck, WS_TABSTOP | BS_AUTOCHECKBOX, M, y, W - 2 * M, 22, 103);
+        SendMessageW(ck, BM_SETCHECK, *checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
     y += 40;
     child(f, L"BUTTON", wok, WS_TABSTOP | BS_DEFPUSHBUTTON, W - M - 2 * 96 - 8, y, 96, 28, IDOK);
     child(f, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, W - M - 96, y, 96, 28, IDCANCEL);
@@ -324,6 +331,7 @@ static bool form_run(const char *title, const char *text, const char *l1, char *
     }
     GetWindowTextW(e1, wv1, 256);
     GetWindowTextW(e2, wv2, 64);
+    if (ck) *checked = SendMessageW(ck, BM_GETCHECK, 0, 0) == BST_CHECKED;
     EnableWindow(s_hwnd, TRUE);
     DestroyWindow(f);
     SetForegroundWindow(s_hwnd);
@@ -375,19 +383,21 @@ static void netplay_dialog(bool host) {
     reg_get("Port", port, sizeof port, "7000");
     reg_get("JoinAddress", addr, sizeof addr, "");
     reg_get("Delay", delay, sizeof delay, "2");
-    bool ok;
+    bool ok, portmap = settings_get_bool("netplay", "port_mapping", true);   /* portmap.c */
     if (host) {
         char ip[256];
         plat_local_ipv4(ip, sizeof ip);
         snprintf(text, sizeof text,
                  "Your opponent chooses Join Game and types one of this computer's addresses and the port.\n\n"
-                 "This computer's addresses: %s\n\nOver the internet, UDP port %s must be forwarded to this computer. "
+                 "This computer's addresses: %s\n\nOver the internet, the game asks your router to forward UDP port %s to "
+                 "this computer and shows the address to give your opponent; if the router can't, forward the port by hand. "
                  "Both games restart from the beginning when your opponent connects.", *ip ? ip : "none found", port);
-        ok = form_run("Host Game", text, "Port:", port, 90, "Input delay:", delay, "Host");
+        ok = form_run("Host Game", text, "Port:", port, 90, "Input delay:", delay,
+                      "Ask the router to open the port automatically", &portmap, "Host");
     } else {
         snprintf(text, sizeof text, "Type the address and port your opponent gave you, for example 192.168.1.20:7000. "
                                     "Both games restart from the beginning when you connect.");
-        ok = form_run("Join Game", text, "Address:port:", addr, 200, "Input delay:", delay, "Join");
+        ok = form_run("Join Game", text, "Address:port:", addr, 200, "Input delay:", delay, NULL, NULL, "Join");
     }
     rt_log("menu: %s dialog %s", host ? "Host Game" : "Join Game", ok ? "accepted" : "cancelled");
     if (!ok) return;
@@ -401,6 +411,8 @@ static void netplay_dialog(bool host) {
         if (p <= 0 || p > 65535) p = 7000;
         snprintf(port, sizeof port, "%d", p);
         reg_set("Port", port);
+        settings_set_bool("netplay", "port_mapping", portmap);
+        settings_save();
         snprintf(arg, sizeof arg, "%d,%d", p, dl);
         frontend_menu_action("netplay-host", arg);
     } else {
@@ -430,20 +442,20 @@ void menu_netplay_progress(const char *text) {
     ui_init();
     if (!s_panel) {
         register_class(L"DestregaPanel", panel_proc);
-        const int W = 380, H = 120;
+        const int W = 420, H = 170;   /* status + the router's answer (portmap.c) */
         RECT r = { 0, 0, px(W), px(H) };
         DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_TOOLWINDOW;
         AdjustWindowRectEx(&r, style, FALSE, ex);
         s_panel = CreateWindowExW(ex, L"DestregaPanel", L"Netplay", style, CW_USEDEFAULT, CW_USEDEFAULT,
                                   r.right - r.left, r.bottom - r.top, s_hwnd, NULL, GetModuleHandleW(NULL), NULL);
         if (!s_panel) return;
-        s_panel_label = child(s_panel, L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 16, 14, W - 32, 56, 0);
+        s_panel_label = child(s_panel, L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 16, 14, W - 32, 106, 0);
         child(s_panel, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, W - 16 - 96, H - 16 - 28, 96, 28, IDCANCEL);
     }
-    wchar_t w[512];
-    to_w(text, w, 512);
+    wchar_t w[1024];
+    to_w(text, w, 1024);
     SetWindowTextW(s_panel_label, w);
-    center_on_game(s_panel);
+    if (!IsWindowVisible(s_panel)) center_on_game(s_panel);   /* updates leave it where it is */
     ShowWindow(s_panel, SW_SHOWNOACTIVATE);
     rt_log("menu: netplay panel: %s", text);
 }

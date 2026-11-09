@@ -31,6 +31,7 @@
 #include "hires.h"
 #include "memcard.h"
 #include "smooth.h"
+#include "portmap.h"   /* host: automatic port forwarding (not part of the build identity) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -463,6 +464,7 @@ bool netplay_active(void) { return o.on; }
 static void print_stats(void);
 static void session_end(const char *msg);
 static void lobby_poll(void);
+static void lobby_portmap_changed(void);
 
 static bool start(void) {
     s_started = true;
@@ -477,8 +479,10 @@ static bool start(void) {
     }
     s_local_idx = o.host ? 0 : 1;
     s_remote_idx = 1 - s_local_idx;
+    if (o.host) portmap_start(o.port);   /* after a menu restart: renews the mapping the lobby made */
     const char *err = handshake();
     if (err) {
+        portmap_stop();
         if (!o.from_menu) fatal(err);
         net_close(s_sock); s_sock = NULL;
         o.on = false; s_started = false;
@@ -523,6 +527,7 @@ static void session_end(const char *msg) {
         s_sock = NULL;
     }
     print_stats();
+    portmap_stop();
     if (s_hash_log) { fclose(s_hash_log); s_hash_log = NULL; }
     o.hash_log = NULL;
     if (s_hires_off) { g_hires = s_hires_saved; s_hires_off = false; }
@@ -547,6 +552,7 @@ static void hires_for_resim(u64 f) {
 }
 
 void netplay_vblank_begin(u64 f) {
+    if (portmap_tick()) lobby_portmap_changed();
     if (!o.on) {   /* --net-hash-log without netplay: the same log for an offline run (tests) */
         lobby_poll();
         if (!o.hash_log) return;
@@ -869,6 +875,7 @@ static u64 s_lt0, s_llast;
 bool netplay_busy(void) { return o.on || s_lobby != LOBBY_OFF; }
 
 static void lobby_stop(void) {
+    portmap_stop();   /* nothing after portmap_keep_for_restart */
     if (s_lsock) net_close(s_lsock);
     s_lsock = NULL;
     s_lobby = LOBBY_OFF;
@@ -884,6 +891,7 @@ static void lobby_restart(bool host, int delay) {
     fprintf(stderr, "netplay: opponent found; restarting both games from a fresh boot (%s %s, input delay %d)\n",
             args[0], a1, delay);
     net_flush(s_lsock, 100);
+    if (host) portmap_keep_for_restart();   /* the session keeps the router's port mapping */
     lobby_stop();
     frontend_restart_with(args, 5);
 }
@@ -900,11 +908,21 @@ void netplay_menu_host(int port, int delay) {
         return;
     }
     s_lobby = LOBBY_HOSTING; s_lport = port; s_ldelay = delay; s_lt0 = ss_now_ns();
-    char ip[256], m[512];
+    char ip[256];
     net_local_addresses(ip, sizeof ip);
-    snprintf(m, sizeof m, "Waiting for an opponent on port %d...\nYour opponent joins with: %s:%d", port,
-             *ip ? ip : "(your IP address)", port);
     fprintf(stderr, "netplay: hosting a game on port %d (addresses: %s), waiting for an opponent\n", port, *ip ? ip : "none");
+    portmap_start(port);
+    lobby_portmap_changed();
+}
+
+/* Host's waiting panel: the home-network address, and what the router said (portmap.c). */
+static void lobby_portmap_changed(void) {
+    if (s_lobby != LOBBY_HOSTING) return;
+    char ip[256], m[800];
+    net_local_addresses(ip, sizeof ip);
+    const char *pm = portmap_text();
+    snprintf(m, sizeof m, "Waiting for an opponent on port %d...\nOn your home network, your opponent joins with: %s:%d%s%s",
+             s_lport, *ip ? ip : "(your IP address)", s_lport, *pm ? "\n" : "", pm);
     menu_netplay_progress(m);
 }
 
@@ -1005,8 +1023,11 @@ static void lobby_poll(void) {
 
 /* One line for the Netplay menu's status item. */
 const char *netplay_status_text(void) {
-    static char t[300];
-    if (s_lobby == LOBBY_HOSTING) snprintf(t, sizeof t, "Waiting for an opponent on port %d", s_lport);
+    static char t[512];
+    if (s_lobby == LOBBY_HOSTING) {
+        const char *pm = portmap_status_short();
+        snprintf(t, sizeof t, "Waiting for an opponent on port %d%s%s%s", s_lport, *pm ? " (" : "", pm, *pm ? ")" : "");
+    }
     else if (s_lobby == LOBBY_JOINING) snprintf(t, sizeof t, "Connecting to %s:%d", s_laddr, s_lport);
     else if (o.on && s_first_desync) snprintf(t, sizeof t, "Desync at frame %llu", (unsigned long long)s_first_desync);
     else if (o.on && s_started && s_sock) snprintf(t, sizeof t, "Connected to %s, ping %.0f ms", net_peer_name(s_sock), s_rtt);
@@ -1056,6 +1077,7 @@ int netplay_parse_arg(int argc, char **argv, int i) {
     if (!strcmp(a, "--net-hash-every") && has) { o.hash_every = atoi(argv[i + 1]); return 2; }
     if (!strcmp(a, "--net-desync-dir") && has) { o.desync_dir = argv[i + 1]; return 2; }
     { int k = smooth_parse_arg(argc, argv, i); if (k) return k; }
+    { int k = portmap_parse_arg(argc, argv, i); if (k) return k; }
     if (!strcmp(a, "--net-from-menu")) { o.from_menu = true; return 1; }
     if (!strcmp(a, "--net-lockstep")) { o.lockstep = true; return 1; }
     if (!strcmp(a, "--net-full-boot")) { o.full_boot = true; return 1; }
@@ -1087,6 +1109,7 @@ void netplay_usage(void) {
         "  --net-desync-stop     stop at the first desync (default: report it and keep playing)\n"
         "  --net-inject-desync F test: corrupt p1.hp at frame F on this peer\n"
         "  --net-test-ident build=HEX|source=HEX  test: claim other game code / emulation sources\n");
+    portmap_usage();
 }
 
 /* windowed pacing (main.c): extra time to add to this frame (gradual time sync) */
@@ -1097,6 +1120,7 @@ u64 netplay_pace_extra_ns(void) {
 }
 
 void netplay_finish(void) {
+    portmap_finish();   /* delete the router's port mapping (bounded wait) */
     smooth_report();
     if (!o.on && s_hash_log) { fclose(s_hash_log); s_hash_log = NULL; }
     if (!o.on || !s_started) return;

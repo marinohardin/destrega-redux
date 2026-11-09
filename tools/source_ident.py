@@ -35,6 +35,9 @@ EXCLUDE = {
     # (netplay exchanges the bits themselves, replays record them)
     "runtime/input.c", "runtime/input.h", "runtime/settings.c", "runtime/settings.h",
     "runtime/controls_mac.m", "runtime/controls_win.c",
+    # automatic port forwarding for the host (router protocols on a worker thread): it only talks
+    # to the router and shows an address, never touches emulated state
+    "runtime/portmap.c", "runtime/portmap.h",
 }
 
 
