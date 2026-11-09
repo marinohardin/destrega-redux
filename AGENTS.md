@@ -463,7 +463,8 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   (`recomp/*.py`) and its analysis inputs (seeds, overrides, procedure / overlay lists), line
   endings normalised. Left out: what only one platform compiles or what is presentation-only and
   proven not to reach emulated state (menus, `platform*.c|h`, `hires*.c|h`, shaders, Windows
-  resources, host input / settings / controls windows, the host's router port mapping `portmap.c|h`),
+  resources, host input / settings / controls windows, the host's router port mapping `portmap.c|h`,
+  the smoothness statistics and render-scale governor `smooth.c|h`),
   plus tools / tests / docs. No compiler, OS or build type: the Mac (clang) and Windows
   (MinGW GCC) builds of the same commit have identical per-frame state hashes (`test_wine.sh`), so
   they emulate the same machine and must be allowed to play; any source change that could alter
@@ -521,14 +522,36 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   Mac<->Wine with the software renderer there, optionally widescreen; `solo` = one offline window)
   and prints one row per peer with the load average. Results depend heavily on machine load:
   compare runs made back-to-back.
-- **Scale governor** (`smooth.c`, presentation-only): during a session, a host whose average frame
-  work stays above 90% of the budget lowers its hi-res render scale one step (4x6 -> 4x4 -> 3x4 ->
-  3x3 -> 2x3 -> 2x2 -> 1x2 -> 1x1) every 2.5 s until it keeps up, logging `smooth: this computer is
-  too slow for render scale ...`; the caps are lifted when the session ends. Otherwise a slow peer
-  drags the fast one (which waits for every late input). Never touches a forced `--scale`;
-  `--no-scale-governor` turns it off. Each input packet also carries the sender's load (% of its
-  frame budget, one byte at the end; older peers ignore it), and the status line says "Opponent's
-  computer is running slowly" (peer >= 95%) or "This computer is running slowly".
+- **Scale governor** (`smooth.c`, presentation-only; offline too): while View > Resolution is
+  **Auto** in a window, a host whose average frame work stays above the budget lowers its hi-res
+  render scale one step (4x6 -> 4x4 -> 3x4 -> 3x3 -> 2x3 -> 2x2 -> 1x2 -> 1x1), and raises it again
+  one step at a time (never above what Auto picks) once the work stays well below the budget.
+  Load = this host's own work per frame / 16.7 ms (waits for the peer excluded), EMA over 0.5 s.
+  Down: above **90%** for 1 s during a netplay session (a late frame drags the opponent: it waits for
+  every late input) or above **95%** for 2 s offline (conservative, so normal play does not flap).
+  Up: below **60%** for 3 s and the next step's cost, estimated as the load times the step's pixel
+  ratio (an upper bound: the hi-res share of the work cannot be timed apart), below **80%**.
+  Warm-up: the first 3 s after the governor starts (program start, Auto chosen, a session starting
+  or ending) and 1 s after any scale change are not measured (pipeline creation, the new target,
+  Wine/D3D12 shader compilation: in a Mac <-> CrossOver session these used to step the Windows side
+  down to 1x1 for the whole session, since nothing ever raised it). Back-off: a scale given up is not
+  tried again for 10 s; failing again within 30 s of being raised to doubles the wait (20, 40 s ..
+  5 min). Logs `smooth: this computer is too slow for render scale AxB (...): lowering it to CxD
+  [for the netplay session] at frame F (AxB not tried again for N s)` and `smooth: render scale AxB
+  uses N% of the frame budget (about M% expected at CxD): raising it to CxD at frame F`; the exit
+  summary counts both. While it holds the scale down, SSAA is capped to the lowered scale's pixels
+  too (else a default 2x SSAA on a lowered 2x3 would render 4x6 again). Never touches a fixed
+  resolution (menu, settings, `--scale`); `--no-scale-governor` turns it off. **A fixed resolution
+  the computer cannot keep up with slows a netplay opponent down too** (every late frame is a late
+  input). Test hook `--fake-load F-G:PCT[@SxxSy],...`: the governor sees PCT% of the budget on
+  frames F..G (only at that render scale with `@`); windowed it is added to the measured load,
+  headless the governor runs only with it (`tools/test_governor.py`, in `run_tests.sh`: warm-up
+  ignored, down to 1x1 and back up, oscillation with back-off 10/20/40 s, 92% offline unchanged and
+  stepping down on a netplay host, fixed choices untouched, resolution menu actions with dump
+  sizes and the settings round trip, every state hash equal to a plain run). Each input packet also
+  carries the sender's load (% of its frame budget, one byte at the end; older peers ignore it), and
+  the status line says "Opponent's computer is running slowly" (peer >= 95%) or "This computer is
+  running slowly".
 - Windows: `plat_sleep_us` uses a high-resolution waitable timer; `Sleep()` rounds to the 15.6 ms
   system tick, which turned every 0.5 ms netplay wait into a 16 ms one.
 - **Final frames and desync detection**: the state at the start of frame F is final once every
@@ -541,16 +564,40 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   confirmed inputs offline and, on the peer that went wrong, reports its first wrong frame.
   `--net-desync-dir DIR` (default: cwd), `--net-desync-stop`, `--net-inject-desync F` (test fault).
 - **Readout**: once a second the window title shows ping (RTT), delay, fps, rollbacks/s, % of
-  vblanks predicted, % of time waiting, DESYNC; every 10 s the same line goes to stderr. Exit
-  summary: frames, predicted / mispredicted inputs, rollbacks (max depth, deferred, impossible),
-  re-simulated frames and cost, stalls, time-sync waits, packets, final frames, hashes checked.
+  vblanks predicted, % of time waiting, DESYNC; every 10 s the same line goes to stderr, followed
+  by the frame-to-frame ping. Exit summary: frames, predicted / mispredicted inputs, rollbacks (max
+  depth, deferred, impossible), re-simulated frames and cost, stalls, time-sync waits, packets,
+  final frames, hashes checked; then `netplay: ping A ms average network round trip (median, min, max, N
+  samples), F ms frame-to-frame`.
+- **How the ping is measured**: every input packet carries the sender's clock (us), the last clock
+  it saw from the peer and how long it held that one (10 us units) **since that packet arrived**,
+  plus (appended after the load byte) how long since its frame loop processed it. RTT = arrival of
+  the reply - our clock echoed - the peer's hold. Arrival times come from `net.c`: a receiver thread
+  per socket blocks in `select` and queues each datagram with its time (macOS / Linux: the kernel's
+  `SO_TIMESTAMP`, so a late thread wakeup on a loaded machine does not count; Windows / Wine: the
+  time the thread read it). Packets are still **processed** only at the frame boundary (`receive()`
+  pops the queue: `net_recv_ts`), so rollback, prediction and time sync are unchanged; the ping is
+  display only (nothing reads `s_rtt`). The old figure used the times each side *looked* at the
+  socket (once per vblank), so up to a frame of waiting on each side counted as network: loopback
+  showed 19-21 ms; now 0.1-0.3 ms Mac <-> Mac, median 0.3 ms Mac host <-> Wine joiner and ~2 ms
+  Wine host <-> Mac joiner (Wine adds spikes on a loaded machine). Windows: the thread waits on the
+  socket's `WSAEventSelect` FD_READ event plus a high-resolution timer, not `select()`: with a
+  `select()` loop in the receiver thread a Mac <-> Wine session fell to ~1 fps with multi-second
+  round trips (cause not pinned down). Status line and menu
+  (`Connected to X, ping N ms`) and the title show the network figure (one decimal below 10 ms);
+  the frame-to-frame one (what the old figure measured: network + waiting for the next frame on
+  both sides) is in the 10 s line and the exit summary. Protocol version 3 (us timestamps).
 - **Transport** (`net.c`): non-blocking UDP over IPv4 (the host listens on IPv4 only), the host
   answers whoever says hello first. Packets carry every unacknowledged input (up to 120 frames),
-  so loss only costs latency. `--net-sim LAT:JITTER:LOSS:REORDER[:SEED]` (ms, ms, %, %) delays /
-  drops / reorders this peer's sends (deterministic per seed) for tests. `--net-pace HZ` paces
+  so loss only costs latency. A receiver thread per socket queues arriving datagrams with their
+  arrival time (above); without it (thread start failed) the main thread reads the socket as
+  before. `--net-sim LAT:JITTER:LOSS:REORDER[:SEED]` (ms, ms, %, %) delays /
+  drops / reorders this peer's sends (deterministic per seed) for tests; the receiver thread sends
+  the delayed packets when due (it looks every 0.5 ms while a simulated link is in use), so the
+  simulated latency no longer rounds up to the sender's next frame. `--net-pace HZ` paces
   headless runs; `--net-hash-log FILE` writes every final frame's hashes (also without netplay, for
   an offline reference run); `--net-lockstep` never predicts.
-- Tests: `tools/test_netplay.py` (in `run_tests.sh`): eleven cases (two extra desync link timings that also assert the report file holds its frame), each two headless processes over
+- Tests: `tools/test_netplay.py` (in `run_tests.sh`): eleven cases (two extra desync link timings that also assert the report file holds its frame) plus `ping` (the exit summary's average network ping over loopback < 3 ms and with `--net-sim 20:0:0:0` each way 38-47 ms), each two headless processes over
   loopback with seeded VS menu + random fight input (`replays.py` scripts), paced at 240 Hz (4x real
   time, so the simulated latencies cover 4x as many frames): lan, wan (20 ms + 8 jitter, 1% loss, 2%
   reorder), lossy (15+15 ms, 10% loss, 10% reorder), asym (35 / 5 ms), a full best-of-3 match with
@@ -693,6 +740,16 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **View > Renderer**: the graphics APIs this platform offers (Metal, Vulkan on the Mac; Direct3D 12,
   Vulkan on Windows), a separator, Software; radio check marks, unavailable APIs greyed out. Action
   `renderer[=software|gpu|metal|vulkan|d3d12|compare]`, see "Graphics APIs".
+- **View > Resolution** (Mac and Windows; radio check marks): **Auto** (default) / 4×6 (Sharpest) /
+  2×3 (Balanced) / 1×1 (Original). Auto renders at 4x6 (2048x1440 for the usual 512x240 display, plus
+  the guard band in widescreen) whatever the window size, more only if the window needs it and
+  `--max-scale` allows, never more than `--max-scale`; the scale governor lowers and raises it when
+  this computer cannot keep up (see "Rollback netplay", "Scale governor"). The fixed choices are
+  never changed by the governor. Action `resolution[=auto|4x6|2x3|1x1]` (none = next), saved as
+  `[display] resolution`; `--scale N|NxM|auto` overrides it for the run. SSAA: the default 2x (GPU)
+  only applies while Auto, and only within the 24-pixel cap (so not at 4x6); with a fixed choice
+  only an explicitly chosen Anti-aliasing level applies (capped to render Sx*Sy <= 24 as always).
+  A switch reallocates the target and seeds it from the 1x VRAM, like a resize.
 - **View > Texture Filtering** (Off (Sharp Pixels) / Bilinear / Smooth 2D Edges + Bilinear 3D),
   **View > Smooth Colours** (checkable) and **View > Anti-aliasing** (Off / 2x / 3x / 4x), Mac and
   Windows: actions `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`;
@@ -716,7 +773,7 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   px` and the new `render scale`. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
-  `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `fullscreen[=on|off]`,
+  `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `resolution[=auto|4x6|2x3|1x1]`, `fullscreen[=on|off]`,
   `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`,
   `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`,
   `controls`, `settings`, `controls-*` (see "Input, controls and settings"),
@@ -731,7 +788,8 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **Windows** (`menu_win.c`): a Win32 menu bar on SDL's window (`SDL_PROP_WINDOW_WIN32_HWND_POINTER`),
   same items and rules: **File** (Load Game Image…, Show Game Files in Explorer, Save Games > Show
   Save Games in Explorer / Import / Export / Delete, Exit), **View** (Widescreen (16:9) with check
-  mark, Renderer > Direct3D 12 / Vulkan / Software, Enter / Exit Full Screen, Controls…), **Netplay** (Host Game…, Join Game…,
+  mark, Renderer > Direct3D 12 / Vulkan / Software, Resolution > Auto / 4×6 / 2×3 / 1×1, Texture
+  Filtering, Smooth Colours, Anti-aliasing, Enter / Exit Full Screen, Controls…), **Netplay** (Host Game…, Join Game…,
   Disconnect, status line). The window procedure is subclassed: `WM_COMMAND` queues the action,
   `WM_INITMENUPOPUP` updates check marks, titles, the status line and greys out refused items
   (`frontend_menu_action_allowed`, as `validateMenuItem` on the Mac). SDL sizes the window by its
@@ -807,7 +865,9 @@ INI-like (`[section]`, `key = value`, `#`/`;` comments, UTF-8 BOM skipped, bad l
 `settings: line N ignored` and dropped, never fatal), in the data directory (SDL pref path, same
 folder as `destrega.pak`; `--data-dir` moves it). Written atomically (temp file, fsync,
 `plat_replace_file`), 0.5 s after the last change and at exit. Keys:
-`[display]` scale, max_scale, widescreen, renderer (software|gpu|metal|vulkan|d3d12; gpu = the
+`[display]` resolution (auto|4x6|2x3|1x1, View > Resolution; absent = auto; the older `scale`
+key, auto|off|NxM, is still read when `resolution` is absent), max_scale, widescreen (absent = on in
+a window), renderer (software|gpu|metal|vulkan|d3d12; gpu = the
 platform's default API, as written by older builds; an API this platform does not offer is logged and
 ignored), fullscreen, window (WxH points);
 `[netplay]` port, delay, join_address, port_mapping (on|off); `[player1]` / `[player2]` device, device_name, stick,
@@ -816,10 +876,10 @@ l1 r1 l2 r2 start select; empty = unbound; keys absent = default).
 
 - **Command-line flags win for that run and are never written back**: each flag locks its key
   (`settings_lock`), so a View toggle cannot save it either. `--widescreen` / `--no-widescreen`,
-  `--renderer`, `--scale`, `--max-scale`, `--window`.
+  `--renderer`, `--scale` (locks `scale` and `resolution`), `--max-scale`, `--window`.
 - **Headless runs never read or write a settings file** unless given `--settings FILE`; tests stay
   hermetic. `--no-settings` makes a windowed run use defaults and write nothing (the Wine netplay
-  test uses it). View toggles that persist: Widescreen, Renderer (not `compare`), Full Screen, window
+  test uses it). View toggles that persist: Widescreen, Renderer (not `compare`), Resolution, Full Screen, window
   size (not while full screen or maximised).
 - Netplay defaults moved from NSUserDefaults (`NetplayPort`, `NetplayJoinAddress`, `NetplayDelay`) /
   `HKCU\Software\Destrega\Netplay` (`Port`, `JoinAddress`, `Delay`) to `[netplay]`: copied once when
@@ -888,13 +948,19 @@ hashing all emulated state per frame).
   the target; fills and VRAM copies are scaled.
 - Falls back to presenting 1x VRAM when the display is 24-bit (FMV), disabled, wider than
   the region (e.g. 640 px modes) or outside it.
-- Auto scale (default): the 4:3 letterbox viewport (vw x vh) inside the window's physical
-  pixels (`SDL_GetWindowSizeInPixels`; the window is HiDPI) is covered without ever
-  upsampling at present: `Sx = ceil(vw / display_w)`, `Sy = ceil(vh / display_h)` using the
-  actual display mode (normally 512x240), capped per axis by `--max-scale N|NxM`
-  (default 4x6, see measurements in the PR). A 1440p-ish window renders 2048x1440 (4x6).
-  `--scale N|NxM` forces a scale (0 = off). On a resize the scales are recomputed; if they
-  changed, the target is reallocated and seeded from the current 1x VRAM.
+- Auto scale (windowed default, View > Resolution > Auto, `--scale auto`): **4x6** whatever the
+  window size (a small window is downsampled at present), capped per axis by `--max-scale N|NxM`
+  (default 4x6, see measurements in the PR), and lowered / raised by the scale governor when this
+  computer cannot keep up ("Rollback netplay", "Scale governor"). Larger only if the window needs
+  it and `--max-scale` allows: the window-fit pick below, per axis. **Window fit** (headless
+  default, so the `--resize` tests keep their window-driven scales; it was the windowed Auto
+  before): the 4:3 letterbox viewport (vw x vh) inside the window's physical pixels
+  (`SDL_GetWindowSizeInPixels`; the window is HiDPI) is covered without ever upsampling at
+  present: `Sx = ceil(vw / display_w)`, `Sy = ceil(vh / display_h)` using the actual display mode
+  (normally 512x240), capped by `--max-scale`. (On a 1x Windows display the default window used to
+  give only 2x3; now Auto is 4x6 there too.) `--scale N|NxM` forces a scale (0 = off). On a
+  resize the scales are recomputed; if they changed, the target is reallocated and seeded from
+  the current 1x VRAM.
   Presented with linear filtering into the letterboxed viewport.
 - Options: `--scale N|NxM`, `--max-scale N|NxM`, `--hires-dither`, `--window WxH` (initial
   window, points), `--resize F:WxH,...` (headless: simulated window sizes in physical pixels),
@@ -1183,8 +1249,9 @@ with every mode on). Options are plain global setters/getters in `hires.h`
 (`hires_set_tex_filter`, `hires_set_colour`, `hires_set_ssaa`), no persistence.
 
 - **Defaults**: windowed = `xbr` filter, full-precision colour, and 2x SSAA when the GPU renderer
-  is active (1 on software; switching the renderer moves the default along unless `--ssaa` or the
-  menu chose a value). In a window SSAA is always capped to a render target of at most 24 hi-res
+  is active and the resolution is Auto (1 on software or with a fixed resolution; switching the
+  renderer moves the default along unless `--ssaa` or the menu chose a value). While the scale
+  governor holds Auto down, the cap is the lowered scale's Sx*Sy instead of 24. In a window SSAA is always capped to a render target of at most 24 hi-res
   pixels per 1x pixel (`ssaa_cap()` in main.c -> `hires_set_ssaa_cap(24)`: render Sx*Sy <= 24, i.e.
   never beyond 4x6), whether it is the default, a menu choice or `display.ssaa` in settings.ini, so
   it only applies to small windows (base Sx*Sy <= 6 for 2x, e.g. 2x3) and is off at the usual 4x6.
@@ -1278,7 +1345,11 @@ with every mode on). Options are plain global setters/getters in `hires.h`
   49.1; 640x480 (3x4) default 10.3, `--ssaa 2` (6x8) 24.6; 1280x720 16:9 (4x6) default 17.6.
   So explicit 2x SSAA does not hold 60 Hz on this machine at these window sizes, hence the cap.
 
-## Widescreen (`--widescreen`, default off)
+## Widescreen (`--widescreen`; default on in a window, off headless)
+
+Windowed runs start in 16:9 (default window 1280x720) unless `settings.ini` says `widescreen = off`,
+`--no-widescreen` is given or View > Widescreen / F9 turns it off (saved). Headless runs stay 4:3
+unless `--widescreen` is given, so every test's hashes and dumps are unchanged.
 
 16:9 fights with **zero** change to emulated state (proved per frame by
 `tools/test_widescreen.sh`). Menus, FMV, character select and other non-stage screens stay 4:3.

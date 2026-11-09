@@ -19,8 +19,8 @@ run() { # name args...
   [ "$JOBS" -lt 3 ] && wait
 }
 rm -f $D/*.rc
-run w1 --no-memcard --window 640x480 $P --frames $F --state-hash $D/w1.txt
-run w2 --no-memcard --window 640x480 $P --frames $F --state-hash $D/w2.txt
+run w1 --no-memcard --no-settings --window 640x480 $P --frames $F --state-hash $D/w1.txt
+run w2 --no-memcard --no-settings --window 640x480 $P --frames $F --state-hash $D/w2.txt
 run h --headless --no-interp --no-memcard $P --frames $F --state-hash $D/h.txt
 wait
 [ "$(cat $D/w1.rc)" = 0 ] || { echo "windowed run 1: FAIL (exit)"; fail=1; }

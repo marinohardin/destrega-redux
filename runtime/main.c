@@ -42,9 +42,19 @@ static int s_profile_on;
 static u32 s_wav_bytes;
 
 /* hi-res options (see hires.h / AGENTS.md) */
-static int s_opt_sx = -1, s_opt_sy = -1;   /* --scale N|NxM: -1 = auto from the window, 0 = off */
+/* Render resolution (View > Resolution, display.resolution, --scale): s_opt_sx/sy -1 = Auto,
+ * 0 = hi-res off, > 0 = fixed. Auto aims for AUTO_SX x AUTO_SY (4x6) whatever the window size,
+ * more only if the window needs it and --max-scale allows, never more than --max-scale; the scale
+ * governor (smooth.h) lowers and raises it when this computer cannot keep up. s_res_fit is the
+ * older "fit to the window" choice (the smallest scale that covers the window's pixels): the
+ * headless default, so the --resize tests keep their window-driven scales. */
+#define AUTO_SX 4
+#define AUTO_SY 6
+static int s_opt_sx = -1, s_opt_sy = -1;   /* --scale N|NxM|auto: -1 = auto, 0 = off */
+static bool s_res_fit;                     /* Auto = fit to the window (headless default) */
+static bool s_res_chosen;                  /* resolution set by --scale auto, settings or the menu */
 static int s_max_sx = 4, s_max_sy = 6;     /* auto-scale caps per axis (see AGENTS.md) */
-static int s_gov_sx, s_gov_sy;             /* netplay scale governor caps, 0 = none (smooth.h) */
+static int s_gov_sx, s_gov_sy;             /* scale governor caps (Auto), 0 = none (smooth.h) */
 static int s_win_w = 960, s_win_h = 720;   /* --window WxH (logical points) */
 static bool s_win_set;                     /* --window given */
 /* --widescreen (see AGENTS.md "Widescreen"): the hi-res target gets a guard band of WS_GUARD
@@ -407,26 +417,47 @@ static int ws_present_extra(const GpuDisplay *d) {
     return ws_extra_for(s_pres_w, s_pres_h, d->w, hires_guard());
 }
 
+static bool res_auto(void) { return s_opt_sx < 0 && !s_res_fit; }
+/* the resolution choice as settings / menu actions name it: auto, off or SxxSy */
+static const char *resolution_name(void) {
+    static char b[16];
+    if (s_opt_sx < 0) return "auto";
+    if (s_opt_sx == 0) return "off";
+    snprintf(b, sizeof b, "%dx%d", s_opt_sx, s_opt_sy);
+    return b;
+}
+static bool gov_allowed(void) { return res_auto() && (!s_headless || smooth_fake_load_given()); }
+static int ssaa_cap(void);
+static int ssaa_default(int r);
+
 /* Pick the render scales for a window of pw x ph physical pixels, from the display mode
  * currently shown (24-bit / disabled displays keep the 512x240 reference). */
 static void apply_window_size(int pw, int ph, bool simulated) {
-    if (!simulated && s_opt_sx >= 0) return;
+    if (!simulated && s_opt_sx >= 0) { smooth_governor_allow(false, 0, 0); return; }
     GpuDisplay d;
     gpu_get_display(&d);
     int dw = 512, dh = 240;
     if (d.enabled && !d.rgb24 && d.w > 0 && d.h > 0) { dw = d.w; dh = d.h; }
     int sx, sy, cx, cy;
     s_pres_w = pw; s_pres_h = ph;
-    int mx = s_gov_sx && s_gov_sx < s_max_sx ? s_gov_sx : s_max_sx;
-    int my = s_gov_sy && s_gov_sy < s_max_sy ? s_gov_sy : s_max_sy;
     if (s_widescreen) {
         /* sized for the widest presentation this window allows, so switching between 4:3
          * screens and 16:9 fights never reallocates the target */
         int e = ws_extra_for(pw, ph, dw, WS_GUARD);
         hires_pick_scale_ar(pw, ph, dw + 2 * e, dh, 4.0 / 3.0 * (dw + 2 * e) / dw,
-                            mx, my, &sx, &sy);
+                            s_max_sx, s_max_sy, &sx, &sy);
     } else
-        hires_pick_scale(pw, ph, dw, dh, mx, my, &sx, &sy);
+        hires_pick_scale(pw, ph, dw, dh, s_max_sx, s_max_sy, &sx, &sy);
+    if (res_auto()) {   /* at least 4x6 (within --max-scale), more if the window needs it */
+        const int ax = AUTO_SX < s_max_sx ? AUTO_SX : s_max_sx, ay = AUTO_SY < s_max_sy ? AUTO_SY : s_max_sy;
+        if (sx < ax) sx = ax;
+        if (sy < ay) sy = ay;
+    }
+    smooth_governor_allow(gov_allowed(), sx, sy);
+    if (s_gov_sx && s_gov_sx < sx) sx = s_gov_sx;
+    if (s_gov_sy && s_gov_sy < sy) sy = s_gov_sy;
+    /* while the governor holds the scale down, SSAA may not render more than the cap either */
+    hires_set_ssaa_cap(ssaa_cap());
     hires_get_scale(&cx, &cy);
     if (sx != cx || sy != cy) {
         rt_log("hires: window %dx%d, display %dx%d -> render scale %dx%d", pw, ph, dw, dh, sx, sy);
@@ -601,7 +632,7 @@ static void renderer_switch(int r, int api) {
         if (r != R_SOFTWARE && hires_gpu_api() < 0) r = R_SOFTWARE;
     }
     backend_for(r);
-    if (!s_ssaa_chosen && !s_headless) hires_set_ssaa(r == R_GPU ? 2 : 1);   /* default follows the renderer */
+    if (!s_ssaa_chosen && !s_headless) hires_set_ssaa(ssaa_default(r));   /* default follows the renderer */
     if (on && !hires_set_scale(sx, sy)) {
         rt_log("hires: renderer %s cannot allocate %dx%d; back to software", renderer_name(r), sx, sy);
         r = R_SOFTWARE;
@@ -854,6 +885,10 @@ void frontend_vblank(void) {
             rt_log("resize %dx%d", s_resizes[i].w, s_resizes[i].h);
             apply_window_size(s_resizes[i].w, s_resizes[i].h, true);
         }
+    if (s_headless) {   /* scale governor test hook (--fake-load); windowed: smooth_present */
+        smooth_headless_frame(s_frame);
+        if (smooth_scale_cap(&s_gov_sx, &s_gov_sy)) apply_window_size(s_pres_w, s_pres_h, true);
+    }
     {   /* which path would present this frame: hi-res target or the 1x fallback */
         int cx, cy;
         if (hires_get_scale(&cx, &cy)) {
@@ -1162,7 +1197,7 @@ static void settings_apply(const char *dir) {
     else if (!s_headless && !s_no_settings) snprintf(path, sizeof path, "%ssettings.ini", dir);
     else path[0] = 0;   /* headless: hermetic unless --settings */
     settings_set_path(path[0] ? path : NULL);
-    if (s_scale_given) settings_lock("display", "scale");
+    if (s_scale_given) { settings_lock("display", "scale"); settings_lock("display", "resolution"); }
     if (s_max_scale_given) settings_lock("display", "max_scale");
     if (s_ws_given) settings_lock("display", "widescreen");
     if (s_renderer_given) settings_lock("display", "renderer");
@@ -1173,8 +1208,13 @@ static void settings_apply(const char *dir) {
     if (path[0] && settings_load() >= 0) rt_log("settings: %s", path);
     const char *v;
     int a, b;
-    if (!s_scale_given && (v = settings_get("display", "scale"))) {
-        if (!strcmp(v, "auto")) s_opt_sx = s_opt_sy = -1;
+    if (!s_scale_given && (v = settings_get("display", "resolution"))) {   /* View > Resolution */
+        if (!strcmp(v, "auto")) { s_opt_sx = s_opt_sy = -1; s_res_chosen = true; }
+        else if (parse_wxh(v, &a, &b, 1, 8)) { s_opt_sx = a; s_opt_sy = b; s_res_chosen = true; }
+        else rt_log("settings: display.resolution: auto, 4x6, 2x3 or 1x1");
+    }
+    else if (!s_scale_given && (v = settings_get("display", "scale"))) {   /* older files, hand edits */
+        if (!strcmp(v, "auto")) { s_opt_sx = s_opt_sy = -1; s_res_chosen = true; }
         else if (!strcmp(v, "off") || !strcmp(v, "0")) s_opt_sx = s_opt_sy = 0;
         else if (parse_wxh(v, &a, &b, 1, 8)) { s_opt_sx = a; s_opt_sy = b; }
         else rt_log("settings: display.scale: auto, off or N / NxM (1..8)");
@@ -1183,7 +1223,8 @@ static void settings_apply(const char *dir) {
         if (parse_wxh(v, &a, &b, 1, 8)) { s_max_sx = a; s_max_sy = b; }
         else rt_log("settings: display.max_scale: N or NxM (1..8)");
     }
-    if (!s_ws_given) s_widescreen = settings_get_bool("display", "widescreen", s_widescreen);
+    /* windowed default: 16:9 fights (default window 1280x720); headless stays 4:3 (tests) */
+    if (!s_ws_given) s_widescreen = settings_get_bool("display", "widescreen", !s_headless);
     if (!s_renderer_given && (v = settings_get("display", "renderer"))) {
         /* software | gpu (the platform default; older files) | metal | vulkan | d3d12 */
         s_renderer_pref_sw = !strcmp(v, "software");
@@ -1216,6 +1257,7 @@ static void settings_apply(const char *dir) {
 static void settings_note_view(const char *name) {
     if (!strcmp(name, "widescreen")) settings_set_bool("display", "widescreen", s_ws_req);
     else if (!strcmp(name, "renderer") && s_renderer != R_COMPARE) settings_set("display", "renderer", renderer_name(s_renderer));
+    else if (!strcmp(name, "resolution")) settings_set("display", "resolution", resolution_name());
     else if (!strcmp(name, "tex-filter")) settings_set("display", "tex_filter", hires_tex_filter_name(hires_get_tex_filter()));
     else if (!strcmp(name, "smooth-colours")) settings_set_bool("display", "smooth_colours", hires_get_colour());
     else if (!strcmp(name, "ssaa") && s_ssaa_chosen) {
@@ -1256,9 +1298,14 @@ static void usage(void) {
         "  --press F:MASK,...    headless input script (MASK = hex PSX button bits, active high)\n"
         "  --press2 F:MASK,...   same, for pad 2 (VS / team modes)\n"
         "  --wav FILE            record audio output (headless)\n"
-        "  --scale N|NxM         internal render scale (horizontal x vertical): 0 = hi-res off, 1..8\n"
-        "                        fixed (default: auto from the window size; headless: off)\n"
+        "  --scale N|NxM|auto    internal render scale (horizontal x vertical): 0 = hi-res off, 1..8\n"
+        "                        fixed; auto = View > Resolution > Auto: 4x6 (more if the window needs it\n"
+        "                        and --max-scale allows), lowered / raised by the scale governor (default\n"
+        "                        in a window; headless default: off, --resize fits the simulated window)\n"
         "  --max-scale N|NxM     per-axis cap for the automatic scale (default 4x6)\n"
+        "  --no-scale-governor   Auto keeps its scale even when this computer cannot keep up\n"
+        "  --fake-load F-G:PCT,..  (testing) the scale governor sees PCT%% of the frame budget as extra\n"
+        "                        load on frames F..G (headless: the governor runs only with this)\n"
         "  --window WxH          initial window size in points (default 960x720)\n"
         "  --hires-threads N     hi-res rasterizer worker threads: -1 auto (performance cores - 1), 0 serial\n"
         "  --segments F,F,...    frame boundaries for the per-segment timing report (default 1200,1800,2400,3000)\n"
@@ -1293,11 +1340,13 @@ static void usage(void) {
         "  --compare-max PCT     compare mode: exit non-zero if a fight frame differs in more than PCT%% of pixels\n"
         "  --widescreen          16:9 fights: wider stage culling + hi-res guard band (menus/FMV stay 4:3;\n"
         "                        needs hi-res; the window aspect picks 4:3..16:9; default window 1280x720;\n"
+        "                        default on in a window, off headless;\n"
         "                        View > Widescreen (16:9) or F9 switches at runtime)\n"
         "  --widescreen-at F:0|1,...  headless: switch widescreen off/on at the given frames\n"
         "  --menu-action F:NAME[=ARG]  (testing) run a menu action on frame F: load=IMAGE, reveal-game,\n"
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete,\n"
         "                        widescreen[=on|off], renderer[=software|gpu|compare],\n"
+        "                        resolution[=auto|4x6|2x3|1x1],\n"
         "                        tex-filter[=nearest|bilinear|xbr], smooth-colours[=on|off], ssaa[=1..4]\n"
         "                        (View menu; no argument = toggle / next), netplay-host=PORT[,DELAY],\n"
         "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect (Netplay menu),\n"
@@ -1681,7 +1730,16 @@ bool frontend_netplay_busy(void) { return netplay_busy(); }
  * 8x12, four times the pixels (measured 49-87 ms per frame on an M-series GPU, a slideshow), and
  * a window big enough for 4x6 gains little from it. Small windows still get it. Headless runs
  * (tests, dumps) take an explicit --ssaa as given. */
-static int ssaa_cap(void) { return s_headless && s_ssaa_chosen ? 0 : 24; }
+static int ssaa_cap(void) {
+    /* Auto lowered by the scale governor: the render target may not exceed the lowered scale's
+     * pixels either (else 2x SSAA on a lowered 2x3 would render 4x6 again and save nothing) */
+    if (res_auto() && s_gov_sx && s_gov_sy) return s_gov_sx * s_gov_sy;
+    return s_headless && s_ssaa_chosen ? 0 : 24;
+}
+/* SSAA when none was chosen: 2x on the GPU renderer in a window while the resolution is Auto (it
+ * only applies when the scale is small enough, see ssaa_cap); a fixed resolution renders exactly
+ * what it says unless anti-aliasing is chosen in the menu. */
+static int ssaa_default(int r) { return !s_headless && r == R_GPU && s_opt_sx < 0 ? 2 : 1; }
 
 static void log_render_quality(const char *when) {
     int rx = 0, ry = 0;
@@ -1705,9 +1763,43 @@ bool frontend_view_checked(const char *action, bool *checked) {
     const size_t n = eq ? (size_t)(eq - action) : strlen(action);
     const char *arg = eq ? eq + 1 : "";
     if (n == 10 && !strncmp(action, "tex-filter", n) && *arg) { *checked = hires_tex_filter_from_name(arg) == hires_get_tex_filter(); return true; }
+    if (n == 10 && !strncmp(action, "resolution", n) && *arg) { *checked = !strcmp(arg, resolution_name()); return true; }
     if (n == 14 && !strncmp(action, "smooth-colours", n)) { *checked = hires_get_colour(); return true; }
     if (n == 4 && !strncmp(action, "ssaa", n) && *arg) { *checked = atoi(arg) == hires_get_ssaa(); return true; }
     return false;
+}
+
+/* View > Resolution (--menu-action resolution=auto|4x6|2x3|1x1, none = next): between frames. Auto
+ * hands the scale back to apply_window_size and the governor; a fixed choice drops the governor's
+ * caps and is never changed by it. A scale change reallocates the target and seeds it from the 1x
+ * VRAM, like a resize. Presentation only. */
+static const char *const k_resolutions[] = { "auto", "4x6", "2x3", "1x1" };
+static void resolution_set(const char *arg) {
+    const int n = (int)(sizeof k_resolutions / sizeof *k_resolutions);
+    int cur = 0, pick = -1;
+    for (int i = 0; i < n; i++) if (!strcmp(resolution_name(), k_resolutions[i])) cur = i;
+    if (!*arg) pick = (cur + 1) % n;
+    for (int i = 0; i < n && pick < 0; i++) if (!strcmp(arg, k_resolutions[i])) pick = i;
+    if (pick < 0) { rt_log("menu: resolution: auto, 4x6, 2x3 or 1x1"); return; }
+    int a = -1, b = -1;
+    if (pick > 0) parse_wxh(k_resolutions[pick], &a, &b, 1, 8);
+    s_opt_sx = a; s_opt_sy = b;
+    s_res_fit = false;
+    s_res_chosen = true;
+    if (!s_ssaa_chosen) hires_set_ssaa(ssaa_default(s_renderer));
+    if (a > 0) {
+        s_gov_sx = s_gov_sy = 0;
+        smooth_governor_allow(false, 0, 0);
+        hires_set_ssaa_cap(ssaa_cap());
+        if (!hires_set_scale(a, b)) rt_log("hires: cannot allocate scale %dx%d", a, b);
+    } else {
+        hires_set_ssaa_cap(ssaa_cap());
+        apply_window_size(s_pres_w, s_pres_h, true);
+    }
+    int rx = 0, ry = 0;
+    hires_get_render_scale(&rx, &ry);
+    rt_log("hires: resolution %s at frame %llu (render scale %dx%d)", resolution_name(),
+           (unsigned long long)s_frame, rx, ry);
 }
 
 static void menu_run(const char *name, const char *arg) {
@@ -1759,6 +1851,7 @@ static void menu_run(const char *name, const char *arg) {
         frontend_set_widescreen(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
                                 : !strcmp(arg, "off") || !strcmp(arg, "0") ? false
                                 : !frontend_widescreen());
+    else if (!strcmp(name, "resolution")) resolution_set(arg);   /* View > Resolution */
     else if (!strcmp(name, "tex-filter")) {   /* View > Texture Filtering; nearest|bilinear|xbr, none = next */
         int m = *arg ? hires_tex_filter_from_name(arg) : (hires_get_tex_filter() + 1) % 3;
         if (m < 0) rt_log("menu: tex-filter: nearest, bilinear or xbr");
@@ -1863,8 +1956,12 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) {
-            char *e; s_opt_sx = (int)strtol(argv[++i], &e, 10); s_scale_given = true;
-            s_opt_sy = (*e == 'x' || *e == 'X') ? (int)strtol(e + 1, NULL, 10) : s_opt_sx;
+            char *e; s_scale_given = true;
+            if (!strcmp(argv[i + 1], "auto")) { s_opt_sx = s_opt_sy = -1; s_res_chosen = true; i++; }
+            else {
+                s_opt_sx = (int)strtol(argv[++i], &e, 10);
+                s_opt_sy = (*e == 'x' || *e == 'X') ? (int)strtol(e + 1, NULL, 10) : s_opt_sx;
+            }
         }
         else if (!strcmp(argv[i], "--max-scale") && i + 1 < argc) {
             char *e; s_max_sx = (int)strtol(argv[++i], &e, 10); s_max_scale_given = true;
@@ -2020,6 +2117,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     settings_apply(s_card_dir);
+    if (s_headless && !s_res_chosen) s_res_fit = true;   /* headless: --resize keeps fitting the window */
     if (s_headless && input_have_events()) {   /* --input-event: SDL's event queue and virtual controllers */
         if (!SDL_Init(SDL_INIT_GAMEPAD)) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
         s_host_input = true;
@@ -2060,7 +2158,7 @@ int main(int argc, char **argv) {
     if (s_widescreen) {
         widescreen_enable(true);
         hires_set_guard(WS_GUARD);
-        if (s_opt_sx == 0 || (s_headless && s_opt_sx < 0 && !s_resize_n))
+        if (s_opt_sx == 0 || (s_headless && s_opt_sx < 0 && !res_auto() && !s_resize_n))
             rt_log("widescreen: hi-res is off, so nothing beyond 4:3 can be shown");
     }
     s_pres_w = s_win_w; s_pres_h = s_win_h;   /* headless: --window (or --resize) is the window */
@@ -2087,7 +2185,7 @@ int main(int argc, char **argv) {
     s_gpu_used = s_renderer != R_SOFTWARE;
     hires_set_tex_filter(s_opt_filter >= 0 ? s_opt_filter : s_headless ? HIRES_TEX_NEAREST : HIRES_TEX_XBR);
     hires_set_colour(s_opt_full >= 0 ? s_opt_full == 1 : !s_headless);
-    hires_set_ssaa(s_opt_ssaa >= 1 ? s_opt_ssaa : (!s_headless && s_renderer == R_GPU) ? 2 : 1);
+    hires_set_ssaa(s_opt_ssaa >= 1 ? s_opt_ssaa : ssaa_default(s_renderer));
     /* default SSAA only while the render target costs no more than 4x6 (measured: 4x6 x2 = 8x12
      * took ~4x the GPU time, far over a 60 Hz frame); an explicit choice is never capped */
     hires_set_ssaa_cap(ssaa_cap());
@@ -2096,6 +2194,7 @@ int main(int argc, char **argv) {
     else if (s_renderer == R_COMPARE) hires_set_backend(NULL, hires_gpu_backend());
     if (s_opt_sx > 0 && !hires_set_scale(s_opt_sx, s_opt_sy))
         rt_log("hires: cannot allocate scale %dx%d", s_opt_sx, s_opt_sy);
+    else if (s_headless && res_auto()) apply_window_size(s_pres_w, s_pres_h, true);   /* --scale auto */
     log_render_quality("");
     spu_init();
     mdec_init();

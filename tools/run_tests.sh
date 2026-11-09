@@ -101,6 +101,8 @@ tl_step menu tools/test_menu.sh
 tl_step savestate tools/test_savestate.sh
 # input layer + settings file: custom bindings and synthetic host events == the --press run
 tl_step input python3 tools/test_input.py
+# View > Resolution and the scale governor (fake load: steps down / up, back-off, fixed choices)
+tl_step governor python3 tools/test_governor.py -j "$JOBS"
 # gameplay regression replays (tools/replays/*.dtr.gz): every frame's gameplay fields must match
 # (a failure means a gameplay change: see AGENTS.md "Replays")
 tl_step replays python3 tools/replays.py run -j "$JOBS"
