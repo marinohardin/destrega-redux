@@ -72,12 +72,8 @@ NETP=$!
 # build/win/destrega.exe)
 python3 tools/test_netplay_wine.py > build/netplay_wine.out 2>&1 &
 NETW=$!
-# the host's automatic port forwarding against a fake router on 127.0.0.1 (tools/fake_router.py;
-# never a real router): PCP, NAT-PMP, UPnP, refusals, CGNAT, no answer, cleanup, menu restart
-python3 tools/test_portmap.py -j 4 > build/portmap.out 2>&1 &
-PMAP=$!
 
-wait %1 %2 %3 %4 %5 %6 %7 %8 %9 2>/dev/null
+wait %1 %2 %3 %4 %5 %6 %7 %8 %9 %10 2>/dev/null   # the 10 compile jobs
 fail=0
 # 3. run the unit tests concurrently, report in order
 for t in gte gpu hires pgxp spu mdec memcard input portmap; do
@@ -135,7 +131,10 @@ wait $NETP || { fail=1; echo "netplay: FAILED"; }
 cat build/netplay.out
 wait $NETW || { fail=1; echo "netplay (Mac <-> Windows under Wine): FAILED"; }
 cat build/netplay_wine.out
-wait $PMAP || { fail=1; echo "port mapping (fake router): FAILED"; }
+# the host's automatic port forwarding against a fake router on 127.0.0.1 (tools/fake_router.py;
+# never a real router): PCP, NAT-PMP, UPnP, refusals, CGNAT, no answer, cleanup, menu restart.
+# Run last, alone (~20 s): its games would add load to the timing-sensitive Wine netplay test.
+python3 tools/test_portmap.py -j 6 > build/portmap.out 2>&1 || { fail=1; echo "port mapping (fake router): FAILED"; }
 cat build/portmap.out
 echo "tests: $(( $(date +%s) - START ))s wall clock, $([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail

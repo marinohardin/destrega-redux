@@ -607,7 +607,7 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   (`netplay_smooth.py`, `test_netplay_wine.py --windowed`) pass `--net-portmap off`.
   `tools/fake_router.py`: PCP + NAT-PMP (one UDP port) and UPnP (HTTP, chunked description, SOAP),
   127.0.0.1 only, modes ok / unsupported / refuse / silent / permanent, external address settable,
-  enforces the PCP nonce, records every request. `tools/test_portmap.py` (in `run_tests.sh`; ~20 s on an idle machine, 15 min inside a loaded full suite):
+  enforces the PCP nonce, records every request. `tools/test_portmap.py` (last in `run_tests.sh`, alone, ~20 s):
   `natpmp`, `pcp`, `upnp` (map, renewals at a 2 s lease, delete on Cancel or at exit; `upnp` also
   checks no UDP was sent), `upnp_permanent` (725 -> lease 0, no renewals, deleted at exit),
   `refused`, `cgnat` (100.72.1.9), `noanswer` (all three silent: message after ~6 s of timeouts;
