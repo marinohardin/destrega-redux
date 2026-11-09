@@ -281,6 +281,40 @@ def run_menu_fail(name, port, pace):
     return not problems, '; '.join(problems) if problems else msg, time.time() - t0, None, None
 
 
+def run_ping(name, port, pace):
+    """The ping shown to the players is the network round trip: packets are timestamped when they
+    arrive (net.c receiver thread, kernel timestamps on macOS / Linux), not when the frame loop gets
+    to them. Two short sessions over loopback: no simulated delay (must be well under a frame:
+    < 3 ms on average, where it used to read 16-21 ms) and 20 ms each way (~40 ms)."""
+    d = os.path.join(OUT, name)
+    os.makedirs(d, exist_ok=True)
+    t0 = time.time()
+    links = (('loopback', None, 0.0, 3.0), ('sim20', '20:0:0:0:', 38.0, 47.0))
+    procs = []
+    for i, (tag, sim, lo, hi) in enumerate(links):
+        common = [BIN, '--headless', '--no-interp', '--no-memcard', '--frames', '1500', '--net-pace', str(pace)]
+        p = port + 100 + 2 * i
+        h = common + ['--host', str(p)] + (['--net-sim', sim + '41'] if sim else [])
+        j = common + ['--join', f'127.0.0.1:{p}'] + (['--net-sim', sim + '42'] if sim else [])
+        for who, cmd in (('host', h), ('join', j)):
+            f = os.path.join(d, f'{tag}-{who}.log')
+            procs.append((tag, who, f, lo, hi, subprocess.Popen(cmd, stdout=open(f, 'w'), stderr=subprocess.STDOUT, cwd=ROOT)))
+    problems, got = [], []
+    for tag, who, f, lo, hi, pr in procs:
+        rc = pr.wait(timeout=600)
+        log = open(f).read()
+        m = re.search(r'netplay: ping ([\d.]+) ms average network round trip \(median >?([\d.]+), min ([\d.]+), max ([\d.]+), (\d+) samples\), '
+                      r'([\d.]+) ms frame-to-frame', log)
+        if rc: problems.append(f'{tag} {who}: exit code {rc}')
+        if not m: problems.append(f'{tag} {who}: no ping summary'); continue
+        avg, n, frame = float(m.group(1)), int(m.group(5)), float(m.group(6))
+        got.append(f'{tag} {who} {avg:.2f} ms (frame-to-frame {frame:.1f})')
+        if n < 100: problems.append(f'{tag} {who}: only {n} ping samples')
+        if not lo <= avg <= hi: problems.append(f'{tag} {who}: average network ping {avg:.2f} ms, expected {lo:g}..{hi:g}')
+    msg = 'network ping ' + ', '.join(got)
+    return not problems, '; '.join(problems) if problems else msg, time.time() - t0, None, None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cases', nargs='*')
@@ -291,13 +325,15 @@ def main():
     if a.list:
         for n, c in CASES.items(): print(f'{n:8s} {c[0]} delay {c[1]} sim {c[2]} / {c[3]}')
         print('menu_session  host / join / disconnect through --menu-action mid-run')
+        print('menu_fail     refused / unanswered menu sessions')
+        print('ping          the shown ping is the network round trip (loopback, 20 ms each way)')
         return 0
-    names = a.cases or list(CASES) + ['menu_session', 'menu_fail']
+    names = a.cases or list(CASES) + ['menu_session', 'menu_fail', 'ping']
     base = 47100 + (os.getpid() % 50) * 20
     t0 = time.time()
     fail = 0
     with cf.ThreadPoolExecutor(a.j) as ex:
-        fn = {'menu_session': run_menu_session, 'menu_fail': run_menu_fail}
+        fn = {'menu_session': run_menu_session, 'menu_fail': run_menu_fail, 'ping': run_ping}
         futs = [ex.submit(fn.get(n, run_case), n, base + 2 * i, a.pace)
                 for i, n in enumerate(names)]
         for n, fu in zip(names, futs):
