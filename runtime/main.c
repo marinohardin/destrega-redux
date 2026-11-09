@@ -11,6 +11,7 @@
 #include "smooth.h"
 #include "input.h"
 #include "settings.h"
+#include "portmap.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1503,6 +1504,7 @@ static void restart_exec(bool netplay, const char *const *extra, int nextra) {
         for (int i = 0; i < nextra; i++) av[n++] = (char *)extra[i];
     }
     rt_log(netplay ? "netplay: restarting for the session (fresh boot on both sides)" : "menu: restarting on the new data pack");
+    if (!netplay) portmap_finish();   /* a new game image: hosting ends, delete the router's port mapping */
     memcard_flush();
     if (s_state_hash) fflush(s_state_hash);
     fflush(NULL);
@@ -2023,7 +2025,7 @@ int main(int argc, char **argv) {
         s_host_input = true;
     }
     if (s_widescreen && !s_win_set) { s_win_w = 1280; s_win_h = 720; }
-    if (!s_headless) create_window();
+    if (!s_headless) { create_window(); portmap_set_windowed(true); }   /* only windowed play maps real ports */
     const char *src = disc_path ? disc_path : pak;
     if (!disc_path) {
         FILE *f = fopen(pak, "rb");

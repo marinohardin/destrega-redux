@@ -232,6 +232,7 @@ def run_menu_session(name, port, pace):
         if 'netplay: session ended' not in log: problems.append(f'{who}: session did not end')
         if f'headless: reached {frames} frames' not in log: problems.append(f'{who}: did not keep playing offline to the end')
     if 'alert: Your opponent left' not in hlog: problems.append('host: no "opponent left" alert')
+    if 'portmap:' in hlog + jlog: problems.append('a headless test tried to map a port on the real router')
     bad = [f for f in both if H[f] != J[f]]
     if bad: problems.append(f'peers differ at {len(bad)} final frames, first {bad[0]}')
     badref = [f for f in both if f in O and O[f] != H[f]]
@@ -272,6 +273,7 @@ def run_menu_fail(name, port, pace):
         problems.append('join: no "different settings" refusal alert')
     if 'refused a player' not in L['host']: problems.append('host: did not refuse')
     if 'alert: No answer from 127.0.0.1' not in L['lone']: problems.append('lone joiner: no timeout alert')
+    if any('portmap:' in v for v in L.values()): problems.append('a headless test tried to map a port on the real router')
     for w, n in (('host', 9000), ('join', 600), ('lone', 3000)):
         if f'headless: reached {n} frames' not in L[w]: problems.append(f'{w}: did not keep playing offline')
         if 'restarting for the session' in L[w]: problems.append(f'{w}: restarted although nothing was agreed')

@@ -21,6 +21,7 @@ cc_job pgxp $CC runtime/gte.c runtime/gpu.c runtime/hires.c runtime/pgxp.c runti
 cc_job spu $CC runtime/spu.c runtime/xa.c runtime/tests/test_spu.c -o build/tests/test_spu &
 cc_job mdec $CC runtime/mdec.c runtime/tests/test_mdec.c -o build/tests/test_mdec -lm &
 cc_job memcard $CC runtime/memcard.c runtime/platform.c runtime/tests/test_memcard.c -o build/tests/test_memcard &
+cc_job portmap $CC runtime/portmap.c runtime/settings.c runtime/platform.c runtime/platform_net.c runtime/tests/test_portmap.c -o build/tests/test_portmap &
 SDLF=$(pkg-config --cflags --libs sdl3 2>/dev/null || echo "-I/opt/homebrew/include -L/opt/homebrew/lib -lSDL3")
 cc_job input $CC runtime/input.c runtime/settings.c runtime/platform.c runtime/tests/test_input.c -o build/tests/test_input $SDLF -lm &
 cc_job hgpu $CC runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c runtime/platform.c runtime/tests/test_hires_gpu.c -o build/tests/test_hires_gpu $SDLF -lm &
@@ -72,15 +73,15 @@ NETP=$!
 python3 tools/test_netplay_wine.py > build/netplay_wine.out 2>&1 &
 NETW=$!
 
-wait %1 %2 %3 %4 %5 %6 %7 %8 %9 2>/dev/null
+wait %1 %2 %3 %4 %5 %6 %7 %8 %9 %10 2>/dev/null   # the 10 compile jobs
 fail=0
 # 3. run the unit tests concurrently, report in order
-for t in gte gpu hires pgxp spu mdec memcard input; do
+for t in gte gpu hires pgxp spu mdec memcard input portmap; do
   if [ "$(cat build/tests/$t.cc.rc)" != 0 ]; then echo "$t: COMPILE FAIL"; cat build/tests/$t.cc.log; fail=1; continue; fi
   ./build/tests/test_$t > build/tests/test_$t.log 2>&1 &
   eval "UT_$t=$!"
 done
-for t in gte gpu hires pgxp spu mdec memcard input; do
+for t in gte gpu hires pgxp spu mdec memcard input portmap; do
   eval "pid=\$UT_$t"
   [ -n "$pid" ] || continue
   printf '%-6s ' "$t"
@@ -130,5 +131,10 @@ wait $NETP || { fail=1; echo "netplay: FAILED"; }
 cat build/netplay.out
 wait $NETW || { fail=1; echo "netplay (Mac <-> Windows under Wine): FAILED"; }
 cat build/netplay_wine.out
+# the host's automatic port forwarding against a fake router on 127.0.0.1 (tools/fake_router.py;
+# never a real router): PCP, NAT-PMP, UPnP, refusals, CGNAT, no answer, cleanup, menu restart.
+# Run last, alone (~20 s): its games would add load to the timing-sensitive Wine netplay test.
+python3 tools/test_portmap.py -j 6 > build/portmap.out 2>&1 || { fail=1; echo "port mapping (fake router): FAILED"; }
+cat build/portmap.out
 echo "tests: $(( $(date +%s) - START ))s wall clock, $([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail

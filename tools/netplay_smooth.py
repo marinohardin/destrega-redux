@@ -55,6 +55,7 @@ def run(name, rp_name, port, extra):
     os.makedirs(d)
     fight_from = rp.frames - 2800          # the fight is running (replays.add_vs)
     common = ['--no-interp', '--frames', str(rp.frames), '--smooth-from', str(fight_from), '--no-memcard', '--net-full-boot',
+              '--net-portmap', 'off',   # windowed peers on loopback: never ask the real router for a port
               '--net-desync-dir', ('path', d)] + extra
     host = common + xh + ['--press', R.fmt(rp.p1), '--host', str(port)] + (['--net-sim', sim_h] if sim_h else [])
     join = common + xj + ['--press', R.fmt(rp.p2), '--join', f'127.0.0.1:{port}'] + (['--net-sim', sim_j] if sim_j else [])

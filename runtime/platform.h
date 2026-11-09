@@ -47,6 +47,9 @@ int plat_backtrace(void **pc, int max);
 /* This machine's IPv4 addresses (up interfaces, no loopback) as "a, b, ..." for the Host Game
  * dialog (getifaddrs / GetAdaptersAddresses). Returns how many were written. */
 int plat_local_ipv4(char *out, size_t n);
+/* The IPv4 default gateway (the home router) as "a.b.c.d": macOS sysctl route table, Linux
+ * /proc/net/route, Windows GetIpForwardTable. Local lookup only, nothing is sent. */
+bool plat_default_gateway_ipv4(char *out, size_t n);
 
 /* CPU time of the calling thread, nanoseconds. */
 uint64_t plat_thread_cpu_ns(void);

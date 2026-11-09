@@ -82,7 +82,7 @@ void menu_netplay_progress(const char *text) {
     @autoreleasepool {
         if (!text) { [s_np_panel orderOut:nil]; return; }
         if (!s_np_panel) {
-            s_np_panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 380, 120)
+            s_np_panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 420, 170)
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskUtilityWindow
                                                       backing:NSBackingStoreBuffered defer:NO];
             s_np_panel.title = @"Netplay";
@@ -90,15 +90,15 @@ void menu_netplay_progress(const char *text) {
             s_np_panel.hidesOnDeactivate = NO;
             s_np_panel.releasedWhenClosed = NO;
             s_np_label = [NSTextField wrappingLabelWithString:@""];
-            s_np_label.frame = NSMakeRect(16, 52, 348, 56);
+            s_np_label.frame = NSMakeRect(16, 52, 388, 106);   /* status + the router's answer (portmap.c) */
             [s_np_panel.contentView addSubview:s_np_label];
             NSButton *cancel = [NSButton buttonWithTitle:@"Cancel" target:s_target action:@selector(netplayCancel:)];
-            cancel.frame = NSMakeRect(270, 12, 96, 32);
+            cancel.frame = NSMakeRect(310, 12, 96, 32);
             cancel.keyEquivalent = @"\e";
             [s_np_panel.contentView addSubview:cancel];
         }
         s_np_label.stringValue = @(text);
-        [s_np_panel center];
+        if (!s_np_panel.visible) [s_np_panel center];   /* updates (the router's answer) leave it where it is */
         [s_np_panel orderFront:nil];
     }
 }
@@ -136,15 +136,24 @@ static void netplay_dialog(bool host) {
             net_local_addresses(ip, sizeof ip);
             a.informativeText = [NSString stringWithFormat:
                 @"Your opponent chooses Join Game and types one of this computer's addresses and the port.\n\n"
-                 "This computer's addresses: %s\n\nOver the internet, UDP port %@ must be forwarded to this computer. "
+                 "This computer's addresses: %s\n\nOver the internet, the game asks your router to forward UDP port %@ to "
+                 "this computer and shows the address to give your opponent; if the router can't, forward the port by hand. "
                  "Both games restart from the beginning when your opponent connects.", *ip ? ip : "none found", port];
         } else {
             a.informativeText = @"Type the address and port your opponent gave you, for example 192.168.1.20:7000. "
                                  "Both games restart from the beginning when you connect.";
         }
-        NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 60)];
-        NSTextField *f1 = host ? field(v, @"Port:", port, 32, 90) : field(v, @"Address:port:", addr, 32, 180);
-        NSTextField *f2 = field(v, @"Input delay:", delay, 0, 50);
+        const CGFloat y0 = host ? 30 : 0;   /* host: room for the router checkbox below the fields */
+        NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 340, 60 + y0)];
+        NSTextField *f1 = host ? field(v, @"Port:", port, 32 + y0, 90) : field(v, @"Address:port:", addr, 32 + y0, 180);
+        NSTextField *f2 = field(v, @"Input delay:", delay, y0, 50);
+        NSButton *pm = nil;
+        if (host) {   /* [netplay] port_mapping (portmap.c) */
+            pm = [NSButton checkboxWithTitle:@"Ask the router to open the port automatically" target:nil action:nil];
+            pm.frame = NSMakeRect(0, 0, 340, 22);
+            pm.state = settings_get_bool("netplay", "port_mapping", true) ? NSControlStateValueOn : NSControlStateValueOff;
+            [v addSubview:pm];
+        }
         a.accessoryView = v;
         [a addButtonWithTitle:host ? @"Host" : @"Join"];
         [a addButtonWithTitle:@"Cancel"];
@@ -158,6 +167,7 @@ static void netplay_dialog(bool host) {
             int p = f1.intValue;
             if (p <= 0 || p > 65535) p = 7000;
             settings_set_int("netplay", "port", p);
+            settings_set_bool("netplay", "port_mapping", pm.state == NSControlStateValueOn);
             settings_save();
             snprintf(arg, sizeof arg, "%d,%d", p, dl);
             frontend_menu_action("netplay-host", arg);

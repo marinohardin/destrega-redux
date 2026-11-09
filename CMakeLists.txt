@@ -72,7 +72,7 @@ add_executable(destrega
   runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/memcard.c runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/gte.c runtime/pgxp.c runtime/spu.c runtime/xa.c runtime/mdec.c
   runtime/overrides/override.c runtime/overrides/collision.c runtime/menu_stub.c
   runtime/overrides/widescreen.c runtime/overrides/char_mesh.c runtime/platform.c runtime/platform_net.c
-  runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c runtime/smooth.c
+  runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c runtime/smooth.c runtime/portmap.c
   runtime/input.c runtime/settings.c)
 target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE} ${CMAKE_CURRENT_BINARY_DIR})
 # Emulation source identity for the netplay handshake (rule in tools/source_ident.py): the same
@@ -160,6 +160,18 @@ if(DESTREGA_TESTS)
     target_link_libraries(test_input PRIVATE m)
   endif()
   add_test(NAME input COMMAND test_input WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  # port mapping for the netplay host: PCP / NAT-PMP / UPnP encoding and parsing (no network use)
+  add_executable(test_portmap runtime/portmap.c runtime/settings.c runtime/platform.c runtime/platform_net.c
+                 runtime/tests/test_portmap.c)
+  target_include_directories(test_portmap PRIVATE runtime)
+  target_compile_options(test_portmap PRIVATE -O2 -Wall -Wextra)
+  if(WIN32)
+    target_link_libraries(test_portmap PRIVATE ws2_32 iphlpapi)
+  endif()
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(test_portmap PRIVATE pthread)
+  endif()
+  add_test(NAME portmap COMMAND test_portmap WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   # SDL_GPU backend vs software on random command streams (needs a GPU device; exit 77 =
   # skipped when there is none, e.g. a CI runner without Vulkan)
   add_executable(test_hires_gpu runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c
