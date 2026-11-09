@@ -1,2 +1,4 @@
 800465a4
 80044210  # stage_render: widescreen shadow pass (runtime/overrides/widescreen.c)
+80036138  # char_mesh_tris_to_ot: PGXP faces dropped by the integer backface test (runtime/overrides/char_mesh.c)
+800363c8  # char_mesh_quads_to_ot: the same for quads

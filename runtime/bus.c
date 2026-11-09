@@ -217,6 +217,7 @@ static const u32 s_dma_cycles_per_word[7] = {
  * 0xffffffff at the end; used by the widescreen shadow pass to inject presentation-only
  * packets (runtime/overrides/widescreen.c). Must not change emulated state. */
 void (*g_gpu_ll_hook)(u32 node);
+void (*g_gpu_ll_hook2)(u32 node);   /* a second one (overrides/char_mesh.c), called after it */
 
 static void dma_run(int ch) {
     u32 chcr = s_dma_chcr[ch];
@@ -249,6 +250,7 @@ static void dma_run(int ch) {
             cost = 0;
             for (;;) {
                 if (g_gpu_ll_hook) g_gpu_ll_hook(a & 0x1ffffc);   /* presentation only */
+                if (g_gpu_ll_hook2) g_gpu_ll_hook2(a & 0x1ffffc);
                 u32 hdr = *(u32 *)(g_ram + (a & 0x1ffffc));
                 u32 n = hdr >> 24;
                 for (u32 i = 0; i < n; i++) {
@@ -260,6 +262,7 @@ static void dma_run(int ch) {
                 a = hdr & 0x1ffffc;
             }
             if (g_gpu_ll_hook) g_gpu_ll_hook(0xffffffffu);
+            if (g_gpu_ll_hook2) g_gpu_ll_hook2(0xffffffffu);
             madr = 0xffffff;
         } else if (to_ram) {
             for (u32 i = 0; i < words; i++, madr = (madr + step) & 0x1ffffc)

@@ -40,7 +40,8 @@ static u32 s_read_latch;
 static bool s_shadow;         /* executing a presentation-only packet (gpu_shadow_packet) */
 static const PgxpVert *const *s_shadow_pv;   /* its precise vertices per word (or NULL) */
 static int s_shadow_side;     /* shadow packets draw only into the guard band: 0 left, 1 right */
-#define SHADOW_SIDES (s_shadow ? 2 : 1)
+static bool s_shadow_in_area; /* ... but one drawn inside the draw area (gpu_shadow_packet_in_area) */
+#define SHADOW_SIDES (s_shadow && !s_shadow_in_area ? 2 : 1)
 
 /* texture window precomputed */
 static u32 s_tw_and_u, s_tw_or_u, s_tw_and_v, s_tw_or_v;
@@ -443,7 +444,7 @@ static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool sem
     h->has_uvr = false;
     h->has_cr = false;
     h->clip_x1 = s_clip_x1; h->clip_y1 = s_clip_y1; h->clip_x2 = s_clip_x2; h->clip_y2 = s_clip_y2;
-    if (s_shadow) {
+    if (s_shadow && !s_shadow_in_area) {
         /* a shadow packet must not touch the 1x draw area (the culled polygons can still reach
          * its outermost columns): clip it to the guard band on one side */
         if (s_shadow_side == 0) { h->clip_x2 = s_clip_x1 - 1; h->clip_x1 = s_clip_x1 - g_hires_guard; }
@@ -455,8 +456,18 @@ static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool sem
  * vertex and depth; ok = false means "use the integer vertex". */
 typedef struct { float dx, dy, w; bool ok; } PVtx;
 
+/* signed area (NCLIP) of a triangle at its precise positions (integer where pv is not ok) */
+static double pv_area(const Vtx *a, const Vtx *b, const Vtx *c, const PVtx *pv)
+{
+    double x0 = a->x + (pv[0].ok ? pv[0].dx : 0), y0 = a->y + (pv[0].ok ? pv[0].dy : 0);
+    double x1 = b->x + (pv[1].ok ? pv[1].dx : 0), y1 = b->y + (pv[1].ok ? pv[1].dy : 0);
+    double x2 = c->x + (pv[2].ok ? pv[2].dx : 0), y2 = c->y + (pv[2].ok ? pv[2].dy : 0);
+    return x0 * y1 + x1 * y2 + x2 * y0 - x0 * y2 - x1 * y0 - x2 * y1;
+}
+
+/* no_hires: draw into 1x VRAM only (a triangle the hi-res target leaves out) */
 static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
-                     const PVtx *pv, bool tex, bool raw, bool semi, bool gour)
+                     const PVtx *pv, bool tex, bool raw, bool semi, bool gour, bool no_hires)
 {
     int minx = a->x, maxx = a->x, miny = a->y, maxy = a->y;
     if (b->x < minx) minx = b->x;
@@ -472,7 +483,7 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     if (maxx < s_clip_x1 || minx > s_clip_x2 || s_shadow) {
         /* outside the 1x draw area (or a presentation-only shadow packet): nothing to draw in
          * 1x VRAM, but with a widescreen guard band the hi-res target may still show it */
-        if (g_hires && g_hires_guard) {
+        if (g_hires && !no_hires && (g_hires_guard || s_shadow_in_area)) {
             const Vtx *vs[3] = { a, b, c };
             HiresVtx hv[3];
             for (int i = 0; i < 3; i++) {
@@ -514,7 +525,8 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     }
 
     /* forward to the hi-res target after the 1x draw, with the UV range 1x actually sampled */
-    if (g_hires) {
+    if (g_hires && no_hires) { s_uv_track = false; s_col_track = false; }
+    else if (g_hires) {
         HiresPrim hp;
         hires_prim(&hp, p, tex, raw, semi, gour);
         /* With a widescreen guard band, a triangle crossing the draw area's left/right edge is
@@ -598,6 +610,7 @@ static void gp0_polygon(const u32 *w)
     PVtx pv[4];
     const PgxpVert *pq[4] = { 0 };
     u32 pxy[4] = { 0 };
+    int ncull = 0;                    /* vertices of a backface-culled mesh (PgxpVert.cull) */
     bool any_pv = false;
     const bool want_pv = g_hires && g_pgxp;
     int i = 0;
@@ -614,6 +627,7 @@ static void gp0_polygon(const u32 *w)
             const PgxpVert *q0 = s_shadow ? (s_shadow_pv && s_shadow_pv[i] && s_shadow_pv[i]->sxy == w[i]
                                              ? s_shadow_pv[i] : 0)
                                           : pgxp_lookup(s_cmd_tag[i], w[i]);
+            ncull += q0 && q0->cull;
             const PgxpVert *q = pgxp_weld(w[i], q0);
             g_pgxp_stat_vtx++;
             pq[k] = q; pxy[k] = w[i];
@@ -658,8 +672,18 @@ static void gp0_polygon(const u32 *w)
         pgxp_check_tri(pq, pxy);
         if (quad) pgxp_check_tri(pq + 1, pxy + 1);
     }
-    draw_tri(&p, &v[0], &v[1], &v[2], any_pv ? &pv[0] : NULL, tex, raw, semi, shaded);
-    if (quad) draw_tri(&p, &v[1], &v[2], &v[3], any_pv ? &pv[1] : NULL, tex, raw, semi, shaded);
+    /* A triangle of a backface-culled mesh that faces away in precise positions (the game kept it
+     * on its integer NCLIP) is not drawn in the hi-res target: it would be an inverted sliver over
+     * its neighbours (overrides/char_mesh.c). Front = positive NCLIP for a triangle and the first
+     * half of a quad, negative for the second half (the character renderer's convention). */
+    bool skip0 = false, skip1 = false;
+    if (any_pv && ncull == n) {
+        skip0 = !(pv_area(&v[0], &v[1], &v[2], &pv[0]) > 0);
+        if (quad) skip1 = !(pv_area(&v[1], &v[2], &v[3], &pv[1]) < 0);
+        g_pgxp_stat_backface += skip0 + skip1;
+    }
+    draw_tri(&p, &v[0], &v[1], &v[2], any_pv ? &pv[0] : NULL, tex, raw, semi, shaded, skip0);
+    if (quad) draw_tri(&p, &v[1], &v[2], &v[3], any_pv ? &pv[1] : NULL, tex, raw, semi, shaded, skip1);
 }
 
 /* ---- rectangles --------------------------------------------------------- */
@@ -1035,6 +1059,13 @@ void gpu_write_gp0_tag(u32 v, u32 tag)
  * texture window, draw area, offset, mask bits, GPUSTAT) is restored afterwards, so the
  * emulated machine cannot observe it. Only polygons, rects, single lines and E1-E6 are
  * executed; fills, copies, transfers, polylines and anything else are skipped. */
+void gpu_shadow_packet_in_area(const u32 *w, int n, const PgxpVert *const *pv)
+{
+    s_shadow_in_area = true;
+    gpu_shadow_packet(w, n, pv);
+    s_shadow_in_area = false;
+}
+
 void gpu_shadow_packet(const u32 *w, int n, const PgxpVert *const *pv)
 {
     if (!g_hires) return;
