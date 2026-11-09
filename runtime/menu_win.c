@@ -176,6 +176,13 @@ void menu_init(void) {
     }
     add(ren, "Software", "renderer=software");
     add_sub(view, "Renderer", ren);
+    HMENU res = CreatePopupMenu();   /* Auto: governed 4x6; the fixed scales are never changed */
+    add(res, "Auto", "resolution=auto");
+    AppendMenuW(res, MF_SEPARATOR, 0, NULL);
+    add(res, "4×6 (Sharpest)", "resolution=4x6");
+    add(res, "2×3 (Balanced)", "resolution=2x3");
+    add(res, "1×1 (Original)", "resolution=1x1");
+    add_sub(view, "Resolution", res);
     HMENU tf = CreatePopupMenu();   /* render quality: presentation only, reseeds like a resize */
     add(tf, "Off (Sharp Pixels)", "tex-filter=nearest");
     add(tf, "Bilinear", "tex-filter=bilinear");

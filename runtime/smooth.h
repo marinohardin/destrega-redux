@@ -32,14 +32,24 @@ void smooth_report(void);
  * ~2 s of presented frames (windowed), 0 if unknown. Netplay sends it to the peer. */
 double smooth_load(void);
 
-/* Scale governor (presentation only, cannot affect sync): while a netplay session runs
- * (netplay.c calls smooth_governor(true/false)), a host whose average frame time stays above 90%
- * of the budget lowers its hi-res render scale one step (4x6 -> 4x4 -> 3x4 -> ... -> 1x1) every
- * 2.5 s until it keeps up, so a slow peer stops dragging the other one; the caps are lifted when
- * the session ends. smooth_scale_cap() returns true once after each change, with the new caps
- * (0 = none) for main.c's auto scale. --no-scale-governor turns it off; a forced --scale is never
- * changed. */
+/* Scale governor (presentation only, cannot affect emulation or sync). While the render resolution
+ * is Auto (main.c, View > Resolution) in a window, a host whose average frame work stays above the
+ * budget lowers its hi-res render scale one step (4x6 -> 4x4 -> 3x4 -> 3x3 -> 2x3 -> 2x2 -> 1x2 ->
+ * 1x1), and raises it again one step at a time, never above what Auto picks, once the work stays
+ * well below the budget. Stricter during a netplay session (netplay.c calls smooth_governor(true /
+ * false)), so a slow peer stops dragging the other one. Thresholds, warm-up and back-off: smooth.c.
+ * smooth_scale_cap() returns true once after each change, with the new caps (0 = none) for main.c.
+ * --no-scale-governor turns it off; a fixed resolution (menu, settings, --scale) is never changed. */
 void smooth_governor(bool on);
+/* main.c: whether the governor may act (resolution Auto, windowed or --fake-load) and the scale
+ * Auto picks without it (the ceiling for steps up). Not allowed: the caps are dropped. */
+void smooth_governor_allow(bool allowed, int ceil_sx, int ceil_sy);
+/* Test hook --fake-load F-G:PCT[@SxxSy],... (smooth_parse_arg): the governor sees PCT% of the frame budget
+ * as extra load on frames F..G (windowed: added to the measured load). Headless runs have no real
+ * load: there the governor only runs when this is given, from smooth_headless_frame (main.c,
+ * once per vblank), with the fake load alone. Deterministic for tests. */
+bool smooth_fake_load_given(void);
+void smooth_headless_frame(uint64_t frame);
 
 /* netplay.c: time-sync slowdown (ns) for the windowed frontend to add to this frame's pacing */
 uint64_t netplay_pace_extra_ns(void);

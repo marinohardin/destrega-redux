@@ -12,9 +12,9 @@ BIN=./build/cmake/destrega
 P="--press 1200:8,1500:8,1800:8,2100:8,2400:4000,2700:4000,3000:4000,3300:4000,3600:4000"
 F=${WD_FRAMES:-4300}
 fail=0
-$BIN --no-memcard --window 640x480 $P --frames $F --state-hash $D/w1.txt > $D/w1.log 2>&1 &
+$BIN --no-memcard --no-settings --window 640x480 $P --frames $F --state-hash $D/w1.txt > $D/w1.log 2>&1 &
 A=$!
-$BIN --no-memcard --window 640x480 $P --frames $F --state-hash $D/w2.txt > $D/w2.log 2>&1 &
+$BIN --no-memcard --no-settings --window 640x480 $P --frames $F --state-hash $D/w2.txt > $D/w2.log 2>&1 &
 B=$!
 $BIN --headless --no-interp --no-memcard $P --frames $F --state-hash $D/h.txt > $D/h.log 2>&1 &
 C=$!
