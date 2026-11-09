@@ -254,6 +254,18 @@ void menu_init(void) {
         renItem.submenu = ren;
         [view insertItem:renItem atIndex:1];
 
+        /* View > Resolution: Auto (4x6, lowered and raised by the scale governor when this computer
+         * cannot keep up) or a fixed scale the governor never touches; radio check marks */
+        NSMenu *res = [[NSMenu alloc] initWithTitle:@"Resolution"];
+        add(res, @"Auto", @"resolution=auto", nil, 0);
+        [res addItem:[NSMenuItem separatorItem]];
+        add(res, @"4×6 (Sharpest)", @"resolution=4x6", nil, 0);
+        add(res, @"2×3 (Balanced)", @"resolution=2x3", nil, 0);
+        add(res, @"1×1 (Original)", @"resolution=1x1", nil, 0);
+        NSMenuItem *resItem = [[NSMenuItem alloc] initWithTitle:@"Resolution" action:nil keyEquivalent:@""];
+        resItem.submenu = res;
+        [view insertItem:resItem atIndex:2];
+
         /* render quality (presentation only; each switch reseeds the hi-res target like a resize) */
         NSMenu *tf = [[NSMenu alloc] initWithTitle:@"Texture Filtering"];
         add(tf, @"Off (Sharp Pixels)", @"tex-filter=nearest", nil, 0);
@@ -261,11 +273,11 @@ void menu_init(void) {
         add(tf, @"Smooth 2D Edges + Bilinear 3D", @"tex-filter=xbr", nil, 0);
         NSMenuItem *tfItem = [[NSMenuItem alloc] initWithTitle:@"Texture Filtering" action:nil keyEquivalent:@""];
         tfItem.submenu = tf;
-        [view insertItem:tfItem atIndex:2];
+        [view insertItem:tfItem atIndex:3];
         NSMenuItem *sc = [[NSMenuItem alloc] initWithTitle:@"Smooth Colours" action:@selector(fire:) keyEquivalent:@""];
         sc.target = s_target;
         sc.representedObject = @"smooth-colours";
-        [view insertItem:sc atIndex:3];
+        [view insertItem:sc atIndex:4];
         NSMenu *aa = [[NSMenu alloc] initWithTitle:@"Anti-aliasing"];
         add(aa, @"Off", @"ssaa=1", nil, 0);
         add(aa, @"2x", @"ssaa=2", nil, 0);
@@ -273,24 +285,24 @@ void menu_init(void) {
         add(aa, @"4x", @"ssaa=4", nil, 0);
         NSMenuItem *aaItem = [[NSMenuItem alloc] initWithTitle:@"Anti-aliasing" action:nil keyEquivalent:@""];
         aaItem.submenu = aa;
-        [view insertItem:aaItem atIndex:4];
+        [view insertItem:aaItem atIndex:5];
 
         /* Enter / Exit Full Screen (title follows the state; also Alt+Enter and F11, handled in
          * main.c's event loop so they work on every platform) */
-        [view insertItem:NSMenuItem.separatorItem atIndex:5];
+        [view insertItem:NSMenuItem.separatorItem atIndex:6];
         NSMenuItem *fs = [[NSMenuItem alloc] initWithTitle:@"Enter Full Screen" action:@selector(fire:)
                                               keyEquivalent:@"f"];
         fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         fs.target = s_target;
         fs.representedObject = @"fullscreen";
-        [view insertItem:fs atIndex:6];
+        [view insertItem:fs atIndex:7];
 
         /* View > Controls… (also Settings… in the application menu, Cmd+,) */
-        [view insertItem:NSMenuItem.separatorItem atIndex:4];
+        [view insertItem:NSMenuItem.separatorItem atIndex:8];
         NSMenuItem *ctl = [[NSMenuItem alloc] initWithTitle:@"Controls…" action:@selector(fire:) keyEquivalent:@""];
         ctl.target = s_target;
         ctl.representedObject = @"controls";
-        [view insertItem:ctl atIndex:5];
+        [view insertItem:ctl atIndex:9];
         NSMenu *app = bar.numberOfItems > 0 ? bar.itemArray[0].submenu : nil;
         if (app && app != file) {
             NSInteger at = app.numberOfItems > 0 ? 1 : 0;   /* after About */

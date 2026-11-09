@@ -59,6 +59,9 @@ SAVST=$!
 # input layer + settings file: custom bindings and synthetic host events == the --press run
 python3 tools/test_input.py > build/input.out 2>&1 &
 INPT=$!
+# View > Resolution and the scale governor (fake load: steps down / up, back-off, fixed choices)
+python3 tools/test_governor.py -j 4 > build/governor.out 2>&1 &
+GOVR=$!
 # gameplay regression replays (tools/replays/*.dtr.gz): every frame's gameplay fields must match
 python3 tools/replays.py run -j 4 > build/replays.out 2>&1 &
 REPL=$!
@@ -123,6 +126,8 @@ wait $SAVST || { fail=1; echo "savestate: FAILED"; }
 cat build/savestate.out
 wait $INPT || { fail=1; echo "input: FAILED"; }
 cat build/input.out
+wait $GOVR || { fail=1; echo "resolution / scale governor: FAILED"; }
+cat build/governor.out
 wait $REPL || { fail=1; echo "replays: FAILED (a gameplay change? see AGENTS.md \"Replays\")"; }
 cat build/replays.out
 wait $WIND || { fail=1; echo "windowed determinism: FAILED"; }
