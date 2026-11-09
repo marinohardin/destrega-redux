@@ -751,7 +751,7 @@ static int upnp_map(Mapping *m, Attempt *a, bool adopt) {
         }
         a->refused = true;
         snprintf(a->why, sizeof a->why, "UPnP AddPortMapping: HTTP %d, error %d", st, err);
-        if (st == 0) { a->refused = false; snprintf(a->why, sizeof a->why, "UPnP: no answer from %s", m->control); }
+        if (st == 0) { a->refused = false; snprintf(a->why, sizeof a->why, "UPnP: no answer from %.120s", m->control); }
     }
     return 0;
 }
