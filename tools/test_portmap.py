@@ -121,8 +121,11 @@ def check_noanswer(problems, r, log, port):
     m = re.search(r'frame loop: (\d+) frames ran while the router was being asked, longest gap between frames ([\d.]+) ms', log)
     if not m: problems.append('no frame-loop measurement'); return
     n, gap = int(m.group(1)), float(m.group(2))
-    if n < 500: problems.append(f'only {n} frames ran while waiting for the router')
-    if gap > 500: problems.append(f'the frame loop stalled {gap} ms while waiting for the router')
+    # A blocking call would hold one frame for a whole timeout (PCP 1.75 s, HTTP 3 s). A loaded
+    # machine (run_tests.sh runs everything at once) makes frames slow and uneven, so the limits
+    # stay well below the timeouts and well above scheduling noise.
+    if n < 100: problems.append(f'only {n} frames ran while waiting for the router')
+    if gap > 1000: problems.append(f'the frame loop stalled {gap} ms while waiting for the router')
     check_noanswer.last = f'{n} frames ran while PCP, NAT-PMP and UPnP timed out, longest gap between frames {gap} ms'
 
 
@@ -184,12 +187,12 @@ def case_restart(name, port, *_):
 
 
 CASES = {
-    'natpmp':         (case_basic, dict(pcp='unsupported', natpmp='ok'), True, False, lifecycle('natpmp'), 12000),
+    'natpmp':         (case_basic, dict(pcp='unsupported', natpmp='ok'), True, False, lifecycle('natpmp'), 7000),
     'pcp':            (case_basic, dict(pcp='ok'), True, False, lifecycle('pcp'), None),
-    'upnp':           (case_basic, dict(upnp='ok'), False, True, no_udp(lifecycle('upnp')), 12000),
+    'upnp':           (case_basic, dict(upnp='ok'), False, True, no_udp(lifecycle('upnp')), 7000),
     'upnp_permanent': (case_basic, dict(upnp='permanent'), False, True, lifecycle('upnp', renew=False), None),
     'refused':        (case_basic, dict(pcp='unsupported', natpmp='refuse', upnp='refuse'), True, True,
-                       expect_text('Your router refused to open port {port}'), 12000),
+                       expect_text('Your router refused to open port {port}'), 7000),
     'cgnat':          (case_basic, dict(pcp='unsupported', natpmp='ok', ext_ip='100.72.1.9'), True, False, check_cgnat, None),
     'noanswer':       (case_basic, dict(pcp='silent', natpmp='silent', upnp='silent'), True, True, check_noanswer, None),
     'off':            (case_basic, dict(), True, True, check_off, None),
@@ -198,7 +201,7 @@ CASES = {
     'restart':        (case_restart,),
 }
 EXTRA = {'off': ['--net-portmap', 'off'], 'noanswer': [], 'no_override': ['--net-portmap', 'on']}
-FRAMES = {'noanswer': 30000}
+FRAMES = {'noanswer': 20000}
 
 
 def run(name, port):
@@ -207,7 +210,7 @@ def run(name, port):
         problems, dt, ev = case_restart(name, port)
     else:
         _, kw, gw, up, expect, disc = c
-        problems, dt, ev = case_basic(name, port, kw, gw, up, expect, disc, FRAMES.get(name, 14000), EXTRA.get(name, ()))
+        problems, dt, ev = case_basic(name, port, kw, gw, up, expect, disc, FRAMES.get(name, 8000), EXTRA.get(name, ()))
     summ = ' '.join(f"{e['proto']}:{e['op']}" for e in ev)
     if len(summ) > 160: summ = summ[:157] + '...'
     if name == 'noanswer' and getattr(check_noanswer, 'last', None): summ = check_noanswer.last

@@ -607,12 +607,13 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   (`netplay_smooth.py`, `test_netplay_wine.py --windowed`) pass `--net-portmap off`.
   `tools/fake_router.py`: PCP + NAT-PMP (one UDP port) and UPnP (HTTP, chunked description, SOAP),
   127.0.0.1 only, modes ok / unsupported / refuse / silent / permanent, external address settable,
-  enforces the PCP nonce, records every request. `tools/test_portmap.py` (in `run_tests.sh`, ~1 min):
+  enforces the PCP nonce, records every request. `tools/test_portmap.py` (in `run_tests.sh`; ~20 s on an idle machine, 15 min inside a loaded full suite):
   `natpmp`, `pcp`, `upnp` (map, renewals at a 2 s lease, delete on Cancel or at exit; `upnp` also
   checks no UDP was sent), `upnp_permanent` (725 -> lease 0, no renewals, deleted at exit),
   `refused`, `cgnat` (100.72.1.9), `noanswer` (all three silent: message after ~6 s of timeouts;
-  frame loop measured while the worker waits: 2554 frames, longest gap 127 ms with 10 games running
-  at once), `off`, `no_override` (headless `--net-portmap on` without overrides: nothing), `plain` (a headless
+  frame loop measured while the worker waits: 5219 frames, longest gap 38 ms with 11 games running
+  at once; the limits are >= 100 frames and < 1 s gap, below any single timeout, because inside the
+  full suite the machine is so loaded that gaps of ~400 ms occur without any router), `off`, `no_override` (headless `--net-portmap on` without overrides: nothing), `plain` (a headless
   host with no port-mapping argument at all: nothing), `restart`
   (menu session host + join: one PCP map, the restarted host renews it with the same nonce, one
   delete after the opponent leaves). `--win` runs them with the Windows build under Wine as the host.

@@ -74,7 +74,7 @@ python3 tools/test_netplay_wine.py > build/netplay_wine.out 2>&1 &
 NETW=$!
 # the host's automatic port forwarding against a fake router on 127.0.0.1 (tools/fake_router.py;
 # never a real router): PCP, NAT-PMP, UPnP, refusals, CGNAT, no answer, cleanup, menu restart
-python3 tools/test_portmap.py -j 5 > build/portmap.out 2>&1 &
+python3 tools/test_portmap.py -j 4 > build/portmap.out 2>&1 &
 PMAP=$!
 
 wait %1 %2 %3 %4 %5 %6 %7 %8 %9 2>/dev/null
