@@ -145,6 +145,8 @@ def main():
                                           "--state-hash", "host.hash", "--input-log", "host.masks"])):
         log = open(os.path.join(OUT, name + ".log"), "w")
         procs.append((name, subprocess.Popen([BIN, "--headless", "--no-interp"] + args, stdout=log, stderr=subprocess.STDOUT, cwd=OUT), log))
+        if int(os.environ.get("JOBS", "2")) < 2:   # JOBS=1: one game at a time
+            procs[-1][1].wait()
     for name, pr, log in procs:
         rc = pr.wait()
         log.close()

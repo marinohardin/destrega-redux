@@ -9,7 +9,8 @@
 #  3. In every run >= 95% of the fight frames come from the hi-res target.
 # The default modes (nearest, 15-bit, no SSAA: headless default) are covered by
 # tools/test_hires_determinism.sh (1x1 --hires-verify, compare at 1x1 and 4x6).
-# Runs JOBS at a time (default: performance cores). Usage: tools/test_render_quality.sh [frames]
+# Runs JOBS at a time (default: performance cores). CASES="call169 glive ..." runs only those (plus
+# the reference run `off`; tools/pr_check.sh). Usage: tools/test_render_quality.sh [frames]
 # (default 7000; needs build/cmake/destrega). Skips the GPU runs when SDL_GPU is unavailable.
 cd "$(dirname "$0")/.."
 if [ "$1" != "--job" ]; then FRAMES=${1:-7000}; fi
@@ -52,16 +53,22 @@ glive --renderer gpu --scale 2x3 --pgxp on $LIVE $FIGHT
 slive --scale 2x3 --hires-threads 2 --pgxp on $WS $LIVE $FIGHT
 off --scale 0 --pgxp off
 EOF
+# CASES: a subset (the reference run `off` is always included)
+has() { [ -z "$CASES" ] && return 0; case " off $CASES " in *" $1 "*) return 0 ;; esac; return 1; }
+sel() { for c in "$@"; do if has $c; then printf '%s ' $c; fi; done; }
+if [ -n "$CASES" ]; then
+  awk -v keep=" off $CASES " 'index(keep, " " $1 " ")' $OUT/jobs.txt > $OUT/jobs.sel && mv $OUT/jobs.sel $OUT/jobs.txt
+fi
 START=$(date +%s)
 xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
 ELAPSED=$(( $(date +%s) - START ))
 
 fail=0
 echo "quality: ran $(wc -l < $OUT/jobs.txt) runs of $FRAMES frames, $JOBS at a time, in ${ELAPSED}s"
-SW="sall slive"
-CMPS="call169 cssaa169 call43 cssaa43 cbil169 cxbr169 cfull169 cbil43 cxbr43 cfull43"
-GPU="gall glive $CMPS"
-if grep -q "GPU renderer unavailable" $OUT/gall.log; then
+SW=$(sel sall slive)
+CMPS=$(sel call169 cssaa169 call43 cssaa43 cbil169 cxbr169 cfull169 cbil43 cxbr43 cfull43)
+GPU="$(sel gall glive) $CMPS"
+if [ -n "${GPU# }" ] && grep -q "GPU renderer unavailable" $(for n in $GPU; do echo $OUT/$n.log; done); then
   echo "quality: SDL_GPU unavailable, GPU and compare runs skipped"; GPU=""; CMPS=""
 fi
 for n in off $SW $GPU; do
@@ -76,7 +83,7 @@ for n in $SW $GPU; do
   else echo "quality: state hash $n DIFFERS from off:"; diff $OUT/off.hash $OUT/$n.hash | head -3; fail=1; fi
   grep -h "texture filter\|hires-frames" $OUT/$n.log | tail -2 | sed "s/^\[ *[0-9]*\] /quality: $n: /"
 done
-for n in slive glive; do   # every live switch reached the target
+for n in $(sel slive glive); do   # every live switch reached the target
   c=$(grep -c "hires: texture filter" $OUT/$n.log)
   [ "$c" -ge 9 ] || { echo "quality: $n: only $c render-quality changes logged (want 9)"; fail=1; }
 done

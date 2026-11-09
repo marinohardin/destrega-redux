@@ -25,7 +25,8 @@
 #     fixed point on the GPU, which picks a different texel in a few pixels per frame (measured:
 #     29 pixels over 331 fight frames). Skipped with a note when SDL_GPU is unavailable.
 # The runs are independent processes and run concurrently (JOBS at a time, default: performance
-# cores). Usage: tools/test_hires_determinism.sh [frames]   (default 7000; needs build/cmake/destrega)
+# cores). CASES="s4x6 c4x6 ..." runs only those (plus the reference run `off`; tools/pr_check.sh).
+# Usage: tools/test_hires_determinism.sh [frames]   (default 7000; needs build/cmake/destrega)
 cd "$(dirname "$0")/.."
 if [ "$1" != "--job" ]; then FRAMES=${1:-7000}; fi
 OUT=build/hires
@@ -65,32 +66,38 @@ gverify1 --renderer gpu --scale 1 --hires-verify --pgxp off $FIGHT
 c4x6 --renderer compare --scale 4x6 --compare-every 10 --compare-max $CMP_MAX --hires-threads 3 --pgxp off $FIGHT
 c1x1 --renderer compare --scale 1 --compare-every 10 --compare-max 0 --hires-threads 1 --pgxp off $FIGHT
 EOF
+# CASES: a subset (the reference run `off` is always included)
+has() { [ -z "$CASES" ] && return 0; case " off $CASES " in *" $1 "*) return 0 ;; esac; return 1; }
+sel() { for c in "$@"; do if has $c; then printf '%s ' $c; fi; done; }
+if [ -n "$CASES" ]; then
+  awk -v keep=" off $CASES " 'index(keep, " " $1 " ")' $OUT/jobs.txt > $OUT/jobs.sel && mv $OUT/jobs.sel $OUT/jobs.txt
+fi
 START=$(date +%s)
 xargs -P "$JOBS" -L1 sh "$0" --job < $OUT/jobs.txt
 ELAPSED=$(( $(date +%s) - START ))
 
 fail=0
 echo "hires: ran $(wc -l < $OUT/jobs.txt) runs of $FRAMES frames, $JOBS at a time, in ${ELAPSED}s"
-GPU="g4x6 gverify1 c4x6 c1x1 cp4x6"
-if grep -q "GPU renderer unavailable" $OUT/g4x6.log; then
+GPU=$(sel g4x6 gverify1 c4x6 c1x1 cp4x6)
+if [ -n "$GPU" ] && grep -q "GPU renderer unavailable" $(for n in $GPU; do echo $OUT/$n.log; done); then
   echo "hires: SDL_GPU unavailable, GPU renderer runs skipped"; GPU=""
 fi
-for n in off s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1 $GPU; do
+for n in $(sel off s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1) $GPU; do
   rc=$(cat $OUT/$n.rc 2>/dev/null || echo missing)
   if [ "$rc" != 0 ]; then echo "hires: $n: run FAILED (exit $rc)"; tail -5 $OUT/$n.log; fail=1; fi
 done
 [ $fail = 0 ] || exit 1
 lines=$(wc -l < $OUT/off.hash)
 [ "$lines" -ge "$FRAMES" ] || { echo "hires: FAIL (only $lines hashed frames)"; exit 1; }
-echo "hires: resize steps applied: $(grep -c 'render scale' $OUT/resize.log) ($(grep -o 'render scale [0-9x]*' $OUT/resize.log | sed 's/render scale //' | tr '\n' ' '))"
-for n in s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1 $GPU; do
+has resize && echo "hires: resize steps applied: $(grep -c 'render scale' $OUT/resize.log) ($(grep -o 'render scale [0-9x]*' $OUT/resize.log | sed 's/render scale //' | tr '\n' ' '))"
+for n in $(sel s2x2 s4x4 s8x8 s2x3 s4x6 resize verify1) $GPU; do
   if cmp -s $OUT/off.hash $OUT/$n.hash; then echo "hires: state hash $n == off ($lines frames): ok"
   else echo "hires: state hash $n DIFFERS from off:"; diff $OUT/off.hash $OUT/$n.hash | head -3; fail=1; fi
   grep -h "hires-frames" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -h "hires-uv" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -q "hires-uv: [0-9]* textured samples, [0-9]* clamped to the 1x-sampled UV range, 0 out of range when fetched" $OUT/$n.log || { echo "hires: $n: UV out-of-range samples (or no UV report)"; fail=1; }
 done
-for n in s8x8 resize s4x6 s4x4 s2x3 $(echo "$GPU" | grep -o "g4x6\|cp4x6"); do
+for n in $(sel s8x8 resize s4x6 s4x4 s2x3) $(echo "$GPU" | grep -o "g4x6\|cp4x6"); do
   grep -h "pgxp:" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
   grep -q "pgxp: [1-9][0-9]* of" $OUT/$n.log || { echo "hires: $n: no precise PGXP vertices"; fail=1; }
   grep -h "pgxp-check\|pgxp-weld" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
@@ -98,18 +105,20 @@ for n in s8x8 resize s4x6 s4x4 s2x3 $(echo "$GPU" | grep -o "g4x6\|cp4x6"); do
   # precise vertices far from their integer one (false associations)
   grep -q "pgxp-check: [0-9]* triangles with precise vertices; 0 with an on-screen vertex > 1.5 px from its integer, 0 with depth ratio > 2, 0 using a value older than 2 frames, 0 split vertices" $OUT/$n.log || { echo "hires: $n: PGXP consistency check failed"; fail=1; }
 done
-if grep -q "pgxp:" $OUT/s2x2.log; then echo "hires: s2x2: --pgxp off still tracked vertices"; fail=1; fi
-grep -q "hires-uv: [0-9]* textured samples, 0 clamped to the 1x-sampled" $OUT/verify1.log || { echo "hires: verify1: UV clamp is not a no-op at 1x1"; fail=1; }
-grep -h "hires-verify" $OUT/verify1.log | sed 's/^\[ *[0-9]*\] /hires: verify1: /'
+if has s2x2 && grep -q "pgxp:" $OUT/s2x2.log; then echo "hires: s2x2: --pgxp off still tracked vertices"; fail=1; fi
+! has verify1 || grep -q "hires-uv: [0-9]* textured samples, 0 clamped to the 1x-sampled" $OUT/verify1.log || { echo "hires: verify1: UV clamp is not a no-op at 1x1"; fail=1; }
+has verify1 && grep -h "hires-verify" $OUT/verify1.log | sed 's/^\[ *[0-9]*\] /hires: verify1: /'
 [ $fail = 0 ] || exit 1
-grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/verify1.log || { echo "hires: 1x1 equivalence FAIL"; exit 1; }
+! has verify1 || grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/verify1.log || { echo "hires: 1x1 equivalence FAIL"; exit 1; }
 if [ -n "$GPU" ]; then
+  if has gverify1; then
   grep -h "hires-verify" $OUT/gverify1.log | sed 's/^\[ *[0-9]*\] /hires: gverify1: /'
   grep -q "hires-verify: $FRAMES frames checked ([1-9][0-9]* in fight window), 0 mismatching" $OUT/gverify1.log || { echo "hires: GPU 1x1 equivalence FAIL"; exit 1; }
-  for n in c1x1 c4x6 cp4x6; do
+  fi
+  for n in $(sel c1x1 c4x6 cp4x6); do
     grep -h "hires-compare" $OUT/$n.log | sed "s/^\[ *[0-9]*\] /hires: $n: /"
     grep -q "hires-compare: fight: [1-9][0-9]* frames compared" $OUT/$n.log || { echo "hires: $n: no fight frames compared"; exit 1; }
   done
-  grep -h "hires-gpu:" $OUT/g4x6.log | sed 's/^\[ *[0-9]*\] /hires: g4x6: /'
+  has g4x6 && grep -h "hires-gpu:" $OUT/g4x6.log | sed 's/^\[ *[0-9]*\] /hires: g4x6: /'
 fi
 echo "hires: determinism + 1x1 equivalence + hi-res coverage of fight frames ok"
