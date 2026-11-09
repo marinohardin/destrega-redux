@@ -8,7 +8,8 @@ runs only map ports when given those overrides, and with an override the game tr
 (no gateway lookup, no SSDP multicast).
 
 Cases: natpmp, pcp, upnp, upnp_permanent, refused, cgnat, noanswer (frame loop not stalled),
-off, no_override (headless without overrides does nothing), restart (the menu session restart
+off, no_override / plain (headless without overrides, with --net-portmap on or with no
+port-mapping argument at all: nothing), restart (the menu session restart
 keeps the mapping: the new process renews it with the same PCP nonce and deletes it when the
 opponent leaves).
 
@@ -60,7 +61,8 @@ def common_checks(problems, rc, log, frames):
 def case_basic(name, port, router_kw, use_gw, use_upnp, expect, disc_at=None, frames=14000, extra=()):
     """Host from frame 30; cancel at disc_at (None = exit while hosting)."""
     r = FakeRouter(**router_kw)
-    args = ['--frames', str(frames), '--net-portmap-lease', LEASE, '--menu-action', f'30:netplay-host={port},2']
+    args = ['--frames', str(frames), '--menu-action', f'30:netplay-host={port},2']
+    if use_gw or use_upnp: args += ['--net-portmap-lease', LEASE]   # 'plain': no port-mapping argument at all
     if use_gw: args += ['--net-portmap-gateway', r.gateway]
     if use_upnp: args += ['--net-portmap-upnp', r.upnp_url]
     if disc_at: args += ['--menu-action', f'{disc_at}:netplay-disconnect']
@@ -192,6 +194,7 @@ CASES = {
     'noanswer':       (case_basic, dict(pcp='silent', natpmp='silent', upnp='silent'), True, True, check_noanswer, None),
     'off':            (case_basic, dict(), True, True, check_off, None),
     'no_override':    (case_basic, dict(), False, False, check_no_override, None),
+    'plain':          (case_basic, dict(), False, False, check_no_override, None),
     'restart':        (case_restart,),
 }
 EXTRA = {'off': ['--net-portmap', 'off'], 'noanswer': [], 'no_override': ['--net-portmap', 'on']}

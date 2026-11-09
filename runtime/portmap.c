@@ -51,7 +51,7 @@ typedef int sock_t;
 /* ---- options --------------------------------------------------------------------------------- */
 static struct {
     int flag;              /* --net-portmap: -1 not given, 0 off, 1 on */
-    bool headless;
+    bool windowed;         /* portmap_set_windowed: only a windowed game talks to the real router */
     char gw[128];          /* --net-portmap-gateway HOST:PORT (PCP / NAT-PMP server) */
     char upnp[512];        /* --net-portmap-upnp URL (root device description) */
     unsigned lease;        /* seconds asked for */
@@ -60,11 +60,6 @@ static struct {
 int portmap_parse_arg(int argc, char **argv, int i) {
     const char *a = argv[i];
     bool has = i + 1 < argc;
-    static bool scanned;
-    if (!scanned) {
-        scanned = true;
-        for (int k = 1; k < argc; k++) if (!strcmp(argv[k], "--headless")) o.headless = true;
-    }
     if (!strcmp(a, "--net-portmap") && has) {
         o.flag = !strcmp(argv[i + 1], "on") || !strcmp(argv[i + 1], "1");
         settings_lock("netplay", "port_mapping");
@@ -91,6 +86,8 @@ void portmap_usage(void) {
 }
 
 static bool test_mode(void) { return o.gw[0] || o.upnp[0]; }
+
+void portmap_set_windowed(bool on) { o.windowed = on; }
 
 /* ---- small helpers --------------------------------------------------------------------------- */
 static void put16(uint8_t *p, unsigned v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
@@ -952,7 +949,7 @@ static void worker(void *arg) {
             if (m.proto == P_UPNP) {
                 int err = 0, got = 0;
                 r = upnp_add(&n, m.ext, m.life, false, &err, &got) == 200 && !err;
-            } else if (gateway_addr(&gw)) r = (m.proto == P_PCP ? pcp_map(&gw, &n, o.lease, &a, 3) : natpmp_map(&gw, &n, o.lease, &a, 3)) == 1;
+            } else if (gateway_addr(&gw)) r = m.proto == P_PCP ? pcp_map(&gw, &n, o.lease, &a, 3) : natpmp_map(&gw, &n, o.lease, &a, 3);
             if (r == 1) {
                 if (n.ext != m.ext) PM_LOG("renewal moved the external port %d -> %d", m.ext, n.ext);
                 m = n;
@@ -979,14 +976,16 @@ static uint64_t s_busy_last_ns, s_busy_max_ns, s_busy_frames;
 static int s_seen_gen;
 
 static bool enabled(void) {
-    if (o.headless && !test_mode()) return false;   /* tests never touch the real network */
+    /* Fail closed: the real router is only ever contacted by a windowed game (main.c says so once
+     * its window exists). Headless runs, i.e. every test, need a fake router given explicitly. */
+    if (!o.windowed && !test_mode()) return false;
     if (o.flag >= 0) return o.flag == 1;
     return settings_get_bool("netplay", "port_mapping", true);
 }
 
 void portmap_start(int port) {
     if (!enabled()) {
-        if (!o.headless) {
+        if (o.windowed) {
             char t[300];
             snprintf(t, sizeof t, "Automatic port opening is off: to play over the internet, forward UDP port %d to this "
                      "computer in your router.", port);

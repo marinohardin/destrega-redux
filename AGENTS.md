@@ -595,11 +595,16 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   a window shows a hint to forward the port by hand. Not part of the build identity
   (`tools/source_ident.py` excludes portmap.[ch]; this change altered only main.c / netplay.c among
   covered files: the hooks).
-- **Port-mapping tests never touch a real router**: headless runs map nothing unless
+- **Port-mapping tests never touch a real router**: fail closed. Only a windowed game asks the real
+  router (main.c calls `portmap_set_windowed(true)` after creating the window; the default is
+  off). An earlier version derived "headless" from scanning argv on the first argument that reached
+  `portmap_parse_arg`, which never ran when no argument got that far, so headless netplay tests
+  mapped real ports: never infer this from argument parsing. Headless runs map only with
   `--net-portmap-gateway HOST:PORT` (PCP / NAT-PMP server) or `--net-portmap-upnp URL` (device
-  description; replaces SSDP) is given, and with either override only the overridden protocols are
-  tried (no gateway lookup, no multicast). `--net-portmap on` alone does nothing headless. So
-  `test_netplay.py`, `test_netplay_wine.py`, `test_menu.sh` etc. (headless, no overrides) never map.
+  description; replaces SSDP), and then only the overridden protocols are tried (no gateway
+  lookup, no multicast). `--net-portmap on` alone does nothing headless. `test_netplay.py` fails if
+  a headless log has a `portmap:` line; the windowed tools that host on loopback
+  (`netplay_smooth.py`, `test_netplay_wine.py --windowed`) pass `--net-portmap off`.
   `tools/fake_router.py`: PCP + NAT-PMP (one UDP port) and UPnP (HTTP, chunked description, SOAP),
   127.0.0.1 only, modes ok / unsupported / refuse / silent / permanent, external address settable,
   enforces the PCP nonce, records every request. `tools/test_portmap.py` (in `run_tests.sh`, ~1 min):
@@ -607,7 +612,8 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   checks no UDP was sent), `upnp_permanent` (725 -> lease 0, no renewals, deleted at exit),
   `refused`, `cgnat` (100.72.1.9), `noanswer` (all three silent: message after ~6 s of timeouts;
   frame loop measured while the worker waits: 2554 frames, longest gap 127 ms with 10 games running
-  at once), `off`, `no_override` (headless `--net-portmap on` without overrides: nothing), `restart`
+  at once), `off`, `no_override` (headless `--net-portmap on` without overrides: nothing), `plain` (a headless
+  host with no port-mapping argument at all: nothing), `restart`
   (menu session host + join: one PCP map, the restarted host renews it with the same nonce, one
   delete after the opponent leaves). `--win` runs them with the Windows build under Wine as the host.
   Unit test `runtime/tests/test_portmap.c` (CTest `portmap`): PCP / NAT-PMP packets, UPnP description

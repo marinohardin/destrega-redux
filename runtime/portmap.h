@@ -17,9 +17,12 @@
  * Host-side plumbing only: nothing here can reach emulated state, so it is not part of the netplay
  * build identity (tools/source_ident.py).
  *
- * Safety for tests: headless runs never touch the real network. Port mapping is off there unless
- * --net-portmap-gateway or --net-portmap-upnp points it at a fake router (tools/fake_router.py),
- * and with either override only the overridden protocols are tried (no gateway lookup, no SSDP). */
+ * Safety for tests: only a windowed game talks to the real router (main.c calls
+ * portmap_set_windowed(true) after creating the window; the default is off, so this fails closed
+ * and does not depend on how the command line is parsed). Headless runs, i.e. every test, map
+ * nothing unless --net-portmap-gateway or --net-portmap-upnp points them at a fake router
+ * (tools/fake_router.py), and with either override only the overridden protocols are tried (no
+ * gateway lookup, no SSDP). */
 #ifndef PORTMAP_H
 #define PORTMAP_H
 #include <stdbool.h>
@@ -30,6 +33,8 @@
  * --net-portmap-lease S). Returns the number of arguments used, 0 if not ours. */
 int portmap_parse_arg(int argc, char **argv, int i);
 void portmap_usage(void);
+/* main.c, once the window exists: this run may ask the real router (never called headless). */
+void portmap_set_windowed(bool on);
 
 /* Host: ask the router to forward UDP `port` (asynchronous; no-op when port mapping is off). */
 void portmap_start(int port);

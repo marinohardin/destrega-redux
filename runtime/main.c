@@ -2025,7 +2025,7 @@ int main(int argc, char **argv) {
         s_host_input = true;
     }
     if (s_widescreen && !s_win_set) { s_win_w = 1280; s_win_h = 720; }
-    if (!s_headless) create_window();
+    if (!s_headless) { create_window(); portmap_set_windowed(true); }   /* only windowed play maps real ports */
     const char *src = disc_path ? disc_path : pak;
     if (!disc_path) {
         FILE *f = fopen(pak, "rb");
