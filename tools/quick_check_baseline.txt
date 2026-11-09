@@ -1,0 +1,2 @@
+# tools/quick_check.sh speed baseline: CPU name <TAB> ms/frame for frames 0-1200 FMV, 1200-1800, 1800-2400, 2400-3000, 3000-3700, 3700- fight
+Apple M1 Pro	0.55 3.42 3.04 5.30 5.38 5.18

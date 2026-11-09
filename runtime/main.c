@@ -1040,8 +1040,12 @@ void frontend_vblank(void) {
         t_emu = t_present = t_sleep = 0;
     }
     if (s_fast) { s_next_tick_ns = now; t_prev_end = SDL_GetTicksNS(); return; }
-    if (s_next_tick_ns == 0 || now > s_next_tick_ns + frame_ns * 4) s_next_tick_ns = now;
-    s_next_tick_ns += frame_ns + netplay_pace_extra_ns();   /* + gradual netplay time sync */
+    /* s_next_tick_ns = when this frame should end (+ gradual netplay time sync). More than 4
+     * frames behind: start over from now, without sleeping (resetting to now and then adding a
+     * frame slept a whole frame on every slow frame, e.g. 16 ms after a 50 ms present). */
+    const u64 extra = netplay_pace_extra_ns();
+    if (s_next_tick_ns == 0 || now > s_next_tick_ns + frame_ns * 4) s_next_tick_ns = now + extra;
+    else s_next_tick_ns += frame_ns + extra;
     if (s_next_tick_ns > now) SDL_DelayNS(s_next_tick_ns - now);
     t_prev_end = SDL_GetTicksNS();
     t_sleep += t_prev_end - now;

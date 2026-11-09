@@ -9,6 +9,17 @@
  * top-left. The graphics API is chosen per device (s_apis, s_order; hires_gpu_shutdown +
  * hires_gpu_init switch it at runtime).
  *
+ * Speed: the fragment shader is the cost (it scales with hi-res pixels; submission is ~1 submit
+ * and ~150 draws per frame). Apple GPUs have no integer divider: 64-bit division is a long
+ * emulated sequence and even 32-bit division is slow. The MSL therefore divides nothing on the
+ * per-pixel path: the plane-equation fraction is a 0/1 carry after a 32-bit floor, span edges and
+ * 1x pixel coordinates are float quotients corrected exactly with integer multiplies, gdx / Sx
+ * comes from the stored split gdx = qx*2Sx + rx, (U1-U0)/n is a 32-bit (or 16-bit long) division
+ * (perspective runs only). Removing the 64-bit divisions made a 4x6 widescreen fight 3x faster
+ * (18 -> 6 ms/frame headless, M1 Pro), the 32-bit ones another 8%. hires.glsl has the same
+ * divide-free forms except the gdx / Sx split and the float floordiv (it still uses 32-bit
+ * division there; porting them needs the DXIL to be regenerated, which needs DXC).
+ *
  * Implements HiresBackend with the same rules as the software rasterizer in hires.c, which
  * stays the reference: same coverage (the scaled vertices are shifted by half a pixel so the
  * GPU's pixel-centre sampling with the top-left fill rule equals the software rasterizer's
@@ -137,13 +148,38 @@ static const char s_msl[] =
 "  VO o; o.pos = float4(in.pos.x * u.k.x - 1.0, 1.0 - in.pos.y * u.k.y, 0.0, 1.0); o.prim = in.prim; return o; }\n"
 "struct FU { int sx, sy, ox, oy, pass, mode, rx, ry, rw, rh, p0, p1; };\n"
 "constant int DITH[16] = { -4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2 };\n"
-"static inline long fdiv(long a, long b) { long q = a / b; if ((a % b) != 0 && ((a < 0) != (b < 0))) q -= 1; return q; }\n"
+/* 64-bit integer division is emulated on Apple GPUs (and costs about as much as the rest of a
+ * pixel), so, as in hires.glsl, none is left on the per-pixel path: floor/trunc of 32-bit values
+ * by small positive divisors, and float estimates corrected exactly with integer multiplies */
+/* floor(a / b) for b > 0 and |a / b| < 2^21: the float quotient is within 1 of it, then exact */
+"static inline int floordiv(int a, int b) {\n"
+"  int q = int(floor(float(a) / float(b))), r = a - q * b;\n"
+"  return r < 0 ? q - 1 : (r >= b ? q + 1 : q); }\n"
 /* floor of the 1x plane equation at hi-res pixel (n = 2X+1-Sx, m = 2Y+1-Sy), exactly:
- * E = C + gdx*n/(2Sx) + gdy*m/(2Sy) with C = cint + cfrac/65536, gdx = qx*2Sx + rx */
-"static inline long attr(device const Prim &p, int i, long n, long m, long sx, long sy) {\n"
-"  uint w = p.rxy[i]; long rx = long(w & 0xFFu), ry = long((w >> 8) & 0xFFu), cf = long(w >> 16);\n"
-"  long F = cf * 4 * sx * sy + rx * n * 2 * sy * 65536 + ry * m * 2 * sx * 65536;\n"
-"  return p.cint[i] + long(p.qx[i]) * n + long(p.qy[i]) * m + fdiv(F, 65536 * 4 * sx * sy); }\n"
+ * E = cint + qx*n + qy*m + floor((cf*D + 65536*G) / (65536*D)), D = 4*Sx*Sy,
+ * G = rx*n*2*Sy + ry*m*2*Sx; with G = q*D + r the last term is q + (cf*D + 65536*r >= 65536*D) */
+"static inline long attr(device const Prim &p, int i, int n, int m, int sx, int sy) {\n"
+"  uint w = p.rxy[i]; int rx = int(w & 0xFFu), ry = int((w >> 8) & 0xFFu), cf = int(w >> 16);\n"
+"  int D = 4 * sx * sy, G = rx * n * 2 * sy + ry * m * 2 * sx;\n"
+"  int q = floordiv(G, D), r = G - q * D;\n"
+"  int c = (cf * D + 65536 * r >= 65536 * D) ? 1 : 0;\n"
+"  return p.cint[i] + long(p.qx[i]) * long(n) + long(p.qy[i]) * long(m) + long(q + c); }\n"
+/* ceil(N / D), D > 0, for quotients well inside 32 bits (pixel columns) */
+"static inline int lceil(long N, long D) {\n"
+"  int t = int(clamp(ceil(float(N) / float(D)), -1073741824.0f, 1073741824.0f));\n"
+"  long r = N - long(t) * D;\n"   /* want -D < r <= 0 */
+"  for (int k = 0; k < 4 && r > 0; k++) { r -= D; t++; }\n"
+"  for (int k = 0; k < 4 && r <= -D; k++) { r += D; t--; }\n"
+"  return t; }\n"
+/* trunc(a / n) for 0 < n <= 8 */
+"static inline long ldivs(long a, int n) {\n"
+"  if (a >= -2147483647L && a <= 2147483647L) return long(int(a) / n);\n"
+"  ulong m = ulong(a < 0 ? -a : a); uint d = uint(n);\n"
+"  uint hi = uint(m >> 32), lo = uint(m), qh = hi / d, r = hi - qh * d;\n"
+"  uint mid = (r << 16) | (lo >> 16), qm = mid / d; r = mid - qm * d;\n"
+"  uint low = (r << 16) | (lo & 0xFFFFu), ql = low / d;\n"
+"  long q = long((ulong(qh) << 32) | ulong((qm << 16) | ql));\n"
+"  return a < 0 ? -q : q; }\n"
 "static inline uint vram_at(texture2d<ushort> t, uint x, uint y) { return uint(t.read(uint2(x & 1023u, y & 511u)).r); }\n"
 "static inline uint tex_fetch(texture2d<ushort> vr, device const Prim &p, uint depth, uint u, uint v) {\n"
 "  uint tw = p.tw;\n"
@@ -243,7 +279,7 @@ static const char s_msl[] =
 "  bool on_long = edge_right_of(X16, Y16, ax, ay, cx, cy), on_short = edge_right_of(X16, Y16, sx0, sy0, sx1, sy1);\n"
 "  return ((p.kf & (1u << 20)) != 0u) ? (on_long && !on_short) : (on_short && !on_long); }\n"
 /* first pixel of the span hires.c draws on row Y: ceil(left edge x), at least the clip */
-"static inline long span_start(device const Prim &p, int Y, int cx1) {\n"
+"static inline int span_start(device const Prim &p, int Y, int cx1) {\n"
 "  long Y16 = long(Y) * 65536;\n"
 "  long ax = p.ev[0], ay = p.ev[1], bx = p.ev[2], by = p.ev[3], cx = p.ev[4], cy = p.ev[5];\n"
 "  long px, py, qx, qy;\n"
@@ -251,10 +287,9 @@ static const char s_msl[] =
 "  else if (Y16 < by) { px = ax; py = ay; qx = bx; qy = by; }\n"
 "  else { px = bx; py = by; qx = cx; qy = cy; }\n"
 "  long N = px * (qy - py) + (qx - px) * (Y16 - py), D = (qy - py) * 65536;\n"
-"  long xs = -fdiv(-N, D);\n"
-"  return xs < long(cx1) ? long(cx1) : xs; }\n"
+"  return max(lceil(N, D), cx1); }\n"
 /* one past the last pixel of that span: ceil(right edge x), at most the clip */
-"static inline long span_end(device const Prim &p, int Y, int cx2) {\n"
+"static inline int span_end(device const Prim &p, int Y, int cx2) {\n"
 "  long Y16 = long(Y) * 65536;\n"
 "  long ax = p.ev[0], ay = p.ev[1], bx = p.ev[2], by = p.ev[3], cx = p.ev[4], cy = p.ev[5];\n"
 "  long px, py, qx, qy;\n"
@@ -262,8 +297,7 @@ static const char s_msl[] =
 "  else if (Y16 < by) { px = ax; py = ay; qx = bx; qy = by; }\n"
 "  else { px = bx; py = by; qx = cx; qy = cy; }\n"
 "  long N = px * (qy - py) + (qx - px) * (Y16 - py), D = (qy - py) * 65536;\n"
-"  long xe = -fdiv(-N, D);\n"
-"  return xe > long(cx2) ? long(cx2) : xe; }\n"
+"  return min(lceil(N, D), cx2); }\n"
 /* hires.c's perspective u/v (PGXP): exact (u*q)/q at the start of every 8-pixel run of the
  * span, integer-stepped in between; float here, double there */
 /* floor(a * 2^24 / q) for q > 0 without 64-bit division (slow on the GPU): float estimates,
@@ -287,19 +321,22 @@ static const char s_msl[] =
 "static inline long2 persp_uv(device const Prim &p, long xs, long xe, long X, int Y) {\n"
 "  long xr = xs + ((X - xs) & ~7L), n = xe - xr < 8 ? xe - xr : 8;\n"
 "  long2 U0 = persp_at(p, xr, Y), U1 = persp_at(p, xr + n, Y);\n"
-"  return long2(U0.x + (X - xr) * ((U1.x - U0.x) / n), U0.y + (X - xr) * ((U1.y - U0.y) / n)); }\n"
+"  return long2(U0.x + (X - xr) * ldivs(U1.x - U0.x, int(n)), U0.y + (X - xr) * ldivs(U1.y - U0.y, int(n))); }\n"
 /* hires.c's attribute value at X: the plane equation at the span start, then stepped by the
  * per-pixel gradient truncated to an integer (gdx / Sx) */
-"static inline long attr_span(device const Prim &p, int i, long xs, long X, long m, long sx, long sy) {\n"
-"  long gdx = long(p.qx[i]) * 2 * sx + long(p.rxy[i] & 0xFFu);\n"
-"  return attr(p, i, 2 * xs + 1 - sx, m, sx, sy) + (X - xs) * (gdx / sx); }\n"
+"static inline long attr_span(device const Prim &p, int i, int xs, int X, int m, int sx, int sy) {\n"
+"  int qx = p.qx[i], rx = int(p.rxy[i] & 0xFFu);\n"
+/* gdx / Sx truncated, without dividing: gdx = qx*2Sx + rx with 0 <= rx < 2Sx (gdx is negative
+ * exactly when qx is, and inexact unless rx is 0 or Sx) */
+"  int step = 2 * qx + (rx >= sx ? 1 : 0) + ((qx < 0 && rx != 0 && rx != sx) ? 1 : 0);\n"
+"  return attr(p, i, 2 * xs + 1 - sx, m, sx, sy) + long(X - xs) * long(step); }\n"
 "fragment float4 fs_prim(VO in [[stage_in]], constant FU &u [[buffer(0)]], device const Prim *prims [[buffer(1)]],\n"
 "    texture2d<float> tmp [[texture(0)]], texture2d<uint> putt [[texture(1)]], texture2d<ushort> vram [[texture(2)]]) {\n"
 "  device const Prim &p = prims[in.prim];\n"
 "  int X = int(in.pos.x) + u.ox, Y = int(in.pos.y) + u.oy;\n"
 "  uint kf = p.kf, kind = kf & 15u;\n"
 "  int hp = u.p0;\n"
-"  int x1 = (X >= 0 ? X : X - u.sx + 1) / u.sx, y1 = Y / u.sy;\n"
+"  int x1 = floordiv(X, u.sx), y1 = Y >= 0 ? floordiv(Y, u.sy) : Y / u.sy;\n"
 "  if (kind == 2u) { if (u.pass != 0) discard_fragment(); return pack4(c15u(p.color & 0xFFFFu, hp), 0, 0, hp); }\n"
 "  if (kind == 6u) return pack4(c15u(vram_at(vram, uint(x1), uint(y1)), hp), 0, 0, hp);\n"
 "  if (kind == 4u) {\n"
@@ -327,12 +364,12 @@ static const char s_msl[] =
 "  int iu = 0, fu = 0, iv = 0, fv = 0, ulo = 0, uhi = 255, vlo = 0, vhi = 255;\n"
 "  if (kind == 0u) {\n"
 "    if ((kf & (1u << 19)) != 0u && !covered(p, X, Y)) discard_fragment();\n"
-"    long m = long(2 * Y + 1 - u.sy), xs = span_start(p, Y, cx1), lX = long(X), lsx = long(u.sx), lsy = long(u.sy);\n"
+"    int m = 2 * Y + 1 - u.sy, xs = span_start(p, Y, cx1);\n"
 "    if (gour) {\n"
 "      int c3[3];\n"
 "      bool c1x = (kf & (1u << 14)) != 0u;\n"
 "      for (int i = 0; i < 3; i++) {\n"
-"        long val = attr_span(p, i, xs, lX, m, lsx, lsy);\n"
+"        long val = attr_span(p, i, xs, X, m, u.sx, u.sy);\n"
 "        int lo = int((p.cmin >> (8 * i)) & 255u), hi = int((p.cmax >> (8 * i)) & 255u);\n"
 "        long s = c1x ? long(uint(val) >> 24) : (val >> 24);\n"
 "        c3[i] = s < long(lo) ? lo : (s > long(hi) ? hi : int(s));\n"
@@ -342,10 +379,10 @@ static const char s_msl[] =
 "    if (tex) {\n"
 "      long U, V;\n"
 "      if ((kf & (1u << 21)) != 0u) {\n"
-"        long xe = span_end(p, Y, cx2);\n"
-"        long2 uv = persp_uv(p, xs, xe, lX, Y);\n"
+"        int xe = span_end(p, Y, cx2);\n"
+"        long2 uv = persp_uv(p, long(xs), long(xe), long(X), Y);\n"
 "        U = uv.x; V = uv.y;\n"
-"      } else { U = attr_span(p, 3, xs, lX, m, lsx, lsy); V = attr_span(p, 4, xs, lX, m, lsx, lsy); }\n"
+"      } else { U = attr_span(p, 3, xs, X, m, u.sx, u.sy); V = attr_span(p, 4, xs, X, m, u.sx, u.sy); }\n"
 "      ulo = int(p.uvr & 255u); uhi = int((p.uvr >> 8) & 255u); vlo = int((p.uvr >> 16) & 255u); vhi = int(p.uvr >> 24);\n"
 "      if (filt) {\n"   /* sample point without the +0.5 rounding bias, footprint inside the 1x-sampled range */
 "        long su = U - 8388608, sv = V - 8388608;\n"
