@@ -20,7 +20,7 @@ const u32 *g_pgxp_depth;
 int g_pgxp_diag;
 u64 g_pgxp_stat_bad_d, g_pgxp_stat_bad_w, g_pgxp_stat_old, g_pgxp_stat_tris, g_pgxp_stat_split;
 u32 g_pgxp_batch = 1;
-u64 g_pgxp_stat_welded, g_pgxp_stat_weld_int, g_pgxp_stat_weld_full;
+u64 g_pgxp_stat_welded, g_pgxp_stat_weld_int, g_pgxp_stat_weld_full, g_pgxp_stat_backface;
 
 #include <stdio.h>
 #include <math.h>
@@ -36,6 +36,7 @@ static bool same_depth(float a, float b) { return a <= b * 1.25f && b <= a * 1.2
 
 const PgxpVert *pgxp_weld(u32 sxy, const PgxpVert *q)
 {
+    if (q && q->cull) return q;              /* the character mesh: closed as it is (pgxp.h) */
     u32 h = pgxp_recent_slot(sxy);
     for (int k = 0; k < WELD_PROBE; k++, h = (h + 1) & ((1u << WELD_BITS) - 1)) {
         if (s_weld[h].batch != g_pgxp_batch) {   /* first use of this word in the batch */
@@ -62,6 +63,7 @@ void pgxp_check_tri(const PgxpVert *const q[3], const u32 sxy[3])
     {   /* an SXY word sent at two different positions within one batch = a crack */
         static struct { u32 sxy, batch; float dx, dy, w; bool prec; } tab[1 << 16];
         for (int i = 0; i < 3; i++) {
+            if (q[i] && q[i]->cull) continue;    /* never welded */
             u32 h = pgxp_recent_slot(sxy[i]) ^ 0x5555;   /* not the weld table's layout */
             for (int k = 0; k < 32; k++, h = (h + 1) & 0xFFFF) {
                 if (tab[h].batch != g_pgxp_batch) {
@@ -181,6 +183,7 @@ u32 pgxp_new(u32 sxy, float dx, float dy, float w)
     PgxpVert *v = &g_pgxp_pool[t];
     v->sxy = sxy; v->dx = dx; v->dy = dy; v->w = w;
     v->frame = g_pgxp_frame;
+    v->cull = 0;
     v->site = g_pgxp_callstack ? g_pgxp_callstack[(*g_pgxp_depth - 1) & 1023] : 0;
     g_pgxp_stat_new++;
     g_pgxp_recent[pgxp_recent_slot(sxy)] = sxy;

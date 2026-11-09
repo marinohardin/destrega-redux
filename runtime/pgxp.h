@@ -31,6 +31,9 @@ typedef struct PgxpVert {
     float w;        /* view depth (the unclamped SZ), > 0 */
     u32 site;       /* diagnostics: guest function that ran the RTPS/RTPT */
     u32 frame;      /* diagnostics: g_pgxp_frame when it was produced */
+    u32 cull;       /* 1: vertex of a backface-culled mesh whose faces are all sent in precise form
+                       (the character mesh, overrides/char_mesh.c): not welded, and its triangles
+                       that face away in precise positions are left out of the hi-res target */
 } PgxpVert;
 
 #define PGXP_POOL_BITS 18
@@ -121,18 +124,25 @@ extern const u32 *g_pgxp_depth;
  * position: the precise value seen first for that word, or the integer one if the word was first
  * sent without a precise value. A precise value at a clearly different depth (w ratio > 1.25)
  * is another mesh on the same integer pixel and is welded separately, so it keeps its own W.
- * Returns the value to use (NULL = integer). */
+ * Returns the value to use (NULL = integer).
+ * Vertices marked `cull` (the character mesh) are not welded: the cracks and torn limbs welding
+ * was introduced for were the faces the integer backface test drops (overrides/char_mesh.c now
+ * draws them); with those present the mesh is closed at its precise positions, and welding a
+ * distant character, where many distinct vertices share a pixel, moved ~30% of its vertices by
+ * up to ~1 px (1x) to whichever vertex came first, a different one every frame: the shimmer. */
 extern u32 g_pgxp_batch;
 static inline void pgxp_new_batch(void) { g_pgxp_batch++; }
 const PgxpVert *pgxp_weld(u32 sxy, const PgxpVert *q);
 extern u64 g_pgxp_stat_welded, g_pgxp_stat_weld_int, g_pgxp_stat_weld_full;
+extern u64 g_pgxp_stat_backface;             /* hi-res triangles left out as back-facing (gpu.c) */
 
 /* Diagnostics / regression check on the vertices actually sent to the hi-res target (after
  * welding): per triangle, an on-screen vertex > 1.5 px from its integer, a depth ratio > 2
  * between precise vertices from different GTE call sites (a vertex from another mesh = false
  * association; one mesh may legitimately span depth, e.g. the stage floor near the camera), a
  * value older than 2 vblanks; per batch, an SXY word at a similar depth sent at two different
- * positions ("split": the crack/tear bug). All must be 0. q[i] = NULL for integer vertices. */
+ * positions ("split": the crack/tear bug; not counted for `cull` vertices, which are never welded).
+ * All must be 0. q[i] = NULL for integer vertices. */
 void pgxp_check_tri(const PgxpVert *const q[3], const u32 sxy[3]);
 extern int g_pgxp_diag;                      /* --pgxp-diag N: log up to N suspicious triangles */
 extern u64 g_pgxp_stat_bad_d, g_pgxp_stat_bad_w, g_pgxp_stat_old, g_pgxp_stat_tris, g_pgxp_stat_split;

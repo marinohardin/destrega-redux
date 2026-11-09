@@ -161,6 +161,9 @@ changes the fighter struct at the start of F+1).
   boot->fight run it is ~62-65% (title, menus and character select draw 2D polygons). Only
   ~0.5% of the misses equal a recent GTE result, so nearly all misses are CPU-computed 2D
   polygons (HUD, menus), not lost associations. No stale-tag misses observed. (verified: probe)
+- **Superseded (see "Character mesh and PGXP" below):** the next bullet's explanation was wrong.
+  The holes were the faces the integer backface test drops, not duplicated vertices; the
+  character mesh is no longer welded. Kept for the history of the measurement.
 - Character meshes depend on integer snapping (verified: dumps + `pgxp-check`). Over a boot->fight run
   ~24% of precise vertex uses (572K of 2.43M in 4300 frames) share their SXY word with another use that has a *different*
   precise value (all 388 logged samples came from `80036b0c`, e.g. word 48,-24 at
@@ -192,6 +195,60 @@ changes the fighter struct at the start of F+1).
 - PGXP never changed the per-frame state hash, i.e. no game code observes the precise values;
   this says nothing yet about whether gameplay depends on the *integer* GTE results (open
   question below).
+
+### Character mesh and PGXP (the "shimmering polygons" report)
+
+User report: at 4x6 with PGXP on, fighters' polygons "shift around a ton" from frame to frame,
+faces look like a jumble of facets, limb pieces poke through each other, worse at a distance;
+also there with `--pgxp off` but much worse with PGXP on.
+
+- **No level of detail.** `fighter_render` (80037144) always draws the mesh at fighter +0xe8 (and
+  the attachment at +0x1a0); `char_mesh_render` has no distance test. Over `practice_milena`
+  the same 4 triangle face lists with the same counts were used at every depth from SZ 525 to
+  23022 (verified: override probe). The "lower-poly" look at a distance is the integer culling
+  below, not another model.
+- **Mesh layout** (verified: override reads every face each call and the rebuilt faces render
+  correctly; decompilation of 80036b0c / 80036138 / 800363c8): per bone part the vertices are
+  projected once with RTPT into the vertex buffer 800c9d38 ({SXY, SZ}, 8 bytes) and lit (NCCT)
+  into 800cb7c8; faces reference both by s16 indices, so vertices are shared between faces and a
+  face may use vertices of two parts (joints are closed by topology, not by rounding). Face
+  records and packets: symbols.txt 80036138 / 800363c8.
+- **Integer backface test** (verified): a triangle is kept only if NCLIP > 0 on the integer SXY
+  words; a quad if NCLIP(D,B,C) < 0 or NCLIP(A,B,C) > 0. A face whose integer projection is
+  degenerate (all on one line or one pixel) is dropped. On the PS1 that costs nothing (it has no
+  area at 1x); at precise positions it does. Share of the faces facing the camera (precise NCLIP)
+  that the game drops, by face depth SZ, `practice_milena`, 9980 frames (verified: probe):
+  2000-6000 (near / mid) 17-28 %, 6000-10000 29-33 %, 10000-16000 (far) 41-59 %, about 40 % over
+  the run. They change from frame to frame as the pose and camera move.
+- **What PGXP made of it** (verified: probe + dumps): the hi-res target drew the kept faces at
+  precise positions, so the dropped ones were holes through which the faces behind showed (far
+  arm, inside of the hair, the other side of the body), flickering every update. That is the
+  "cracks / torn limbs / dark smear" that welding was added for. Welding hid part of it by
+  snapping every vertex sharing an SXY word with an earlier one (at similar depth) to that first
+  value; a distant fighter has many distinct vertices per pixel, so ~28 % of the precise vertex uses moved
+  by up to ~1 px (1x, i.e. 4x6 hi-res px; median ~0.6 px), towards whichever vertex happened to
+  come first: a different one every frame. The distance between the welded values has no peak
+  near 0 (log histogram rising to 0.5-1 px; 3D distance 8-500 view units), i.e. they were not
+  duplicates of one point. Also ~4 % of the kept triangles are back-facing at precise positions
+  (inverted slivers). Integer snapping with `--pgxp off` moves each vertex by at most 0.5 px and
+  keeps the integer mesh closed (degenerate faces have no area there), which is why off looked
+  steadier than on.
+- **Fix (runtime/overrides/char_mesh.c):** before 80036138 / 800363c8 run, the same face list is
+  read; every face the game is about to drop but which faces the camera at precise positions is
+  rebuilt (the game's own packet words, UV words from the packet buffer, the game's OT slot) and
+  drawn into the hi-res target only when the GPU DMA reaches that slot. Mesh vertices get
+  `PgxpVert.cull`: they are not welded, and their triangles that face away at precise positions
+  are left out of the hi-res target. Guest state is untouched (replays, state hashes).
+  Measured with `tools/flicker_metric.py` (mean temporal second difference over the fighter,
+  4x6 widescreen GPU, 30 updates; lower = steadier): idle Celia (timeout_draw 4300, mid-far)
+  old on 1.34, off 0.98, new on 1.04 (pixels flickering by > 64: 317 / 245 / 193 per update);
+  idle Gradd 4.05 / 3.98 / 3.87; walking Milena (practice_milena 8400) 3.04 / 2.80 / 2.87;
+  close Milena (9600) 1.33 / 1.14 / 1.23 (verified: measurement; the metric includes the real
+  animation, so it only ranks). By eye: faces, hands and limbs are whole and steady.
+- Not covered: other meshes the game culls the same way (stage builders, effects) still lose
+  their integer-degenerate faces at precise positions; they are large, so this was not visible.
+  Whether `char_mesh_chains` (800367d8) vertices reach these face lists: guess (they are written
+  to the same vertex buffer).
 
 ## Memory card
 

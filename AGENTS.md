@@ -172,7 +172,9 @@ scheduler event (`frontend_vblank`: present, input, audio, 60 Hz pacing).
   `tools/soak.sh SEED` does a random-input soak with checks on. Guest code the
   override still calls goes through `guest_call()`; watch for undeclared
   register arguments (e.g. `f_80044918` reads a3 = normal.y).
-  Done so far: `f_800465a4` -> `sphere_vs_poly` (collision.c).
+  Done so far: `f_800465a4` -> `sphere_vs_poly` (collision.c). Presentation-only wrappers that run
+  the original unchanged and bypass `override_call`: `f_80044210` (widescreen.c) and
+  `f_80036138` / `f_800363c8` (char_mesh.c, PGXP faces).
   The game's stack moves into the scratchpad (0x1f800000) during fights.
 - Cycle accounting: `CYC(n)` (2 cycles/insn), `EVT_CHECK()` at function entry and
   backward branches runs `rt_event()` → scheduler + IRQ delivery.
@@ -823,16 +825,27 @@ hi-res target; the guest still sees exactly the integer GTE results, RAM and 1x 
   pass each word's tag to `gpu_write_gp0_tag`. A tag is used only if the pool entry's integer
   word still equals the GP0 word (`pgxp_lookup`), so stale tags (ALU ops, sh/sb rewrites,
   ring reuse) just fall back to the integer vertex. No invalidation anywhere.
-- **Welding (required, see NOTES.md "GTE projection call sites")**: the character meshes rely on
-  integer snapping. Vertices of different primitives that are meant to meet (hair/face/limb
-  pieces) are distinct GTE results that only coincide after rounding to the same SXY word; drawn
-  at their own precise positions they separate by up to 1 px: cracks, torn shoulders, back
-  geometry and a dark smear showing through the face. So within one batch (one GPU linked-list
-  DMA, or one vblank) every use of an SXY word gets one position: the first precise value seen
-  for it, or the integer if it was first sent without one (`pgxp_weld`). Vertices on different
-  integer pixels stay independent, so the stage and the character outlines remain wobble-free.
-  A precise value whose W differs by more than 1.25x is another mesh on the same pixel (stage
-  vertex w=9073 vs character vertex w=3065 on one word) and is welded separately, keeping its W.
+- **Character mesh: dropped faces (`runtime/overrides/char_mesh.c`, NOTES.md "Character mesh and
+  PGXP")**: the character renderer keeps a face only if NCLIP on its *integer* positions is > 0,
+  so every face that is degenerate at 1x is never sent (17-59 % of the faces facing the camera,
+  more with distance). At precise positions those faces have area: without them the mesh has
+  holes that flicker every update (the "torn limbs / smear through the face" once blamed on
+  missing welding, and the shimmer of distant fighters). `f_80036138` / `f_800363c8` (listed in
+  `analysis/overrides.txt`) read the face list before running the original unchanged, rebuild
+  each dropped face that faces the camera at precise positions (the game's packet words and OT
+  slot) and hand it to the second linked-list DMA hook (`g_gpu_ll_hook2`), which draws it into
+  the hi-res target only (`gpu_shadow_packet_in_area`) when the DMA reaches that slot. Their
+  vertices get `PgxpVert.cull`: never welded, and their triangles that face away at precise
+  positions are left out of the hi-res target (`gp0_polygon`). Summary line `pgxp-mesh:`.
+- **Welding (other meshes; see NOTES.md "GTE projection call sites")**: within one batch (one GPU
+  linked-list DMA, or one vblank) every use of an SXY word gets one position: the first precise
+  value seen for it, or the integer if it was first sent without one (`pgxp_weld`); it keeps
+  shared words of the widescreen extras and the real stage in one place. Vertices on different
+  integer pixels stay independent. A precise value whose W differs by more than 1.25x is another
+  mesh on the same pixel (stage vertex w=9073 vs character vertex w=3065 on one word) and is
+  welded separately, keeping its W. Character vertices (`cull`) are not welded: on a distant
+  fighter the first-seen value moved ~28 % of the vertices by up to ~1 px, a different way every
+  frame.
 - `gpu.c` adds the offsets to polygon vertices for `g_hires` only (`HiresVtx.x/y` 16.16 plus
   `HiresVtx.w`, 0 = none). Lines and rects (2D sprites, HUD, text) are untouched.
 - `hires.c`: a textured triangle with `w` on all three vertices is textured perspective-

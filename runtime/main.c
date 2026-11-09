@@ -662,6 +662,7 @@ extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g
 static void finish(void) {
     ss_finish();   /* savestate / replay / netplay reports (savestate.c) */
     void widescreen_report(void); widescreen_report();
+    void char_mesh_report(void); char_mesh_report();
     if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
     if (!s_headless) rt_log("audio: %u host-side underrun pads in %llu frames", g_audio_underruns, (unsigned long long)s_frame);
     if (s_state_hash) fclose(s_state_hash);
@@ -699,9 +700,9 @@ static void finish(void) {
                (unsigned long long)g_pgxp_stat_bad_w, (unsigned long long)g_pgxp_stat_old,
                (unsigned long long)g_pgxp_stat_split);
         rt_log("pgxp-weld: %llu vertex uses snapped to another precise value of the same word, %llu to the "
-               "integer, %llu table-full fallbacks",
+               "integer, %llu table-full fallbacks; %llu back-facing character triangles left out",
                (unsigned long long)g_pgxp_stat_welded, (unsigned long long)g_pgxp_stat_weld_int,
-               (unsigned long long)g_pgxp_stat_weld_full);
+               (unsigned long long)g_pgxp_stat_weld_full, (unsigned long long)g_pgxp_stat_backface);
     }
     {
         u64 ft, f2, fr;

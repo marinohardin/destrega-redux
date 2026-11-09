@@ -127,6 +127,9 @@ void gpu_write_gp0(u32 v);
 struct PgxpVert;
 /* presentation-only packet (hi-res target only); pv: optional precise vertex per word (PGXP) */
 void gpu_shadow_packet(const u32 *w, int n, const struct PgxpVert *const *pv);
+/* The same for polygons that belong inside the 1x draw area (drawn into the hi-res target only,
+ * clipped like the guest's own polygons): the character faces of overrides/char_mesh.c. */
+void gpu_shadow_packet_in_area(const u32 *w, int n, const struct PgxpVert *const *pv);
 /* GP0 word with its PGXP precision tag (runtime/pgxp.h; 0 = none). */
 void gpu_write_gp0_tag(u32 v, u32 tag);
 void gpu_write_gp1(u32 v);
