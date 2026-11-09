@@ -63,7 +63,8 @@ void replay_field_str(int k, u32 v, char *b, size_t n);
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_BYE = 4,
        PKT_LOBBY_HELLO = 5, PKT_LOBBY_WELCOME = 6, PKT_LOBBY_REFUSE = 7 };   /* menu sessions (below) */
 #define NET_MAGIC 0x504e5344u               /* "DSNP" */
-#define NET_VERSION 2                       /* 2: the hello carries the emulation source identity */
+#define NET_VERSION 3                       /* 2: the hello carries the emulation source identity;
+                                             * 3: ping timestamps in microseconds, held from arrival */
 
 typedef struct {
     bool on, host;
@@ -119,9 +120,18 @@ static double s_sync_debt_ns;               /* time-sync slowdown still to sprea
 static u64 s_sync_next;                     /* first frame the next slowdown may be decided */
 static u64 s_fe_extra_ns;                   /* windowed: slowdown for the frontend's pacing to add */
 static int s_peer_load = -1;                /* peer's share of its frame budget in use (%), -1 = unknown */
-static u32 s_echo_ts;                       /* round-trip time */
-static u64 s_echo_at;
-static double s_rtt;
+/* Round-trip time. Each input packet carries the sender's clock (us), the last clock it saw from
+ * us and how long it held that one: from the packet's ARRIVAL (net.c's receiver thread timestamps
+ * every datagram as it arrives) and, for comparison, from when the frame loop PROCESSED it. Packets
+ * are still processed only at the frame boundary; the arrival times just keep the wait for the next
+ * frame out of the network figure (it used to add up to a frame on each side: ~16-20 ms on
+ * loopback). The ping is only shown and logged: nothing (time sync, prediction) depends on it. */
+static u32 s_echo_ts;
+static u64 s_echo_at, s_echo_seen;          /* arrival / processing time of the packet that carried it */
+static double s_rtt, s_rtt_frame;           /* smoothed: network, frame-to-frame (ms) */
+static double s_rtt_sum, s_rtt_min, s_rtt_max, s_rttf_sum;
+static u16 s_rtt_hist[1001];                /* network samples per 0.1 ms up to 100 ms (median) */
+static u64 s_rtt_n, s_rttf_n;
 
 static Snapshot s_snap[SNAPS];
 static u64 s_resim_until;                   /* re-simulating until begin(this frame) */
@@ -293,16 +303,21 @@ static void send_inputs(void) {
         u16 v = hf && s_hframe[slot(hf)] == hf ? s_fld[slot(hf)][k] : 0;
         b[n++] = (u8)v; b[n++] = (u8)(v >> 8);
     }
-    /* round-trip time: our clock, the peer's last clock we saw and how long we held it (ms) */
+    /* round-trip time: our clock (us, never 0), the peer's last clock we saw and how long we held
+     * it since it arrived (10 us units; 65535 = too long, no sample) */
     u64 now = ss_now_ns();
-    put_u32(b + n, (u32)(now / 1000000));
+    put_u32(b + n, (u32)(now / 1000) | 1);
     put_u32(b + n + 4, s_echo_ts);
-    u64 hold = s_echo_at ? (now - s_echo_at) / 1000000 : 0;
+    u64 hold = s_echo_at ? (now - s_echo_at) / 10000 : 0;
     b[n + 8] = (u8)(hold > 65535 ? 65535 : hold); b[n + 9] = (u8)((hold > 65535 ? 65535 : hold) >> 8);
     n += 10;
     /* our load: % of the frame budget used by our own work (255 = unknown, e.g. headless) */
     double ld = smooth_load();
     b[n++] = ld <= 0 ? 255 : ld * 100 > 250 ? 250 : (u8)(ld * 100);
+    /* how long we held the peer's clock since our frame loop processed it (frame-to-frame figure) */
+    hold = s_echo_seen ? (now - s_echo_seen) / 10000 : 0;
+    b[n] = (u8)(hold > 65535 ? 65535 : hold); b[n + 1] = (u8)((hold > 65535 ? 65535 : hold) >> 8);
+    n += 2;
     net_send(s_sock, b, n);
     st.pkts_out++;
 }
@@ -313,8 +328,9 @@ static void status(u64 f);                             /* connection-quality rea
 static void receive(void) {
     u8 b[1500];
     int n;
+    u64 arrived;
     net_poll(s_sock);
-    while ((n = net_recv(s_sock, b, sizeof b)) > 0) {
+    while ((n = net_recv_ts(s_sock, b, sizeof b, &arrived)) > 0) {
         if (n < 8 || get_u32(b) != NET_MAGIC) continue;
         if (b[4] == PKT_BYE) {   /* ends the session at the next safe moment (end_pending) */
             if (!s_peer_left) fprintf(stderr, "netplay: peer left at our frame %llu\n", (unsigned long long)s_applied);
@@ -356,12 +372,27 @@ static void receive(void) {
             u32 ts = get_u32(b + r), echo = get_u32(b + r + 4);
             u32 hold = b[r + 8] | b[r + 9] << 8;
             u64 now = ss_now_ns();
-            s_echo_ts = ts; s_echo_at = now;
-            if (echo) {
-                double rtt = (double)((u32)(now / 1000000) - echo) - hold;
-                if (rtt >= 0 && rtt < 5000) s_rtt = s_rtt ? s_rtt + (rtt - s_rtt) / 8 : rtt;
+            s_echo_ts = ts; s_echo_at = arrived; s_echo_seen = now;
+            if (echo && hold != 65535) {   /* network: from our send to the reply's arrival */
+                double rtt = ((double)(u32)((u32)(arrived / 1000) - echo) - hold * 10.0) / 1000;
+                if (rtt >= 0 && rtt < 5000) {
+                    s_rtt = s_rtt_n ? s_rtt + (rtt - s_rtt) / 8 : rtt;
+                    s_rtt_sum += rtt; s_rtt_n++;
+                    int hb = rtt >= 100 ? 1000 : (int)(rtt * 10);
+                    if (s_rtt_hist[hb] < 65535) s_rtt_hist[hb]++;
+                    if (s_rtt_n == 1 || rtt < s_rtt_min) s_rtt_min = rtt;
+                    if (rtt > s_rtt_max) s_rtt_max = rtt;
+                }
             }
             if (n >= r + 11) s_peer_load = b[r + 10] == 255 ? -1 : b[r + 10];
+            u32 holdf = n >= r + 13 ? (u32)(b[r + 11] | b[r + 12] << 8) : 65535;
+            if (echo && holdf != 65535) {  /* frame-to-frame: from our send to processing the reply */
+                double rtt = ((double)(u32)((u32)(now / 1000) - echo) - holdf * 10.0) / 1000;
+                if (rtt >= 0 && rtt < 5000) {
+                    s_rtt_frame = s_rttf_n ? s_rtt_frame + (rtt - s_rtt_frame) / 8 : rtt;
+                    s_rttf_sum += rtt; s_rttf_n++;
+                }
+            }
         }
         if (n >= h + 26) {
             u64 pf = get_u32(b + h + 20);
@@ -614,7 +645,7 @@ void netplay_vblank_begin(u64 f) {
         if (o.pace_hz > 0) {
             u64 due = s_t0_ns + (u64)((double)f * 1e9 / o.pace_hz);
             u64 now = ss_now_ns();
-            if (due > now && due - now < 1000000000ull) net_sleep_us((due - now) / 1000);
+            if (due > now && due - now < 1000000000ull) net_wait(s_sock, due, false);
         }
         receive();
         if (s_end_pending) { s_end_pending = false; session_end(s_end_msg); return; }
@@ -639,7 +670,7 @@ void netplay_vblank_begin(u64 f) {
                 send_inputs();
                 last_send = ss_now_ns();
             }
-            net_sleep_us(500);
+            net_wait(s_sock, ss_now_ns() + 500000, true);
             receive();
         }
         if (t0) { st.stall_ns += ss_now_ns() - t0; smooth_stall(ss_now_ns() - t0); }
@@ -758,7 +789,16 @@ void netplay_vblank_end(u64 f) {
     g_pad_buttons[s_local_idx] = (u16)~local_now;
     g_pad_buttons[s_remote_idx] = (u16)~rem;
     if (!o.full_boot) boot_vs_pads(f);
-    if (!resim) { send_inputs(); status(f); }
+    if (!resim) { net_drain(s_sock); send_inputs(); status(f); }   /* drain: only without net.c's receiver thread */
+}
+
+/* A ping for people: one decimal below 10 ms (loopback / LAN), whole milliseconds above. */
+static const char *ping_text(double ms) {
+    static char t[2][24];
+    static int k;
+    k ^= 1;
+    snprintf(t[k], sizeof t[k], ms < 10 ? "%.1f ms" : "%.0f ms", ms);
+    return t[k];
 }
 
 /* Connection-quality readout, once a second: window title (windowed) and every 10 s on stderr. */
@@ -770,8 +810,8 @@ static void status(u64 f) {
     if (now - last_ns < 1000000000ull) return;
     double sec = (double)(now - last_ns) / 1e9;
     char b[256];
-    snprintf(b, sizeof b, "netplay %s | ping %.0f ms | delay %d | %.0f fps | rollbacks %.1f/s | predicted %.0f%% | waiting %.0f%%%s",
-             o.host ? "host P1" : "P2", s_rtt, o.delay, (double)(f - last_f) / sec,
+    snprintf(b, sizeof b, "netplay %s | ping %s | delay %d | %.0f fps | rollbacks %.1f/s | predicted %.0f%% | waiting %.0f%%%s",
+             o.host ? "host P1" : "P2", ping_text(s_rtt), o.delay, (double)(f - last_f) / sec,
              (double)(st.rollbacks - last_rb) / sec,
              f > last_f ? 100.0 * (double)(st.predicted - last_pred) / (double)(f - last_f) : 0.0,
              100.0 * (double)(st.stall_ns - last_stall_ns) / (double)(now - last_ns),
@@ -780,7 +820,7 @@ static void status(u64 f) {
              smooth_load() >= 0.95 ? " | This computer is running slowly" : "");
     frontend_set_status(b);
     static int n;
-    if (++n % 10 == 0) fprintf(stderr, "%s\n", b);
+    if (++n % 10 == 0) fprintf(stderr, "%s | frame-to-frame ping %s\n", b, ping_text(s_rtt_frame));
     last_ns = now; last_f = f; last_rb = st.rollbacks; last_pred = st.predicted; last_stall_ns = st.stall_ns;
 }
 
@@ -1030,7 +1070,7 @@ const char *netplay_status_text(void) {
     }
     else if (s_lobby == LOBBY_JOINING) snprintf(t, sizeof t, "Connecting to %s:%d", s_laddr, s_lport);
     else if (o.on && s_first_desync) snprintf(t, sizeof t, "Desync at frame %llu", (unsigned long long)s_first_desync);
-    else if (o.on && s_started && s_sock) snprintf(t, sizeof t, "Connected to %s, ping %.0f ms", net_peer_name(s_sock), s_rtt);
+    else if (o.on && s_started && s_sock) snprintf(t, sizeof t, "Connected to %s, ping %s", net_peer_name(s_sock), ping_text(s_rtt));
     else if (o.on) snprintf(t, sizeof t, "Connecting...");
     else snprintf(t, sizeof t, "Not connected");
     return t;
@@ -1146,6 +1186,17 @@ static void print_stats(void) {
             (unsigned long long)st.sync_waits, (unsigned long long)st.sync_frames,
             (unsigned long long)st.pkts_out, (unsigned long long)st.pkts_in, (unsigned long long)s_final_through,
             (unsigned long long)s_hash_checked, (unsigned long long)s_desyncs);
+    if (s_rtt_n) {
+        u64 tot = 0, acc = 0;
+        int med = 0;
+        for (int k = 0; k <= 1000; k++) tot += s_rtt_hist[k];
+        for (int k = 0; k <= 1000; k++) { acc += s_rtt_hist[k]; if (2 * acc >= tot) { med = k; break; } }
+        fprintf(stderr, "netplay: ping %.2f ms average network round trip (median %s%.1f, min %.2f, max %.2f, %llu samples), "
+                "%.2f ms frame-to-frame (packets processed at the frame boundary)\n",
+                s_rtt_sum / (double)s_rtt_n, med == 1000 ? ">" : "", med / 10.0 + (med == 1000 ? 0 : 0.05),
+                s_rtt_min, s_rtt_max, (unsigned long long)s_rtt_n,
+                s_rttf_n ? s_rttf_sum / (double)s_rttf_n : 0.0);
+    }
     if (st.resim_frames)
         fprintf(stderr, "netplay: re-simulation cost %.3f ms per re-simulated vblank (incl. restore)\n",
                 st.resim_ns / 1e6 / (double)st.resim_frames);

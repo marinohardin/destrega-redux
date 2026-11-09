@@ -529,16 +529,40 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   confirmed inputs offline and, on the peer that went wrong, reports its first wrong frame.
   `--net-desync-dir DIR` (default: cwd), `--net-desync-stop`, `--net-inject-desync F` (test fault).
 - **Readout**: once a second the window title shows ping (RTT), delay, fps, rollbacks/s, % of
-  vblanks predicted, % of time waiting, DESYNC; every 10 s the same line goes to stderr. Exit
-  summary: frames, predicted / mispredicted inputs, rollbacks (max depth, deferred, impossible),
-  re-simulated frames and cost, stalls, time-sync waits, packets, final frames, hashes checked.
+  vblanks predicted, % of time waiting, DESYNC; every 10 s the same line goes to stderr, followed
+  by the frame-to-frame ping. Exit summary: frames, predicted / mispredicted inputs, rollbacks (max
+  depth, deferred, impossible), re-simulated frames and cost, stalls, time-sync waits, packets,
+  final frames, hashes checked; then `netplay: ping A ms average network round trip (median, min, max, N
+  samples), F ms frame-to-frame`.
+- **How the ping is measured**: every input packet carries the sender's clock (us), the last clock
+  it saw from the peer and how long it held that one (10 us units) **since that packet arrived**,
+  plus (appended after the load byte) how long since its frame loop processed it. RTT = arrival of
+  the reply - our clock echoed - the peer's hold. Arrival times come from `net.c`: a receiver thread
+  per socket blocks in `select` and queues each datagram with its time (macOS / Linux: the kernel's
+  `SO_TIMESTAMP`, so a late thread wakeup on a loaded machine does not count; Windows / Wine: the
+  time the thread read it). Packets are still **processed** only at the frame boundary (`receive()`
+  pops the queue: `net_recv_ts`), so rollback, prediction and time sync are unchanged; the ping is
+  display only (nothing reads `s_rtt`). The old figure used the times each side *looked* at the
+  socket (once per vblank), so up to a frame of waiting on each side counted as network: loopback
+  showed 19-21 ms; now 0.1-0.3 ms Mac <-> Mac, median 0.3 ms Mac host <-> Wine joiner and ~2 ms
+  Wine host <-> Mac joiner (Wine adds spikes on a loaded machine). Windows: the thread waits on the
+  socket's `WSAEventSelect` FD_READ event plus a high-resolution timer, not `select()`: with a
+  `select()` loop in the receiver thread a Mac <-> Wine session fell to ~1 fps with multi-second
+  round trips (cause not pinned down). Status line and menu
+  (`Connected to X, ping N ms`) and the title show the network figure (one decimal below 10 ms);
+  the frame-to-frame one (what the old figure measured: network + waiting for the next frame on
+  both sides) is in the 10 s line and the exit summary. Protocol version 3 (us timestamps).
 - **Transport** (`net.c`): non-blocking UDP over IPv4 (the host listens on IPv4 only), the host
   answers whoever says hello first. Packets carry every unacknowledged input (up to 120 frames),
-  so loss only costs latency. `--net-sim LAT:JITTER:LOSS:REORDER[:SEED]` (ms, ms, %, %) delays /
-  drops / reorders this peer's sends (deterministic per seed) for tests. `--net-pace HZ` paces
+  so loss only costs latency. A receiver thread per socket queues arriving datagrams with their
+  arrival time (above); without it (thread start failed) the main thread reads the socket as
+  before. `--net-sim LAT:JITTER:LOSS:REORDER[:SEED]` (ms, ms, %, %) delays /
+  drops / reorders this peer's sends (deterministic per seed) for tests; the receiver thread sends
+  the delayed packets when due (it looks every 0.5 ms while a simulated link is in use), so the
+  simulated latency no longer rounds up to the sender's next frame. `--net-pace HZ` paces
   headless runs; `--net-hash-log FILE` writes every final frame's hashes (also without netplay, for
   an offline reference run); `--net-lockstep` never predicts.
-- Tests: `tools/test_netplay.py` (in `run_tests.sh`): eleven cases (two extra desync link timings that also assert the report file holds its frame), each two headless processes over
+- Tests: `tools/test_netplay.py` (in `run_tests.sh`): eleven cases (two extra desync link timings that also assert the report file holds its frame) plus `ping` (the exit summary's average network ping over loopback < 3 ms and with `--net-sim 20:0:0:0` each way 38-47 ms), each two headless processes over
   loopback with seeded VS menu + random fight input (`replays.py` scripts), paced at 240 Hz (4x real
   time, so the simulated latencies cover 4x as many frames): lan, wan (20 ms + 8 jitter, 1% loss, 2%
   reorder), lossy (15+15 ms, 10% loss, 10% reorder), asym (35 / 5 ms), a full best-of-3 match with
