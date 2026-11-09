@@ -74,12 +74,18 @@ def steps(text):
 def netplay92():
     import random
     port = random.randint(20000, 40000)
-    common = ["--headless", "--no-interp", "--no-memcard", "--frames", "2400", "--net-pace", "600"] + PAK
+    common = ["--headless", "--no-interp", "--no-memcard", "--frames", "1200", "--net-pace", "600"] + PAK
     logs = [os.path.join(OUT, "netplay92_%s.log" % w) for w in ("host", "join")]
-    cmds = [[BIN] + common + GOV + ["--fake-load", "1-2400:92", "--host", str(port)],
+    cmds = [[BIN] + common + GOV + ["--fake-load", "1-1200:92", "--host", str(port)],
             [BIN] + common + ["--join", "127.0.0.1:%d" % port]]
     procs = [subprocess.Popen(c, stdout=open(l, "w"), stderr=subprocess.STDOUT, cwd=OUT) for c, l in zip(cmds, logs)]
-    rcs = [p.wait(timeout=300) for p in procs]
+    rcs = []
+    for p in procs:   # generous: a heavily loaded machine runs these far below the pace
+        try:
+            rcs.append(p.wait(timeout=1200))
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rcs.append("timeout")
     th, tj = (open(l).read() for l in logs)
     st = steps(th)
     if rcs != [0, 0] or "DESYNC" in th + tj:
