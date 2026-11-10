@@ -92,6 +92,19 @@ Evidence that nothing else changed (verified):
 - Rasterizing these pixels was 49 % of the main thread in a plain 1x run and 14 % in the user
   configuration (macOS `sample`).
 
+### Host profile after the performance work (macOS `sample`, M1 Pro, machine under load)
+
+Main-thread self time by area, Hills fight (verified by sampling; percentages shift with load):
+- Plain headless 1x (`--gpu-1x skip`): recompiled guest code 33-38 %, SPU 21-24 % (almost all
+  `spu_render`: voices + reverb), GTE 20-22 %, CD/XA 8 %, GP0 decode 5 %, bus 3 %, 1x rasterizer
+  (UV/colour tracking only) 2 %, PGXP 1 %.
+- User configuration (GPU 4x6, 16:9, xbr, full colour, PGXP): waiting on the GPU fence 59 %,
+  guest 9 %, hi-res backend 9 %, GTE 5 %, SPU 4 %, widescreen shadow pass 4 % (0.46 ms per
+  pass: snapshot, wide run, restore, diff), 1x tracking 3 %. Wall time is GPU-bound there.
+- Next candidates: the widescreen shadow pass's full RAM/scratchpad copies (a write journal would
+  avoid them), the per-voice SPU loop, and the per-function `CYC`/`EVT_CHECK` overhead in the
+  generated code (must keep cycle counts identical).
+
 ### What the render-quality modes see (runtime work, `--tex-filter` etc., AGENTS.md "Render quality")
 
 - The fight HUD (name lettering "GRADD"/"ANJIE", health-bar frames, round markers, "PUSH START")
