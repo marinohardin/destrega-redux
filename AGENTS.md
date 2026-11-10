@@ -1221,8 +1221,13 @@ The header comment of `hires_gpu.c` has the details.
   The perspective u/v path (PGXP on) was the largest remaining shader cost: sharing one
   reciprocal of q for u and v (`div24r`), skipping `span_end` unless the run is the span's last
   and a shift for the common n = 8 took the user configuration's fight from 5.7 to 4.85 ms/frame
-  (Metal, frames byte-identical). The GLSL still has the old form (equal results); port it
-  when DXC is at hand to regenerate DXIL.
+  (Metal, frames byte-identical). `shaders/hires.glsl` has the same form (`div24r`,
+  `span_end_beyond`, `ltdiv8` on `uvec2` pairs; SPIR-V and DXIL regenerated): Vulkan compare
+  counts unchanged (`test_vulkan.sh`: 0 pixels with PGXP off / affine, 24 (4:3) and 31 (16:9)
+  with PGXP on, as before), `test_hires_gpu` 114/114 0 pixels on MoltenVK and on D3D12 under
+  CrossOver. On MoltenVK the user configuration's fight showed no measurable gain (11.5-13.0
+  ms/frame before and after, alternated A/B at a load of ~100: the 64-bit emulation and exact
+  edge test dominate there).
 - Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
   mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
   chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), no DXBC

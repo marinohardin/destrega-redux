@@ -332,8 +332,8 @@ static const char s_msl[] =
  * which an exact edge comparison tells without the division in span_end; X == xr needs only U0;
  * trunc(a / 8) is a shift; div24r shares one float reciprocal of q between u and v instead of
  * four float divisions (the integer corrections keep it exact). Together 5.7 -> 4.85 ms per 4x6
- * fight frame on an M1 Pro, dumped frames byte-identical. MSL only so far: shaders/hires.glsl
- * keeps the old form (same values; regenerating DXIL needs DXC). */
+ * fight frame on an M1 Pro, dumped frames byte-identical. shaders/hires.glsl (Vulkan, D3D12)
+ * has the same form (div24r, span_end_beyond, ltdiv8 on uvec2 pairs). */
 "static inline bool span_end_beyond(device const Prim &p, int Y, long k) {\n"   /* ceil(right edge) > k */
 "  long Y16 = long(Y) * 65536;\n"
 "  long ax = p.ev[0], ay = p.ev[1], bx = p.ev[2], by = p.ev[3], cx = p.ev[4], cy = p.ev[5];\n"
