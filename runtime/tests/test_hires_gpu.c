@@ -176,6 +176,7 @@ static void compare(const char *what, u64 max_diff)
 static bool setup(int sx, int sy, int guard)
 {
     gpu_init();
+    gpu_enable_display_copy();   /* full 1x picture, as the windowed 15-bit fallback has */
     g_pgxp = false;
     hires_set_region(0, 0, 512, 480);
     hires_set_backend(NULL, hires_gpu_backend());

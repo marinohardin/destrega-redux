@@ -136,7 +136,18 @@ void gpu_write_gp1(u32 v);
 u32 gpu_read_data(void);              /* GPUREAD 0x1f801810 */
 u32 gpu_read_stat(void);              /* GPUSTAT 0x1f801814 */
 void gpu_vblank(void);                /* called at the start of each vblank */
-u16 *gpu_vram(void);                  /* 1024x512 16bpp */
+u16 *gpu_vram(void);                  /* 1024x512 16bpp: the emulated VRAM (hashed, saved) */
+/* The 1x picture: the presentation-only display copy when enabled, else the emulated VRAM (which
+ * lacks the pixels of primitives drawn inside the framebuffer region, see gpu.c). */
+u16 *gpu_display_vram(void);
+bool gpu_display_copy(void);
+void gpu_enable_display_copy(void);   /* keep the full 1x picture from now on (never turned off) */
+void gpu_set_skip_rule(bool on);      /* unit tests only: draw every primitive into the emulated VRAM */
+/* Guest reads of skipped framebuffer pixels so far: kind 0 equal values, 1 differing, 2 unverified. */
+u64 gpu_1x_observed(int kind);
+/* Polygons, rects and lines processed so far (changes whenever anything is drawn). */
+u64 gpu_prim_count(void);
+void gpu_1x_report(void);
 typedef struct {
     int x, y;          /* display area start in VRAM */
     int w, h;          /* resolution (e.g. 320x240) */

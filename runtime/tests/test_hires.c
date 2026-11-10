@@ -26,6 +26,7 @@ static u32 xy(int x, int y) { return ((u32)(y & 0xFFFF) << 16) | (u32)(x & 0xFFF
 static void setup(int sx, int sy)
 {
     gpu_init();
+    gpu_enable_display_copy();   /* the 1x picture these tests compare against (gpu.c skip rule) */
     hires_set_region(0, 0, 512, 480);
     hires_set_scale(0, 0);
     hires_set_scale(sx, sy);
@@ -164,7 +165,7 @@ static void test_fill_upload_copy(int Sx, int Sy)
 
 static u64 vram_hash(void)
 {
-    const u64 *w = (const u64 *)gpu_vram();
+    const u64 *w = (const u64 *)gpu_display_vram();
     u64 h = 1469598103934665603ull;
     for (int i = 0; i < 1024 * 512 * 2 / 8; i++) h = (h ^ w[i]) * 1099511628211ull;
     return h;
