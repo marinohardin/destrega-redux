@@ -1467,7 +1467,12 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     /* full VRAM upload, then seed the target from it (nearest-neighbour upscale) */
     memset(s_dirty, 0xFF, sizeof s_dirty);
     s_ready = true;
+    /* The seed pass samples the VRAM texture, so upload the seed picture first. Its framebuffer
+     * region may hold drawn pixels the emulated VRAM lacks (gpu.c skip rule); no primitive samples
+     * the framebuffer region, and later writes there re-upload from the emulated VRAM as usual. */
+    s_vram = hires_seed_vram(vram1x);
     ensure_vram(0, 0, VRAM_W, VRAM_H);
+    s_vram = vram1x;   /* the texture source from now on; the seed picture may be freed after this call */
     u32 idx;
     GPrim *g = new_prim(&idx);
     g->kf = K_SEED;

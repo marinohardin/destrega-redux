@@ -1413,10 +1413,14 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
     }
 }
 
+static const u16 *s_seed_src;   /* the picture for the configure() in progress (hires_seed_vram) */
+const u16 *hires_seed_vram(const u16 *vram1x) { return s_seed_src ? s_seed_src : vram1x; }
+
 static void seed(void)
 {
+    const u16 *pic = hires_seed_vram(s_vram);
     for (int y = 0; y < s_rh; y++) {
-        const u16 *src = &s_vram[(s_ry + y) * VRAM_W + s_rx];
+        const u16 *src = &pic[(s_ry + y) * VRAM_W + s_rx];
         if (s_t32) {
             u32 *row0 = s_t32 + (size_t)y * s_Sy * s_tw;
             memset(row0, 0, (size_t)s_tw * sizeof(u32));   /* the guard band starts black */
@@ -1671,7 +1675,9 @@ bool hires_set_scale(int sx, int sy)
     if (s_be->set_guard) s_be->set_guard(gx);
     if (s_shadow && s_shadow->set_guard) s_shadow->set_guard(gx);
     s_pend_fmt = fmt;
-    const bool ok = be->configure(seed_vram(), sx * n, sy * n, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh);
+    s_seed_src = seed_vram();   /* textures keep coming from the emulated VRAM; this is the picture only */
+    const bool ok = be->configure(gpu_vram(), sx * n, sy * n, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh);
+    s_seed_src = NULL;
     drop_seed();
     if (!ok) {
         off_state();
@@ -1698,7 +1704,10 @@ void hires_reseed(void)
     if (!g_hires) return;
     const HiresBackend *be = g_hires;
     s_pend_fmt = s_cur_fmt;
-    if (!be->configure(gpu_display_vram(), s_cur_sx, s_cur_sy, s_rx, s_ry, s_rw, s_rh)) off_state();
+    s_seed_src = gpu_display_vram();
+    const bool ok = be->configure(gpu_vram(), s_cur_sx, s_cur_sy, s_rx, s_ry, s_rw, s_rh);
+    s_seed_src = NULL;
+    if (!ok) off_state();
 }
 
 bool hires_get_scale(int *sx, int *sy)

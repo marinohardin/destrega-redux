@@ -74,7 +74,9 @@ typedef struct {
 typedef struct HiresBackend {
     const char *name;
     /* (Re)allocate the target for scales sx (horizontal) x sy (vertical) over the 1x VRAM rectangle (rx,ry,rw,rh)
-     * and seed it from `vram1x` by nearest-neighbour upscale. */
+     * and seed it by nearest-neighbour upscale from hires_seed_vram(vram1x). `vram1x` is the emulated 1x VRAM:
+     * the backend keeps it as its texture source for as long as the target lives. The seed picture is only
+     * valid during this call (it may be a temporary copy: never keep that pointer). */
     bool (*configure)(const u16 *vram1x, int sx, int sy, int rx, int ry, int rw, int rh);
     void (*tri)(const HiresPrim *p, const HiresVtx v[3]);
     void (*rect)(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g, u32 b,
@@ -218,6 +220,10 @@ int hires_ssaa(void);
 bool hires_reconfigure(void);
 /* Render scale of the allocated target (base x ssaa); false when off. */
 bool hires_get_render_scale(int *sx, int *sy);
+/* The picture a backend's configure() seeds its target from: a temporary copy of the displayed
+ * picture while the control layer reallocates a target, else `vram1x` itself. Only valid inside
+ * configure(); textures must always be read from configure's `vram1x`. */
+const u16 *hires_seed_vram(const u16 *vram1x);
 /* Pixel format the next configure() must allocate (for backends). */
 int hires_target_fmt(void);
 /* Rows [y0, y1) of the view as presented: RGBA8 (R in the low byte, A = 0xFF), each pixel the
