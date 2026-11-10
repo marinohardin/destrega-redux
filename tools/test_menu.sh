@@ -50,10 +50,11 @@ ln -s "$BINF" $D/a2/Destrega.iso     # a raw 2352-byte image named .iso is accep
 ( $BIN --headless --no-interp --data-dir $D/a --frames 1700 --press 1200:8 --dump $D/a --dump-every 1700 \
     --state-hash $D/a.hash --menu-action 5:load="$IMG" "$IMG" > $D/a.log 2>&1 || fail "load run failed (see $D/a.log)" ) &
 LA=$!
+if [ "${JOBS:-2}" -lt 2 ]; then wait $LA || fail "load run"; LA=; fi   # JOBS=1: one game at a time
 ( $BIN --headless --no-interp --data-dir $D/a2 --frames 300 \
     --menu-action 5:load=$D/a2/Destrega.iso "$IMG" > $D/a2.log 2>&1 || fail "iso load run failed (see $D/a2.log)" ) &
 LB=$!
-wait $LA || fail "load run"
+[ -z "$LA" ] || wait $LA || fail "load run"
 wait $LB || fail "iso load run"
 for l in a a2; do
   logok $D/$l.log "menu: load OK"

@@ -15,7 +15,7 @@
 #     more than TOL percent (default 25) or 1 ms is a WARNING only: the machine is noisy (other
 #     processes use the GPU too). With no entry for this machine it prints the numbers.
 # Usage: tools/quick_check.sh [--update-baseline]   (exit 0 = gameplay and renderer checks pass)
-# Env: TOL (percent), BIN, DESTREGA_PAK. Work files go to build/quick (TMPDIR too).
+# Env: TOL (percent), BIN, DESTREGA_PAK, JOBS (game processes at once in 1 + 2, default 4 = all at once). Work files go to build/quick (TMPDIR too).
 cd "$(dirname "$0")/.."
 BIN=${BIN:-./build/cmake/destrega}
 OUT=build/quick
@@ -29,9 +29,14 @@ MATCH=tools/replays/match_gradd_celia_hills.dtr.gz
 [ -x "$BIN" ] || { echo "quick_check: no $BIN (build first)"; exit 2; }
 START=$(date +%s)
 fail=0
+JOBS=${JOBS:-4}
+RJ=2; [ "$JOBS" -lt 4 ] && RJ=1   # the replays step runs two games with -j 2
+slot() { # wait until fewer than JOBS game processes run (the replays job counts RJ)
+  while [ $(( $(jobs -pr | wc -l) + RJ - 1 )) -ge "$JOBS" ] && [ "$(jobs -pr | wc -l)" -gt 0 ]; do sleep 1; done
+}
 
 # 1 + 2 concurrently
-DESTREGA_BIN=$BIN python3 tools/replays.py run vs_tieme_rohzen_villa 1p_reyus_cpu > $OUT/replays.txt 2>&1 &
+DESTREGA_BIN=$BIN python3 tools/replays.py run -j $RJ vs_tieme_rohzen_villa 1p_reyus_cpu > $OUT/replays.txt 2>&1 &
 RP=$!
 cmp_run() { # name extra...
   local n=$1; shift
@@ -39,8 +44,10 @@ cmp_run() { # name extra...
     --renderer compare --compare-every 10 --compare-max 0 --pgxp off \
     --resize 3600:3834x2328 --widescreen "$@" "${PAK[@]}" > $OUT/$n.log 2>&1
 }
+slot
 cmp_run cmp_default &
 C1=$!
+slot
 cmp_run cmp_window --tex-filter xbr --hires-colour full &
 C2=$!
 

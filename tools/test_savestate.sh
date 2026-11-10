@@ -15,25 +15,31 @@ BIN=./build/cmake/destrega
 P="--press 1200:8,1500:8,1800:8,2100:8,2400:4000,2700:4000,3000:4000,3300:4000,3600:4000"
 F=${SS_FRAMES:-6000}
 fail=0
-rm -f $D/card_plain.mcd $D/card_rewind.mcd $D/card_inplace.mcd
+rm -f $D/card_plain.mcd $D/card_rewind.mcd $D/card_inplace.mcd $D/t?.rc
+# The four runs are independent: JOBS at a time (default 4 = all at once).
+JOBS=${JOBS:-4}
 # 1: logo 100, FMV 400/700, title 1300, menu 1900/2200, character select 2450, stage load 3000, fight 3900/5000
-$BIN --headless --no-interp $P --frames $F \
+t1() { $BIN --headless --no-interp $P --frames $F \
   --savestate-test 100:130,400:460,700:790,1300:1360,1900:1930,2200:2260,2450:2510,3000:3090,3300:3360,3900:3960,5000:5240 \
-  > $D/test.log 2>&1 &
-T1=$!
-$BIN --headless --no-interp $P --frames $F --memcard1 $D/card_plain.mcd --ss-hash $D/plain.txt --state-hash $D/plain_sh.txt \
-  > $D/plain.log 2>&1 &
-T2=$!
-$BIN --headless --no-interp $P --frames $F --memcard1 $D/card_rewind.mcd --savestate-rewind 37:23 --ss-hash $D/rewind.txt \
+  > $D/test.log 2>&1; }
+t2() { $BIN --headless --no-interp $P --frames $F --memcard1 $D/card_plain.mcd --ss-hash $D/plain.txt --state-hash $D/plain_sh.txt \
+  > $D/plain.log 2>&1; }
+t3() { $BIN --headless --no-interp $P --frames $F --memcard1 $D/card_rewind.mcd --savestate-rewind 37:23 --ss-hash $D/rewind.txt \
   --state-hash $D/rewind_sh.txt \
-  > $D/rewind.log 2>&1 &
-T3=$!
-$BIN --headless --no-interp $P --frames $F --memcard1 $D/card_inplace.mcd --savestate-inplace 7 --state-hash $D/inplace_sh.txt > $D/inplace.log 2>&1 &
-T4=$!
-wait $T1 || { echo "savestate-test: FAIL (exit)"; fail=1; }
-wait $T2 || { echo "savestate plain run: FAIL (exit)"; fail=1; }
-wait $T3 || { echo "savestate rewind: FAIL (exit)"; fail=1; }
-wait $T4 || { echo "savestate in-place: FAIL (exit)"; fail=1; }
+  > $D/rewind.log 2>&1; }
+t4() { $BIN --headless --no-interp $P --frames $F --memcard1 $D/card_inplace.mcd --savestate-inplace 7 --state-hash $D/inplace_sh.txt > $D/inplace.log 2>&1; }
+i=0
+for t in t1 t2 t3 t4; do
+  ( $t; echo $? > $D/$t.rc ) &
+  i=$((i + 1))
+  if [ $((i % JOBS)) = 0 ]; then wait; fi
+done
+wait
+rc() { [ "$(cat $D/$1.rc 2>/dev/null)" = 0 ]; }
+rc t1 || { echo "savestate-test: FAIL (exit)"; fail=1; }
+rc t2 || { echo "savestate plain run: FAIL (exit)"; fail=1; }
+rc t3 || { echo "savestate rewind: FAIL (exit)"; fail=1; }
+rc t4 || { echo "savestate in-place: FAIL (exit)"; fail=1; }
 grep -E "^savestate" $D/test.log
 n=$(grep -c "re-run: identical" $D/test.log)
 [ "$n" = 11 ] || { echo "savestate-test: FAIL ($n of 11 points identical)"; fail=1; }

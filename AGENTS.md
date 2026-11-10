@@ -40,7 +40,8 @@ python3 recomp/recomp.py                                   # -> gen/*.c (≈1 s)
 cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake -j10
 ./build/cmake/destrega                                     # play from the data pack (first launch imports)
 ./build/cmake/destrega --import Destrega/Destrega.cue      # CLI import -> data pack
-tools/run_tests.sh                                         # verification (see below)
+tools/pr_check.sh                                          # check for every PR (see "Verification")
+tools/run_tests.sh                                         # full suite, before a release
 ```
 
 On macOS the default build also runs `tools/make_app.sh` (target
@@ -200,6 +201,41 @@ P2 slot `0x8001a268` (`Mxxx2.BIN`, `EVENTOVL.BIN`). See `recomp/overlays.py`.
 
 ## Verification
 
+**Policy.** The machine is shared: the old all-at-once `run_tests.sh` (load ~450 on 10 cores)
+made the whole Mac unusable for an hour.
+- Every PR: `tools/pr_check.sh` (a few minutes, `nice -n 10`, at most `PR_JOBS` (3) game processes).
+- Before a release, or when explicitly asked: the full `tools/run_tests.sh`.
+- Never two heavy test runs at once (yours or another agent's), and check `uptime` first: with a
+  load already near the core count, wait or lower `PR_JOBS` / `JOBS`.
+
+**PR check** (`tools/pr_check.sh [--all-groups] [--group NAME] [--base REF] [--dry-run]`): steps
+one after another (`tools/testlib.sh`), each with at most `PR_JOBS` games at once; a summary table
+with each step's result and time, the load average at start / end / peak (sampled every 10 s into
+`build/pr/load.log`) and the exit status. Always: build (`-DDESTREGA_TESTS=ON`), the CTest unit
+tests (without `hires_gpu*`), `smoke_test.sh`, `quick_check.sh`. Groups, picked from the files
+changed since the merge base with `origin/main` (plus uncommitted / untracked files; the header of
+the script has the exact patterns), each a small subset:
+- **net** (`runtime/net*`, `netplay*`, `portmap*`, `platform_net*`, `smooth*`): `test_netplay.py`
+  lan, wan, desync, menu_session (+ ping once it exists), `test_portmap.py`, and
+  `test_netplay_wine.py` mac_hosts / win_hosts only when `build/win/destrega.exe` and CrossOver exist.
+- **renderer** (`hires*`, `gpu.[ch]`, `pgxp*`, `shaders/`, `widescreen*`, `overrides/char_mesh.c`):
+  CTest `hires_gpu*`, `test_hires_determinism.sh` with `CASES="s4x6 verify1 c4x6"` and
+  `test_render_quality.sh` with `CASES="call169 cxbr43 glive"` (each plus its `off` reference).
+- **menus** (`menu_*`, `settings*`, `input*`, `controls_*`, `main.c`): `test_menu.sh` (its ~1 GB of
+  scratch is deleted after a pass), `test_input.py`, `test_governor.py` when present.
+- **core** (other `runtime/*.c|h`, `runtime/overrides/`, `recomp/`, `analysis/overrides.txt`,
+  `extra_seeds.txt`, procedure / overlay lists, `CMakeLists.txt`): scenarios `vs_hills`, `story`,
+  `option_game`, `practice`; replays `practice_gradd`, `opts_handicap_recover`,
+  `vs_falma_reyus_cave`; `test_savestate.sh`.
+- A group's own test scripts trigger it too; docs and other tools add nothing.
+
+**Full suite** (`tools/run_tests.sh`, the release suite; same coverage as ever): runs under
+`nice -n 10`, its steps one after another, each with at most `JOBS` game processes (default: half the
+performance cores, 4 on an M1 Pro); `DRY_RUN=1` lists the steps, `ONLY="unit smoke ..."` runs only those. The sub-scripts take `JOBS` too
+(`test_hires_determinism.sh`, `test_widescreen.sh`, `test_render_quality.sh`, `test_savestate.sh`,
+`quick_check.sh`, `test_windowed_determinism.sh`, `test_menu.sh`, `test_input.py`; the Python
+runners `-j`), and the hi-res and render-quality scripts `CASES="..."` for a subset.
+
 `tools/run_tests.sh`: GTE/GPU/SPU/MDEC unit tests + a headless smoke test that
 boots to a fight via scripted input and fails on FATAL / dispatch misses /
 unhandled BIOS calls / black screen. Useful headless flags:
@@ -210,7 +246,7 @@ Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000.
 `--press2 F:MASK,...` is the same for pad 2 (VS mode waits for it). Presses are taps (held 6 frames).
 `python3 tools/contact_sheet.py out.png frames...` tiles screenshots for review.
 
-**Quick check** (`tools/quick_check.sh`, ~25 s; run it before the full suite, after any
+**Quick check** (`tools/quick_check.sh`, ~25 s; part of `tools/pr_check.sh`, or alone after any
 runtime/renderer change): two replays (`vs_tieme_rohzen_villa`, `1p_reyus_cpu`: every frame's
 gameplay hashes and the state hash vs the recording); GPU == software (`--renderer compare
 --pgxp off --compare-max 0`, every 10th frame) on the Hills match replay at the 3834x2328 window
@@ -242,8 +278,7 @@ frame (`--keep`, `tools/contact_sheet.py`), then `scenarios.py record NAME` to s
 `tools/scenario_expect.json`. A scenario that exposes a real bug is `xfail=` (the run must still fail
 that way) and the bug goes in `analysis/NOTES.md`. `run_tests.sh` runs all scenarios (`--no-interp`,
 `--verify-overrides`) and the hi-res determinism / `--hires-verify` check on the `hires`-tagged
-subset (every stage; plus widescreen with PGXP on/off and the crack check `tools/check_ws_cracks.py`)
-concurrently with the rest; `SCENARIOS=0 tools/run_tests.sh` skips them.
+subset (every stage; plus widescreen with PGXP on/off and the crack check `tools/check_ws_cracks.py`); `SCENARIOS=0 tools/run_tests.sh` skips them.
 Headless runs ~200x real time (30k frames ≈ 13 s).
 
 ## Memory cards (`runtime/memcard.[ch]`, `bios.c`)
@@ -654,7 +689,7 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   (`netplay_smooth.py`, `test_netplay_wine.py --windowed`) pass `--net-portmap off`.
   `tools/fake_router.py`: PCP + NAT-PMP (one UDP port) and UPnP (HTTP, chunked description, SOAP),
   127.0.0.1 only, modes ok / unsupported / refuse / silent / permanent, external address settable,
-  enforces the PCP nonce, records every request. `tools/test_portmap.py` (last in `run_tests.sh`, alone, ~20 s):
+  enforces the PCP nonce, records every request. `tools/test_portmap.py` (last in `run_tests.sh`, ~20 s):
   `natpmp`, `pcp`, `upnp` (map, renewals at a 2 s lease, delete on Cancel or at exit; `upnp` also
   checks no UDP was sent), `upnp_permanent` (725 -> lease 0, no renewals, deleted at exit),
   `refused`, `cgnat` (100.72.1.9), `noanswer` (all three silent: message after ~6 s of timeouts;
@@ -942,7 +977,7 @@ hashing all emulated state per frame).
   Sx x Sy, including Sx != Sy; UV-bleed and 1x-sampled-range regressions; 0 vs 4 worker threads identical), `tools/test_hires_determinism.sh` (12 runs, 8 at a time, some with worker threads: off,
   2x2, 4x4, 8x8, 2x3, 4x6, a resize schedule with Sx != Sy, and the 1x1 equivalence run; all
   state hashes equal, >=95% of fight frames hi-res, 0 UV fetches outside the 1x-sampled range, UV clamp a no-op at 1x1). `tools/run_tests.sh` runs the unit
-  tests, `tools/smoke_test.sh` and the determinism script concurrently (~1.7 min).
+  tests, `tools/smoke_test.sh` and the determinism script.
 
 ## PGXP: sub-pixel vertices and perspective-correct textures (`runtime/pgxp.[ch]`)
 
