@@ -312,15 +312,46 @@ static const char s_msl[] =
 "  for (int k = 0; k < 8 && r2 >= q; k++) { r2 -= q; e++; }\n"
 "  return t * 16777216 + e; }\n"
 /* u (k = 0) and v (k = 1) in 8.24 at hi-res pixel X: q, u*q, v*q planes in 2^-38 */
+"static inline long div24r(long a, long q, float rq) {\n"   /* div24 with 1/q computed once for u and v */
+"  long t = long(floor(float(a) * rq)), r = a - t * q;\n"
+"  for (int k = 0; k < 8 && r < 0; k++) { r += q; t--; }\n"
+"  for (int k = 0; k < 8 && r >= q; k++) { r -= q; t++; }\n"
+"  long s = r << 24, e = long(float(s) * rq), r2 = s - e * q;\n"
+"  for (int k = 0; k < 16 && r2 < 0; k++) { r2 += q; e--; }\n"
+"  for (int k = 0; k < 16 && r2 >= q; k++) { r2 -= q; e++; }\n"
+"  return t * 16777216 + e; }\n"
 "static inline long2 persp_at(device const Prim &p, long X, int Y) {\n"
 "  long fx = X - long(p.porg[0]), fy = long(Y - p.porg[1]);\n"
 "  long q = p.pl[0] + p.pl[3] * fx + p.pl[6] * fy;\n"
 "  if (q <= 0) return long2(8388608, 8388608);\n"
 "  long a = p.pl[1] + p.pl[4] * fx + p.pl[7] * fy, b = p.pl[2] + p.pl[5] * fx + p.pl[8] * fy;\n"
-"  return long2(div24(a, q) + 8388608, div24(b, q) + 8388608); }\n"
-"static inline long2 persp_uv(device const Prim &p, long xs, long xe, long X, int Y) {\n"
-"  long xr = xs + ((X - xs) & ~7L), n = xe - xr < 8 ? xe - xr : 8;\n"
-"  long2 U0 = persp_at(p, xr, Y), U1 = persp_at(p, xr + n, Y);\n"
+"  float rq = 1.0f / float(q);\n"
+"  return long2(div24r(a, q, rq) + 8388608, div24r(b, q, rq) + 8388608); }\n"
+/* Same values as `n = min(span_end - xr, 8)`, U0 + (X - xr) * trunc((U1 - U0) / n), but cheaper
+ * (it was ~2 ms of a 4x6 fight frame): the run is a full 8 pixels unless it is the span's last,
+ * which an exact edge comparison tells without the division in span_end; X == xr needs only U0;
+ * trunc(a / 8) is a shift; div24r shares one float reciprocal of q between u and v instead of
+ * four float divisions (the integer corrections keep it exact). Together 5.7 -> 4.85 ms per 4x6
+ * fight frame on an M1 Pro, dumped frames byte-identical. MSL only so far: shaders/hires.glsl
+ * keeps the old form (same values; regenerating DXIL needs DXC). */
+"static inline bool span_end_beyond(device const Prim &p, int Y, long k) {\n"   /* ceil(right edge) > k */
+"  long Y16 = long(Y) * 65536;\n"
+"  long ax = p.ev[0], ay = p.ev[1], bx = p.ev[2], by = p.ev[3], cx = p.ev[4], cy = p.ev[5];\n"
+"  long px, py, qx, qy;\n"
+"  if ((p.kf & (1u << 20)) == 0u) { px = ax; py = ay; qx = cx; qy = cy; }\n"
+"  else if (Y16 < by) { px = ax; py = ay; qx = bx; qy = by; }\n"
+"  else { px = bx; py = by; qx = cx; qy = cy; }\n"
+"  long N = px * (qy - py) + (qx - px) * (Y16 - py), D = (qy - py) * 65536;\n"
+"  return N > k * D; }\n"
+"static inline long tdiv8(long a) { return a >= 0 ? (a >> 3) : -((-a) >> 3); }\n"
+"static inline long2 persp_uv(device const Prim &p, long xs, int cx2, long X, int Y) {\n"
+"  long xr = xs + ((X - xs) & ~7L);\n"
+"  long2 U0 = persp_at(p, xr, Y);\n"
+"  if (X == xr) return U0;\n"
+"  long n = 8;\n"
+"  if (xr + 8 > long(cx2) || !span_end_beyond(p, Y, xr + 7)) { long xe = long(span_end(p, Y, cx2)); n = xe - xr < 8 ? xe - xr : 8; }\n"
+"  long2 U1 = persp_at(p, xr + n, Y);\n"
+"  if (n == 8) return long2(U0.x + (X - xr) * tdiv8(U1.x - U0.x), U0.y + (X - xr) * tdiv8(U1.y - U0.y));\n"
 "  return long2(U0.x + (X - xr) * ldivs(U1.x - U0.x, int(n)), U0.y + (X - xr) * ldivs(U1.y - U0.y, int(n))); }\n"
 /* hires.c's attribute value at X: the plane equation at the span start, then stepped by the
  * per-pixel gradient truncated to an integer (gdx / Sx) */
@@ -379,8 +410,7 @@ static const char s_msl[] =
 "    if (tex) {\n"
 "      long U, V;\n"
 "      if ((kf & (1u << 21)) != 0u) {\n"
-"        int xe = span_end(p, Y, cx2);\n"
-"        long2 uv = persp_uv(p, long(xs), long(xe), long(X), Y);\n"
+"        long2 uv = persp_uv(p, long(xs), cx2, long(X), Y);\n"
 "        U = uv.x; V = uv.y;\n"
 "      } else { U = attr_span(p, 3, xs, X, m, u.sx, u.sy); V = attr_span(p, 4, xs, X, m, u.sx, u.sy); }\n"
 "      ulo = int(p.uvr & 255u); uhi = int((p.uvr >> 8) & 255u); vlo = int((p.uvr >> 16) & 255u); vhi = int(p.uvr >> 24);\n"
@@ -1437,7 +1467,12 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     /* full VRAM upload, then seed the target from it (nearest-neighbour upscale) */
     memset(s_dirty, 0xFF, sizeof s_dirty);
     s_ready = true;
+    /* The seed pass samples the VRAM texture, so upload the seed picture first. Its framebuffer
+     * region may hold drawn pixels the emulated VRAM lacks (gpu.c skip rule); no primitive samples
+     * the framebuffer region, and later writes there re-upload from the emulated VRAM as usual. */
+    s_vram = hires_seed_vram(vram1x);
     ensure_vram(0, 0, VRAM_W, VRAM_H);
+    s_vram = vram1x;   /* the texture source from now on; the seed picture may be freed after this call */
     u32 idx;
     GPrim *g = new_prim(&idx);
     g->kf = K_SEED;

@@ -153,7 +153,13 @@ static int s_script2_n;
 static void convert_display(int *ow, int *oh) {
     GpuDisplay d;
     gpu_get_display(&d);
-    u16 *vram = gpu_vram();
+    /* the 1x picture of a 15-bit display needs the display copy (gpu.c skip rule): a window falls
+     * back to 1x only when the hi-res target cannot show the display, so start it then */
+    if (d.enabled && !d.rgb24 && !gpu_display_copy()) {
+        rt_log("gpu-1x: presenting a 15-bit display from 1x VRAM: starting the display copy");
+        gpu_enable_display_copy();
+    }
+    u16 *vram = gpu_display_vram();
     int w = d.w > 640 ? 640 : d.w, h = d.h > 512 ? 512 : d.h;
     if (w <= 0 || h <= 0) { w = 320; h = 240; }
     for (int y = 0; y < h; y++) {
@@ -247,7 +253,7 @@ void frontend_screenshot(const char *path) {
 
 static void dump_vram(const char *path) {
     static u32 buf[1024 * 512];
-    u16 *v = gpu_vram();
+    u16 *v = gpu_display_vram();
     for (int i = 0; i < 1024 * 512; i++) {
         u16 p = v[i];
         buf[i] = 0xff000000u | (((p >> 10) & 31) << 19) | (((p >> 5) & 31) << 11) | ((p & 31) << 3);
@@ -259,6 +265,7 @@ static void dump_vram(const char *path) {
  * Host input -> pad masks lives in input.c (keyboard, controllers, bindings, press-to-bind). Here:
  * the SDL event loop, the window's own keys (which never reach a pad) and the --press scripts. */
 
+static int s_gpu1x;          /* --gpu-1x: 0 auto, 1 copy, 2 skip (display copy of the 1x picture), 3 draw (no skip rule) */
 static bool s_host_input;   /* headless: --input-event given, so host input feeds the pads */
 static void window_settings_event(const SDL_Event *e);
 
@@ -694,6 +701,7 @@ extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g
 static void finish(void) {
     ss_finish();   /* savestate / replay / netplay reports (savestate.c) */
     void widescreen_report(void); widescreen_report();
+    gpu_1x_report();
     void char_mesh_report(void); char_mesh_report();
     if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
     if (!s_headless) rt_log("audio: %u host-side underrun pads in %llu frames", g_audio_underruns, (unsigned long long)s_frame);
@@ -1330,6 +1338,9 @@ static void usage(void) {
         "  --gameplay-trace FILE per frame: fighters' health/gauge/position, round time, wins, RNG seed\n"
         "  --ram-snap DIR        write raw guest RAM + scratchpad to DIR every --ram-snap-every N frames (100)\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
+        "  --gpu-1x MODE         auto|copy|skip|draw: 1x primitives inside the framebuffer region are not\n"
+        "                        drawn into the emulated VRAM (gpu.c); copy keeps the full 1x picture for\n"
+        "                        presentation, skip never does, draw turns the rule off (old state hashes)\n"
         "  --renderer R          hi-res renderer: software, gpu (SDL_GPU: Metal or Vulkan), or compare\n"
         "                        (default: gpu in a window when a device exists, else software; headless:\n"
         "                        software; macOS View > Renderer switches at runtime)\n"
@@ -2050,6 +2061,14 @@ int main(int argc, char **argv) {
             s_state_hash = fopen(argv[++i], "wb");
             if (!s_state_hash) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
         }
+        else if (!strcmp(argv[i], "--gpu-1x") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "auto")) s_gpu1x = 0;
+            else if (!strcmp(m, "copy")) s_gpu1x = 1;
+            else if (!strcmp(m, "skip")) s_gpu1x = 2;
+            else if (!strcmp(m, "draw")) s_gpu1x = 3;
+            else { fprintf(stderr, "--gpu-1x: expected auto, copy, skip or draw\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--resize") && i + 1 < argc) {
             char *s = argv[++i];
             while (*s && s_resize_n < 256) {
@@ -2196,6 +2215,21 @@ int main(int argc, char **argv) {
         rt_log("hires: cannot allocate scale %dx%d", s_opt_sx, s_opt_sy);
     else if (s_headless && res_auto()) apply_window_size(s_pres_w, s_pres_h, true);   /* --scale auto */
     log_render_quality("");
+    {   /* the full 1x picture (gpu.c display copy): presentation only, the emulated VRAM is the same */
+        bool early_hires = hires_get_scale(NULL, NULL);
+        for (int k = 0; k < s_resize_n; k++) early_hires |= s_resizes[k].frame <= 1;
+        if (s_gpu1x == 3) {
+            /* draw every primitive into the emulated VRAM, as builds before the skip rule did: the
+             * complete state hash then differs from other runs, so never in a netplay session */
+            bool net = false;
+            for (int k = 1; k < argc; k++) net |= !strcmp(argv[k], "--host") || !strcmp(argv[k], "--join");
+            if (net) { rt_log("gpu-1x: draw ignored in a netplay session (both players must hash the same VRAM)"); s_gpu1x = 0; }
+            else { gpu_set_skip_rule(false); rt_log("gpu-1x: skip rule off, every primitive drawn into the emulated VRAM"); }
+        }
+        bool on = s_gpu1x == 1 || (s_gpu1x == 0 && (s_verify || (s_headless && !early_hires)));
+        if (on) gpu_enable_display_copy();
+        rt_log("gpu-1x: display copy %s", on ? "on (full 1x picture)" : "off (the picture comes from the hi-res target)");
+    }
     spu_init();
     mdec_init();
 

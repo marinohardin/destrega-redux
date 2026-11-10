@@ -909,6 +909,27 @@ target out; swap it for a GPU backend later) to a separate target covering VRAM
 machine, so resolution cannot affect gameplay (`tools/test_hires_determinism.sh` proves it by
 hashing all emulated state per frame).
 
+- **1x skip rule** (`gpu.c` header, NOTES.md "Rendering: what the 1x VRAM holds"): polygons,
+  rects and lines whose draw area lies inside the 512x480 framebuffer region are **not**
+  rasterized into the emulated VRAM (the game never reads drawn framebuffer pixels back; the
+  u/v and colour ranges the hi-res clamp needs are still tracked). Fills, uploads, copies and
+  everything outside the region are emulated as before. The rule depends only on the guest's
+  draw area, so every renderer, scale, window, widescreen setting and netplay peer computes the
+  same VRAM; it changed the complete state hash (VRAM is hashed) but no gameplay field: the
+  replays' `s` lines were re-recorded for that reason only, and `--gpu-1x draw` (rule off, never
+  in netplay) reproduces the old per-frame `--state-hash` byte for byte. It roughly halves the
+  CPU time of a plain 1x run (fight 0.94 -> 0.50 ms/frame with `--gpu-1x skip`) and cuts the
+  user configuration's main-thread CPU by ~25 % (that run is GPU-bound, so its wall time is
+  unchanged). The picture comes from the hi-res target; a presentation-only **display copy**
+  (`gpu_display_vram()`, never hashed or saved) receives every write including the skipped
+  pixels where the 1x picture is needed: `--gpu-1x copy`, headless runs without hi-res (dumps),
+  `--hires-verify`, and lazily when a window has to present a 15-bit display from 1x VRAM.
+  `--gpu-1x auto|copy|skip|draw` (default auto). A target reallocated between frames (resize,
+  resolution / renderer / SSAA / colour change) is seeded from the old target sampled at each 1x
+  pixel centre (`keep_picture` in hires.c), so it shows no black frames; a save-state load
+  (`hires_reseed`) seeds from the display VRAM, i.e. without the copy the screen region is black
+  until the game redraws it (2 game updates; netplay rollbacks do not reseed). A tile map of
+  skipped pixels logs every guest observation of them (`gpu-1x:` summary line: must stay 0).
 - Rules match the 1x GPU: same top-left fill rule, colour/texture math, mask bit and
   semi-transparency (applied against hi-res destination pixels). At 1x1 the target is
   bit-identical to the 1x VRAM region (`--hires-verify`).
@@ -1197,6 +1218,11 @@ The header comment of `hires_gpu.c` has the details.
   0 pixels with `--pgxp off`, the PGXP-on difference counts unchanged, `test_hires_gpu` 0.
   Any new per-pixel `/` or `%` in the MSL costs real time: use the float-estimate + exact-correction
   helpers (`floordiv`, `lceil`, `div24`) or precompute per primitive.
+  The perspective u/v path (PGXP on) was the largest remaining shader cost: sharing one
+  reciprocal of q for u and v (`div24r`), skipping `span_end` unless the run is the span's last
+  and a shift for the common n = 8 took the user configuration's fight from 5.7 to 4.85 ms/frame
+  (Metal, frames byte-identical). The GLSL still has the old form (equal results); port it
+  when DXC is at hand to regenerate DXIL.
 - Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
   mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
   chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), no DXBC

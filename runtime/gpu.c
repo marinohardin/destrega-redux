@@ -13,11 +13,42 @@
 #include "pgxp.h"
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 #define VRAM_W 1024
 #define VRAM_H 512
 
 static u16 s_vram[VRAM_W * VRAM_H];
+
+/* ---- 1x drawing rule (see "Rendering: what the 1x VRAM holds" in analysis/NOTES.md) -------------
+ * The emulated VRAM (s_vram: hashed, saved, read back by the CPU, sampled for textures) does not
+ * receive the pixels of polygons, rects and lines whose draw area lies inside the framebuffer
+ * region FB_W x FB_H: the game never reads, samples or copies drawn framebuffer pixels back
+ * (verified by instrumentation over every scenario), so nothing in the emulated machine can depend
+ * on them, and rasterizing them at 1x was half of the emulation's CPU time. The rule depends only on
+ * guest state (the draw area), never on the renderer, scale, window or widescreen, so every
+ * configuration and every netplay peer computes the same VRAM. Fills, uploads, copies, GPU state
+ * and everything outside the region are emulated exactly as before.
+ *
+ * The picture itself comes from the hi-res target. Where the 1x picture is needed (no hi-res
+ * target, headless dumps, --hires-verify, a 15-bit display the target cannot show) a
+ * presentation-only display copy (s_dvram) receives every VRAM write including the skipped pixels:
+ * it is what s_vram used to be. It is never hashed or saved and nothing emulated reads it.
+ *
+ * Safety net: a 16x16-tile map of region tiles holding skipped pixels. Any guest observation of
+ * such a tile (VRAM->CPU read, texture/CLUT sampling, a copy out of the region, a masked write
+ * over it) is logged and counted (gpu-1x summary line); with the display copy the observed values
+ * are compared exactly, so a harmless observation (equal values) is told apart. */
+#define FB_W 512
+#define FB_H 480
+#define TILE 16
+#define TW (FB_W / TILE)
+#define TH (FB_H / TILE)
+static bool s_skip_rule = true;   /* the rule above; off only in unit tests (gpu_set_skip_rule) */
+static u16 *s_dvram;              /* presentation-only display copy, NULL = none */
+static u8 s_skipped[TH][TW];      /* tiles holding skipped pixels (diagnostics only, not state) */
+static bool s_any_skipped;
+static u64 s_n_skipped, s_n_drawn, s_obs_benign, s_obs_differ, s_obs_unverified, s_obs_logged;
 
 /* Optional presentation-only hi-res target (hires.c). Every drawing command is also
  * forwarded there; nothing in it is ever read back into the emulated machine. */
@@ -130,21 +161,22 @@ typedef struct {
     u16 mask_or;
     bool mask_check;
     u32 tw_and_u, tw_or_u, tw_and_v, tw_or_v;
+    u16 *px;            /* VRAM drawn into and sampled: s_vram, or the display copy */
 } Prim;
 
 static inline u16 tex_fetch(const Prim *p, int depth, u32 u, u32 v)
 {
     u = (u & p->tw_and_u) | p->tw_or_u;
     v = (v & p->tw_and_v) | p->tw_or_v;
-    const u16 *row = &s_vram[((p->tp_y + v) & 511) * VRAM_W];
+    const u16 *row = &p->px[((p->tp_y + v) & 511) * VRAM_W];
     if (depth == 0) {
         u16 w = row[(p->tp_x + (u >> 2)) & 1023];
         u32 idx = (w >> ((u & 3) * 4)) & 0xF;
-        return s_vram[p->clut_y * VRAM_W + ((p->clut_x + idx) & 1023)];
+        return p->px[p->clut_y * VRAM_W + ((p->clut_x + idx) & 1023)];
     } else if (depth == 1) {
         u16 w = row[(p->tp_x + (u >> 1)) & 1023];
         u32 idx = (w >> ((u & 1) * 8)) & 0xFF;
-        return s_vram[p->clut_y * VRAM_W + ((p->clut_x + idx) & 1023)];
+        return p->px[p->clut_y * VRAM_W + ((p->clut_x + idx) & 1023)];
     } else {
         return row[(p->tp_x + u) & 1023];
     }
@@ -189,7 +221,7 @@ static inline __attribute__((always_inline)) void
 plot(const Prim *p, int x, int y, u32 r, u32 g, u32 b, u32 u, u32 v,
      const int TEX, const int DEPTH, const int RAW, const int SEMI, const int DITHER)
 {
-    u16 *dst = &s_vram[y * VRAM_W + x];
+    u16 *dst = &p->px[y * VRAM_W + x];
     if (p->mask_check && (*dst & 0x8000)) return;
     u16 out;
     bool do_blend;
@@ -286,7 +318,7 @@ static inline __attribute__((always_inline)) void
 span(const Prim *p, const Grad *gr, int y, int xs, int xe,
      u32 r, u32 g, u32 b, u32 u, u32 v,
      const int TEX, const int DEPTH, const int RAW, const int SEMI,
-     const int GOUR, const int DITHER)
+     const int GOUR, const int DITHER, const int PLOT)
 {
     const u32 drdx = gr->drdx, dgdx = gr->dgdx, dbdx = gr->dbdx, dudx = gr->dudx, dvdx = gr->dvdx;
     if (TEX && s_uv_track) uv_track_span(u, v, dudx, dvdx, xe - xs);
@@ -295,6 +327,7 @@ span(const Prim *p, const Grad *gr, int y, int xs, int xe,
         col_track_span(1, g, dgdx, xe - xs);
         col_track_span(2, b, dbdx, xe - xs);
     }
+    if (!PLOT) return;   /* track-only pass: the hi-res clamp ranges without drawing (skip rule) */
     for (int x = xs; x < xe; x++) {
         plot(p, x, y, r >> FRAC, g >> FRAC, b >> FRAC, u >> FRAC, v >> FRAC,
              TEX, DEPTH, RAW, SEMI, DITHER);
@@ -313,7 +346,7 @@ static inline s64 floor_div(s64 a, s64 b)
 static inline __attribute__((always_inline)) void
 tri_impl(const Prim *p, const Vtx *v0, const Vtx *v1, const Vtx *v2,
          const int TEX, const int DEPTH, const int RAW, const int SEMI,
-         const int GOUR, const int DITHER)
+         const int GOUR, const int DITHER, const int PLOT)
 {
     const Prim lp = *p; /* local copy: keeps fields in registers despite VRAM stores */
     /* sort by y */
@@ -383,7 +416,7 @@ tri_impl(const Prim *p, const Vtx *v0, const Vtx *v1, const Vtx *v2,
                     u += gr.dudx * rx + gr.dudy * ry;
                     v += gr.dvdx * rx + gr.dvdy * ry;
                 }
-                span(&lp, &gr, y, xs, xe, r, g, bb, u, v, TEX, DEPTH, RAW, SEMI, GOUR, DITHER);
+                span(&lp, &gr, y, xs, xe, r, g, bb, u, v, TEX, DEPTH, RAW, SEMI, GOUR, DITHER, PLOT);
             }
             lx += long_step;
             sx += short_step;
@@ -395,7 +428,16 @@ typedef void (*TriFn)(const Prim *, const Vtx *, const Vtx *, const Vtx *);
 
 #define TRI_FN(name, TEX, DEPTH, RAW, SEMI, GOUR, DITHER)                         \
     static void name(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c)   \
-    { tri_impl(p, a, b, c, TEX, DEPTH, RAW, SEMI, GOUR, DITHER); }
+    { tri_impl(p, a, b, c, TEX, DEPTH, RAW, SEMI, GOUR, DITHER, 1); }
+#define TRI_TRK(name, TEX, GOUR)                                                  \
+    static void name(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c)   \
+    { tri_impl(p, a, b, c, TEX, 2, 0, 0, GOUR, 0, 0); }
+/* track-only: [tex][gour], the UV / colour ranges the 1x draw would sample, no pixels */
+TRI_TRK(tri_trk_00, 0, 0)
+TRI_TRK(tri_trk_01, 0, 1)
+TRI_TRK(tri_trk_10, 1, 0)
+TRI_TRK(tri_trk_11, 1, 1)
+static const TriFn s_tri_trk[2][2] = { { tri_trk_00, tri_trk_01 }, { tri_trk_10, tri_trk_11 } };
 
 /* untextured: index = semi*4 + gour*2 + dither */
 TRI_FN(tri_u000, 0, 0, 0, 0, 0, 0)
@@ -450,6 +492,84 @@ static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool sem
         if (s_shadow_side == 0) { h->clip_x2 = s_clip_x1 - 1; h->clip_x1 = s_clip_x1 - g_hires_guard; }
         else { h->clip_x1 = s_clip_x2 + 1; h->clip_x2 = s_clip_x2 + g_hires_guard; }
     }
+}
+
+/* ---- skip rule bookkeeping (see the top of the file) ---------------------------------------- */
+
+static inline bool area_in_fb(void) { return s_skip_rule && s_clip_x2 < FB_W && s_clip_y2 < FB_H; }
+
+/* the pixels of a skipped primitive lie in [x0,x1] x [y0,y1] (inclusive), clipped to the draw area */
+static void mark_skipped(int x0, int y0, int x1, int y1)
+{
+    if (x0 < s_clip_x1) x0 = s_clip_x1;
+    if (y0 < s_clip_y1) y0 = s_clip_y1;
+    if (x1 > s_clip_x2) x1 = s_clip_x2;
+    if (y1 > s_clip_y2) y1 = s_clip_y2;
+    if (x0 > x1 || y0 > y1) return;
+    for (int ty = y0 / TILE; ty <= y1 / TILE; ty++) memset(&s_skipped[ty][x0 / TILE], 1, (size_t)(x1 / TILE - x0 / TILE + 1));
+    s_any_skipped = true;
+}
+
+/* does the VRAM rectangle (wrapping like the hardware) touch a tile holding skipped pixels? */
+static bool rect_skipped(int x, int y, int w, int h)
+{
+    if (!s_any_skipped || w <= 0 || h <= 0) return false;
+    for (int ty = 0; ty < TH; ty++) {
+        int y0 = ty * TILE;
+        if (!(((y0 - y) & 511) < h || ((y - y0) & 511) < TILE)) continue;
+        for (int tx = 0; tx < TW; tx++) {
+            if (!s_skipped[ty][tx]) continue;
+            int x0 = tx * TILE;
+            if (((x0 - x) & 1023) < w || ((x - x0) & 1023) < TILE) return true;
+        }
+    }
+    return false;
+}
+
+/* a write that replaces every pixel of the rectangle: tiles it covers completely are real again */
+static void rect_written(int x, int y, int w, int h)
+{
+    if (!s_any_skipped || x + w > VRAM_W || y + h > VRAM_H) return;
+    for (int ty = (y + TILE - 1) / TILE; ty < TH && (ty + 1) * TILE <= y + h; ty++)
+        for (int tx = (x + TILE - 1) / TILE; tx < TW && (tx + 1) * TILE <= x + w; tx++) s_skipped[ty][tx] = 0;
+}
+
+static void taint_rect(int x, int y, int w, int h)   /* a copy of skipped pixels inside the region */
+{
+    for (int ty = y / TILE; ty <= (y + h - 1) / TILE && ty < TH; ty++)
+        for (int tx = x / TILE; tx <= (x + w - 1) / TILE && tx < TW; tx++) s_skipped[ty][tx] = 1;
+    s_any_skipped = true;
+}
+
+/* The guest observes the VRAM rectangle (what = kind). Only called when it touches skipped tiles.
+ * With the display copy, equal values mean the observation cannot tell the difference. */
+static void observe(const char *what, int x, int y, int w, int h)
+{
+    const char *res = "unverified (no display copy)";
+    if (s_dvram) {
+        bool same = true;
+        for (int j = 0; j < h && same; j++)
+            for (int i = 0; i < w; i++) {
+                int k = ((y + j) & 511) * VRAM_W + ((x + i) & 1023);
+                if (s_vram[k] != s_dvram[k]) { same = false; break; }
+            }
+        if (same) { s_obs_benign++; return; }
+        s_obs_differ++;
+        res = "VALUES DIFFER";
+    } else s_obs_unverified++;
+    if (s_obs_logged++ < 10)
+        rt_log("gpu-1x: the guest observes skipped framebuffer pixels: %s %dx%d at (%d,%d): %s", what, w, h, x, y, res);
+}
+
+/* texture page and CLUT of a textured primitive */
+static void observe_tex(const Prim *p)
+{
+    if (!s_any_skipped) return;
+    int pw = 64 << p->depth;
+    if (((int)p->tp_x < FB_W || (int)p->tp_x + pw > VRAM_W) && rect_skipped((int)p->tp_x, (int)p->tp_y, pw, 256))
+        observe("texture page", (int)p->tp_x, (int)p->tp_y, pw, 256);
+    if (p->depth < 2 && (int)p->clut_y < FB_H && rect_skipped((int)p->clut_x, (int)p->clut_y, p->depth ? 256 : 16, 1))
+        observe("CLUT", (int)p->clut_x, (int)p->clut_y, p->depth ? 256 : 16, 1);
 }
 
 /* Precise (PGXP) position of a polygon vertex for the hi-res target: offsets from the integer
@@ -514,15 +634,16 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     s_col_track = g_hires && gour;
     if (s_col_track) for (int i = 0; i < 3; i++) { s_trk_cmin[i] = 1 << 20; s_trk_cmax[i] = -1; }
 
-    if (!tex) {
-        int idx = (semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0);
-        s_tri_untex[idx](p, a, b, c);
-    } else if (raw) {
-        s_tri_tex[p->depth][semi ? 1 : 0](p, a, b, c);
-    } else {
-        int idx = 2 + ((semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0));
-        s_tri_tex[p->depth][idx](p, a, b, c);
-    }
+    TriFn fn;
+    if (!tex) fn = s_tri_untex[(semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0)];
+    else if (raw) fn = s_tri_tex[p->depth][semi ? 1 : 0];
+    else fn = s_tri_tex[p->depth][2 + ((semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0))];
+    Prim q = *p;
+    const bool skip = area_in_fb();
+    if (skip) { s_n_skipped++; mark_skipped(minx, miny, maxx, maxy); }
+    else { s_n_drawn++; q.px = s_vram; fn(&q, a, b, c); }
+    if (s_dvram) { q.px = s_dvram; fn(&q, a, b, c); }
+    else if (skip && (s_uv_track || s_col_track)) s_tri_trk[tex][gour](&q, a, b, c);
 
     /* forward to the hi-res target after the 1x draw, with the UV range 1x actually sampled */
     if (g_hires && no_hires) { s_uv_track = false; s_col_track = false; }
@@ -668,6 +789,7 @@ static void gp0_polygon(const u32 *w)
     if (tex && raw) {
         for (int k = 0; k < n; k++) v[k].r = v[k].g = v[k].b = 0x80;
     }
+    if (tex && !s_shadow) observe_tex(&p);
     if (want_pv) {
         pgxp_check_tri(pq, pxy);
         if (quad) pgxp_check_tri(pq + 1, pxy + 1);
@@ -771,11 +893,13 @@ static void gp0_rect(const u32 *w)
         s_shadow_side = 0;
     }
     if (s_shadow) return;
-    if (!tex) {
-        (semi ? rect_u1 : rect_u0)(&p, x, y, wd, ht, r, g, b, 0, 0, false, false);
-    } else {
-        s_rect_tex[p.depth][(raw ? 2 : 0) | (semi ? 1 : 0)](&p, x, y, wd, ht, r, g, b, u0, v0, fx, fy);
-    }
+    if (tex) observe_tex(&p);
+    RectFn fn = !tex ? (semi ? rect_u1 : rect_u0) : s_rect_tex[p.depth][(raw ? 2 : 0) | (semi ? 1 : 0)];
+    if (!tex) { u0 = v0 = 0; fx = fy = false; }
+    const bool skip = area_in_fb();
+    if (skip) { s_n_skipped++; mark_skipped(x, y, x + wd - 1, y + ht - 1); }
+    else { s_n_drawn++; p.px = s_vram; fn(&p, x, y, wd, ht, r, g, b, u0, v0, fx, fy); }
+    if (s_dvram) { p.px = s_dvram; fn(&p, x, y, wd, ht, r, g, b, u0, v0, fx, fy); }
 }
 
 /* ---- lines ----------------------------------------------------------------- */
@@ -803,6 +927,15 @@ static void draw_line(int x0, int y0, u32 c0, int x1, int y1, u32 c1, bool gour,
         s_shadow_side = 0;
     }
     if (s_shadow) return;
+    const bool skip = area_in_fb();
+    if (skip) {
+        s_n_skipped++;
+        mark_skipped(x0 < x1 ? x0 : x1, y0 < y1 ? y0 : y1, x0 < x1 ? x1 : x0, y0 < y1 ? y1 : y0);
+    } else s_n_drawn++;
+    u16 *const tg[2] = { skip ? s_dvram : s_vram, skip ? NULL : s_dvram };
+    for (int t = 0; t < 2; t++) {
+    if (!tg[t]) continue;
+    p.px = tg[t];
     int k = adx > ady ? adx : ady;
     /* 32.32 fixed point positions, centered */
     s64 xf = ((s64)x0 << 32) + (1ll << 31);
@@ -836,6 +969,7 @@ static void draw_line(int x0, int y0, u32 c0, int x1, int y1, u32 c1, bool gour,
         xf += sx; yf += sy;
         r += dr; g += dg; b += db;
     }
+    }
 }
 
 /* ---- VRAM ops ----------------------------------------------------------- */
@@ -848,19 +982,24 @@ static void gp0_fill(const u32 *w)
     int wd = (int)(((w[2] & 0x3FF) + 0xF) & ~0xFu);
     int ht = (int)((w[2] >> 16) & 0x1FF);
     if (g_hires) g_hires->fill(x, y, wd, ht, c);
+    rect_written(x, y, wd, ht);
+    for (int t = 0; t < 2; t++) {
+    u16 *base = t ? s_dvram : s_vram;
+    if (!base) continue;
     for (int j = 0; j < ht; j++) {
-        u16 *row = &s_vram[((y + j) & 511) * VRAM_W];
+        u16 *row = &base[((y + j) & 511) * VRAM_W];
         if (x + wd <= VRAM_W) {
             for (int i = 0; i < wd; i++) row[x + i] = c;
         } else {
             for (int i = 0; i < wd; i++) row[(x + i) & 1023] = c;
         }
     }
+    }
 }
 
-static inline void vram_put(int x, int y, u16 v)
+static inline void vram_put(u16 *base, int x, int y, u16 v)
 {
-    u16 *d = &s_vram[(y & 511) * VRAM_W + (x & 1023)];
+    u16 *d = &base[(y & 511) * VRAM_W + (x & 1023)];
     if (s_mask_check && (*d & 0x8000)) return;
     *d = v | (s_mask_set ? 0x8000 : 0);
 }
@@ -873,10 +1012,23 @@ static void gp0_copy(const u32 *w)
     int ht = (int)((((w[3] >> 16) & 0xFFFF) - 1) & 0x1FF) + 1;
     static u16 buf[1024];
     if (g_hires) g_hires->copy(sx, sy, dx, dy, wd, ht, s_mask_check, s_mask_set);
-    for (int j = 0; j < ht; j++) {
-        const u16 *src = &s_vram[((sy + j) & 511) * VRAM_W];
-        for (int i = 0; i < wd; i++) buf[i] = src[(sx + i) & 1023];
-        for (int i = 0; i < wd; i++) vram_put(dx + i, dy + j, buf[i]);
+    if (s_any_skipped) {
+        if (s_mask_check && rect_skipped(dx, dy, wd, ht)) observe("masked copy destination", dx, dy, wd, ht);
+        if (rect_skipped(sx, sy, wd, ht)) {
+            /* skipped pixels copied within the region stay unobservable (the destination is
+             * tracked like them); copied anywhere else they become texture data */
+            if (dx + wd <= FB_W && dy + ht <= FB_H) taint_rect(dx, dy, wd, ht);
+            else observe("copy source", sx, sy, wd, ht);
+        } else if (!s_mask_check) rect_written(dx, dy, wd, ht);
+    }
+    for (int t = 0; t < 2; t++) {
+        u16 *base = t ? s_dvram : s_vram;
+        if (!base) continue;
+        for (int j = 0; j < ht; j++) {
+            const u16 *src = &base[((sy + j) & 511) * VRAM_W];
+            for (int i = 0; i < wd; i++) buf[i] = src[(sx + i) & 1023];
+            for (int i = 0; i < wd; i++) vram_put(base, dx + i, dy + j, buf[i]);
+        }
     }
 }
 
@@ -902,7 +1054,8 @@ static void cpu2vram_word(u32 v)
         if (g_hires)
             g_hires->put(s_wr.x + s_wr.cx, s_wr.y + s_wr.cy, (u16)(k ? v >> 16 : v),
                          s_mask_check, s_mask_set);
-        vram_put(s_wr.x + s_wr.cx, s_wr.y + s_wr.cy, (u16)(k ? v >> 16 : v));
+        vram_put(s_vram, s_wr.x + s_wr.cx, s_wr.y + s_wr.cy, (u16)(k ? v >> 16 : v));
+        if (s_dvram) vram_put(s_dvram, s_wr.x + s_wr.cx, s_wr.y + s_wr.cy, (u16)(k ? v >> 16 : v));
         xfer_advance(&s_wr);
     }
     if (!s_wr.remaining) s_mode = MODE_CMD;
@@ -999,10 +1152,16 @@ static void gp0_execute(const u32 *w)
     case 5:
         xfer_setup(&s_wr, w);
         s_mode = MODE_CPU2VRAM;
+        if (s_any_skipped) {
+            if (s_mask_check && rect_skipped(s_wr.x, s_wr.y, s_wr.w, s_wr.h))
+                observe("masked upload destination", s_wr.x, s_wr.y, s_wr.w, s_wr.h);
+            else if (!s_mask_check) rect_written(s_wr.x, s_wr.y, s_wr.w, s_wr.h);
+        }
         break;
     case 6:
         xfer_setup(&s_rd, w);
         s_rd_active = true;
+        if (rect_skipped(s_rd.x, s_rd.y, s_rd.w, s_rd.h)) observe("VRAM->CPU read", s_rd.x, s_rd.y, s_rd.w, s_rd.h);
         break;
     default:
         gp0_env(w[0]);
@@ -1230,6 +1389,28 @@ void gpu_vblank(void)
 }
 
 u16 *gpu_vram(void) { return s_vram; }
+u16 *gpu_display_vram(void) { return s_dvram ? s_dvram : s_vram; }
+bool gpu_display_copy(void) { return s_dvram != NULL; }
+
+void gpu_enable_display_copy(void)
+{
+    if (s_dvram || !s_skip_rule) return;   /* without the rule the emulated VRAM is the picture */
+    s_dvram = malloc(sizeof s_vram);
+    if (!s_dvram) { rt_log("gpu-1x: cannot allocate the display copy"); return; }
+    memcpy(s_dvram, s_vram, sizeof s_vram);
+}
+
+void gpu_set_skip_rule(bool on) { s_skip_rule = on; }
+u64 gpu_prim_count(void) { return s_n_skipped + s_n_drawn; }
+u64 gpu_1x_observed(int kind) { return kind == 0 ? s_obs_benign : kind == 1 ? s_obs_differ : s_obs_unverified; }
+
+void gpu_1x_report(void)
+{
+    rt_log("gpu-1x: %llu primitives inside the framebuffer region not drawn into the emulated VRAM, %llu drawn;"
+           " display copy %s; guest observations of skipped pixels: %llu with equal values, %llu differing, %llu unverified",
+           (unsigned long long)s_n_skipped, (unsigned long long)s_n_drawn, s_dvram ? "on" : "off",
+           (unsigned long long)s_obs_benign, (unsigned long long)s_obs_differ, (unsigned long long)s_obs_unverified);
+}
 
 void gpu_get_display(GpuDisplay *d)
 {
@@ -1249,6 +1430,9 @@ void gpu_get_display(GpuDisplay *d)
 void gpu_init(void)
 {
     memset(s_vram, 0, sizeof s_vram);
+    if (s_dvram) memset(s_dvram, 0, sizeof s_vram);
+    memset(s_skipped, 0, sizeof s_skipped);
+    s_any_skipped = false;
     s_read_latch = 0;
     gpu_reset_state();
 }
@@ -1272,4 +1456,11 @@ void gpu_state_io(StateIO *io) {
     SS_VAR(io, s_wr); SS_VAR(io, s_rd); SS_VAR(io, s_rd_active);
     SS_VAR(io, s_pl_gouraud); SS_VAR(io, s_pl_semi); SS_VAR(io, s_pl_x); SS_VAR(io, s_pl_y);
     SS_VAR(io, s_pl_color); SS_VAR(io, s_pl_pending_color); SS_VAR(io, s_pl_have_color);
+    if (io->mode == SS_LOAD) {
+        /* presentation-only: the display copy restarts from the loaded VRAM (the skipped pixels
+         * reappear as the game redraws), and every region tile may hold skipped pixels */
+        if (s_dvram) memcpy(s_dvram, s_vram, sizeof s_vram);
+        memset(s_skipped, 1, sizeof s_skipped);
+        s_any_skipped = true;
+    }
 }

@@ -1413,10 +1413,14 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
     }
 }
 
+static const u16 *s_seed_src;   /* the picture for the configure() in progress (hires_seed_vram) */
+const u16 *hires_seed_vram(const u16 *vram1x) { return s_seed_src ? s_seed_src : vram1x; }
+
 static void seed(void)
 {
+    const u16 *pic = hires_seed_vram(s_vram);
     for (int y = 0; y < s_rh; y++) {
-        const u16 *src = &s_vram[(s_ry + y) * VRAM_W + s_rx];
+        const u16 *src = &pic[(s_ry + y) * VRAM_W + s_rx];
         if (s_t32) {
             u32 *row0 = s_t32 + (size_t)y * s_Sy * s_tw;
             memset(row0, 0, (size_t)s_tw * sizeof(u32));   /* the guard band starts black */
@@ -1599,13 +1603,56 @@ static void off_state(void)
     s_cur_ssaa = 1;
 }
 
+/* The picture to seed a new target with. Without the display copy (gpu.c skip rule) the 1x VRAM
+ * has no drawn pixels in the framebuffer region, so a target reallocated between frames (resize,
+ * resolution / renderer / SSAA / colour change) would show a black screen until the game redrew
+ * the displayed buffer (4 vblanks in a fight). keep_picture() samples the old target at each 1x
+ * pixel's centre into a copy of the 1x VRAM: the same 1x picture the seed used to have. Valid only
+ * while no primitive has been sent since (the same moment between frames). */
+static u16 *s_seed;
+static u64 s_seed_stamp;
+static void keep_picture(void)
+{
+    free(s_seed);
+    s_seed = NULL;
+    if (!g_hires || gpu_display_copy() || !s_be || !s_be->read) return;
+    HiresView v;
+    if (!s_be->read(s_rx, s_ry, s_rw, s_rh, &v) || (!v.pixels && !v.px32)) return;
+    u16 *t = malloc((size_t)1024 * 512 * sizeof(u16));
+    if (!t) return;
+    memcpy(t, gpu_vram(), (size_t)1024 * 512 * sizeof(u16));
+    const int cx = v.scale_x / 2, cy = v.scale_y / 2;
+    for (int y = 0; y < s_rh; y++) {
+        const size_t row = (size_t)(y * v.scale_y + cy) * v.stride;
+        u16 *d = t + (size_t)((s_ry + y) & 511) * 1024;
+        for (int x = 0; x < s_rw; x++) {
+            const size_t i = row + (size_t)(x * v.scale_x + cx);
+            u16 c;
+            if (v.pixels) c = v.pixels[i];
+            else {
+                const u32 p = v.px32[i];
+                c = (u16)(((p & 0xFF) >> 3) | (((p >> 8) & 0xFF) >> 3 << 5) | (((p >> 16) & 0xFF) >> 3 << 10) |
+                          ((p >> 24) ? 0x8000 : 0));
+            }
+            d[(s_rx + x) & 1023] = c;
+        }
+    }
+    s_seed = t;
+    s_seed_stamp = gpu_prim_count();
+}
+static const u16 *seed_vram(void)
+{
+    return s_seed && s_seed_stamp == gpu_prim_count() ? s_seed : gpu_display_vram();
+}
+static void drop_seed(void) { free(s_seed); s_seed = NULL; }
+
 bool hires_set_scale(int sx, int sy)
 {
     if (sx <= 0 || sy <= 0) sx = sy = 0;
     if (sx > HIRES_MAX_SCALE) sx = HIRES_MAX_SCALE;
     if (sy > HIRES_MAX_SCALE) sy = HIRES_MAX_SCALE;
     if (sx == 0) {
-        if (g_hires) g_hires->destroy();
+        if (g_hires) { keep_picture(); g_hires->destroy(); }
         off_state();
         return true;
     }
@@ -1618,6 +1665,7 @@ bool hires_set_scale(int sx, int sy)
         s_rw == s_cfg_rw && s_rh == s_cfg_rh && s_be == s_want_be && s_shadow == s_want_shadow &&
         s_cur_gx == gx && s_cur_fmt == fmt && s_cur_ssaa == n)
         return true;
+    if (g_hires) keep_picture();
     if (g_hires && (s_be != s_want_be || s_shadow != s_want_shadow)) { g_hires->destroy(); g_hires = NULL; }
     s_be = s_want_be;
     s_shadow = s_want_shadow;
@@ -1627,7 +1675,11 @@ bool hires_set_scale(int sx, int sy)
     if (s_be->set_guard) s_be->set_guard(gx);
     if (s_shadow && s_shadow->set_guard) s_shadow->set_guard(gx);
     s_pend_fmt = fmt;
-    if (!be->configure(gpu_vram(), sx * n, sy * n, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh)) {
+    s_seed_src = seed_vram();   /* textures keep coming from the emulated VRAM; this is the picture only */
+    const bool ok = be->configure(gpu_vram(), sx * n, sy * n, s_cfg_rx, s_cfg_ry, s_cfg_rw, s_cfg_rh);
+    s_seed_src = NULL;
+    drop_seed();
+    if (!ok) {
         off_state();
         return false;
     }
@@ -1652,7 +1704,10 @@ void hires_reseed(void)
     if (!g_hires) return;
     const HiresBackend *be = g_hires;
     s_pend_fmt = s_cur_fmt;
-    if (!be->configure(gpu_vram(), s_cur_sx, s_cur_sy, s_rx, s_ry, s_rw, s_rh)) off_state();
+    s_seed_src = gpu_display_vram();
+    const bool ok = be->configure(gpu_vram(), s_cur_sx, s_cur_sy, s_rx, s_ry, s_rw, s_rh);
+    s_seed_src = NULL;
+    if (!ok) off_state();
 }
 
 bool hires_get_scale(int *sx, int *sy)
@@ -1784,7 +1839,7 @@ u32 hires_verify_1x(int *first_x, int *first_y)
     HiresView v;
     if (!hires_verify_possible()) return 0;
     if (!g_hires->read(s_rx, s_ry, s_rw, s_rh, &v)) return 0;
-    const u16 *vram = gpu_vram();
+    const u16 *vram = gpu_display_vram();
     u32 bad = 0;
     for (int y = 0; y < s_rh; y++)
         for (int x = 0; x < s_rw; x++)

@@ -10,6 +10,7 @@
 
 static int g_irq_count;
 void irq_raise(int bit) { if (bit == IRQ_GPU) g_irq_count++; }
+void rt_log(const char *fmt, ...) { (void)fmt; }
 
 static int g_fail, g_pass;
 #define CHECK(cond, ...)                                              \
@@ -394,8 +395,54 @@ static void scene_and_bench(void)
     printf("bench: %d textured gouraud dithered triangles (~200px) in %.3f ms (best of 8)\n", N, ms);
 }
 
+/* The fixed 1x skip rule (gpu.c header): with the draw area inside the 512x480 framebuffer
+ * region, primitives are not drawn into the emulated VRAM; fills and transfers still are, and
+ * the optional display copy holds exactly the picture full drawing gives. */
+static void skip_stream(void)
+{
+    gp0(0xE3000000); gp0(0xE4000000 | (479u << 10) | 511u); gp0(0xE5000000);
+    gp0(0x02102030); gp0(xy(0, 200)); gp0(xy(64, 32));                /* fill */
+    gp0(0x2000FF00); gp0(xy(10, 10)); gp0(xy(60, 12)); gp0(xy(20, 50)); /* flat tri */
+    gp0(0x600000FF); gp0(xy(100, 100)); gp0(xy(16, 8));              /* rect */
+    gp0(0x40FF0000); gp0(xy(200, 5)); gp0(xy(300, 40));              /* line */
+    gp0(0xA0000000); gp0(xy(400, 300)); gp0(xy(2, 1)); gp0(0x7FFF001F); /* upload */
+    gp0(0xE4000000 | (511u << 10) | 1023u);                         /* area outside the region */
+    gp0(0x2000FF00); gp0(xy(600, 10)); gp0(xy(650, 12)); gp0(xy(610, 50));
+}
+
+static void test_skip_rule(void)
+{
+    static u16 full[1024 * 512], skip[1024 * 512];
+    gpu_init(); gpu_set_skip_rule(false); skip_stream();
+    memcpy(full, gpu_vram(), sizeof full);
+    gpu_set_skip_rule(true);
+    gpu_init(); skip_stream();
+    memcpy(skip, gpu_vram(), sizeof skip);
+    CHECK(full[20 * 1024 + 25] != 0 && skip[20 * 1024 + 25] == 0, "triangle in the region skipped");
+    CHECK(full[104 * 1024 + 108] != 0 && skip[104 * 1024 + 108] == 0, "rect in the region skipped");
+    CHECK(skip[216 * 1024 + 32] == full[216 * 1024 + 32] && skip[216 * 1024 + 32] != 0, "fill still written");
+    CHECK(skip[300 * 1024 + 401] == 0x7FFF, "upload still written");
+    CHECK(skip[20 * 1024 + 615] != 0 && skip[20 * 1024 + 615] == full[20 * 1024 + 615], "outside the region drawn");
+    int other = 0;
+    for (int y = 0; y < 512; y++)
+        for (int x = 512; x < 1024; x++) other += full[y * 1024 + x] != skip[y * 1024 + x];
+    CHECK(other == 0, "texture area identical (%d differ)", other);
+    /* a guest read of skipped pixels is reported (no display copy: unverified) */
+    u64 u0 = gpu_1x_observed(2);
+    gp0(0xC0000000); gp0(xy(20, 20)); gp0(xy(2, 1)); (void)gpu_read_data();
+    CHECK(gpu_1x_observed(2) == u0 + 1, "VRAM->CPU read of skipped pixels observed");
+    /* display copy = full drawing; emulated VRAM unchanged by it */
+    gpu_init(); gpu_enable_display_copy(); skip_stream();
+    CHECK(memcmp(gpu_display_vram(), full, sizeof full) == 0, "display copy equals full drawing");
+    CHECK(memcmp(gpu_vram(), skip, sizeof skip) == 0, "emulated VRAM independent of the display copy");
+    u64 d0 = gpu_1x_observed(1);
+    gp0(0xC0000000); gp0(xy(20, 20)); gp0(xy(2, 1)); (void)gpu_read_data();
+    CHECK(gpu_1x_observed(1) == d0 + 1, "differing read observed with the copy");
+}
+
 int main(void)
 {
+    gpu_set_skip_rule(false);   /* rasterizer tests use small draw areas; test_skip_rule turns it on */
     test_stat();
     test_fill();
     test_transfer();
@@ -405,6 +452,7 @@ int main(void)
     test_semi();
     test_lines();
     scene_and_bench();
+    test_skip_rule();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

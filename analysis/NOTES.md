@@ -69,6 +69,42 @@ All verified with GPU command logging during title -> 1P battle -> fights (hi-re
   fills, 3638 VRAM->VRAM copies (3547 with the source inside the framebuffer region), and
   29.6M CPU->VRAM upload pixels (29.26M inside the framebuffer region, i.e. mostly FMV).
 
+### Rendering: what the 1x VRAM holds (runtime `gpu.c` skip rule, `--gpu-1x`)
+
+The game never reads back what it draws into the framebuffer region (0,0)-(511,479):
+- No VRAM->CPU read, texture page, CLUT, or VRAM->VRAM copy source touches drawn framebuffer
+  pixels, and no primitive checks or sets the mask bit (verified: gpu.c's tile detector, which
+  logs every guest observation of a skipped tile, reported 0 observations in all 24 scenarios
+  (`scenarios.py run --all`), the 30 library replays and the Hills match replay; 1.0-1.2 M
+  primitives skipped per scenario).
+- The only copies with a framebuffer source are the 2x1 (0,0)->(0,0) no-op per frame, which stays
+  inside the region (verified, same instrumentation).
+- GPU timing is not emulated (always ready), so drawing less cannot change emulated time.
+
+So since the performance work, the emulated VRAM no longer receives the pixels of polygons, rects
+and lines whose draw area lies inside 512x480. Fills, uploads (FMV) and copies are still written.
+Evidence that nothing else changed (verified):
+- `--gpu-1x draw` (rule off) gives the per-frame `--state-hash` of the build before the change,
+  byte-identical over the 11530 frames of `match_gradd_celia_hills`.
+- With the rule on, final RAM (`--ram-dump`) is identical to the old build, and every gameplay
+  field hash of all 30 replays is identical. Only the complete state hash lines (`s`, which hash
+  VRAM) changed: 20 of each replay's lines before the first drawn frame stayed equal.
+- Rasterizing these pixels was 49 % of the main thread in a plain 1x run and 14 % in the user
+  configuration (macOS `sample`).
+
+### Host profile after the performance work (macOS `sample`, M1 Pro, machine under load)
+
+Main-thread self time by area, Hills fight (verified by sampling; percentages shift with load):
+- Plain headless 1x (`--gpu-1x skip`): recompiled guest code 33-38 %, SPU 21-24 % (almost all
+  `spu_render`: voices + reverb), GTE 20-22 %, CD/XA 8 %, GP0 decode 5 %, bus 3 %, 1x rasterizer
+  (UV/colour tracking only) 2 %, PGXP 1 %.
+- User configuration (GPU 4x6, 16:9, xbr, full colour, PGXP): waiting on the GPU fence 59 %,
+  guest 9 %, hi-res backend 9 %, GTE 5 %, SPU 4 %, widescreen shadow pass 4 % (0.46 ms per
+  pass: snapshot, wide run, restore, diff), 1x tracking 3 %. Wall time is GPU-bound there.
+- Next candidates: the widescreen shadow pass's full RAM/scratchpad copies (a write journal would
+  avoid them), the per-voice SPU loop, and the per-function `CYC`/`EVT_CHECK` overhead in the
+  generated code (must keep cycle counts identical).
+
 ### What the render-quality modes see (runtime work, `--tex-filter` etc., AGENTS.md "Render quality")
 
 - The fight HUD (name lettering "GRADD"/"ANJIE", health-bar frames, round markers, "PUSH START")

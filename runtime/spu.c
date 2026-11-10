@@ -411,8 +411,11 @@ static void noise_tick(void) {
 static u32 rv_addr(s32 rel) {
     s32 size = (s32)(0x40000u - rv_base);
     if (size <= 0) size = 1;
-    s32 off = ((s32)rv_cur - (s32)rv_base + rel) % size;
-    if (off < 0) off += size;
+    /* (x mod size) in [0, size): one add or subtract covers every offset the reverb registers
+     * give in practice, the division only the rest (same result, ~15 divisions per sample saved) */
+    s32 off = (s32)rv_cur - (s32)rv_base + rel;
+    if (off >= size) { off -= size; if (off >= size) off %= size; }
+    else if (off < 0) { off += size; if (off < 0) { off %= size; if (off < 0) off += size; } }
     return rv_base + (u32)off;
 }
 
@@ -504,9 +507,14 @@ static void reverb_core(s32 inl, s32 inr, s32 *outl, s32 *outr) {
     if (rv_cur > 0x3ffff) rv_cur = rv_base;
 }
 
+/* rv_fir without its zero taps (every odd one except the centre): the same sum, half the work */
+static const u8 rv_fir_nz[21] = { 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 19, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38 };
 static s32 fir39(const s16 *h, u32 pos) {
     s32 sum = 0;
-    for (int k = 0; k < 39; k++) sum += rv_fir[k] * h[(pos - (u32)k) & 63];
+    for (int i = 0; i < 21; i++) {
+        const int k = rv_fir_nz[i];
+        sum += rv_fir[k] * h[(pos - (u32)k) & 63];
+    }
     return sum;
 }
 
