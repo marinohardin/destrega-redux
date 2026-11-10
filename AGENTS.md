@@ -1218,6 +1218,11 @@ The header comment of `hires_gpu.c` has the details.
   0 pixels with `--pgxp off`, the PGXP-on difference counts unchanged, `test_hires_gpu` 0.
   Any new per-pixel `/` or `%` in the MSL costs real time: use the float-estimate + exact-correction
   helpers (`floordiv`, `lceil`, `div24`) or precompute per primitive.
+  The perspective u/v path (PGXP on) was the largest remaining shader cost: sharing one
+  reciprocal of q for u and v (`div24r`), skipping `span_end` unless the run is the span's last
+  and a shift for the common n = 8 took the user configuration's fight from 5.7 to 4.85 ms/frame
+  (Metal, frames byte-identical). The GLSL still has the old form (equal results); port it
+  when DXC is at hand to regenerate DXIL.
 - Not implemented / approximate: mode 0 + mask check, mode 0 with F=0 over odd B (off by one;
   mode 0 unused by the game), VRAM->VRAM copies that overlap themselves inside the target are
   chunked by rows, `hires-uv:` sample counts are 0 on the GPU (no shader counters), no DXBC
