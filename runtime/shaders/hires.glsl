@@ -15,7 +15,7 @@
  *   attr()     the 2^-16 fraction is split off (G = q*D + r), leaving a 0/1 carry test;
  *   lceil()    span edges: float estimate of N/D, corrected with integer multiplies (the
  *              quotient is a pixel column, |q| < 2^15);
- *   div24()    already estimate + correction in MSL;
+ *   div24()    already estimate + correction in MSL (div24r: one reciprocal of q for u and v);
  *   ldivs()    (U1 - U0) / n with n <= 8: 16-bit long division.
  * Signed 32-bit division and % are avoided too (GLSL leaves negative operands loosely
  * specified): floordiv()/tdiv() divide magnitudes.
@@ -298,7 +298,7 @@ bool covered(uint pi, int X, int Y)
 }
 /* ceil of the x of the span edge on row Y: the long edge (left = true when the long edge is
  * on that side) or the short edge a-b / b-c */
-int span_edge(uint pi, int Y, bool use_long)
+void span_edge_nd(uint pi, int Y, bool use_long, out uvec2 N, out uvec2 D)   /* edge x = N / D */
 {
     uvec2 Y16 = lmul32(Y, 65536);
     int ax = prims[pi].ev[0], ay = prims[pi].ev[1], bx = prims[pi].ev[2], by = prims[pi].ev[3];
@@ -308,13 +308,21 @@ int span_edge(uint pi, int Y, bool use_long)
     else if (llt(Y16, L(by))) { px = ax; py = ay; qx = bx; qy = by; }
     else { px = bx; py = by; qx = cx; qy = cy; }
     uvec2 dy = lsub(L(qy), L(py));
-    uvec2 N = ladd(lmul(L(px), dy), lmul(lsub(L(qx), L(px)), lsub(Y16, L(py))));
-    return lceil(N, lshl(dy, 16));
+    N = ladd(lmul(L(px), dy), lmul(lsub(L(qx), L(px)), lsub(Y16, L(py))));
+    D = lshl(dy, 16);
 }
+int span_edge(uint pi, int Y, bool use_long) { uvec2 N, D; span_edge_nd(pi, Y, use_long, N, D); return lceil(N, D); }
 /* first pixel of the span hires.c draws on row Y: ceil(left edge x), at least the clip */
 int span_start(uint pi, int Y, int cx1) { return max(span_edge(pi, Y, (prims[pi].kf & (1u << 20)) != 0u), cx1); }
 /* one past the last pixel of that span: ceil(right edge x), at most the clip */
 int span_end(uint pi, int Y, int cx2) { return min(span_edge(pi, Y, (prims[pi].kf & (1u << 20)) == 0u), cx2); }
+/* ceil(right edge x) > k, i.e. N > k * D: exact, without the division in span_end */
+bool span_end_beyond(uint pi, int Y, int k)
+{
+    uvec2 N, D;
+    span_edge_nd(pi, Y, (prims[pi].kf & (1u << 20)) == 0u, N, D);
+    return llt(lmul(L(k), D), N);
+}
 
 /* floor(a * 2^24 / q) for q > 0: float estimates corrected exactly with integer multiplies;
  * r < q <= 2^38 keeps r << 24 in range */
@@ -332,6 +340,21 @@ uvec2 div24(uvec2 a, uvec2 q)
     for (int k = 0; k < 8 && !llt(r2, q); k++) { r2 = lsub(r2, q); e++; }
     return ladd(lshl(L(t), 24), L(e));
 }
+/* div24 with 1/q computed once for u and v (rq): the reciprocal rounds once more than a
+ * division, so the correction loops allow more steps; the result is the same exact floor */
+uvec2 div24r(uvec2 a, uvec2 q, float rq)
+{
+    int t = int(clamp(floor(lfloat(a) * rq), -1073741824.0, 1073741824.0));
+    uvec2 r = lsub(a, lmul(L(t), q));
+    for (int k = 0; k < 8 && lisneg(r); k++) { r = ladd(r, q); t--; }
+    for (int k = 0; k < 8 && !llt(r, q); k++) { r = lsub(r, q); t++; }
+    uvec2 s = lshl(r, 24);
+    int e = int(clamp(lfloat(s) * rq, -1073741824.0, 1073741824.0));
+    uvec2 r2 = lsub(s, lmul(L(e), q));
+    for (int k = 0; k < 16 && lisneg(r2); k++) { r2 = ladd(r2, q); e--; }
+    for (int k = 0; k < 16 && !llt(r2, q); k++) { r2 = lsub(r2, q); e++; }
+    return ladd(lshl(L(t), 24), L(e));
+}
 /* u (x) and v (y) in 8.24 at hi-res pixel X: q, u*q, v*q planes in 2^-38 */
 void persp_at(uint pi, int X, int Y, out uvec2 U, out uvec2 V)
 {
@@ -340,16 +363,30 @@ void persp_at(uint pi, int X, int Y, out uvec2 U, out uvec2 V)
     if (lle(q, uvec2(0u))) { U = L(8388608); V = L(8388608); return; }
     uvec2 a = ladd(ladd(prims[pi].pl[1], lmul(prims[pi].pl[4], fx)), lmul(prims[pi].pl[7], fy));
     uvec2 b = ladd(ladd(prims[pi].pl[2], lmul(prims[pi].pl[5], fx)), lmul(prims[pi].pl[8], fy));
-    U = ladd(div24(a, q), L(8388608));
-    V = ladd(div24(b, q), L(8388608));
+    float rq = 1.0 / lfloat(q);
+    U = ladd(div24r(a, q, rq), L(8388608));
+    V = ladd(div24r(b, q, rq), L(8388608));
 }
-/* hires.c's perspective u/v (PGXP): exact at the start of every 8-pixel run, stepped in between */
-void persp_uv(uint pi, int xs, int xe, int X, int Y, out uvec2 U, out uvec2 V)
+/* trunc(a / 8) */
+uvec2 ltdiv8(uvec2 a) { return lisneg(a) ? lneg(lsar(lneg(a), 3)) : lsar(a, 3); }
+/* hires.c's perspective u/v (PGXP): exact at the start of every 8-pixel run, stepped in between.
+ * Same values as n = min(span_end - xr, 8), U0 + (X - xr) * trunc((U1 - U0) / n), but cheaper
+ * (as in the MSL): the run is a full 8 pixels unless it is the span's last, which an exact edge
+ * comparison tells without span_end's division; X == xr needs only U0; trunc(a / 8) is a shift */
+void persp_uv(uint pi, int xs, int cx2, int X, int Y, out uvec2 U, out uvec2 V)
 {
-    int xr = xs + ((X - xs) & ~7), n = xe - xr < 8 ? xe - xr : 8;
+    int xr = xs + ((X - xs) & ~7);
     uvec2 U0, V0, U1, V1;
     persp_at(pi, xr, Y, U0, V0);
+    if (X == xr) { U = U0; V = V0; return; }
+    int n = 8;
+    if (xr + 8 > cx2 || !span_end_beyond(pi, Y, xr + 7)) { int xe = span_end(pi, Y, cx2); n = xe - xr < 8 ? xe - xr : 8; }
     persp_at(pi, xr + n, Y, U1, V1);
+    if (n == 8) {
+        U = ladd(U0, lmul(L(X - xr), ltdiv8(lsub(U1, U0))));
+        V = ladd(V0, lmul(L(X - xr), ltdiv8(lsub(V1, V0))));
+        return;
+    }
     U = ladd(U0, lmul(L(X - xr), ldivs(lsub(U1, U0), n)));
     V = ladd(V0, lmul(L(X - xr), ldivs(lsub(V1, V0), n)));
 }
@@ -422,8 +459,7 @@ void main()
         if (tex) {
             uvec2 U, V;
             if ((kf & (1u << 21)) != 0u) {
-                int xe = span_end(pi, Y, cx2);
-                persp_uv(pi, xs, xe, X, Y, U, V);
+                persp_uv(pi, xs, cx2, X, Y, U, V);
             } else {
                 U = attr_span(pi, 3, xs, X, m, u.sx, u.sy);
                 V = attr_span(pi, 4, xs, X, m, u.sx, u.sy);
