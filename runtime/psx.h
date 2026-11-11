@@ -130,6 +130,13 @@ typedef struct { u32 d[32], c[32], flag; } GteState;
 void gte_save(GteState *s);              /* snapshot of all GTE registers */
 void gte_restore(const GteState *s);
 void gte_write_ctrl(int reg, u32 v);  /* ctc2 */
+/* The same operations on a caller-owned state (HLR audit; guest GTE and PGXP tags untouched,
+ * PGXP production off). Not for generated code. */
+void gte_exec_on(GteState *s, u32 cmd);
+void gte_write_data_on(GteState *s, int reg, u32 v);
+void gte_write_ctrl_on(GteState *s, int reg, u32 v);
+u32 gte_read_data_on(GteState *s, int reg);
+u32 gte_read_ctrl_on(GteState *s, int reg);
 
 /* ---- GPU (runtime/gpu.c) ------------------------------------------------- */
 
