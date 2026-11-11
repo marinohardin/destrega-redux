@@ -169,8 +169,10 @@ static void game_builds(int fault)
         int xmin = 9999, xmax = -9999, ymin = 9999, ymax = -9999;
         for (int i = 0; i < 4; i++) {
             const int x = (s16)(xy[i] & 0xffff), y = (s16)(xy[i] >> 16);
-            if (x < xmin) xmin = x; if (x > xmax) xmax = x;
-            if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+            if (x < xmin) xmin = x;
+            if (x > xmax) xmax = x;
+            if (y < ymin) ymin = y;
+            if (y > ymax) ymax = y;
         }
         if (xmax < -254 || xmin >= 255 || ymax < -118 || ymin >= 119) continue;
         u32 sz = 0;

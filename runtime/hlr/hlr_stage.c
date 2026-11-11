@@ -131,8 +131,10 @@ static Box box_of(const u32 *xyw, int n)
     Box b = { sx(xyw[0]), sx(xyw[0]), sy(xyw[0]), sy(xyw[0]) };
     for (int i = 1; i < n; i++) {
         s32 x = sx(xyw[i]), y = sy(xyw[i]);
-        if (x < b.xmin) b.xmin = x; if (x > b.xmax) b.xmax = x;
-        if (y < b.ymin) b.ymin = y; if (y > b.ymax) b.ymax = y;
+        if (x < b.xmin) b.xmin = x;
+        if (x > b.xmax) b.xmax = x;
+        if (y < b.ymin) b.ymin = y;
+        if (y > b.ymax) b.ymax = y;
     }
     return b;
 }
@@ -341,8 +343,10 @@ static bool visible(u32 flags, u32 ptr, u32 mode)
             s32 xmin = sx(xyw[0]), xmax = xmin, ymin = sy(xyw[0]), ymax = ymin;
             for (int i = 1; i < 4; i++) {
                 s32 x = sx(xyw[i]), y = sy(xyw[i]);
-                if (x < xmin) xmin = x; if (x > xmax) xmax = x;
-                if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+                if (x < xmin) xmin = x;
+                if (x > xmax) xmax = x;
+                if (y < ymin) ymin = y;
+                if (y > ymax) ymax = y;
             }
             if (xmax < -256 || xmin >= 257 || ymax < -120 || ymin >= 121) vis = false;
         }
