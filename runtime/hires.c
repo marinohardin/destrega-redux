@@ -399,7 +399,7 @@ typedef struct {
     BandFn fn;
     const void *ctx;
     int ylo, chunk_rows, nchunks;
-    _Atomic u64 ctr;                  /* (job tag << 32) | next chunk index */
+    _Atomic u64 ctr;                  /* (job tag << 32) | (chunk count << 16) | next chunk index */
     atomic_int done;
 } PoolJob;
 
@@ -417,24 +417,27 @@ static inline void cpu_relax(void) { plat_cpu_relax(); }
 
 /* Claim and run chunks of job `g`. Safe against stale workers: a chunk can only be claimed
  * while the slot still holds job g (tag in the counter), and a claimed chunk keeps the
- * dispatcher from reusing the slot until it is done. */
+ * dispatcher from reusing the slot until it is done.
+ * The chunk count lives in the same atomic word as the tag and the index: it used to be read
+ * from the slot's plain field, so a worker 64 jobs behind (preempted on a loaded machine) could
+ * read the next job's count while the counter still carried the old tag, win the CAS just before
+ * the dispatcher published the new counter, run a chunk of the new job and add to `done` after
+ * the reset: `done` then never equalled the chunk count and par_rows spun forever. */
 static void run_chunks(unsigned g)
 {
     PoolJob *j = &P.ring[g % RING];
     for (;;) {
         u64 c = atomic_load_explicit(&j->ctr, memory_order_acquire);
         for (;;) {
-            if ((unsigned)(c >> 32) != g || (unsigned)c >= (unsigned)j->nchunks) return;
+            if ((unsigned)(c >> 32) != g || (unsigned)(c & 0xffff) >= (unsigned)((c >> 16) & 0xffff))
+                return;
             if (atomic_compare_exchange_weak_explicit(&j->ctr, &c, c + 1, memory_order_acq_rel,
                                                       memory_order_acquire))
                 break;
         }
-        int idx = (int)(unsigned)c;
+        int idx = (int)(c & 0xffff);
         int y0 = j->ylo + idx * j->chunk_rows;
-        int y1 = y0 + j->chunk_rows;
-        int yend = j->ylo + j->chunk_rows * j->nchunks;   /* callers pass exact ranges; clamp below */
-        (void)yend;
-        j->fn(j->ctx, y0, y1);
+        j->fn(j->ctx, y0, y0 + j->chunk_rows);   /* the last chunk may pass yhi: BandFns clip */
         flush_counters();
         atomic_fetch_add_explicit(&j->done, 1, memory_order_release);
     }
@@ -503,7 +506,7 @@ static void par_rows(BandFn fn, const void *ctx, int ylo, int yhi)
     j->fn = fn; j->ctx = ctx; j->ylo = ylo; j->chunk_rows = chunk_rows; j->nchunks = nchunks;
     /* the last chunk may extend past yhi: BandFn implementations clip to their own bounds */
     atomic_store_explicit(&j->done, 0, memory_order_relaxed);
-    atomic_store_explicit(&j->ctr, (u64)g << 32, memory_order_release);
+    atomic_store_explicit(&j->ctr, ((u64)g << 32) | ((u64)nchunks << 16), memory_order_release);
     plat_mutex_lock(&P.mu);
     atomic_store_explicit(&P.gen, g, memory_order_release);
     plat_cond_broadcast(&P.cv);

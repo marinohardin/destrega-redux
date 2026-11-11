@@ -1341,6 +1341,7 @@ static void settings_apply(const char *dir) {
         else rt_log("settings: display.ssaa: 1 (off) to %d", HIRES_MAX_SSAA);
     }
     s_fs_start = !s_headless && settings_get_bool("display", "fullscreen", false);
+    input_set_virtual_only(s_headless);
     input_init();
     atexit(settings_save_at_exit);
 }

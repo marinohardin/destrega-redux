@@ -102,6 +102,7 @@ void input_assign(const InputPlayer pl[2], const char *const *guids, int n, cons
 /* open_gamepads: open controllers as they are added (needs SDL_INIT_GAMEPAD). Loads the players
  * from the settings store. */
 void input_init(void);
+void input_set_virtual_only(bool on);   /* headless: ignore physical controllers */
 /* Feed an SDL event. Frontend keys must already be filtered out by the caller. */
 void input_handle_event(const SDL_Event *e);
 /* Press-to-bind: true if the event was consumed by an armed capture (call before anything else). */

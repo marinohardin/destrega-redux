@@ -872,6 +872,8 @@ the left stick is mapped to the D-pad, never reported as analog.
   `input_handle_event` path (SDL virtual controllers: `pad-add:N[:ps4|xbox]`, `pad-remove:N`,
   `pad-down:N:south`, `pad-up`, `pad-axis:N:leftx:-0.8` (triggers 0..1), `key-down:Z`, `key-up:Z`);
   `--input-log FILE` writes `frame pad1 pad2` (hex, active high) whenever a mask changes.
+  Headless runs open only SDL virtual controllers (`input_set_virtual_only`): a physical controller
+  plugged into the test machine is logged as ignored and never reaches a pad.
 
 ### Settings file (`settings.ini`)
 
@@ -970,7 +972,10 @@ hashing all emulated state per frame).
   cores - 1) starts a worker pool. A primitive whose hi-res bbox is >= 4000 px
   (`--hires-par-min`) is split into row chunks, rasterized fork-join (the emulation thread
   takes chunks too and waits), so command order within every pixel is preserved and the result
-  is identical to serial (unit-tested, state hashes unchanged). Workers spin ~50 us after the
+  is identical to serial (unit-tested, state hashes unchanged). The job counter word holds tag, chunk count and next
+  index together (`run_chunks`): with the count in a plain field, a worker 64 jobs behind could claim
+  a chunk of the slot's next job and over-count `done`, so `par_rows` spun forever (seen ~1 in 3
+  governor runs under load). Workers spin ~50 us after the
   last job, then sleep. Smaller primitives run inline. Texture reads come from 1x VRAM while
   the emulation thread waits, so nothing races. The 1x GPU and emulated state stay on the
   emulation thread. Windowed present converts rows on the same pool and uploads only when the

@@ -421,9 +421,19 @@ void input_init(void) {
     reassign();
 }
 
+/* Headless runs only take SDL virtual controllers (the ones --input-event attaches): a real
+ * controller plugged into the test machine must not change a test's pads (test_input.py's P2
+ * got the wrong virtual pad while a physical one took the first slot). */
+static bool s_virtual_only;
+void input_set_virtual_only(bool on) { s_virtual_only = on; }
+
 static void pad_added(SDL_JoystickID id) {
     for (int i = 0; i < s_npads; i++) if (s_pads[i].id == id) return;
     if (s_npads >= MAX_PADS) return;
+    if (s_virtual_only && !SDL_IsJoystickVirtual(id)) {
+        ilog("controller %u ignored (headless: only test controllers)", (unsigned)id);
+        return;
+    }
     SDL_Gamepad *g = SDL_OpenGamepad(id);
     if (!g) { ilog("cannot open controller %u: %s", (unsigned)id, SDL_GetError()); return; }
     Pad *p = &s_pads[s_npads++];
