@@ -161,6 +161,243 @@ control-register probe, and the widescreen tests).
   (80028c70) pans sound effects by projected x (|x| <= 256); several HUD/menu functions compare
   against 120/121/256 (not investigated: a scan for `slti` with these immediates lists ~40).
 
+## Rendering pipeline (for a high-level renderer)
+
+Phase-1 research for a renderer that would draw the fight scene from the game's 3D data
+instead of from the GPU packets (plan: `docs/HIGH_LEVEL_RENDERER.md`). Sources: REA/Ghidra
+decompilation of the functions named here (read in full unless said otherwise), and one
+headless RAM dump at fight frame 4201 of `tools/fight_script.py` (Celia's stage, `--ram-dump`),
+read with a small script that walks the GsOT headers and ordering-table chains. "probe" below
+means that dump. Addresses are in `symbols.txt`.
+
+### Libraries
+
+The game renders with Psy-Q **libgs** on top of libgpu / libgte (likely: function shapes match
+the library, GsOT headers in RAM have the libgs layout):
+`ResetGraph` 8008ff28, `DrawSync` 800902a4, `ClearOTagR` 80090790, `PutDrawEnv` 80090908,
+`PutDispEnv` 80090ad4, `AddPrim` 80092fa8, `GsDrawOt` 80094298, `GsSortOt` 80094328 (links a
+sub-OT's chain into a slot of another OT), `GsSetRefView2` 800945f8, `TransMatrix` 80095c08,
+`SetRotMatrix` 80095d78, `SetTransMatrix` 80095e08, `RotMatrix` 800961f8, `SetGeomScreen`
+80095f98 (already verified). The 3D drawing itself is **not** libgs's (`GsSortObject4` etc. are
+not used for the stage or characters): every mesh is hand-written GTE code that fills its own
+packets (likely: decompilation).
+
+### Frame structure in a fight
+
+`fight_round_loop` (8002beb0) runs one game update per pass (30 Hz in fights, see Pitfalls in
+AGENTS.md). Order of the render-relevant calls (likely: decompilation, call order read in full):
+
+1. Logic: fighter updates, collision, `camera_update` (80088408: modes 1-3 through a table at
+   gp+0x460, else the follow camera `camera_from_fighters` 8003f214), `fighter_ot_depth_range`
+   (80035594).
+2. `hud_update` (8007d25c): health / gauge bars (8007c178, 8007c3f8) and mode-specific parts.
+3. `background_prims_add` (8003e32c): adds the two sky / ground prims to OT D.
+4. `stage_render` (80044210).
+5. `fighters_render` (80037280): ticks the dynamic light (`dyn_light_tick` 80033860), then per
+   fighter `fighter_shadow_render` (8007ec5c), `fighter_render` (80037144), then 8007ccdc
+   (bookkeeping, mode 6 / mode 0; not examined).
+6. `fighter_effects_render` (8004cb04): per-fighter magic / projectiles.
+7. `effects_render` (80052240), then `particle_burst_render` (800511bc) and
+   `particle_sets_render` (80051b58).
+8. `hud_render` (8007b874) into OT A (2D HUD; 800798dc and 8007d4bc also write OT A in other
+   states, not examined).
+9. `frame_submit` (80026628): `ot_compact_empty` (80026768) on the scene OT, then sets
+   `frame_ready` (800c0298).
+10. `frame_wait` (800266bc): `VSync(800c02a4 ? 2 : 0)`.
+
+**Ordering tables** (verified: probe of the GsOT headers {length, org, offset, point, tag},
+two per OT for the two buffers, stride 0x14; plus the code that clears and links them):
+
+| OT | GsOT headers | slots | used for |
+|----|--------------|-------|----------|
+| D  | 800c4748     | 4     | background (sky gradient + ground colour) |
+| B  | 800c4860     | 4     | org 800c06c0; empty in the probe, use unknown |
+| C  | 800c0720     | 2048  | the 3D scene: stage, characters, shadows, effects |
+| A  | 800c4770     | 16    | HUD and other 2D |
+| root | 800c47b8   | 8     | org 800c06e0 / 800c0700: the OT that is drawn |
+
+`ot_clear_and_link` (80026828, per buffer index) clears all of them with `ClearOTagR` and links
+A, B, C, D into the root OT with `GsSortOt` at their `point` (A 1, C 2, B 3, D 4). The tables are
+reverse (`ClearOTagR`), so the drawn order is **D, B, C, A**: background first, then the scene
+back to front (slot 0x7ff first), the HUD last. The old `ot_pointer_table` (800c0724) is the
+`org` field of the scene GsOT. Packet codes in the scene OT at the probe: 0x34 (GT3), 0x36
+(GT3 semi, 128 = 2 fighters x 64 shadow triangles), 0x3c (GT4); in OT A: 0x2c/0x2d (FT4), 0x2f,
+0x64 (sprites), 0xe1 (draw mode), 0x80 (verified: probe, counted per code).
+
+**Double buffering**: scratch 1f800000 is the buffer index. Each OT has two headers; every
+packet record holds two copies of its packet (GT3 at record + idx*0x28, GT4 at + idx*0x34;
+stage packets in two whole buffers at gp+0x5e8 / gp+0x5e4) (likely: decompilation; the
+character layout is verified by `char_mesh.c`).
+
+**Present** (likely: decompilation): the VBlank callback `vblank_callback` (80027268) handles
+the pads and the memory card, and on every second vblank, if `frame_ready` is set, calls
+`ResetGraph(1)`, `PutDispEnv(800c0698 + idx*0x14)`, `PutDrawEnv(800c05d8 + idx*0x5c)`,
+`GsDrawOt`/`DrawOTag` of the root OT of buffer idx, flips idx and clears / links the OTs of the
+new buffer (80026828). So the **GPU draw is started from interrupt context**, one vblank after
+the game finished building the frame; the next update builds into the other buffer while it is
+drawn. 800266ec / 800269fc are other frame-end variants (menus; not examined).
+`setup_draw_disp_envs` (800275bc, param p): `SetDefDrawEnv` / `SetDefDispEnv` for two buffers
+of 512 x (240 - 2p) at y 0 and 240.
+
+**Background** (verified: probe): 800cc510 is a gouraud quad (code 0x38) from screen-centred
+x -255..256, y -119..0, dark blue (B 0x40) at the top to light cyan (192,255,255) at y 0;
+800cc540 a flat quad (0x28) in light cyan for y 0..119 (the "light cyan triangle" of the
+section above). They are fixed 4:3 screen coordinates: in widescreen they do not cover the
+guard band (the runtime extends full-width fills / rects; these are polygons).
+
+### Camera
+
+(likely: decompilation; values at frame 4201 verified: probe)
+- `camera_from_fighters` (8003f214) builds the follow camera from both fighters' positions,
+  clamped and smoothed by `camera_follow_clamp` (8003e758, +-8000, step 0x28): rotation
+  angles at 800cc5c8 (pitch = -(0x80..0x280)), translation 800cc5d0 (x clamped to +-0x1ce8,
+  z >= -0x1db0), and H through 80093d08 -> `SetGeomScreen` from the fighters' distance.
+  8003ebb0 / 8003e988 smooth the view point z (800cc5e8).
+- `RotMatrix(800cc5c8 -> 800cc674)` + `TransMatrix(800cc5d0)` build a matrix that becomes the
+  `super` of the GsRVIEW2 at 800cc5e0 ({vpx,vpy,vpz, vrx,vry,vrz, rz, super = 800cc670});
+  a second matrix from 800cc5b0/b8 goes to 800cc624 (use not examined).
+- `GsSetRefView2(800cc5e0)` writes the **world-to-screen matrix GsWSMATRIX at 800ed4c8**
+  (the `camera_matrix` symbol) and a copy at 800ed488. Its base is 800ed4e8 =
+  diag(0x1000, 0x0a00, 0x1000): the camera matrix carries a **Y scale of 0.625** (the
+  512x240 display's pixel aspect folded into the matrix). 800ed4a8 holds an identity rotation
+  (verified: probe), used by the effects.
+- OFX/OFY are 0 (see above); H 0x38a..0x3bb in fights; there is no separate projection matrix.
+  A 3D renderer gets the PS1 projection exactly as: view = WS * world, sx = H * x / z,
+  sy = H * y / z (y already scaled by 0.625), screen centre (256, 120).
+
+### Stage (stage_render 80044210)
+
+(likely: decompilation, unless marked)
+- Lighting set once per call: GTE light matrix <- 800cc6e0..f0, light colour matrix <-
+  800cc6c0..d0 (probe: colour diag 0x0c8c, i.e. one white light of 0.78), then
+  `SetRotMatrix` / `SetTransMatrix` (WS). **The stage is in world space**: there is no
+  per-object matrix, every stage object is drawn with the camera matrix alone.
+- Data (all RAM, loaded from the stage pack of DATA.BNS; not decoded on disc): root pointer at
+  gp+0x5d0 (800c03b8), vertex base gp+0x5cc, normal table 800c03b4, packet buffers gp+0x5e8
+  (idx 0) / gp+0x5e4 (idx 1). Root: u32 object count, then 16 bytes per object {data offset,
+  packet offset, normal-index offset, flags}. Object data: bounding data (flags & 4: 4 points =
+  8 words; flags & 1: a sphere = 2 words), u32 command count, then commands.
+- Command word: bits 0-7 = packet type, 8-19 = polygon count, 20-31 = strip count. Builders:
+  0x20 F3 8003fcb8, 0x28 F4 800401f8, 0x34 GT3 80040820, 0x3c GT4 80040e98, 0x35 GT3
+  8004163c, 0x3d GT4 80041c14; objects with flag 0x2000 use 800426c4 / 800433c4 (param 0/1)
+  instead. Vertices are world SVECTORs, either strips (one carried vertex + 3 new per quad) or
+  independent quads.
+- Lighting per builder: **0x34 / 0x3c** take per-vertex normal indices (16 bytes per quad)
+  into the normal table and light with NCDT (3 vertices) + NCDS (4th) from base colour
+  0x3c808080 with IR0 from the projection: lit and **depth-cued**. **0x35 / 0x3d** take
+  pre-lit vertex colours (4 words per quad) and run DPCT + DPCS with the projection's IR0:
+  vertex colour **depth-cued** only (80041c14 read in full). Depth cueing blends toward the GTE
+  far colour FC with IR0 = DQB + DQA * H / SZ; where FC / DQA / DQB / BK are set was not found
+  (not in stage_render; a GTE control-register probe would show it).
+- Visibility: object 0 always drawn; others through `stage_object_visible` (80043fd4: bounding
+  box projected, x +-257 / y +-121; or the sphere through MVMVA, rejected if IR3 < 1; a
+  debug "SIZE %d" print is compiled in). Flags hide objects: 0x4000; 8 without 0x8000; 0x40 in
+  camera modes 0/1, 0x100 in mode 2. Flags 0xe000 are cleared every frame.
+- Per polygon: x +-255, y +-119 and **near plane max SZ > 0x18f** (no clipping: a polygon
+  is dropped whole when all its vertices are nearer than 0x18f, kept whole otherwise). **OT slot
+  from the maximum SZ** (furthest vertex) through the 3-segment map. Only the tag, colours and
+  XYs are written; UV / CLUT / tpage words are pre-initialised in the packet buffers.
+- Animation (object flags & 0x80): a table after the polygon data steps the u bytes (+0xc,
+  +0x18, +0x24, +0x30) of the current buffer's GT4 packets: UV-scroll flipbooks, counters in
+  RAM, advanced only for visible objects.
+
+### Characters (fighter_render 80037144, char_mesh_render 80036b0c)
+
+(likely: decompilation; the face-list layout is verified by `char_mesh.c`)
+- `fighter_render`: per bone part (0x70 bytes, count fighter+0xf0, array +0xf4)
+  `bone_light_matrices` (800338d8, coord+0x24, part+0x24, part+0x44) builds that part's light
+  matrix and light colour matrix; then `char_mesh_render(fighter+0xe8, scene OT, 0xb)`. An
+  attachment (weapon / extra mesh) at fighter+0x1a0 (count +0xc, array +0x10) is drawn the same
+  way from +0x1a0+4.
+- Model block: +8 part count, +0xc parts (0x70 each), +0x10 face groups. Each part's word 0
+  points to a GsCOORDINATE2-like struct with the bone's world matrix (`workm`): rotation shorts
+  at +0x24, translation at +0x38/+0x3c/+0x40 (used truncated to 16 bits). Screen matrix =
+  WS * workm (MVMVA), translation WS * t + WS.t.
+- Vertices: pointer part+0x64, count short part+0x6c, in the part's bone space; RTPT in threes
+  (rest RTPS) into `char_vertex_buffer` (800c9d38, {SXY, SZ}). Normals: part+0x68, count
+  part+0x6e; NCCT / NCCS with the part's light matrices and base colour `char_base_rgb`
+  (800bfe28) into `char_colour_buffer` (800cb7c8). Skinning is rigid: one bone per vertex;
+  faces index vertices across parts (so joints stretch). `char_mesh_chains` (800367d8) handles
+  jointed chains (hair / cloth; guess).
+- Face groups: type 0x1a -> `char_mesh_tris_to_ot` (80036138, GT3), 0x1b ->
+  `char_mesh_quads_to_ot` (800363c8, GT4). NCLIP backface test on integer positions, OT slot
+  from the average SZ (tris) or the minimum SZ (quads). UV / CLUT / tpage pre-set per face.
+- Lights (`bone_light_matrices`): 3 lights at `char_lights` (800c9cf0, 12 bytes each:
+  direction, colour). Light 0 is the **dynamic point light** `dyn_light` (800c9d20 {position,
+  intensity, rgb, duration, timer}): its direction per bone = normalise(bone position - light
+  position) (800952a4), its colour scaled by timer / duration; `dyn_light_tick` counts it down
+  and clears it. So hits / magic flash the characters with a coloured light (guess: what sets
+  it was not traced).
+
+### Shadows (fighter_shadow_render 8007ec5c)
+
+(likely: decompilation; the 128 semi GT3 at frame 4201 verified: probe)
+- Centre between two bone positions (fighter +0x8c0/+0xa2c and +0x8c8/+0xa34) blended 4:1 with
+  the fighter position; `ground_height` (80044d60) gives the floor height under it.
+- A 3x3 grid (offsets 800b6264, stretched along the feet spread beyond 200) plus 36 midpoints
+  (pair table 800b6158) = 45 vertices (800e70f0), each moved onto the ground height (clamped to
+  within 250 of the centre), projected with RTPS into 800e6f80.
+- 64 semi-transparent gouraud triangles (code 0x36, packet stride 0x58, buffer copy at
+  + idx*0x28, vertex indices at +0x50..+0x54), grey = 0x80 - height above ground / 10, at least
+  0x18; the draw mode selects subtractive blending (B-F, likely: matches the GPU command counts
+  above). OT slot from the first vertex's SZ. NCLIP is computed but its result is not used.
+  It is a **terrain-draped decal**: in a depth-buffered renderer it lies exactly on the floor.
+
+### Effects
+
+(likely: decompilation)
+- All effects are 3D points projected by the GTE, drawn as **view-aligned billboards**: the
+  rotation is the identity 800ed4a8, the translation WS * position, so offsets are in screen
+  space at the effect's depth. Primitive builders: `effect_billboard_tri` (80055b70: one GT3
+  (tag length 9) from 3 vertices at +0x50..+0x64 plus a reference point at +0x68, OT slot from
+  the minimum SZ) and `effect_billboard_tri_mode` (80056704: GT3 (tag 8) plus a 1-word draw-mode
+  prim linked into the same slot). The rest of the 80055820..80057100 family are variants (lit
+  ones use NCDS / NCCS).
+- Containers: `magic_block_render` (8004e794, one 0x854-byte block per fighter at 800e2398,
+  enabled at +0x7b0: 6 sub-objects of 0xb0 through 80056704, 8 of 0x84 through 80055b70);
+  `effect_lists_render` (8004d7ec: 20 objects of 0x108 at *800c048c and 20 of 0x104 at
+  *800c0490); `effects_render` (80052240: 16 objects of 0x8c at 800e1ad8, update functions in
+  table 800b5448); `particle_burst_render` (800511bc: bursts at 800dd5f8, stride 0x1138, grey
+  fades by 8 per update); `particle_sets_render` (80051b58: 2x2 sets of 24 particles at
+  800da178.., fade 0x14 per update, u/v flipbook). Projectiles: 0x1b0-byte objects dispatched
+  through `projectile_fn_table` (800b356c, index char*0xe0 + type*0x10 + slot*4; entries point
+  into the P1/P2 overlay slots, i.e. per-character code; verified: probe, all entries are
+  0x8001xxxx), and `fighter_effects_render` runs overlay functions when the character id % 14
+  == 3 (not examined).
+- Fading is done through the vertex colour, which works with additive (B+F) and subtractive
+  (B-F) blending; B-F dominates the game's semi-transparent triangles (GPU counts above).
+
+### Draw order: where a depth buffer would change the picture
+
+The PS1 picture is the painter's order of the scene OT; a depth-buffered renderer differs where:
+- **Stage polygons are sorted by their furthest vertex** and characters by average (tris) /
+  nearest (quads) SZ, so large floor polygons sort behind everything standing on them
+  (correct-looking); with a depth buffer this is fine, and intersections become exact.
+- **Shadows are coplanar decals** on the floor: they need a depth bias / polygon offset or a
+  "draw over floor" pass, or they z-fight.
+- **Semi-transparent effects and shadows** (B-F, B+F, B+F/4) must be drawn after the opaque
+  geometry, sorted back to front, without depth writes; B-F (subtractive) has no standard
+  blend-equation form except `reverse subtract`, which all modern APIs have.
+- **Billboards** are sorted by minimum SZ; with a depth test they would cut into walls and the
+  floor they used to overlap.
+- **Background** (OT D) is drawn first and is 2D: a renderer clears to it, not depth-tests it.
+- **Integer-degenerate faces** (see "Character mesh and PGXP"): a high-level renderer that
+  draws from bone-space vertices has no such faces; the backface test must be redone in float.
+- **Stage near plane**: polygons are dropped whole when every vertex is nearer than SZ 0x18f;
+  a real near-plane clip draws parts the PS1 never shows (walls very close to the camera).
+- HUD (OT A) and the root-level order stay as they are (2D, on top).
+
+### Not found / open (rendering)
+
+- Where the GTE far colour / depth-cue parameters (FC, DQA, DQB) and back colour BK are set
+  per stage (a ctc2 probe of registers 21-23 and 27-28 would answer it).
+- OT B's producer (empty at the probe); 8007ccdc; the second camera matrix at 800cc624;
+  `fighter_effects_render`'s overlay path.
+- Story EVENTOVL scenes: they use `stage_render` too (AGENTS.md), but their character / camera
+  code in the overlay was not read.
+- The stage data on disc (DATA.BNS stage packs) was not decoded; only the in-RAM layout.
+- Effect culling (if any) was not examined: effects may pop at the widescreen edges.
+
 ## Fight state (what gameplay is made of)
 
 Fighter structs at 800c9938 (P1) and 800c9b14 (P2), 0x1dc bytes each (verified: probe of
@@ -629,6 +866,13 @@ Highest value first. Move items to "done" with the PR that did them.
    gameplay.
 6. **Fight frame update** (somewhere under `8002beb0`, see the call stack above).
 7. **Overlay loaders** (`8004c1e8`, `8003e36c`, `8006b35c`): which mode loads which file.
+8. **Renderers for a high-level renderer** (see "Rendering pipeline (for a high-level renderer)"
+   and `docs/HIGH_LEVEL_RENDERER.md`): `stage_render` 80044210 with its builders (world-space
+   meshes, the simplest to capture), `fighter_render` 80037144 / `char_mesh_render` 80036b0c /
+   `bone_light_matrices` 800338d8 (bone matrices, lights), `fighter_shadow_render` 8007ec5c, and
+   the effect billboard family 80055820..80057100 with its containers (8004e794, 8004d7ec,
+   80052240, 800511bc, 80051b58). Readable versions make each one capturable as meshes +
+   matrices + materials instead of packets.
 
 Done:
 - `sphere_vs_poly` (`800465a4`), PR #3.
@@ -636,9 +880,8 @@ Done:
 ## Open questions
 
 - Purpose of the original port's extra seeds `800a8e28` and `800a9528`.
-- Effects (projectiles, hit sparks) are drawn by other code (8004cb04, 80052240, 80055b70,
-  80056704 project vertices) whose culling, if any, was not examined: they may pop in at the
-  widescreen edges.
+- Effects (projectiles, hit sparks) are view-aligned billboards (see "Rendering pipeline");
+  their culling, if any, was not examined: they may pop in at the widescreen edges.
 - Does any gameplay code depend on the GTE results beyond the screen coordinates it draws
   with (e.g. on-screen tests that change behaviour)? Matters for widescreen and PGXP.
 - Which RAM address holds the mode / stage / character ids? Not searched (the scenarios fingerprint the
