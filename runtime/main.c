@@ -95,6 +95,7 @@ static bool s_hires_dither;
 static int s_opt_filter = -1, s_opt_full = -1, s_opt_ssaa = -1;
 static bool s_ssaa_chosen;                 /* --ssaa or View > Anti-aliasing: no renderer-based default */
 static int s_pgxp = 2;              /* --pgxp: 0 off, 1 precise positions only (affine), 2 on */
+static bool s_char_depth = false;   /* --char-depth: depth-tested character meshes (hires.h) */
 static bool s_verify;              /* --hires-verify: at scale 1 the target must equal the 1x VRAM */
 static u64 s_verify_frames, s_verify_bad_frames;
 static const char *s_memcard_path[2];  /* --memcard1/2 */
@@ -811,6 +812,12 @@ static void finish(void) {
                (unsigned long long)tris, (unsigned long long)g_pgxp_stat_miss_stale,
                (unsigned long long)g_pgxp_stat_miss_gte);
     }
+    if (hires_get_char_depth()) {
+        u64 zt = 0, zr = 0;
+        hires_get_char_depth_stats(&zt, &zr);
+        rt_log("char-depth: %llu character faces depth-tested (software backend), %llu hi-res pixels hidden by a nearer face",
+               (unsigned long long)zt, (unsigned long long)zr);
+    }
     {
         HiresUvStats uv;
         hires_get_uv_stats(&uv);
@@ -1415,6 +1422,8 @@ static void usage(void) {
         "                        (default: 2 with the GPU renderer in a window, else 1)\n"
         "  --pgxp on|off|affine  sub-pixel GTE vertices + perspective-correct textures in the hi-res\n"
         "                        target (default on; affine = precise positions, PS1 texture mapping)\n"
+        "  --char-depth on|off   hi-res target: draw character meshes with a depth test on their PGXP\n"
+        "                        depth instead of the game's sort order (needs PGXP; default off)\n"
         "  --resize F:WxH,...    headless: simulate window resizes (physical pixels) on given frames\n"
         "  --ram-dump FILE       headless: write main RAM to FILE at the end\n"
         "  --memcard1 PATH       memory card image for slot 1 (raw 128 KiB .mcd; created if missing)\n"
@@ -2142,6 +2151,12 @@ int main(int argc, char **argv) {
             else if (!strcmp(m, "affine")) s_pgxp = 1;
             else { fprintf(stderr, "--pgxp: expected on, off or affine\n"); return 1; }
         }
+        else if (!strcmp(argv[i], "--char-depth") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "on")) s_char_depth = true;
+            else if (!strcmp(m, "off")) s_char_depth = false;
+            else { fprintf(stderr, "--char-depth: expected on or off\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--hires-verify")) s_verify = true;
         else if (!strcmp(argv[i], "--widescreen")) s_widescreen = s_ws_given = true;
         else if (!strcmp(argv[i], "--no-widescreen")) { s_widescreen = false; s_ws_given = true; }
@@ -2341,6 +2356,7 @@ int main(int argc, char **argv) {
     g_pgxp = s_pgxp > 0;
     { extern u32 g_callstack[1024]; extern u32 g_depth; g_pgxp_callstack = g_callstack; g_pgxp_depth = &g_depth; }
     hires_set_perspective(s_pgxp == 2);
+    hires_set_char_depth(s_char_depth && s_pgxp > 0);
     widescreen_add_state_hook(pgxp_snapshot_save, pgxp_snapshot_restore);   /* shadow pass leaves PGXP alone */
     hires_set_threads(s_hires_threads);
     if (s_renderer != R_SOFTWARE) {

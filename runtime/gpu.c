@@ -485,6 +485,7 @@ static void hires_prim(HiresPrim *h, const Prim *p, bool tex, bool raw, bool sem
     h->mask_or = p->mask_or; h->mask_check = p->mask_check;
     h->has_uvr = false;
     h->has_cr = false;
+    h->zchar = false;
     h->clip_x1 = s_clip_x1; h->clip_y1 = s_clip_y1; h->clip_x2 = s_clip_x2; h->clip_y2 = s_clip_y2;
     if (s_shadow && !s_shadow_in_area) {
         /* a shadow packet must not touch the 1x draw area (the culled polygons can still reach
@@ -587,7 +588,7 @@ static double pv_area(const Vtx *a, const Vtx *b, const Vtx *c, const PVtx *pv)
 
 /* no_hires: draw into 1x VRAM only (a triangle the hi-res target leaves out) */
 static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
-                     const PVtx *pv, bool tex, bool raw, bool semi, bool gour, bool no_hires)
+                     const PVtx *pv, bool tex, bool raw, bool semi, bool gour, bool no_hires, bool zchar)
 {
     int minx = a->x, maxx = a->x, miny = a->y, maxy = a->y;
     if (b->x < minx) minx = b->x;
@@ -622,6 +623,7 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
             for (s_shadow_side = 0; s_shadow_side < SHADOW_SIDES; s_shadow_side++) {
                 HiresPrim hp;
                 hires_prim(&hp, p, tex, raw, semi, gour);
+                hp.zchar = zchar;
                 g_hires->tri(&hp, hv);
             }
             s_shadow_side = 0;
@@ -650,6 +652,7 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     else if (g_hires) {
         HiresPrim hp;
         hires_prim(&hp, p, tex, raw, semi, gour);
+        hp.zchar = zchar;
         /* With a widescreen guard band, a triangle crossing the draw area's left/right edge is
          * also drawn beyond it, where the 1x draw sampled nothing: the 1x-sampled UV / colour
          * ranges alone would smear its texture there, so they are widened by the vertex ranges
@@ -804,8 +807,15 @@ static void gp0_polygon(const u32 *w)
         if (quad) skip1 = !(pv_area(&v[1], &v[2], &v[3], &pv[1]) < 0);
         g_pgxp_stat_backface += skip0 + skip1;
     }
-    draw_tri(&p, &v[0], &v[1], &v[2], any_pv ? &pv[0] : NULL, tex, raw, semi, shaded, skip0);
-    if (quad) draw_tri(&p, &v[1], &v[2], &v[3], any_pv ? &pv[1] : NULL, tex, raw, semi, shaded, skip1);
+    /* a face of a character mesh (every vertex precise and from char_mesh.c's renderer): drawn with
+     * the character depth test when that is on (hires_set_char_depth); presentation only */
+    bool zc0 = false, zc1 = false;
+    if (any_pv && ncull == n && !semi) {
+        zc0 = pv[0].ok && pv[1].ok && pv[2].ok;
+        zc1 = quad && pv[1].ok && pv[2].ok && pv[3].ok;
+    }
+    draw_tri(&p, &v[0], &v[1], &v[2], any_pv ? &pv[0] : NULL, tex, raw, semi, shaded, skip0, zc0);
+    if (quad) draw_tri(&p, &v[1], &v[2], &v[3], any_pv ? &pv[1] : NULL, tex, raw, semi, shaded, skip1, zc1);
 }
 
 /* ---- rectangles --------------------------------------------------------- */

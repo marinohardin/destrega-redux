@@ -538,7 +538,75 @@ typedef struct {
     const HiresVtx *v;
 } HV;
 
-typedef struct { HiresPrim p; HiresVtx v[3]; bool persp, precise, xbr; } TriArgs;
+typedef struct {
+    HiresPrim p; HiresVtx v[3]; bool persp, precise, xbr;
+    bool zt, zr;            /* character depth: test + write (zchar), or reset to "none" */
+    double zA, zB, zC;      /* zt: depth plane hires_char_z(w) = zA + zB * X + zC * Y (1x units) */
+} TriArgs;
+
+/* ---- character depth test (hires_set_char_depth) ---------------------------------------------
+ * s_z: one float per target pixel, 1.0 = no character face (allocated on first use). s_zb*: the
+ * box (target array coordinates, [x0, x1) x [y0, y1)) outside which every value is 1.0, so the
+ * resets done by everything that is not a character face cost nothing until a character face was
+ * drawn, and a new scope only clears that box. Resetting more than the pixels written is always
+ * safe: it only makes the result closer to plain painter's order. */
+static bool s_zon;
+static float *s_z;
+static int s_zbx0 = 1 << 30, s_zby0 = 1 << 30, s_zbx1 = -1, s_zby1 = -1;
+static atomic_ullong s_ztris, s_zrej;
+void hires_get_char_depth_stats(u64 *tris, u64 *rejected)
+{
+    *tris = atomic_load(&s_ztris);
+    *rejected = atomic_load(&s_zrej);
+}
+static inline bool zbox_hit(int x0, int y0, int x1, int y1)
+{
+    return s_z && x0 < s_zbx1 && x1 > s_zbx0 && y0 < s_zby1 && y1 > s_zby0;
+}
+/* back to "no character face" in [x0, x1) x [y0, y1) (target array coordinates) */
+static void z_reset_box(int x0, int y0, int x1, int y1)
+{
+    if (!zbox_hit(x0, y0, x1, y1)) return;
+    if (x0 < s_zbx0) x0 = s_zbx0;
+    if (x1 > s_zbx1) x1 = s_zbx1;
+    if (y0 < s_zby0) y0 = s_zby0;
+    if (y1 > s_zby1) y1 = s_zby1;
+    for (int y = y0; y < y1; y++) {
+        float *r = s_z + (size_t)y * s_tw;
+        for (int x = x0; x < x1; x++) r[x] = 1.0f;
+    }
+}
+/* the same for a rectangle of 1x pixels (region coordinates, guard band included) */
+static void z_reset_1x(int x0, int y0, int x1, int y1)
+{
+    if (s_z) z_reset_box(x0 * s_Sx - s_ox, y0 * s_Sy - s_oy, x1 * s_Sx - s_ox, y1 * s_Sy - s_oy);
+}
+static void z_free(void)
+{
+    free(s_z);
+    s_z = NULL;
+    s_zbx0 = s_zby0 = 1 << 30; s_zbx1 = s_zby1 = -1;
+}
+static bool z_ensure(void)
+{
+    if (s_z) return true;
+    const size_t n = (size_t)s_tw * s_th;
+    s_z = malloc(n * sizeof(float));
+    if (!s_z) return false;
+    for (size_t i = 0; i < n; i++) s_z[i] = 1.0f;
+    s_zbx0 = s_zby0 = 1 << 30; s_zbx1 = s_zby1 = -1;
+    return true;
+}
+static void be_zclear(void)
+{
+    if (!s_z || s_zbx1 <= s_zbx0) return;
+    const int x0 = imax(s_zbx0, 0), x1 = imin(s_zbx1, s_tw), y0 = imax(s_zby0, 0), y1 = imin(s_zby1, s_th);
+    for (int y = y0; y < y1; y++) {
+        float *r = s_z + (size_t)y * s_tw;
+        for (int x = x0; x < x1; x++) r[x] = 1.0f;
+    }
+    s_zbx0 = s_zby0 = 1 << 30; s_zbx1 = s_zby1 = -1;
+}
 
 /* PGXP perspective-correct texturing (see be_tri) */
 static bool s_persp = true;
@@ -549,6 +617,16 @@ void hires_get_filter_stats(u64 *tris, u64 *tris_2d, u64 *rects)
     *tris = atomic_load(&s_filt_tris);
     *tris_2d = atomic_load(&s_filt_2d);
     *rects = atomic_load(&s_filt_rects);
+}
+void hires_set_char_depth(bool on)
+{
+    s_zon = on;
+    if (!on) z_free();
+}
+bool hires_get_char_depth(void) { return s_zon; }
+void hires_char_depth_clear(void)
+{
+    if (s_zon && g_hires && g_hires->zclear) g_hires->zclear();
 }
 void hires_set_perspective(bool enable) { s_persp = enable; }
 bool hires_get_perspective(void) { return s_persp; }
@@ -734,6 +812,14 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                     pv = pq[2] + pdx[2] * (P - ax) + pdy[2] * (Q - ay);
                 }
                 const size_t row_off = (size_t)(y - s_oy) * s_tw + (xs - s_ox);
+                float *zrow = (ta->zt || ta->zr) ? s_z + row_off : NULL;
+                double zcur = 0, zstep = 0;
+                u64 nzrej = 0;
+                if (ta->zt) {
+                    const double P = ((double)xs + 0.5) / Sx - 0.5, Q = ((double)y + 0.5) / Sy - 0.5;
+                    zcur = ta->zA + ta->zB * P + ta->zC * Q;
+                    zstep = ta->zB / Sx;
+                }
                 u16 *dst = HP ? NULL : s_t + row_off;
                 u32 *dst32 = HP ? s_t32 + row_off : NULL;
                 const int y1 = y / Sy;
@@ -808,6 +894,13 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                             ok = shade(p, DITHER ? x / Sx : 0, y1, CCOL(r, 0), CCOL(g, 1), CCOL(bb, 2), 0, 0,
                                        0, DEPTH, RAW, SEMI, DITHER, &out, &blend);
                         }
+                        if (ok && zrow) {
+                            if (ta->zt) {
+                                const float d = (float)zcur;
+                                if (d > zrow[px]) { ok = false; nzrej++; }
+                                else zrow[px] = d;
+                            } else zrow[px] = 1.0f;
+                        }
                         if (ok) {
                             if (HP) {
                                 if (blend) out32 = blend32(blendm, dst32[px], out32);
@@ -819,10 +912,12 @@ tri_impl(const TriArgs *ta, int by0, int by1,
                         }
                     }
                     if (GOUR) { r += gs[0]; g += gs[1]; bb += gs[2]; }
+                    zcur += zstep;
                     if (PERSP) { U += pus; V += pvs; }
                     else if (TEX) { U += ustep; V += vstep; }
                 }
                 if (TEX) { tl_samples += (u64)(xe - xs); tl_clamped += n_clamped; tl_escaped += n_escaped; }
+                if (nzrej) atomic_fetch_add_explicit(&s_zrej, nzrej, memory_order_relaxed);
             }
             lx += long_step;
             sx += short_step;
@@ -976,6 +1071,28 @@ static void be_tri(const HiresPrim *p, const HiresVtx v[3])
     int xlo = imax(imax((int)(((s64)minx * s_Sx) >> 16), cp->clip_x1 * s_Sx), s_ox);
     int xhi = imin(imin((int)((((s64)maxx * s_Sx) >> 16) + 1), (cp->clip_x2 + 1) * s_Sx), s_ox + s_tw);
     if (yhi <= ylo || xhi <= xlo) return;
+    ta.zt = ta.zr = false;
+    if (s_zon && p->zchar && v[0].w > 0 && v[1].w > 0 && v[2].w > 0 && z_ensure()) {
+        /* depth plane through the three vertices (1x units); hires_char_z is linear in 1/w */
+        double X[3], Y[3], Z[3];
+        for (int i = 0; i < 3; i++) {
+            X[i] = (double)v[i].x / 65536.0; Y[i] = (double)v[i].y / 65536.0; Z[i] = hires_char_z(v[i].w);
+        }
+        const double den = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+        if (den != 0) {
+            ta.zt = true;
+            ta.zB = ((Z[1] - Z[0]) * (Y[2] - Y[0]) - (Z[2] - Z[0]) * (Y[1] - Y[0])) / den;
+            ta.zC = ((Z[2] - Z[0]) * (X[1] - X[0]) - (Z[1] - Z[0]) * (X[2] - X[0])) / den;
+            ta.zA = Z[0] - ta.zB * X[0] - ta.zC * Y[0];
+            atomic_fetch_add_explicit(&s_ztris, 1, memory_order_relaxed);
+            const int bx0 = xlo - s_ox, bx1 = xhi - s_ox, by0 = ylo - s_oy, by1 = yhi - s_oy;
+            if (bx0 < s_zbx0) s_zbx0 = bx0;
+            if (bx1 > s_zbx1) s_zbx1 = bx1;
+            if (by0 < s_zby0) s_zby0 = by0;
+            if (by1 > s_zby1) s_zby1 = by1;
+        }
+    }
+    if (!ta.zt) ta.zr = zbox_hit(xlo - s_ox, ylo - s_oy, xhi - s_ox, yhi - s_oy);
     mark_dirty(ylo / s_Sy, (yhi - 1) / s_Sy);
     s64 area = (s64)(yhi - ylo) * (xhi - xlo);
     if (area >= s_par_threshold) { g_hires_stat_par_px += (u64)area; g_hires_stat_par_jobs++; par_rows(fn, &ta, ylo, yhi); }
@@ -1205,6 +1322,7 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
     int xs = imax(imax(x, p->clip_x1), s_rx - s_gx), xe = imin(imin(x + w, p->clip_x2 + 1), s_rx + s_rw + s_gx);
     if (ys >= ye || xs >= xe) return;
     mark_dirty(ys, ye - 1);
+    z_reset_1x(xs, ys, xe, ye);
     int ylo = ys * s_Sy, yhi = ye * s_Sy;
     if ((s64)(yhi - ylo) * (xe - xs) * s_Sx >= s_par_threshold) par_rows(fn, &ra, ylo, yhi);
     else { fn(&ra, ylo, yhi); flush_counters(); }
@@ -1229,6 +1347,7 @@ static void be_line(const HiresPrim *p0, int x0, int y0, u32 c0, int x1, int y1,
     int dx = x1 - x0, dy = y1 - y0;
     int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
     mark_dirty(imax((y0 < y1 ? y0 : y1) - 1, 0), (y0 > y1 ? y0 : y1) + 1);
+    z_reset_1x((x0 < x1 ? x0 : x1) - 1, (y0 < y1 ? y0 : y1) - 1, (x0 > x1 ? x0 : x1) + 2, (y0 > y1 ? y0 : y1) + 2);
     const bool gour = p->gour;
     if (!gour) c1 = c0;
     const bool dith = dither_on(p);
@@ -1311,6 +1430,7 @@ static void fill_span(int x0, int x1, int y, u16 c)
 {
     const size_t off = (size_t)(y * s_Sy - s_oy) * s_tw + (x0 * s_Sx - s_ox);
     const int n = (x1 - x0) * s_Sx;
+    z_reset_1x(x0, y, x1, y + 1);
     if (s_t32) {
         u32 *row0 = s_t32 + off;
         const u32 c32 = c15to32(c);
@@ -1359,6 +1479,7 @@ static void be_put(int x, int y, u16 v, bool mc, bool ms)
     x &= 1023; y &= 511;
     if (!in_region(x, y)) return;
     mark_dirty(y, y);
+    z_reset_1x(x, y, x + 1, y + 1);
     const u16 val = v | (ms ? 0x8000 : 0);
     const u32 val32 = c15to32(val);
     for (int sy = 0; sy < s_Sy; sy++) {
@@ -1403,6 +1524,7 @@ static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, boo
         for (int i = 0; i < wd; i++) {
             int dcol = (dx + i) & 1023;
             if (!in_region(dcol, drow)) continue;
+            z_reset_1x(dcol, drow, dcol + 1, drow + 1);
             for (int a = 0; a < Sy; a++) {
                 const size_t di = (size_t)(drow * Sy + a - s_oy) * s_tw + (dcol * Sx - s_ox);
                 for (int b = 0; b < Sx; b++) {
@@ -1450,6 +1572,7 @@ static void be_destroy(void)
     free(s_t32);
     s_t = NULL;
     s_t32 = NULL;
+    z_free();
     s_Sx = s_Sy = 0;
     s_gx = 0; g_hires_guard = 0;
 }
@@ -1476,6 +1599,7 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     s_tw = (rw + 2 * gx) * sx; s_th = rh * sy;
     s_ox = (rx - gx) * sx; s_oy = ry * sy;
     memset(s_fb_tex_seen, 0, sizeof s_fb_tex_seen);
+    z_free();   /* reallocated (all "none") by the next character face */
     seed();
     s_epoch++;
     mark_dirty(0, VRAM_H);
@@ -1506,7 +1630,7 @@ static void be_set_guard(int gx) { s_pend_gx = gx < 0 ? 0 : (gx > HIRES_MAX_GUAR
 
 static const HiresBackend s_soft = {
     "software", be_configure, be_tri, be_rect, be_line, be_fill, be_copy, be_put, be_view, be_view, be_destroy,
-    be_set_guard,
+    be_set_guard, be_zclear,
 };
 
 /* ---- control --------------------------------------------------------------------- */
@@ -1544,8 +1668,14 @@ static bool tee_view(int x, int y, int w, int h, HiresView *o)
 }
 static bool tee_read(int x, int y, int w, int h, HiresView *o) { return s_be->read(x, y, w, h, o); }
 static void tee_destroy(void) { s_be->destroy(); s_shadow->destroy(); }
+static void tee_zclear(void)
+{
+    if (s_be->zclear) s_be->zclear();
+    if (s_shadow->zclear) s_shadow->zclear();
+}
 static const HiresBackend s_tee = {
     "tee", tee_configure, tee_tri, tee_rect, tee_line, tee_fill, tee_copy, tee_put, tee_view, tee_read, tee_destroy,
+    NULL, tee_zclear,
 };
 
 void hires_set_backend(const HiresBackend *be, const HiresBackend *shadow)

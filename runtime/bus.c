@@ -2,6 +2,7 @@
 #include "psx.h"
 #include "mdec.h"
 #include "pgxp.h"
+#include "hires.h"
 #include "savestate.h"
 
 u32 sio_read(u32 off, int size);
@@ -247,6 +248,7 @@ static void dma_run(int ch) {
     case 2: /* GPU */
         if (sync == 2) {
             pgxp_new_batch();   /* PGXP welding scope: one ordering-table DMA */
+            hires_char_depth_clear();   /* the character depth test's scope too (presentation only) */
             u32 a = madr, guard = 0;
             cost = 0;
             for (;;) {

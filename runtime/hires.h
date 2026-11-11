@@ -48,6 +48,11 @@ typedef struct {
      * false and the vertex colour range is used */
     bool has_cr;
     int cr_min[3], cr_max[3];
+    /* Character-mesh face (overrides/char_mesh.c: every vertex a precise PgxpVert.cull vertex,
+     * so all three HiresVtx.w > 0; opaque). With hires_get_char_depth() a backend draws it with a
+     * depth test against the other character faces drawn into the same pixels since anything
+     * else was drawn there (see hires_set_char_depth); otherwise it is an ordinary triangle. */
+    bool zchar;
 } HiresPrim;
 
 /* Target pixel formats (hires_set_colour): 15-bit PS1 colour (the 1x VRAM format, bit 15 =
@@ -97,6 +102,8 @@ typedef struct HiresBackend {
      * widened across the guard band (fades). view() then accepts x in [rx - gx, rx + rw + gx).
      * The 1x VRAM, and so all emulated state, never sees any of it. */
     void (*set_guard)(int gx);
+    /* Optional (NULL = no character depth test): start a new depth scope (hires_char_depth_clear). */
+    void (*zclear)(void);
 } HiresBackend;
 
 /* Active backend; NULL = hi-res off. Defined in gpu.c, set by hires_set_scale(). */
@@ -176,6 +183,27 @@ void hires_get_persp_stats(u64 *tris, u64 *persp);
 /* software backend, texture filter on: textured triangles filtered / of them drawn with the 2D
  * (xbr) rule / textured rects filtered */
 void hires_get_filter_stats(u64 *tris, u64 *tris_2d, u64 *rects);
+
+/* Depth-tested character meshes (--char-depth; presentation only). The game sorts a fighter's
+ * faces into integer ordering-table slots (average SZ for triangles, minimum SZ for quads), so two
+ * overlapping faces swap drawing order whenever their SZ crosses a slot boundary, though their
+ * real depth order holds: parts of the face pop in and out (analysis/NOTES.md "Floor tile seams
+ * and face shimmer"). With this on, a HiresPrim.zchar triangle is drawn only where it is nearer
+ * than (or as near as) the character face already in that pixel; anything else drawn into a
+ * pixel (every other primitive, fill, copy, upload) makes it "no character face" again, so the
+ * painter's order between character meshes and everything else is unchanged and only the order
+ * of consecutive character faces is replaced by their PGXP depth. Depth value: hires_char_z(w)
+ * = 1 - HIRES_ZK / w, which is linear in screen space (1/w is) and in [0, 1) for w >= HIRES_ZK
+ * (clamped below), interpolated per pixel; 1.0 = no character face. The scope also ends at every
+ * ordering-table DMA (hires_char_depth_clear). Off: no depth buffer, the same picture as before. */
+#define HIRES_ZK 64.0
+void hires_set_char_depth(bool on);
+bool hires_get_char_depth(void);
+static inline double hires_char_z(double w) { double d = 1.0 - HIRES_ZK / w; return d < 0 ? 0 : d; }
+/* New depth scope (gpu linked-list DMA start): every pixel back to "no character face". */
+void hires_char_depth_clear(void);
+/* character faces drawn with the depth test, and of their hi-res pixels those rejected by it */
+void hires_get_char_depth_stats(u64 *tris, u64 *rejected);
 
 /* ---- render quality (presentation only; AGENTS.md "Render quality") --------------------------
  * Plain global settings with getters/setters (a settings layer may persist them). The colour
