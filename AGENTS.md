@@ -1414,7 +1414,7 @@ replay 4500 frames, 4x6 widescreen xbr full colour).
   Software, a radio pair "Exact" / "Fast (Approximate)" (applies whenever a GPU API runs). The log
   line `hires-gpu: SDL_GPU device ready (...; fast precision)` and the exit line `... N primitives
   in fast precision` say what ran.
-- **Compare mode** (works with either precision): `hires-compare:` adds a second line per range with
+- **Compare mode** (works with either precision): a `hires-compare-steps:` line per range (after `hires-compare:`, separate prefix so its parsers are untouched) gives
   the pixels off by > 1 / > 2 / > 4 15-bit steps (1 step = 8 of 255), the mean absolute error per
   channel and PSNR, and the worst frame for the tolerance. `--compare-tol PCT[:STEPS]` (STEPS 1, 2
   or 4, default 4): exit 6 if a fight frame has more than PCT% of its pixels off by more than STEPS.

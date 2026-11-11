@@ -828,7 +828,7 @@ static void finish(void) {
                    (unsigned long long)s_cmp[k].diff, (unsigned long long)s_cmp[k].px,
                    100.0 * (double)s_cmp[k].diff / px, (unsigned long long)s_cmp[k].big,
                    (unsigned long long)s_cmp[k].mask, (unsigned long long)s_cmp[k].worst_frame, s_cmp[k].worst);
-            rt_log("hires-compare: %s: steps (1 = 8 of 255): > 1 %.4f%%, > 2 %.4f%%, > 4 %.4f%% of pixels; "
+            rt_log("hires-compare-steps: %s: (1 step = 8 of 255): > 1 %.4f%%, > 2 %.4f%%, > 4 %.4f%% of pixels; "
                    "mean abs error %.4f of 255 per channel, PSNR %.2f dB; worst frame > %d steps %llu: %.4f%%",
                    k ? "fight" : "all", 100.0 * (double)s_cmp[k].big / px, 100.0 * (double)s_cmp[k].big2 / px,
                    100.0 * (double)s_cmp[k].big4 / px, (double)s_cmp[k].sum_abs / (3.0 * px),
