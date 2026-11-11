@@ -1167,7 +1167,7 @@ void frontend_vblank(void) {
     const u64 extra = netplay_pace_extra_ns();
     if (s_next_tick_ns == 0 || now > s_next_tick_ns + frame_ns * 4) s_next_tick_ns = now + extra;
     else s_next_tick_ns += frame_ns + extra;
-    if (s_next_tick_ns > now) SDL_DelayNS(s_next_tick_ns - now);
+    if (s_next_tick_ns > now && !menu_wait_until(s_next_tick_ns)) SDL_DelayNS(s_next_tick_ns - now);
     t_prev_end = SDL_GetTicksNS();
     t_sleep += t_prev_end - now;
 }

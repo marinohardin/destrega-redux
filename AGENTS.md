@@ -784,7 +784,11 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   keeps the menu bar reachable by moving the mouse to the top (SDL's default hides it entirely
   when full screen is entered through `SDL_SetWindowFullscreen`, i.e. every path here). The hi-res auto scale follows the new pixel size in `present_frame` like any resize
   (widescreen and both renderers included); the log shows `fullscreen: entered/left, window WxH
-  px` and the new `render scale`. Headless runs have no window and only log the request.
+  px` and the new `render scale`. **macOS: the 60 Hz pacing wait runs the Cocoa run loop**
+  (`menu_wait_until`, `nextEventMatchingMask` without dequeueing, then `SDL_PumpEvents` for anything
+  that arrives) instead of `nanosleep`: in a full-screen Space the menu bar is drawn inside this
+  process, and with the main thread asleep ~95% of every frame revealing and using the menus lagged
+  badly (windowed the system draws the menu bar, so it never showed there). Other platforms sleep. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
   `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `resolution[=auto|4x6|2x3|1x1]`, `fullscreen[=on|off]`,

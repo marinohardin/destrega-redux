@@ -11,4 +11,5 @@ void menu_reveal(const char *path) { (void)path; }
 bool menu_executable_path(char *out, size_t n) { return plat_executable_path(out, n); }
 void controls_open(void) { fprintf(stderr, "menu: no Controls window on this platform (use the controls-* menu actions or settings.ini)\n"); }
 bool menu_test(const char *cmd) { fprintf(stderr, "menu: test %s: no native menus on this platform\n", cmd); return false; }
+bool menu_wait_until(unsigned long long deadline_ns) { (void)deadline_ns; return false; }
 #endif

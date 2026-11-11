@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <SDL3/SDL.h>
 #include "menu.h"
 #include "widescreen.h"
 #include "settings.h"
@@ -191,7 +192,27 @@ static NSMenuItem *add(NSMenu *m, NSString *title, NSString *action, NSString *k
     return it;
 }
 
+static bool s_menus_built;
+
+bool menu_wait_until(unsigned long long deadline_ns) {
+    if (!s_menus_built) return false;
+    @autoreleasepool {
+        for (int spins = 0;; spins++) {
+            const Uint64 now = SDL_GetTicksNS();
+            if (now >= deadline_ns) return true;
+            if (spins > 1000) { SDL_DelayNS(deadline_ns - now); return true; }   /* an event SDL leaves queued */
+            NSDate *until = [NSDate dateWithTimeIntervalSinceNow:(double)(deadline_ns - now) / 1e9];
+            /* runs the run loop (timers, Core Animation, the full-screen menu bar) until an event
+             * arrives or the deadline; the event stays queued for SDL */
+            NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until
+                                                inMode:NSDefaultRunLoopMode dequeue:NO];
+            if (ev) SDL_PumpEvents();
+        }
+    }
+}
+
 void menu_init(void) {
+    s_menus_built = true;
     @autoreleasepool {
         s_target = [DestregaMenu new];
         NSMenu *file = [[NSMenu alloc] initWithTitle:@"File"];

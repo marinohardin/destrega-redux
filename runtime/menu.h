@@ -21,6 +21,12 @@ void menu_netplay_progress(const char *text);
  * greyed / checked state; "click=Menu/Submenu/Item" chooses that item as a click would.
  * Windows only (menu_win.c); elsewhere it logs and returns false. */
 bool menu_test(const char *cmd);
+/* Wait until SDL_GetTicksNS() >= deadline_ns while keeping the native event loop running
+ * (macOS: a macOS full-screen Space draws the menu bar inside this process, so a plain sleep for
+ * most of every frame made revealing and using the menus lag). Events that arrive are handed to
+ * SDL_PumpEvents at once; SDL queues its own events for the next frame's poll as before.
+ * Returns false where there is nothing to run (no menus, other platforms): sleep instead. */
+bool menu_wait_until(unsigned long long deadline_ns);
 
 /* ---- provided by netplay.c / net.c (Netplay menu) ---- */
 const char *netplay_status_text(void);
