@@ -82,6 +82,38 @@
  *   handful of samples land on the neighbouring texel (29 pixels over 331 fight frames at 4x6;
  *   a float version gave 12,494). Colours stay affine, the UV clamp also applies at 1x1 when a
  *   vertex is precise, and clamped GTE vertices never have precise values (pgxp.c).
+ *
+ * Fast precision (hires_gpu_set_fast, --gpu-precision fast; AGENTS.md "Fast GPU precision"):
+ * triangles and rects only; fills, uploads, copies, lines and the seed stay on the exact
+ * pipelines, so the target is the exact one wherever no polygon is drawn. Approximate, not
+ * bit-exact, and presentation only like everything here.
+ * - Geometry: the exact path's vertex positions (16.16 scaled, + 0.5) straight to the
+ *   hardware rasterizer: its own fill rule and sub-pixel snapping, no edge test, no bbox
+ *   fallback (the GPU clips). Rects are quads on their 1x pixel edges.
+ * - Attributes are interpolated by the hardware. u/v: each vertex gets the value hires.c's
+ *   planes have at the vertex + (0.5 / S - 0.5) 1x pixels (hires.c samples at (X + 0.5) / S -
+ *   0.5, the hardware at the pixel centre, X / S here) plus the +0.5 rounding bias. With PGXP
+ *   depth on all three vertices, clip w = 1 / q at that shifted point, so the hardware's
+ *   perspective division reproduces hires.c's u/v (which hires.c itself only computes exactly
+ *   every 8 pixels). Colour: screen-linear (noperspective), unshifted, rounded like the PS1
+ *   (floor(c + 0.5)); no clamp to the 1x colour range.
+ * - Texture decode in fs_fast / hires_fast.glsl FS_FAST: integer u/v (floor), texture window,
+ *   4/8-bit through the CLUT or 15-bit direct from the R16_UINT VRAM texture (the same
+ *   dirty-block upload as exact); texel 0 is transparent; then the exact backend's integer
+ *   modulation, raw texture, dither (only with F_DITHER: off above 1x1 as in hires.c) and
+ *   texture filters (tcomb / samp_filt logic, sample point = interpolated u/v - 0.5, clamped to
+ *   the UV range of the record). Rects without a filter take no clamp.
+ * - Blending, mask bit and pass split: the same 10 pipeline blend states as exact, the same
+ *   two-pass split for semi-transparent textured primitives (opaque texels, then STP texels),
+ *   and the mask bit in the target's alpha: set-mask writes alpha 1, check-mask uses
+ *   ONE_MINUS_DST_ALPHA in the blend. So semi-transparency is fixed-function and exact given
+ *   the same input colour.
+ * - Records: FVtx (28 bytes: position, w, u/v, RGBA8 colour, record index) and FPrim (32
+ *   bytes: flags, page, CLUT, window, clip rectangle, UV clamp range) instead of the 272-byte
+ *   GPrim with its exact plane equations, so the CPU builds a triangle with a few float
+ *   operations and the fragment shader has no 64-bit or exact rational math. Group keys
+ *   NKEYS..2*NKEYS-1 are the fast pipelines; they share the group / tile-mask ordering, so
+ *   exact and fast primitives (e.g. a fill between them) keep command order.
  */
 #include "hires_gpu.h"
 #include "shaders/hires_spirv.h"
