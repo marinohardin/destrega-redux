@@ -27,6 +27,7 @@
  */
 #include "psx.h"
 #include "hlr.h"
+#include "../platform.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -105,6 +106,7 @@ static u64 st_alt_objs, st_alt_tris, st_alt_quads, st_alt_split, st_alt_subs, st
 static u64 st_kind[K_N], st_kind_mis[K_N];
 static int s_logged;
 static u64 st_rejected;
+static u64 st_ns, st_t0;                    /* host time in pre + post (hlr-cost line) */
 
 static PPkt *new_pkt(u32 addr, int kind, int nw)
 {
@@ -505,6 +507,7 @@ static bool s_capture;              /* this pass becomes an HlrFrame (hlr_draws(
 void hlr_stage_pre(u32 mode)
 {
     s_np = 0; s_valid = false;
+    st_t0 = plat_mono_ns();
     s_capture = hlr_draws() && (hlr_get_parts() & HLR_PART_STAGE);
     if (!s_capture && hlr_get_mode() != HLR_AUDIT) return;
     const u32 idx = s32r(SCR_IDX);
@@ -671,9 +674,11 @@ void hlr_stage_post(void)
                        (unsigned long long)st_frames, k_name[s_p[i].kind], s_p[i].addr, s_p[i].slot);
             }
         }
-    if (!s_capture) return;
-    if (st_mismatch + st_unexpl + st_missing + st_badwalk + st_head != bad0) { st_rejected++; return; }
-    capture();
+    if (s_capture) {
+        if (st_mismatch + st_unexpl + st_missing + st_badwalk + st_head != bad0) st_rejected++;
+        else capture();
+    }
+    st_ns += plat_mono_ns() - st_t0;
 }
 
 void hlr_stage_get_stats(HlrAuditStats *st)
@@ -706,4 +711,6 @@ void hlr_stage_report(void)
            " (%llu sub packets audited)",
            (unsigned long long)st_alt_objs, (unsigned long long)st_alt_tris, (unsigned long long)st_alt_quads,
            (unsigned long long)st_alt_split, (unsigned long long)st_alt_subs, (unsigned long long)st_alt_full);
+    rt_log("hlr-cost: %.3f ms host time per stage pass (prediction, audit and capture; the original pass"
+           " runs as before)", (double)st_ns / 1e6 / (double)st_frames);
 }

@@ -155,7 +155,7 @@ static bool s_tex_cache_given;
 /* --hlr off|on|exact|audit, --hlr-parts LIST (settings display.hlr / hlr_parts, View > 3D Scene):
  * the native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md); presentation only */
 static bool s_hlr_given, s_hlr_parts_given;
-#define HLR_WINDOW_DEFAULT HLR_OFF   /* phase 2a: off until the acceptance runs pass */
+#define HLR_WINDOW_DEFAULT HLR_ON    /* windowed default: draws only with a GPU API (HiresBackend.external) */
 
 static void wav_header(FILE *f, u32 bytes) {
     u32 hdr[11] = {0x46464952, 36 + bytes, 0x45564157, 0x20746d66, 16, 0x00020001, 44100,
