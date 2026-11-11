@@ -420,7 +420,7 @@ guard band (the runtime extends full-width fills / rects; these are polygons).
 
 ### Stage builders in full: the audit model (verified (HLR phase 0 A))
 
-`--hlr audit` (`runtime/hlr/hlr_audit.c`, around the real `stage_render` pass in
+`--hlr audit` (`runtime/hlr/hlr_stage.c`, around the real `stage_render` pass in
 `overrides/widescreen.c`) re-runs every stage builder on a host GTE state (`gte_exec_on`) and
 compares the predicted packets word by word with the scene OT after the original ran. 0 mismatched
 packets on all 12 VS stages, practice and story (table below), so the rules here are exact:
@@ -442,13 +442,25 @@ packets on all 12 VS stages, practice and story (table below), so the rules here
   (0x3c) read IR0 when the colour is computed (after the last RTPS); independent quads save IR0
   after the RTPT, before the 4th vertex's RTPS.
 - Strip fans: triangles alternate the carried vertex (`idx ^= 2`), SZ per vertex.
-- **Not modelled: objects with flag 0x2000** (800426c4 / 800433c4 via 800423e0 / 80042fec):
-  they subdivide polygons. When gp+0x5bc is non-zero, stage_render's prologue reserves two
-  areas of the packet buffer for them, at offsets gp+0x5dc (quads, 20 x 52 bytes) and gp+0x5d4
-  (tris, 20 x 40 bytes; -1 = none) (likely: prologue read; the sizes bound every alt packet seen,
-  verified by the audit). The audit treats their packets as an "alt" range and
-  stops at them; any link into that range is counted separately. Seen on gate (10 objects),
-  castle1 (605 objects, 2417 packets), remains (622 / 494) and story (168 / 49).
+- **Objects with flag 0x2000** (verified (HLR phase 2a audit); 800426c4 / 800433c4, sub builders
+  800423e0 / 80042fec read in full): types 0x34 / 0x35 (triangles) and 0x3c / 0x3d (quads) take
+  the polygon count only (no strips; a3 = prelit). Per polygon the packet advances 40 (tri) / 52
+  (quad) bytes and the stream 12 / 16, culled or not; culls and SZ < 400 as above; the colour
+  (lit NCDT/NCDS or prelit DPCT/DPCS) is computed before the size test. A polygon with an x span
+  >= 901, a y span >= 451, max y >= 513 or min y < -512 is **not linked** but split into four
+  (`a, ab, ca, bc...` midpoints; quads into four quads with the centre vertex): each quarter is a
+  12-byte stack vertex {x, y, z of the model vertex, u/v from the parent packet's UV words' low
+  halves, colour word}; midpoints use C `/2` (rounds toward 0) on x/y/z and `>> 1` per byte on u,
+  v and r/g/b (the code byte is the first vertex's); the quarter is projected again (RTPT, plus
+  RTPS for the 4th vertex), culled with the same bounds, its tpage (parent w6 high half) and CLUT
+  (w3 high) copied, OT slot from the SZ of vertices 0-2 only (quads), and written at the sub
+  cursor gp+0x5c4 (quads) / gp+0x5c0 (tris). At most 20 quarters of each kind per frame (counts
+  gp+0x5e0 / gp+0x5d8, reset by the prologue); a culled quarter does not advance the cursor or
+  the count. Prologue: when gp+0x5bc is non-zero the cursors are re-based to gp+0x5dc / gp+0x5d4
+  + this frame's packet buffer (-1 = none), else they keep last frame's value. Seen: gate (10
+  objects: 280 triangles, 130 quads), castle1 (305 objects, 2135 quads, 10 split, 20 quarters
+  linked), remains (4508 triangles, 644 quads), story (1344 quads). No stage splits a triangle,
+  so 800423e0's model is read but not exercised.
 
 | scenario | packets checked | mismatched | alt (0x2000) packets |
 |---|---:|---:|---:|
@@ -460,9 +472,31 @@ packets on all 12 VS stages, practice and story (table below), so the rules here
 Each run: scenario frames + 600 (story 16200), `--no-interp --verify-overrides`; also 0
 unexplained packets, 0 missing, 0 OT slot heads different. Story's two GT4 packets that link to
 an alt packet (frames 3851/3852) are the only links into alt ranges. A deliberately broken
-builder produced mismatches (the probe sees errors). Per-frame `--state-hash` with `--hlr audit`
+builder produced mismatches (the probe sees errors). (The alt column is from phase 0, when the
+0x2000 objects were only recognised; since phase 2a they are predicted like the rest: 0 mismatched,
+0 unexplained, 0 missing on all 12 stages, practice and story, `tools/test_hlr.py audit`.) Per-frame `--state-hash` with `--hlr audit`
 on equals off (vs_hills 3700 frames; vs_castle1 widescreen 2x3 4100 frames; the Milena repro 3966
 frames).
+
+### HLR phase 2a: stage capture and per-node replay (verified (tests))
+
+How the native renderer gets the stage without touching emulation (`runtime/hlr/`, AGENTS.md "Native
+high-level renderer"): `stage_pre` (before the real pass of stage_render, `overrides/widescreen.c`)
+predicts every packet from the root, the GTE state the pass finds and the matrices / lights it loads
+(800ed4c8, 800cc6e0, 800cc6c0), on a copy of the GTE; `stage_post` audits RAM and the OT, and a
+clean frame becomes an `HlrFrame` (a copy of each linked packet's words; the predicted XY / colour
+words plus, for the words no builder computes (UV, CLUT, tpage, F3/F4 colours), the RAM words).
+Facts the pairing relies on (verified by the exact-dump and hash tests on every stage):
+- the scene OT of one index is built by exactly one stage pass and walked by exactly one GPU
+  linked-list DMA before it is built again (305 captures, 304 walks, 0 replaced in vs_castle1; the
+  last one is never walked because the run ends);
+- the stage packets are not rewritten between the pass and the DMA (0 stale packets in every run:
+  the walk compares each node's words with the capture before replacing it);
+- a frame whose audit fails is not captured and is drawn the old way (`frames not captured`: 0 in
+  every run so far); packets linked but never drawn by the HLR are those of the last, unwalked
+  capture (e.g. vs_hills 22443 of 22492).
+Cost: 0.37 ms host time per stage pass (one per game update) in the Hills fight, quick_check bench
+configuration (`hlr-cost:` line).
 
 ### Fog, depth cue and lights per stage (verified (phase 1))
 

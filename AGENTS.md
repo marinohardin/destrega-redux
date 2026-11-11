@@ -236,6 +236,9 @@ the script has the exact patterns), each a small subset:
   `test_render_quality.sh` with `CASES="call169 cxbr43 glive"` (each plus its `off` reference).
 - **menus** (`menu_*`, `settings*`, `input*`, `controls_*`, `main.c`): `test_menu.sh` (its ~1 GB of
   scratch is deleted after a pass), `test_input.py`, `test_governor.py` when present.
+- **hlr** (`runtime/hlr/`, `hlr_hook.h`, `tools/test_hlr.py`, `runtime/tests/test_hlr.c`): CTest `hlr`,
+  `hlr_gpu`, `test_hlr.py` audit / exact / hash / rewind on a subset (castle1 remains gate, Metal), and
+  `test_netplay.py lan_hlr`.
 - **core** (other `runtime/*.c|h`, `runtime/overrides/`, `recomp/`, `analysis/overrides.txt`,
   `extra_seeds.txt`, procedure / overlay lists, `CMakeLists.txt`): scenarios `vs_hills`, `story`,
   `option_game`, `practice`; replays `practice_gradd`, `opts_handicap_recover`,
@@ -1766,6 +1769,40 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
   refused, and traps instead of using stdio): the Windows job downloads Zig 0.17.1 (sha256 checked)
   next to `build/launcher/destrega.exe` and requires the bundled Zig to build and load the DLL,
   then "is current" on a second run; the Linux jobs run it with their gcc / clang.
+
+## Native high-level renderer (`runtime/hlr/`, `--hlr`; docs/HLR_PLAN.md)
+
+Presentation only, in phases (plan and results: `docs/HLR_PLAN.md`; game facts: NOTES.md "Stage
+builders in full", "HLR phase 2a"). Phase 2a: the stage is captured and redrawn exactly.
+
+- **Hooks** (`runtime/hlr_hook.h`, table `g_hlr` in bus.c; all NULL = off): `stage_pre(mode)` /
+  `stage_post()` around the real pass of `stage_render` (`overrides/widescreen.c real_pass`),
+  `ll_filter(node)` per node of the GPU linked-list DMA (`bus.c`; `0xffffffff` = end of the walk),
+  `on_restore()` from `ss_restore`. Hooks only read guest RAM / scratchpad; GTE work runs on a copy
+  (`gte_exec_on`); they never call guest code or touch cycles, the scheduler, RAM or GPU state.
+- **Capture** (`hlr_stage.c`): predicts every stage packet (all builders incl. the 0x2000
+  subdivision ones), audits the prediction against RAM and the scene OT, and a clean frame becomes
+  an `HlrFrame` (copies of the packet words, keyed by the OT it was linked into; two slots). A
+  frame whose audit fails is not captured (`frames not captured`).
+- **Drawing** (`hlr.c hlr_ll_filter`): when the walk enters a captured table the frame becomes
+  active (and an empty `HiresBackend.external` pass is inserted: GPU backend only; phase 2b draws
+  the native stage there); each node that is a captured packet whose RAM words still equal the
+  capture is drawn into the hi-res target by `gpu_hires_replay` and sent to the 1x GPU only
+  (`gpu_set_node_no_hires`); a changed packet ("stale") goes the normal way. The end of the walk
+  consumes the frame; a save-state load or a mode / parts change drops every frame.
+- **Modes**: `off`; `audit` (prediction + checks, draws nothing differently); `exact` (any hi-res
+  backend); `on` (= exact in 2a, needs a GPU API). Default: on in a window, off headless. `--hlr-parts
+  stage|chars|shadows|fx|story|all|none` (only stage exists). Settings `[display] hlr` (on|off),
+  `hlr_parts`; menu actions `hlr[=on|off]`, `hlr-part=stage:on|off`; View > 3D Scene > Original /
+  Native, Stage (Mac, Windows; greyed unless a GPU API renders). `runtime/hlr/` is outside the
+  netplay build identity (`source_ident.py`), `hlr_hook.h` and the call sites are inside.
+- Exit lines: `hlr-audit:` (+ `-kinds`, `-alt`), `hlr-cost:` (host ms per stage pass), `hlr:` (frames
+  captured / walked / dropped, packets drawn by the HLR, stale, external passes).
+  `DESTREGA_HLR_TEST_DROP=N` leaves out every Nth packet (tests prove they notice).
+- **Tests**: CTest `hlr` (no disc) and `hlr_gpu` (`test_hires_gpu external`); `tools/test_hlr.py
+  [audit hash exact rewind]` (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`); `test_netplay.py
+  lan_hlr`; pr_check group `hlr`. Must hold: audit 0 everywhere, state hashes on == off, exact
+  dumps byte-identical to off.
 
 ## Releases (`docs/RELEASES.md`)
 

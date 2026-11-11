@@ -1,6 +1,6 @@
 # Destrega native high-level renderer (HLR): implementation plan
 
-Status: design only, nothing implemented. Builds on `docs/HIGH_LEVEL_RENDERER.md` (phase 1 done,
+Status: phase 0 done, phase 2a done (see "Phase 2a results"); phase 2b next. Builds on `docs/HIGH_LEVEL_RENDERER.md` (phase 1 done,
 phase 2 "go") and corrects it where the findings of PRs #34 / #35 and a closer reading of the
 runtime change it. Written against commit bb2d4bf. Facts about the game carry the NOTES.md
 confidence levels (`verified` / `likely` / `guess`); design claims about the runtime are from
@@ -52,6 +52,54 @@ Terms: "HLR" = this renderer; "original path" = 1x GPU (`gpu.c`) + hi-res backen
   the jitter; `--hlr-motion extrap` must extrapolate a smoothed bone signal (EMA + prediction, or
   a one-euro filter) to stay steady without latency. `--hlr-bones float` is dropped; `smooth`
   becomes the only option against the shimmer (user decision whether it may be on by default).
+
+## Phase 2a results (2026-11-11, `feature/hlr`)
+
+What exists: `runtime/hlr/` (`hlr.c` switches, frame store `HlrFrame[2]` (copies, never pointers into
+guest RAM), linked-list filter; `hlr_stage.c` prediction, audit and capture), the hook table
+`runtime/hlr_hook.h` (`stage_pre` / `stage_post` around the real `stage_render` pass, `ll_filter`
+per node of the GPU linked-list DMA in `bus.c`, `on_restore` from `ss_restore`), `gpu.c`
+`gpu_set_node_no_hires` / `gpu_hires_replay`, `HiresBackend.external` (GPU backend; software
+NULL), `--hlr off|on|exact|audit`, `--hlr-parts`, `[display] hlr` / `hlr_parts`, menu actions
+`hlr[=on|off]` / `hlr-part=stage:on|off`, View > 3D Scene (Mac, Windows; greyed unless a GPU API
+renders). Default: on in a window (draws only with a GPU API), off headless. `runtime/hlr/` is
+excluded from the netplay identity (`tools/source_ident.py`); `hlr_hook.h` and the call sites are not.
+
+Acceptance (all pass):
+- audit: 0 mismatched / unexplained / missing / slot heads / bad walks on all 12 VS stages, practice
+  and story, the 0x2000 subdivision builders included (castle1 2135 alt quads, 10 split, 20 quarters
+  linked; remains 4508 tris / 644 quads; gate; story 1344 quads); `tools/test_hlr.py audit`.
+- state hash on == off (`--renderer gpu --no-interp --verify-overrides`): vs_hills 4:3 4x6, vs_castle1
+  16:9 4x6, story 2x3 (15600 frames), key-frame dumps identical too (`test_hlr.py hash`).
+- exact dumps byte-identical on every VS stage at 4:3 / 16:9 x 2x3 / 4x6 on Metal and MoltenVK
+  (`test_hlr.py exact`; a run that leaves out every 50th packet is detected).
+- savestate rewinds (37:23) with the HLR on: per-frame complete-state hashes equal to a plain run,
+  68 loads, captures dropped (`test_hlr.py rewind`); netplay `test_netplay.py lan_hlr` (one peer on
+  the HLR): in sync, equal to offline, 51 rollbacks dropped 51 captures.
+- CTest `hlr` (no disc: switches, a synthetic stage audited / broken three ways, capture -> filter
+  replay == plain target, stale packets, restore / mode drop, suppression) and `hlr_gpu` (an empty
+  external pass every 37 primitives leaves GPU == software; exit 77 without a device).
+- Timing (quick_check bench configuration, Metal, fight 3700-4000, 3 A/B rounds): off 4.27-4.34,
+  on 4.23-4.29 ms/frame (no measurable change: the run is GPU-bound); host CPU of prediction + audit
+  + capture 0.37 ms per stage pass (`hlr-cost:`), i.e. ~0.19 ms per vblank in fights.
+
+**Deviation from 2.3 / 2.4 and step 5 of phase 2a, and why.** Exact mode does not emit the stage
+through the external pass. The filter instead replays each captured packet at its own node of the
+DMA walk (`gpu_hires_replay`: hi-res only, with the node's PGXP tags, GPU state saved and restored)
+and sends the original words to the 1x GPU only. Reason: stage packets are interleaved with
+character, shadow and effect packets in the same 2048-slot OT, so drawing the stage as one block
+in an external pass changes painter's order and cannot be byte-identical; per-node replay is
+byte-identical by construction and proves the capture (every packet's words compared at DMA time:
+0 stale in every run). The external pass is still inserted (empty) where the walk enters a captured
+table, exercised by `hlr_gpu` and counted (`external passes`); phase 2b draws the depth-tested
+native stage there and suppresses the stage packets without replaying them. Also: unit tests are
+C (`runtime/tests/test_hlr.c`) plus `tools/test_hlr.py` for the disc-based checks (no shell
+wrapper); `test_hlr_gpu` is a mode of `test_hires_gpu` (`external`), CTest name `hlr_gpu`.
+
+Blocking / open for 2b: the external pass gets the colour target only (no depth buffer yet; 2b
+needs a depth attachment and its clear per captured table); `on` currently draws like `exact`, so
+"Native" looks identical until 2b; the triangle subdivision builder 800423e0 is modelled but never
+exercised by any scenario; not run on a native Vulkan / D3D12 driver or under Wine.
 
 ## 1. Executive summary
 
