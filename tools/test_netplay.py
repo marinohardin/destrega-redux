@@ -112,6 +112,8 @@ def run_case(name, port, pace):
                      '--net-hash-log', os.path.join(d, 'join.hash')]
     if expect.get('desync'):
         join += ['--net-inject-desync', str(rp.frames // 2)]
+        for side in (host, join):   # Netplay > Copy Out-of-Sync Report Location (headless: logged only)
+            side += ['--menu-action', f'{rp.frames - 5}:netplay-copy-report']
     with open(os.path.join(d, 'host.log'), 'w') as hl, open(os.path.join(d, 'join.log'), 'w') as jl:
         ph = subprocess.Popen(host, stdout=hl, stderr=subprocess.STDOUT, cwd=ROOT)
         pj = subprocess.Popen(join, stdout=jl, stderr=subprocess.STDOUT, cwd=ROOT)
@@ -155,6 +157,10 @@ def run_case(name, port, pace):
             if want is None and (r.returncode or m): problems.append(f'{who} report does not replay cleanly')
             if want is not None and not (m and int(m.group(1)) == want and re.search(r'p1\.hp +DIFFERS', log)):
                 problems.append(f'{who} report replay: expected a p1.hp divergence at {want}')
+            wlog = hlog if who == 'host' else jlog
+            c = re.search(r'netplay: copy report location: (\S+)', wlog)
+            txt = os.path.join(os.path.abspath(d), found[0][:-4] + '.txt')
+            if not c or os.path.normpath(c.group(1)) != txt: problems.append(f'{who}: copy report location: {c.group(1) if c else "nothing"}, expected {txt}')
         ok = not problems
         dt = time.time() - t0
         msg = '; '.join(problems) if problems else (f'injected at {inj}, detected at {frames[0]}; '
@@ -250,20 +256,32 @@ def run_menu_session(name, port, pace):
     return not problems, '; '.join(problems) if problems else msg, dt, None, None
 
 
+# Join Game input the player might type or paste, and the alert each must give (netplay_ui.c)
+BAD_JOINS = [('127.0.0.1:abc', '"abc" is not a port'), ('127.0.0.1', 'Add the port after the address'),
+             ('my host:7000', '"my host" is not an address'), ('fe80::1:7000', 'looks like an IPv6 address'),
+             ('127.0.0.1:70000', '"70000" is not a port'), ('127.0.0.1:7000,99', 'input delay is a number of frames')]
+
+
 def run_menu_fail(name, port, pace):
     """Menu sessions that cannot start must alert and keep playing offline: a host with other
-    settings refuses the joiner (plain-language reason), and joining a port nobody hosts times out."""
+    settings refuses the joiner (plain-language reason), and joining a port nobody hosts times out.
+    Also: Copy My Address is refused when not hosting and copies the home-network address while
+    hosting without a router; mistyped Join Game addresses get a plain alert, and pasted whitespace
+    is ignored. At most two game processes run at once (the lone joiner starts when the joiner is done)."""
     d = os.path.join(OUT, name)
     os.makedirs(d, exist_ok=True)
     t0 = time.time()
     common = [BIN, '--headless', '--no-interp', '--net-pace', str(pace)]
-    host = common + ['--frames', '9000', '--net-window', '6', '--menu-action', f'100:netplay-host={port}']
-    join = common + ['--frames', '600', '--menu-action', f'300:netplay-join=127.0.0.1:{port}']
+    host = common + ['--frames', '9000', '--net-window', '6', '--menu-action', f'100:netplay-host={port}',
+                     '--menu-action', '50:netplay-copy-address', '--menu-action', '200:netplay-copy-address']
+    join = common + ['--frames', '600', '--menu-action', f'300:netplay-join=  127.0.0.1:{port}\n']
+    join += [x for i, (t, _) in enumerate(BAD_JOINS) for x in ('--menu-action', f'{150 + 10 * i}:netplay-join={t}')]
     # the join attempt gives up after --net-timeout + 5 s (20 s by default): 0.5 s here
     lone = common + ['--frames', '3000', '--net-timeout', '-4.5', '--menu-action', f'100:netplay-join=127.0.0.1:{port + 1}']
     logs = {}
     procs = {}
     for who, cmd in (('host', host), ('join', join), ('lone', lone)):
+        if who == 'lone': procs['join'].wait(timeout=900)
         logs[who] = os.path.join(d, who + '.log')
         procs[who] = subprocess.Popen(cmd, stdout=open(logs[who], 'w'), stderr=subprocess.STDOUT, cwd=ROOT)
     rcs = {w: p.wait(timeout=900) for w, p in procs.items()}
@@ -273,11 +291,19 @@ def run_menu_fail(name, port, pace):
         problems.append('join: no "different settings" refusal alert')
     if 'refused a player' not in L['host']: problems.append('host: did not refuse')
     if 'alert: No answer from 127.0.0.1' not in L['lone']: problems.append('lone joiner: no timeout alert')
+    for t, want in BAD_JOINS:
+        if not re.search(r'alert: [^\n]*' + re.escape(want), L['join']): problems.append(f'join {t!r}: no alert "{want}"')
+    if L['join'].count('netplay: joining ') != 1: problems.append('join: a mistyped address was used, or the padded one was not')
+    if 'menu: REFUSED netplay-copy-address: not hosting a game' not in L['host']: problems.append('host: copy not refused before hosting')
+    c = re.search(r'netplay: copy address: (\S+) \(your home-network address', L['host'])
+    if not (c and c.group(1).endswith(f':{port}')) and 'This computer has no network address' not in L['host']:
+        problems.append('host: Copy My Address did not copy the home-network address')
     if any('portmap:' in v for v in L.values()): problems.append('a headless test tried to map a port on the real router')
     for w, n in (('host', 9000), ('join', 600), ('lone', 3000)):
         if f'headless: reached {n} frames' not in L[w]: problems.append(f'{w}: did not keep playing offline')
         if 'restarting for the session' in L[w]: problems.append(f'{w}: restarted although nothing was agreed')
-    msg = 'settings mismatch refused with an alert, unanswered join timed out with an alert, all kept playing offline'
+    msg = ('settings mismatch refused with an alert, unanswered join timed out with an alert, all kept playing offline; '
+           f'copy address refused / home network ({c.group(1) if c else "none"}), {len(BAD_JOINS)} mistyped joins alerted')
     return not problems, '; '.join(problems) if problems else msg, time.time() - t0, None, None
 
 

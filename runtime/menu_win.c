@@ -460,7 +460,7 @@ static void netplay_dialog(bool host) {
             snprintf(arg, sizeof arg, "%d,%d", p, dl);
             frontend_menu_action("netplay-host", arg);
         } else {
-            char h[256], defp[256];
+            char h[200], defp[256];
             reg_get("Port", defp, sizeof defp, "7000");
             int dp = atoi(defp);
             if (!netplay_ui_parse_address(addr, dp > 0 && dp <= 65535 ? dp : 7000, h, sizeof h, &p, err, sizeof err)) {

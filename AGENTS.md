@@ -427,16 +427,43 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
 - **Netplay menu** (macOS `menu_mac.m` and Windows `menu_win.c`; top level, after View): Host
   Game… (port, default 7000, and input delay, default 2, both remembered in `settings.ini`
   `[netplay]`, see "Settings file"; the dialog lists this computer's IPv4
-  addresses, `plat_local_ipv4`), Join Game… (address:port, remembered, and delay),
-  Disconnect (enabled while a session or an attempt runs), and a disabled status line
-  (`netplay_status_text`: Not connected / Waiting for an opponent on port N (+ what the router
-  said, see "Automatic port forwarding") / Connecting to X / Connected to X, ping N ms / Desync at
-  frame F). While hosting or connecting a small non-modal panel says so with Cancel (hosting: the
-  home-network address and the router's answer, updated when it arrives); the game keeps running
-  offline. The Host dialog has a check box "Ask the router to open the port automatically"
-  (`[netplay] port_mapping`). UI words: Netplay, Host Game, Join
-  Game, opponent (no console jargon). Menu actions (also `--menu-action`, every platform):
-  `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`.
+  addresses, `plat_local_ipv4`), Join Game… (address:port, remembered, and delay; a **Paste**
+  button, since the game has no Edit menu and Cmd+V does not reach a Mac text field), **Copy My
+  Address** (while hosting; titled "Copy My Home-Network Address" when the router gave no internet
+  address), Disconnect (enabled while a session or an attempt runs), a disabled status line and
+  **Copy Out-of-Sync Report Location** (enabled once this process wrote a desync report). Status
+  line (`netplay_status_text`): Not connected / Waiting for an opponent on port N (your address:
+  A:P, or what the router said, see "Automatic port forwarding") / Connecting to X:P... /
+  Connected to X, ping N ms, connection excellent|good|fair|poor (+ "your opponent's computer is
+  running slowly" / "this computer is running slowly") / Your opponent left / Out of sync since
+  frame F (a report was saved). The quality word comes from the last second's ping, rollbacks/s
+  and % of time waiting for the opponent (thresholds in `netplay_ui.c quality()`). While hosting
+  or connecting a small non-modal panel says so with Cancel; hosting: "Give your opponent this
+  address: A:P" (the router's public address) and the home-network address, or, without one, the
+  router's answer, the home-network address and "Players outside your home network need your
+  internet address instead", plus a **Copy Address** button and "Copied ... to the clipboard"
+  after a copy. The game keeps running offline. The Host dialog has a check box "Ask the router to
+  open the port automatically" (`[netplay] port_mapping`). UI words: Netplay, Host Game, Join
+  Game, opponent (no console jargon). Menu actions (also `--menu-action`, every platform, Linux
+  included): `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`,
+  `netplay-copy-address`, `netplay-copy-report`.
+- **Netplay UI code** (`runtime/netplay_ui.[ch]`, presentation only, excluded from the build
+  identity in `tools/source_ident.py`): status line, panel text (logged as `netplay: panel: ...`
+  whenever it changes, on every platform), the copy actions and the parsing of typed / pasted
+  input. netplay.c only exposes its state (`netplay_ui_info`) and calls `netplay_ui_panel_update()`;
+  the menus call `menu_netplay_progress(text, copy)`. **Copy My Address** copies the router's
+  external address and port when portmap.c has a public one (`portmap_address` = PM_RES_PUBLIC),
+  else this computer's home-network address (a private one first, `plat_local_ipv4`) and says why
+  (router still asking, CGNAT, refused / no answer, port opening off); it is refused when not hosting
+  (`menu: REFUSED netplay-copy-address: not hosting a game ...`). `SDL_SetClipboardText` in a window
+  (`frontend_copy_text`, main.c); headless runs only log `netplay: copy address: A:P (...)
+  [headless: the clipboard is left alone]`. No outside "what is my IP" service is ever asked.
+  **Input**: the Host / Join dialogs and the two actions trim spaces, tabs, line breaks, no-break
+  spaces and quotes, take `host:port`, `host port`, `udp://host:port`, an address pasted into the
+  port field (the port after the last `:`), and refuse with a plain sentence (alert; the dialog
+  then opens again with what was typed): a port outside 1..65535, a missing port (actions; the
+  dialogs add the remembered port), characters other than letters, digits, `.` and `-`, an IPv6
+  address, an input delay outside 1..30.
 - **Synchronised start = fresh boot on both sides.** The game is already running when someone
   picks Host / Join, so the two machines differ. A short lobby exchange runs between frames
   (`lobby_poll`, packet types 5-7): the joiner sends a hello every 200 ms, the host checks the
@@ -476,7 +503,8 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   endings normalised. Left out: what only one platform compiles or what is presentation-only and
   proven not to reach emulated state (menus, `platform*.c|h`, `hires*.c|h`, shaders, Windows
   resources, host input / settings / controls windows, the host's router port mapping `portmap.c|h`,
-  the smoothness statistics and render-scale governor `smooth.c|h`),
+  the smoothness statistics and render-scale governor `smooth.c|h`, the Netplay status / panel
+  text, copy actions and address parsing `netplay_ui.c|h`),
   plus tools / tests / docs. No compiler, OS or build type: the Mac (clang) and Windows
   (MinGW GCC) builds of the same commit have identical per-frame state hashes (`test_wine.sh`), so
   they emulate the same machine and must be allowed to play; any source change that could alter
@@ -633,7 +661,11 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   `--net-full-boot` so their replay scripts still start from power-on; the joiner disconnects, the host gets the
   "opponent left" alert, both keep playing offline to `--frames`) and `menu_fail` (a host with a
   different rollback window refuses with a reason, an unanswered join times out with an alert, all
-  three keep playing offline, nobody restarts).
+  three keep playing offline, nobody restarts; also Copy My Address refused before hosting and the
+  home-network address copied while hosting without a router, six mistyped Join Game inputs each
+  answered by its alert, and a join padded with spaces and a line break accepted; the lone joiner
+  starts once the joiner is done, so at most two games run at once). The `desync` cases also check
+  that `netplay-copy-report` gives the absolute path of each peer's report.
 - **Mac <-> Windows** (`tools/test_netplay_wine.py`, in `run_tests.sh`; skipped with a message
   when Wine, `build/win/destrega.exe` + `SDL3.dll` or the data pack is missing): the native build
   and the Windows build under Wine (`WINE`, `WINE_ARGS`, `WIN_EXE`, `PAK`; default CrossOver's wine
@@ -710,7 +742,9 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   full suite the machine is so loaded that gaps of ~400 ms occur without any router), `off`, `no_override` (headless `--net-portmap on` without overrides: nothing), `plain` (a headless
   host with no port-mapping argument at all: nothing), `restart`
   (menu session host + join: one PCP map, the restarted host renews it with the same nonce, one
-  delete after the opponent leaves). `--win` runs them with the Windows build under Wine as the host.
+  delete after the opponent leaves). Every basic case also runs `netplay-copy-address` before
+  hosting (refused) and while hosting: the router's address in the four mapping cases, else the
+  home-network address with the case's reason. `--win` runs them with the Windows build under Wine as the host.
   Unit test `runtime/tests/test_portmap.c` (CTest `portmap`): PCP / NAT-PMP packets, UPnP description
   / SOAP / fault parsing, chunked HTTP, URL joining, address classes; prints the local default
   gateway (routing table read only).
@@ -769,7 +803,8 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   see "Render quality". Texture Filtering ends with a separator and the check item **Smooth Distant
   Textures (Fast Renderer)**: action `tex-cache[=on|off]` (none = toggle), the fast precision's
   texture cache, see "Texture cache".
-- **Netplay** menu (after View): Host Game…, Join Game…, Disconnect, status line; see "Rollback netplay".
+- **Netplay** menu (after View): Host Game…, Join Game…, Copy My Address, Disconnect, status line, Copy
+  Out-of-Sync Report Location; see "Rollback netplay".
 - **View > Controls…** (both platforms) and app menu **Settings… (Cmd+,)** on macOS: the Controls
   window, see "Input, controls and settings". View toggles are saved in `settings.ini`.
 - **Full screen** on every platform from the SDL event loop in `main.c` (so not a Cocoa-only
@@ -820,7 +855,7 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   Save Games in Explorer / Import / Export / Delete, Exit), **View** (Widescreen (16:9) with check
   mark, Renderer > Direct3D 12 / Vulkan / Software, Resolution > Auto / 4×6 / 2×3 / 1×1, Texture
   Filtering, Smooth Colours, Anti-aliasing, Enter / Exit Full Screen, Controls…), **Netplay** (Host Game…, Join Game…,
-  Disconnect, status line). The window procedure is subclassed: `WM_COMMAND` queues the action,
+  Copy My Address, Disconnect, status line, Copy Out-of-Sync Report Location). The window procedure is subclassed: `WM_COMMAND` queues the action,
   `WM_INITMENUPOPUP` updates check marks, titles, the status line and greys out refused items
   (`frontend_menu_action_allowed`, as `validateMenuItem` on the Mac). SDL sizes the window by its
   client area and accounts for the menu bar, so the picture keeps its size; full screen covers the

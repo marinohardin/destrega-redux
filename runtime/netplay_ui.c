@@ -53,7 +53,7 @@ static void home_address(char *out, size_t n) {
     snprintf(out, n, "%s", best);
 }
 
-static char s_copied[160];     /* "Copied ... to the clipboard." shown in the panel until it changes */
+static char s_copied[320];     /* "Copied ... to the clipboard." shown in the panel until it changes */
 static int s_copied_port;
 
 /* ---- status line ----------------------------------------------------------------------------- */

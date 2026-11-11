@@ -106,7 +106,7 @@ static u64 s_local_through;                 /* our inputs are known up to this f
 static u64 s_first_bad;                     /* earliest mispredicted frame (0 = none) */
 static u16 s_last_remote;                   /* prediction source */
 static bool s_peer_left, s_pred_prev;
-static char s_end_msg[512];                 /* session end requested (peer left, desync, timeout) */
+static char s_end_msg[1400];                 /* session end requested (peer left, desync, timeout) */
 static bool s_end_pending;
 static void end_later(const char *msg) {
     if (s_end_pending) return;
@@ -893,7 +893,7 @@ static void desync_report(u64 frame) {
     fprintf(stderr, "netplay: desync report written to %s%s%s\n", txt, rec ? " and " : "", rec ? dtr : "");
     if (o.desync_stop) { fprintf(stderr, "netplay: stopping (--net-desync-stop)\n"); frontend_set_max_frames(s_applied + 1); }
     if (o.from_menu) {
-        char m[512];
+        char m[1400];
         snprintf(m, sizeof m, "Netplay stopped: the two games went out of sync at frame %llu. Continuing offline. "
                  "A report was saved as %s (Netplay > Copy Out-of-Sync Report Location copies where it is).",
                  (unsigned long long)frame, txt);
