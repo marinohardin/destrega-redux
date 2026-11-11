@@ -6,7 +6,7 @@
 #
 # Always:
 #   build        cmake configure (-DDESTREGA_TESTS=ON) + build of build/cmake, -j PR_JOBS
-#   unit         the CTest module unit tests (except hires_gpu*, see renderer)
+#   unit         the CTest module unit tests (except hires_gpu* and hlr_gpu, see renderer / hlr)
 #   smoke        tools/smoke_test.sh: boot to a fight, --no-interp --verify-overrides
 #   quick_check  tools/quick_check.sh: two replays, GPU == software at 4x6 widescreen, and the
 #                speed segment alone at the end (warnings only)
@@ -22,6 +22,9 @@
 #             (each plus its reference run)
 #   menus     runtime/menu*, settings*, input*, controls_*, main.c, their test tools:
 #             test_menu.sh, test_input.py, test_overlay_menu.py, test_governor.py (if present)
+#   hlr       runtime/hlr/, hlr_hook.h, tools/test_hlr.py: CTest hlr + hlr_gpu, test_hlr.py audit
+#             (castle1 remains gate, practice), exact (the same stages, Metal), hash (vs_castle1),
+#             rewind, and test_netplay.py lan_hlr
 #   core      every other runtime/*.c|h, runtime/overrides/, recomp/, analysis/overrides.txt,
 #             extra_seeds.txt, idle_loops.txt, rea_*.json, overlays/, CMakeLists.txt, scenarios / replays tools:
 #             4 scenarios (stage fight, story, options, practice), 3 replays, test_savestate.sh,
@@ -39,7 +42,7 @@ PR_JOBS=${PR_JOBS:-3}
 export JOBS=$PR_JOBS
 mkdir -p build/tmp
 export TMPDIR=$PWD/build/tmp
-GROUPS_ALL="net renderer menus core"
+GROUPS_ALL="net renderer menus hlr core"
 FORCE=""
 ALLG=0
 BASE_REF=origin/main
@@ -66,6 +69,7 @@ classify() { # path -> group (or nothing)
     runtime/overrides/widescreen.c|runtime/overrides/char_mesh.c|analysis/widescreen_cull.txt) echo renderer ;;
     tools/test_hires_determinism.sh|tools/test_render_quality.sh|tools/test_widescreen.sh|tools/check_ws_*.py) echo renderer ;;
     tools/gen_spirv.py|tools/gen_dxil.py) echo renderer ;;
+    runtime/hlr/*|runtime/hlr_hook.h|tools/test_hlr.py|runtime/tests/test_hlr.c) echo hlr ;;
     runtime/menu*|runtime/settings*|runtime/input*|runtime/controls_*|runtime/main.c) echo menus ;;
     tools/test_menu.sh|tools/test_input.py|tools/test_overlay_menu.py|tools/test_governor.py) echo menus ;;
     runtime/tests/*|runtime/win/*) ;;
@@ -116,7 +120,7 @@ do_build() {
 if ! tl_step build do_build; then
   tl_summary "pr_check"; exit 1
 fi
-tl_step unit ctest --test-dir build/cmake -j "$PR_JOBS" -E hires_gpu --output-on-failure
+tl_step unit ctest --test-dir build/cmake -j "$PR_JOBS" -E 'hires_gpu|hlr_gpu' --output-on-failure
 tl_step smoke tools/smoke_test.sh
 tl_step quick_check tools/quick_check.sh
 
@@ -149,6 +153,12 @@ for g in $sel; do
     tl_step menus:overlay python3 tools/test_overlay_menu.py
     if [ -f tools/test_governor.py ]; then tl_step menus:governor python3 tools/test_governor.py
     else tl_note menus:governor "not present (tools/test_governor.py)"; fi
+    ;;
+  hlr)
+    tl_step hlr:unit ctest --test-dir build/cmake -j "$PR_JOBS" -R '^hlr' --output-on-failure
+    tl_step hlr:test_hlr env CASES="audit exact hash rewind" STAGES="castle1 remains gate" AUDIT_MODES=practice \
+      API=metal HASH=vs_castle1 python3 tools/test_hlr.py
+    tl_step hlr:netplay python3 tools/test_netplay.py -j 1 lan_hlr
     ;;
   core)
     tl_step core:scenarios python3 tools/scenarios.py run vs_hills story option_game practice -j "$PR_JOBS" \

@@ -2,7 +2,7 @@
 """Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phase 2a. Needs the disc.
 
   tools/test_hlr.py [CASE...] [-j N]        CASES: audit hash exact rewind (default: all)
-  CASES="hash exact" tools/test_hlr.sh      the same through the shell wrapper (pr_check.sh)
+  CASES="hash exact" STAGES="castle1" ...    environment selection (tools/pr_check.sh group hlr)
 
   audit   --hlr audit on all 12 VS stages, practice and story: every stage packet the game links is
           predicted exactly (0 mismatched, 0 unexplained, 0 missing, 0 slot heads, 0 bad walks).
@@ -12,7 +12,9 @@
   exact   every VS stage, --hlr exact vs off on Metal and (if it loads) Vulkan: one run each that
           dumps the stage at 4:3 2x3, 16:9 2x3, 16:9 4x6 and 4:3 4x6 (View-menu actions switch
           between frames); the dumps and state hashes must be byte-identical.
-          API="metal" / API="metal vulkan" picks the APIs, STAGES="hills castle1" the stages.
+          API="metal" / API="metal vulkan" picks the APIs, STAGES="hills castle1" the stages (also
+          for audit; AUDIT_MODES="practice story" the other modes audited, HASH="vs_hills story" the
+          hash runs).
   rewind  --savestate-rewind 37:23 with --hlr on (GPU, 2x3) vs a plain run with the HLR off: equal
           per-frame complete-state hashes, and the HLR dropped its captures on every load.
 
@@ -69,7 +71,8 @@ def audit_one(scn):
 
 
 def case_audit(pool):
-    names = [f'vs_{st}' for st in STAGES] + ['practice', 'story']
+    stages = os.environ.get('STAGES', ' '.join(STAGES)).split()
+    names = [f'vs_{st}' for st in stages] + os.environ.get('AUDIT_MODES', 'practice story').split()
     return list(pool.map(audit_one, names))
 
 
@@ -104,6 +107,8 @@ def case_hash(pool):
     items = [('vs_hills', ['--scale', '4x6'], 3100),
              ('vs_castle1', ['--scale', '4x6', '--widescreen', '--window', '1280x720'], 3500),
              ('story', ['--scale', '2x3'], 15600)]
+    want = os.environ.get('HASH')
+    if want: items = [i for i in items if i[0] in want.split()]
     return list(pool.map(hash_pair, items))
 
 
