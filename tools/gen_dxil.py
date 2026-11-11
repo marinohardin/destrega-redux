@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Compile runtime/shaders/hires.glsl to DXIL (Direct3D 12) and write runtime/shaders/hires_dxil.h.
+"""Compile runtime/shaders/hires.glsl to DXIL (Direct3D 12) and write runtime/shaders/hires_dxil.h
+(and hires_fast.glsl, the fast precision's shaders, to hires_fast_dxil.h).
 
 The SDL_GPU hi-res backend (runtime/hires_gpu.c) embeds DXIL for Direct3D 12 next to the MSL
 (Metal) and SPIR-V (Vulkan, tools/gen_spirv.py) versions. One shader source for Vulkan and
@@ -10,7 +11,8 @@ needs no shader compiler.
 
     python3 tools/gen_dxil.py               # regenerate the header
     python3 tools/gen_dxil.py --check       # compile + validate only; exit 1 on errors
-    python3 tools/gen_dxil.py --check-fresh # no tools: the header was made from this hires.glsl
+    python3 tools/gen_dxil.py --check-fresh # no tools: the headers were made from these sources
+    python3 tools/gen_dxil.py --src hires_fast   # only that source
 
 Tools: glslangValidator, spirv-cross (Homebrew: glslang, spirv-cross) and DXC. DXC is taken from
 $DXC (a command line, e.g. a Windows dxc.exe run through Wine:
@@ -19,7 +21,8 @@ PATH (the Linux release of microsoft/DirectXShaderCompiler validates and signs b
 
 Resource registers follow SDL_GPU's D3D12 convention, which is the SPIR-V one with set = space:
 vertex uniforms b0 space1; fragment textures t0..t2 + samplers s0..s2 space2, the primitive
-storage buffer t3 space2, fragment uniforms b0 space3. Vertex inputs are TEXCOORD<location>.
+storage buffer t3 space2 (hires_fast.glsl: one texture, t0 / s0, and the buffer t1), fragment
+uniforms b0 space3. Vertex inputs are TEXCOORD<location>.
 """
 import hashlib
 import os
@@ -31,21 +34,26 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, 'runtime', 'shaders', 'hires.glsl')
-OUT = os.path.join(ROOT, 'runtime', 'shaders', 'hires_dxil.h')
-# (array name, -D define, glslang stage, DXC profile)
-ENTRIES = [
-    ('s_dxil_vs_prim', 'VS_PRIM', 'vert', 'vs_6_0'),
-    ('s_dxil_fs_prim', 'FS_PRIM', 'frag', 'ps_6_0'),
-    ('s_dxil_vs_full', 'VS_FULL', 'vert', 'vs_6_0'),
-    ('s_dxil_fs_present', 'FS_PRESENT', 'frag', 'ps_6_0'),
-]
+SHD = os.path.join(ROOT, 'runtime', 'shaders')
+# source -> (header, [(array name, -D define, glslang stage, DXC profile)])
+SOURCES = {
+    'hires': ('hires_dxil.h', [
+        ('s_dxil_vs_prim', 'VS_PRIM', 'vert', 'vs_6_0'),
+        ('s_dxil_fs_prim', 'FS_PRIM', 'frag', 'ps_6_0'),
+        ('s_dxil_vs_full', 'VS_FULL', 'vert', 'vs_6_0'),
+        ('s_dxil_fs_present', 'FS_PRESENT', 'frag', 'ps_6_0'),
+    ]),
+    'hires_fast': ('hires_fast_dxil.h', [
+        ('s_dxil_vs_fast', 'VS_FAST', 'vert', 'vs_6_0'),
+        ('s_dxil_fs_fast', 'FS_FAST', 'frag', 'ps_6_0'),
+    ]),
+}
 # -Gis: IEEE strictness (no fast-math flags: the float estimates are corrected exactly, but the
 # blend inputs F/2 - 1/4 and c/31 must stay what the MSL and SPIR-V versions compute).
 DXC_FLAGS = ['-nologo', '-Gis', '-O3', '-Qstrip_debug', '-Qstrip_reflect', '-E', 'main']
 
 
-def src_hash():
+def src_hash(SRC):
     with open(SRC, 'rb') as f:
         data = f.read().replace(b'\r\n', b'\n')
     return hashlib.sha256(data).hexdigest()[:16]
@@ -78,7 +86,7 @@ def run(cmd, what, cwd=None):
     return err
 
 
-def compile_all(tmp):
+def compile_all(tmp, SRC, ENTRIES):
     glslang, cross, dxc = tool('glslangValidator'), tool('spirv-cross'), dxc_cmd()
     blobs = []
     for name, define, stage, prof in ENTRIES:
@@ -110,10 +118,10 @@ def compile_all(tmp):
     return blobs, vline, xver
 
 
-def header_hash():
+def header_hash(src, OUT):
     try:
         with open(OUT) as f:
-            m = re.search(r'hires\.glsl sha256 ([0-9a-f]{16})', f.read())
+            m = re.search(re.escape(src) + r'\.glsl sha256 ([0-9a-f]{16})', f.read())
         return m.group(1) if m else None
     except OSError:
         return None
@@ -121,35 +129,40 @@ def header_hash():
 
 def main():
     args = sys.argv[1:]
-    if '--check-fresh' in args:
-        h, want = header_hash(), src_hash()
-        if h != want:
-            sys.exit(f'gen_dxil: runtime/shaders/hires_dxil.h is stale (made from hires.glsl {h}, '
-                     f'now {want}): run python3 tools/gen_dxil.py')
-        print(f'gen_dxil: hires_dxil.h matches hires.glsl ({want})')
-        return
-    check = '--check' in args
-    with tempfile.TemporaryDirectory() as tmp:
-        blobs, ver, xver = compile_all(tmp)
-    if check:
+    names = list(SOURCES)
+    if '--src' in args:
+        names = [args[args.index('--src') + 1]]
+    for src in names:
+        out_name, entries = SOURCES[src]
+        SRC, OUT = os.path.join(SHD, src + '.glsl'), os.path.join(SHD, out_name)
+        if '--check-fresh' in args:
+            h, want = header_hash(src, OUT), src_hash(SRC)
+            if h != want:
+                sys.exit(f'gen_dxil: runtime/shaders/{out_name} is stale (made from {src}.glsl {h}, '
+                         f'now {want}): run python3 tools/gen_dxil.py')
+            print(f'gen_dxil: {out_name} matches {src}.glsl ({want})')
+            continue
+        check = '--check' in args
+        with tempfile.TemporaryDirectory() as tmp:
+            blobs, ver, xver = compile_all(tmp, SRC, entries)
+        if check:
+            for name, define, prof, b in blobs:
+                print(f'gen_dxil: {define}: {len(b)} bytes {prof} OK (signed)')
+            continue
+        lines = [f'/* Generated by tools/gen_dxil.py from runtime/shaders/{src}.glsl - do not edit.',
+                 f' * {src}.glsl sha256 {src_hash(SRC)} (tools/gen_dxil.py --check-fresh).',
+                 f' * glslangValidator -DPORTABLE_MUL -> SPIRV-Cross {xver} --hlsl --shader-model 60',
+                 f' * -> {ver}, {" ".join(DXC_FLAGS)}. */', '#pragma once', '']
         for name, define, prof, b in blobs:
-            print(f'gen_dxil: {define}: {len(b)} bytes {prof} OK (signed)')
-        return
-    lines = ['/* Generated by tools/gen_dxil.py from runtime/shaders/hires.glsl - do not edit.',
-             f' * hires.glsl sha256 {src_hash()} (tools/gen_dxil.py --check-fresh).',
-             f' * glslangValidator -DPORTABLE_MUL -> SPIRV-Cross {xver} --hlsl --shader-model 60',
-             f' * -> {ver}, {" ".join(DXC_FLAGS)}. */', '#pragma once', '']
-    for name, define, prof, b in blobs:
-        lines.append(f'/* {define} ({prof}) */')
-        lines.append(f'static const unsigned char {name}[{len(b)}] = {{')
-        for i in range(0, len(b), 20):
-            lines.append('    ' + ', '.join(f'0x{x:02x}' for x in b[i:i + 20]) + ',')
-        lines.append('};')
-        lines.append('')
-    with open(OUT, 'w', newline='\n') as f:
-        f.write('\n'.join(lines))
-    print(f'gen_dxil: wrote {os.path.relpath(OUT, ROOT)} ({", ".join(f"{d} {len(b)}" for _, d, _, b in blobs)} bytes)')
-
+            lines.append(f'/* {define} ({prof}) */')
+            lines.append(f'static const unsigned char {name}[{len(b)}] = {{')
+            for i in range(0, len(b), 20):
+                lines.append('    ' + ', '.join(f'0x{x:02x}' for x in b[i:i + 20]) + ',')
+            lines.append('};')
+            lines.append('')
+        with open(OUT, 'w', newline='\n') as f:
+            f.write('\n'.join(lines))
+        print(f'gen_dxil: wrote {os.path.relpath(OUT, ROOT)} ({", ".join(f"{d} {len(b)}" for _, d, _, b in blobs)} bytes)')
 
 if __name__ == '__main__':
     main()

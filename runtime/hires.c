@@ -1850,6 +1850,20 @@ u32 hires_verify_1x(int *first_x, int *first_y)
     return bad;
 }
 
+static inline void cmp_px(HiresCompare *c, int x, int y, int dr, int dg, int db)
+{
+    /* channel differences on the 8-bit scale (a 15-bit step = 8) */
+    if (!c->diff) { c->first_x = x; c->first_y = y; }
+    c->diff++;
+    int m = dr > dg ? dr : dg;
+    if (db > m) m = db;
+    if (m > 8) c->diff_big++;
+    if (m > 16) c->diff_big2++;
+    if (m > 32) c->diff_big4++;
+    c->sum_abs += (u64)(dr + dg + db);
+    c->sum_sq += (u64)(dr * dr + dg * dg + db * db);
+}
+
 bool hires_compare(HiresCompare *c)
 {
     memset(c, 0, sizeof *c);
@@ -1869,11 +1883,8 @@ bool hires_compare(HiresCompare *c)
                 u32 p = pa[x], q = pb[x];
                 if (p == q) continue;
                 if (((p ^ q) & 0xFFFFFF) == 0) { c->mask_diff++; continue; }
-                if (!c->diff) { c->first_x = x; c->first_y = y; }
-                c->diff++;
-                int dr = abs((int)(p & 255) - (int)(q & 255)), dg = abs((int)((p >> 8) & 255) - (int)((q >> 8) & 255)),
-                    db = abs((int)((p >> 16) & 255) - (int)((q >> 16) & 255));
-                if (dr > 8 || dg > 8 || db > 8) c->diff_big++;
+                cmp_px(c, x, y, abs((int)(p & 255) - (int)(q & 255)), abs((int)((p >> 8) & 255) - (int)((q >> 8) & 255)),
+                       abs((int)((p >> 16) & 255) - (int)((q >> 16) & 255)));
             }
         }
         c->pixels = (u64)a.w * a.h;
@@ -1886,13 +1897,48 @@ bool hires_compare(HiresCompare *c)
             u16 p = pa[x], q = pb[x];
             if (p == q) continue;
             if (((p ^ q) & 0x7FFF) == 0) { c->mask_diff++; continue; }
-            if (!c->diff) { c->first_x = x; c->first_y = y; }
-            c->diff++;
-            int dr = abs((p & 31) - (q & 31)), dg = abs(((p >> 5) & 31) - ((q >> 5) & 31)),
-                db = abs(((p >> 10) & 31) - ((q >> 10) & 31));
-            if (dr > 1 || dg > 1 || db > 1) c->diff_big++;
+            cmp_px(c, x, y, 8 * abs((p & 31) - (q & 31)), 8 * abs(((p >> 5) & 31) - ((q >> 5) & 31)),
+                   8 * abs(((p >> 10) & 31) - ((q >> 10) & 31)));
         }
     }
     c->pixels = (u64)a.w * a.h;
+    return true;
+}
+
+static u32 *view_rgba(const HiresView *v)
+{
+    u32 *o = malloc((size_t)v->w * v->h * 4);
+    if (!o) return NULL;
+    for (int y = 0; y < v->h; y++)
+        for (int x = 0; x < v->w; x++) {
+            u32 r, g, b;
+            if (v->fmt == HIRES_FMT_RGBA8) {
+                u32 p = v->px32[(size_t)y * v->stride + x];
+                r = p & 255; g = (p >> 8) & 255; b = (p >> 16) & 255;
+            } else {
+                u16 p = v->pixels[(size_t)y * v->stride + x];
+                r = (p & 31) << 3; g = ((p >> 5) & 31) << 3; b = ((p >> 10) & 31) << 3;
+                r |= r >> 5; g |= g >> 5; b |= b >> 5;
+            }
+            o[(size_t)y * v->w + x] = r | (g << 8) | (b << 16) | 0xFF000000u;
+        }
+    return o;
+}
+
+bool hires_compare_images(u32 **primary, u32 **shadow, int *w, int *h)
+{
+    *primary = *shadow = NULL;
+    if (!g_hires || !s_shadow) return false;
+    HiresView a, b;
+    const int x0 = s_rx - s_cur_gx, ww = s_rw + 2 * s_cur_gx;
+    if (!s_shadow->read(x0, s_ry, ww, s_rh, &b)) return false;
+    *shadow = view_rgba(&b);
+    if (!s_be->read(x0, s_ry, ww, s_rh, &a)) { free(*shadow); *shadow = NULL; return false; }
+    *primary = view_rgba(&a);
+    if (!*primary || !*shadow || a.w != b.w || a.h != b.h) {
+        free(*primary); free(*shadow); *primary = *shadow = NULL;
+        return false;
+    }
+    *w = a.w; *h = a.h;
     return true;
 }

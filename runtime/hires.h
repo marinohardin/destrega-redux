@@ -240,9 +240,18 @@ bool hires_verify_possible(void);
 /* Compare the primary backend's target against the shadow's over the whole region (and the
  * guard band, if any).
  * diff = pixels whose colour differs (mask bit ignored), diff_big = those where some channel
- * differs by more than one 15-bit step (1 of 31, or 8 of 255 in full precision); mask_diff =
+ * differs by more than one 15-bit step (1 of 31, or 8 of 255 in full precision; diff_big2 / 4:
+ * 2 / 4 steps); mask_diff =
  * pixels where only the mask bit differs. */
-typedef struct { u64 pixels, diff, diff_big, mask_diff; int first_x, first_y; } HiresCompare;
+typedef struct {
+    u64 pixels, diff, diff_big, mask_diff;
+    u64 diff_big2, diff_big4;   /* some channel off by more than 2 / 4 steps (16 / 32 of 255) */
+    u64 sum_abs, sum_sq;        /* over all channels of the differing pixels, 8-bit scale: MAE, PSNR */
+    int first_x, first_y;
+} HiresCompare;
 bool hires_compare(HiresCompare *c);
+/* Both targets of the compare mode (whole region + guard band) as RGBA8 (R | G << 8 | B << 16,
+ * alpha 255), malloc'ed: primary = the presented (software) backend, shadow = the GPU one. */
+bool hires_compare_images(u32 **primary, u32 **shadow, int *w, int *h);
 
 #endif

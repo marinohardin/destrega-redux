@@ -86,6 +86,8 @@
 #include "hires_gpu.h"
 #include "shaders/hires_spirv.h"
 #include "shaders/hires_dxil.h"
+#include "shaders/hires_fast_spirv.h"
+#include "shaders/hires_fast_dxil.h"
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <stdio.h>
@@ -134,6 +136,15 @@ typedef struct {   /* must match struct Prim in the MSL source */
 _Static_assert(sizeof(GPrim) == 272, "GPrim must match the MSL struct Prim");
 
 typedef struct { int sx, sy, ox, oy, pass, mode, rx, ry, rw, rh, p0, p1; } FragU;
+
+/* fast precision: vertex (float target position, clip w, u/v in texels, RGBA8 colour, primitive)
+ * and per-primitive record (= FVI / FPrim in the MSL and hires_fast.glsl) */
+typedef struct { float x, y, w, u, v; u32 col, prim; } FVtx;
+typedef struct { u32 kf, tp, clut, tw, clip0, clip1, ur, vr; } FPrim;
+_Static_assert(sizeof(FVtx) == 28 && sizeof(FPrim) == 32, "FVtx / FPrim must match the shaders");
+/* group keys: 0..NKEYS-1 exact pipelines (GVtx), NKEYS..2*NKEYS-1 the same blend states with the
+ * fast shaders (FVtx) */
+#define NGKEYS (2 * NKEYS)
 
 static const char s_msl[] =
 "#include <metal_stdlib>\n"
@@ -480,7 +491,94 @@ static const char s_msl[] =
 "      else s += uint3(uint(rint(v.b * 31.0)), uint(rint(v.g * 31.0)), uint(rint(v.r * 31.0))) * 8u;\n"
 "    }\n"
 "  uint nn = uint(u.n * u.n);\n"
-"  return float4(float3((s + nn / 2u) / nn) / 255.0, 1.0); }\n";
+"  return float4(float3((s + nn / 2u) / nn) / 255.0, 1.0); }\n"
+/* ---- fast (approximate) precision: hardware rasterization and interpolation (see "Fast
+ * precision" in the header comment; shaders/hires_fast.glsl is the same for Vulkan / D3D12).
+ * Vertices carry float target positions, clip w (PGXP depth for perspective-correct u/v, else 1),
+ * u/v in texels (with the PS1's +0.5 rounding bias) and an 8-bit colour, interpolated without
+ * perspective (the PS1's colours are affine); a 32-byte record per primitive holds the texture
+ * page, CLUT, texture window, draw area and UV clamp range. */
+"struct FPrim { uint kf, tp, clut, tw, clip0, clip1, ur, vr; };\n"
+"struct FVI { float2 pos [[attribute(0)]]; float w [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 col [[attribute(3)]]; uint prim [[attribute(4)]]; };\n"
+"struct FVO { float4 pos [[position]]; float2 uv; float3 col [[center_no_perspective]]; uint prim [[flat]]; };\n"
+"vertex FVO vs_fast(FVI in [[stage_in]], constant VU &u [[buffer(0)]]) {\n"
+"  FVO o; float w = in.w;\n"
+"  o.pos = float4((in.pos.x * u.k.x - 1.0) * w, (1.0 - in.pos.y * u.k.y) * w, 0.0, w);\n"
+"  o.uv = in.uv; o.col = in.col.rgb * 255.0; o.prim = in.prim; return o; }\n"
+"static inline uint f_fetch(texture2d<ushort> vr, uint tp, uint clut, uint tw, uint depth, uint u, uint v) {\n"
+"  u = (u & (tw & 0xFFu)) | ((tw >> 8) & 0xFFu);\n"
+"  v = (v & ((tw >> 16) & 0xFFu)) | (tw >> 24);\n"
+"  uint tpx = tp & 0xFFFFu, row = ((tp >> 16) + v) & 511u, cx = clut & 0xFFFFu, cy = clut >> 16;\n"
+"  if (depth == 0u) { uint w = vram_at(vr, tpx + (u >> 2), row); return vram_at(vr, cx + ((w >> ((u & 3u) * 4u)) & 0xFu), cy); }\n"
+"  if (depth == 1u) { uint w = vram_at(vr, tpx + (u >> 1), row); return vram_at(vr, cx + ((w >> ((u & 1u) * 8u)) & 0xFFu), cy); }\n"
+"  return vram_at(vr, tpx + u, row); }\n"
+"static inline bool f_samp(texture2d<ushort> vr, uint tp, uint clut, uint tw, uint depth, bool xbr, int iu, int fu, int iv, int fv,\n"
+"    int ulo, int uhi, int vlo, int vhi, int sx, int sy, thread int4 &o) {\n"
+"  uint t[5] = { 0u, 0u, 0u, 0u, 0u }; uint w[5] = { 0u, 0u, 0u, 0u, 0u }; int n;\n"
+"  if (!xbr) {\n"
+"    int iu1 = iu < uhi ? iu + 1 : uhi, iv1 = iv < vhi ? iv + 1 : vhi;\n"
+"    t[0] = f_fetch(vr, tp, clut, tw, depth, uint(iu), uint(iv));\n"
+"    if (fu != 0) t[1] = f_fetch(vr, tp, clut, tw, depth, uint(iu1), uint(iv));\n"
+"    if (fv != 0) t[2] = f_fetch(vr, tp, clut, tw, depth, uint(iu), uint(iv1));\n"
+"    if (fu != 0 && fv != 0) t[3] = f_fetch(vr, tp, clut, tw, depth, uint(iu1), uint(iv1));\n"
+"    w[0] = uint((256 - fu) * (256 - fv)); w[1] = uint(fu * (256 - fv)); w[2] = uint((256 - fu) * fv); w[3] = uint(fu * fv);\n"
+"    n = 4;\n"
+"  } else {\n"
+"    int ie = iu, dx = fu, je = iv, dy = fv;\n"
+"    if (fu >= 128) { ie = iu + 1; dx = fu - 256; }\n"
+"    if (fv >= 128) { je = iv + 1; dy = fv - 256; }\n"
+"    int hx = dx >= 0 ? 1 : -1, hy = dy >= 0 ? 1 : -1;\n"
+"    t[0] = f_fetch(vr, tp, clut, tw, depth, uint(ie), uint(je));\n"
+"    t[1] = f_fetch(vr, tp, clut, tw, depth, uint(min(max(ie + hx, ulo), uhi)), uint(je));\n"
+"    t[2] = f_fetch(vr, tp, clut, tw, depth, uint(ie), uint(min(max(je + hy, vlo), vhi)));\n"
+"    t[3] = f_fetch(vr, tp, clut, tw, depth, uint(min(max(ie - hx, ulo), uhi)), uint(je));\n"
+"    t[4] = f_fetch(vr, tp, clut, tw, depth, uint(ie), uint(min(max(je - hy, vlo), vhi)));\n"
+"    w[0] = 65536u; n = 2;\n"
+"    if (t[1] == t[2] && t[1] != t[0] && t[1] != t[3] && t[2] != t[4]) {\n"
+"      int d8 = abs(dx) + abs(dy) - 128, a = min(max(((d8 * (sx + sy)) >> 1) + 128, 0), 256);\n"
+"      w[0] = uint(256 - a) * 256u; w[1] = uint(a) * 256u; }\n"
+"  }\n"
+"  return tcomb(t, w, n, o); }\n"
+"fragment float4 fs_fast(FVO in [[stage_in]], constant FU &u [[buffer(0)]], device const FPrim *prims [[buffer(1)]],\n"
+"    texture2d<ushort> vram [[texture(0)]]) {\n"
+"  device const FPrim &p = prims[in.prim];\n"
+"  int X = int(in.pos.x) + u.ox, Y = int(in.pos.y) + u.oy;\n"
+"  int cx1 = int(p.clip0 << 16) >> 16, cy1 = int(p.clip0 >> 16), cx2 = int(p.clip1 << 16) >> 16, cy2 = int(p.clip1 >> 16);\n"
+"  if (X < cx1 || X >= cx2 || Y < cy1 || Y >= cy2) discard_fragment();\n"
+"  uint kf = p.kf; int hp = u.p0;\n"
+"  bool tex = (kf & (1u << 4)) != 0u, raw = (kf & (1u << 5)) != 0u, semi = (kf & (1u << 6)) != 0u, dith = (kf & (1u << 8)) != 0u;\n"
+"  int3 c = int3(clamp(floor(in.col + 0.5), 0.0, 255.0));\n"
+"  int d = 0;\n"
+"  if (dith) { int x1 = floordiv(X, u.sx), y1 = floordiv(Y, u.sy); d = DITH[(y1 & 3) * 4 + (x1 & 3)]; }\n"
+"  uint4 outc; bool blend;\n"
+"  if (tex) {\n"
+"    uint depth = (kf >> 9) & 3u; int4 t8;\n"
+"    int ulo = int(p.ur << 16) >> 16, uhi = int(p.ur) >> 16, vlo = int(p.vr << 16) >> 16, vhi = int(p.vr) >> 16;\n"
+"    if ((kf & (3u << 22)) != 0u) {\n"   /* filter sample point: without the rounding bias */
+"      float2 s = in.uv - 0.5, f0 = floor(s);\n"
+"      int iu = int(f0.x), iv = int(f0.y), fu = min(int((s.x - f0.x) * 256.0), 255), fv = min(int((s.y - f0.y) * 256.0), 255);\n"
+"      clamp_axis(iu, fu, ulo, uhi); clamp_axis(iv, fv, vlo, vhi);\n"
+"      if (!f_samp(vram, p.tp, p.clut, p.tw, depth, (kf & (1u << 23)) != 0u, iu, fu, iv, fv, ulo, uhi, vlo, vhi, u.sx, u.sy, t8)) discard_fragment();\n"
+"    } else {\n"
+"      int iu = int(floor(in.uv.x)), iv = int(floor(in.uv.y));\n"
+"      if ((kf & (1u << 15)) != 0u) { iu = clamp(iu, ulo, uhi); iv = clamp(iv, vlo, vhi); }\n"
+"      uint t = f_fetch(vram, p.tp, p.clut, p.tw, depth, uint(iu), uint(iv));\n"
+"      if (t == 0u) discard_fragment();\n"
+"      t8 = int4(int(t & 31u) << 8, int((t >> 5) & 31u) << 8, int((t >> 10) & 31u) << 8, int(t >> 15));\n"
+"    }\n"
+"    outc = tex_out(t8, c.x, c.y, c.z, raw, dith, d, hp);\n"
+"    blend = semi && t8.w != 0;\n"
+"  } else {\n"
+"    int3 o3;\n"
+"    if (hp != 0) o3 = c;\n"
+"    else if (dith) o3 = int3(clamp255(c.x + d) >> 3, clamp255(c.y + d) >> 3, clamp255(c.z + d) >> 3);\n"
+"    else o3 = c >> 3;\n"
+"    outc = uint4(uint(o3.x), uint(o3.y), uint(o3.z), 0u);\n"
+"    blend = semi;\n"
+"  }\n"
+"  if (blend != (u.pass == 1)) discard_fragment();\n"
+"  if ((kf & (1u << 13)) != 0u) outc.w = 1u;\n"
+"  return pack4(outc, u.pass, u.mode, hp); }\n";
 
 /* ---- small dynamic arrays --------------------------------------------------------- */
 
@@ -507,11 +605,13 @@ typedef struct { int type, key; u32 first, count; int x, y, w, h; size_t off; } 
 
 static SDL_GPUDevice *s_dev;
 static SDL_GPUGraphicsPipeline *s_pipe[2][NKEYS], *s_present_pipe;   /* [hp][key] */
+static SDL_GPUGraphicsPipeline *s_fpipe[2][NKEYS];                    /* fast precision: [hp][key] */
+static bool s_fast;            /* fast precision: tris and rects with the fast shaders (hires_gpu_set_fast) */
 static SDL_GPUSampler *s_samp;
 static SDL_GPUTexture *s_vramtex, *s_target, *s_temp, *s_puttex, *s_present;
 static int s_pw, s_ph;
-static SDL_GPUBuffer *s_vbuf, *s_pbuf;
-static u32 s_vbuf_cap, s_pbuf_cap;
+static SDL_GPUBuffer *s_vbuf, *s_pbuf, *s_fvbuf, *s_fpbuf;
+static u32 s_vbuf_cap, s_pbuf_cap, s_fvbuf_cap, s_fpbuf_cap;
 static SDL_GPUTransferBuffer *s_up, *s_down;
 static u32 s_up_cap, s_down_cap;
 static SDL_GPUFence *s_fences[2];
@@ -532,9 +632,10 @@ static int s_ssaa_present = 1; /* box filter of the present pass (the view's ssa
 static int s_aw, s_ah;
 
 static Vec s_verts = { .esz = sizeof(GVtx) }, s_prims = { .esz = sizeof(GPrim) },
-           s_steps = { .esz = sizeof(Step) }, s_arena = { .esz = 1 };
-static Vec s_gv[NKEYS];
-static u64 s_gm[NKEYS][8];
+           s_steps = { .esz = sizeof(Step) }, s_arena = { .esz = 1 },
+           s_fverts = { .esz = sizeof(FVtx) }, s_fprims = { .esz = sizeof(FPrim) };
+static Vec s_gv[NGKEYS];     /* group vertices per key: GVtx (exact keys) or FVtx (fast keys) */
+static u64 s_gm[NGKEYS][8];
 static u32 s_gused;
 
 static u64 s_dirty[32];    /* 1x VRAM blocks (16x16) changed since uploaded to s_vramtex */
@@ -549,6 +650,8 @@ static bool s_dirty_present = true;
 
 static HiresGpuStats s_st;
 void hires_gpu_get_stats(HiresGpuStats *st) { *st = s_st; }
+void hires_gpu_set_fast(bool on) { s_fast = on; }
+bool hires_gpu_get_fast(void) { return s_fast; }
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int imax(int a, int b) { return a > b ? a : b; }
@@ -598,13 +701,14 @@ static Step *add_step(int type)
 static void close_group(void)
 {
     if (!s_gused) return;
-    for (int k = 0; k < NKEYS; k++) {
+    for (int k = 0; k < NGKEYS; k++) {
         if (!s_gv[k].n) continue;
+        Vec *dst = k < NKEYS ? &s_verts : &s_fverts;
         Step *st = add_step(ST_DRAW);
         st->key = k;
-        st->first = (u32)s_verts.n;
+        st->first = (u32)dst->n;
         st->count = (u32)s_gv[k].n;
-        memcpy(vec_push(&s_verts, s_gv[k].n), s_gv[k].p, s_gv[k].n * sizeof(GVtx));
+        memcpy(vec_push(dst, s_gv[k].n), s_gv[k].p, s_gv[k].n * dst->esz);
         s_gv[k].n = 0;
     }
     memset(s_gm, 0, sizeof s_gm);
@@ -669,19 +773,19 @@ static void tile_mask(int x0, int y0, int x1, int y1, u64 m[8])
 
 /* Add a primitive's parts (pipeline keys) to the group. A group is emitted key by key, so a
  * part may not overtake an earlier overlapping part of a later key: close the group then. */
-static void group_add(const int *keys, int nk, const GVtx *v, int nv, const u64 m[8])
+static void group_add(const int *keys, int nk, const void *v, int nv, const u64 m[8])
 {
     bool conflict = false;
     for (int i = 0; i < nk && !conflict; i++)
-        for (int j = keys[i] + 1; j < NKEYS && !conflict; j++)
+        for (int j = keys[i] + 1; j < NGKEYS && !conflict; j++)
             if (s_gused & (1u << j))
                 for (int w = 0; w < 8; w++)
                     if (s_gm[j][w] & m[w]) { conflict = true; break; }
     if (conflict) close_group();
     for (int i = 0; i < nk; i++) {
         int k = keys[i];
-        if (!s_gv[k].esz) s_gv[k].esz = sizeof(GVtx);
-        memcpy(vec_push(&s_gv[k], (size_t)nv), v, (size_t)nv * sizeof(GVtx));
+        if (!s_gv[k].esz) s_gv[k].esz = k < NKEYS ? sizeof(GVtx) : sizeof(FVtx);
+        memcpy(vec_push(&s_gv[k], (size_t)nv), v, (size_t)nv * s_gv[k].esz);
         s_gused |= 1u << k;
         for (int w = 0; w < 8; w++) s_gm[k][w] |= m[w];
     }
@@ -741,12 +845,92 @@ static void set_tex(GPrim *g, const HiresPrim *p)
     g->tw = (p->tw_and_u & 0xFF) | ((p->tw_or_u & 0xFF) << 8) | ((p->tw_and_v & 0xFF) << 16) | ((p->tw_or_v & 0xFF) << 24);
 }
 
-static void set_clip(GPrim *g, const HiresPrim *p)
+static void clip_words(const HiresPrim *p, u32 *c0, u32 *c1)
 {
     int cx1 = imax(p->clip_x1 * s_Sx, s_ox), cy1 = imax(p->clip_y1 * s_Sy, s_oy);
     int cx2 = imin((p->clip_x2 + 1) * s_Sx, s_ox + s_tw), cy2 = imin((p->clip_y2 + 1) * s_Sy, s_oy + s_th);
-    g->clip0 = ((u32)cx1 & 0xFFFFu) | ((u32)imax(cy1, 0) << 16);   /* x signed (guard band) */
-    g->clip1 = ((u32)cx2 & 0xFFFFu) | ((u32)imax(cy2, 0) << 16);
+    *c0 = ((u32)cx1 & 0xFFFFu) | ((u32)imax(cy1, 0) << 16);   /* x signed (guard band) */
+    *c1 = ((u32)cx2 & 0xFFFFu) | ((u32)imax(cy2, 0) << 16);
+}
+static void set_clip(GPrim *g, const HiresPrim *p) { clip_words(p, &g->clip0, &g->clip1); }
+
+/* ---- fast precision ------------------------------------------------------------------------ */
+
+static FPrim *new_fprim(u32 *idx, const HiresPrim *p, u32 kf)
+{
+    *idx = (u32)s_fprims.n;
+    FPrim *f = vec_push(&s_fprims, 1);
+    memset(f, 0, sizeof *f);
+    f->kf = kf;
+    f->tp = p->tp_x | (p->tp_y << 16);
+    f->clut = p->clut_x | (p->clut_y << 16);
+    f->tw = (p->tw_and_u & 0xFF) | ((p->tw_or_u & 0xFF) << 8) | ((p->tw_and_v & 0xFF) << 16) | ((p->tw_or_v & 0xFF) << 24);
+    clip_words(p, &f->clip0, &f->clip1);
+    s_st.prims++;
+    s_st.fast_prims++;
+    s_dirty_present = true;
+    return f;
+}
+static inline u32 srange(int lo, int hi) { return ((u32)lo & 0xFFFFu) | ((u32)hi << 16); }   /* signed 16-bit pair */
+
+/* Triangle with hardware rasterization and interpolation. Coverage: the same vertex positions as
+ * the exact path (pixel centres on the 1x grid scaled), but the GPU's own fill rule and sub-pixel
+ * snapping. Attributes: hires.c samples a hi-res pixel's u/v at the 1x point P = (X + 0.5) / S - 0.5
+ * while the hardware interpolates at the pixel centre, i.e. at 1x X / S with these positions; so
+ * each vertex gets the triangle's u/v at its own position + (0.5 / S - 0.5) (affine, or perspective
+ * with weights 1 / w), plus the PS1's +0.5 rounding bias. Colours are not shifted (sub-pixel). */
+static void fast_tri(const HiresPrim *p, const HiresVtx *sv[3], bool persp, u32 kf, int umin, int umax, int vmin, int vmax,
+                     int xlo, int ylo, int xhi, int yhi)
+{
+    const int Sx = s_Sx, Sy = s_Sy;
+    u32 idx;
+    FPrim *f = new_fprim(&idx, p, kf);
+    f->ur = srange(umin, umax);
+    f->vr = srange(vmin, vmax);
+    double X[3], Y[3], q[3] = { 1, 1, 1 };
+    double wmin = 0;
+    if (persp) {
+        wmin = sv[0]->w;
+        for (int k = 1; k < 3; k++) if (sv[k]->w < wmin) wmin = sv[k]->w;
+    }
+    for (int k = 0; k < 3; k++) {
+        X[k] = (double)sv[k]->x / 65536.0;
+        Y[k] = (double)sv[k]->y / 65536.0;
+        if (persp) q[k] = wmin / (double)sv[k]->w;
+    }
+    const double den = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+    const double dx = 0.5 / Sx - 0.5, dy = 0.5 / Sy - 0.5;
+    const bool tex = (kf & F_TEX) != 0, gour = (kf & F_GOUR) != 0;
+    FVtx v[3];
+    for (int i = 0; i < 3; i++) {
+        const HiresVtx *s = sv[i];
+        double uu = s->u, vv = s->v;
+        if (tex && fabs(den) > 1e-9) {
+            const double px = X[i] + dx, py = Y[i] + dy;
+            double l1 = ((px - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (py - Y[0])) / den;
+            double l2 = ((X[1] - X[0]) * (py - Y[0]) - (px - X[0]) * (Y[1] - Y[0])) / den;
+            double l0 = 1 - l1 - l2;
+            double wq = l0 * q[0] + l1 * q[1] + l2 * q[2];
+            if (wq > 1e-9) {
+                uu = (l0 * q[0] * sv[0]->u + l1 * q[1] * sv[1]->u + l2 * q[2] * sv[2]->u) / wq;
+                vv = (l0 * q[0] * sv[0]->v + l1 * q[1] * sv[1]->v + l2 * q[2] * sv[2]->v) / wq;
+            }
+        }
+        const HiresVtx *cs = gour ? s : sv[0];
+        v[i].x = (float)((double)((s64)s->x * Sx) / 65536.0 - s_ox + 0.5);
+        v[i].y = (float)((double)((s64)s->y * Sy) / 65536.0 - s_oy + 0.5);
+        v[i].w = persp ? (float)((double)s->w / wmin) : 1.0f;
+        v[i].u = (float)(uu + 0.5);
+        v[i].v = (float)(vv + 0.5);
+        v[i].col = (cs->r & 255) | ((cs->g & 255) << 8) | ((cs->b & 255) << 16);
+        v[i].prim = idx;
+    }
+    int keys[2];
+    int nk = prim_keys(p, p->semi, keys);
+    for (int i = 0; i < nk; i++) keys[i] += NKEYS;
+    u64 m[8];
+    tile_mask(xlo / Sx, ylo / Sy, (xhi - 1) / Sx, (yhi - 1) / Sy, m);
+    group_add(keys, nk, v, 3, m);
 }
 
 /* guard band: a draw area that ends at the region's left/right edge extends gx columns further */
@@ -899,10 +1083,20 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
     }
     if (tex) tex_need(p, umin, umax, vmin, vmax);
 
-    u32 idx;
-    GPrim *g = new_prim(&idx);
     const bool dith = dither_on(p);
     const int filt = tex ? hires_get_tex_filter() : HIRES_TEX_NEAREST;
+    if (s_fast) {
+        u32 kf = base_flags(p, K_TRI, tex) | (gour ? F_GOUR : 0) | (dith ? F_DITHER : 0) |
+                 ((Sx > 1 || Sy > 1 || precise) ? F_CLAMP : 0);
+        if (filt != HIRES_TEX_NEAREST)
+            kf |= F_CLAMP | ((filt == HIRES_TEX_XBR && hires_tri_is_2d(vin)) ? F_XBR : F_BILIN);
+        const HiresVtx *sv[3] = { a, b, c };
+        fast_tri(p, sv, persp, kf, umin, umax, vmin, vmax, xlo, ylo, xhi, yhi);
+        return;
+    }
+    (void)frac;
+    u32 idx;
+    GPrim *g = new_prim(&idx);
     g->kf = base_flags(p, K_TRI, tex) | (gour ? F_GOUR : 0) | (dith ? F_DITHER : 0) |
             (gour && p->has_cr ? F_C1X : 0) | ((Sx > 1 || Sy > 1 || precise) ? F_CLAMP : 0) |
             (persp ? F_PERSP : 0);
@@ -1045,6 +1239,40 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
             if (ulo < 0 || uhi > 255) { ulo = 0; uhi = 255; }
             if (vlo < 0 || vhi > 255) { vlo = 0; vhi = 255; }
             tex_need(p, ulo, uhi, vlo, vhi);
+        }
+        if (s_fast) {
+            /* quad on the 1x pixel edges; U at 1x x-coordinate e is t0 + d * (e - 0.5 - x) + 0.5, so
+             * floor(U) at a hi-res pixel centre is the 1x rect's texel for that column (and U - 0.5
+             * the filter's sample point) */
+            u32 kf = base_flags(p, K_RECT, p->tex);
+            if (filt) kf |= F_CLAMP | (hires_get_tex_filter() == HIRES_TEX_XBR ? F_XBR : F_BILIN);
+            u32 idx;
+            FPrim *f = new_fprim(&idx, p, kf);
+            f->ur = srange(fr[0], fr[1]);
+            f->vr = srange(fr[2], fr[3]);
+            const double t0 = (double)(u0 | (fx ? 1u : 0u)), s0 = (double)v0;
+            const double du = fx ? -1 : 1, dv = fy ? -1 : 1;
+            const int ex[2] = { rxs, rxe }, ey[2] = { rys, rye };
+            FVtx c4[4];
+            for (int j = 0; j < 4; j++) {
+                const int ix = ex[j & 1], iy = ey[j >> 1];
+                c4[j].x = (float)(ix * s_Sx - s_ox);
+                c4[j].y = (float)(iy * s_Sy - s_oy);
+                c4[j].w = 1.0f;
+                c4[j].u = (float)(t0 + du * (ix - 0.5 - x) + 0.5);
+                c4[j].v = (float)(s0 + dv * (iy - 0.5 - y) + 0.5);
+                c4[j].col = (r & 255) | ((g8 & 255) << 8) | ((b & 255) << 16);
+                c4[j].prim = idx;
+            }
+            const FVtx v[6] = { c4[0], c4[1], c4[2], c4[1], c4[3], c4[2] };
+            int keys[2];
+            int nk = prim_keys(p, p->semi, keys);
+            for (int i = 0; i < nk; i++) keys[i] += NKEYS;
+            u64 m[8];
+            tile_mask(rxs, rys, rxe - 1, rye - 1, m);
+            group_add(keys, nk, v, 6, m);
+            if (mxs < mxe) mark_vram(mxs, ys, mxe - mxs, ye - ys);
+            return;
         }
         u32 idx;
         GPrim *gp = new_prim(&idx);
@@ -1268,6 +1496,7 @@ static void wait_fence(SDL_GPUFence **f)
 static void reset_lists(void)
 {
     s_verts.n = s_prims.n = s_steps.n = s_arena.n = 0;
+    s_fverts.n = s_fprims.n = 0;
 }
 
 /* Record and submit everything pending. readback: also download the target rectangle
@@ -1281,16 +1510,20 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
     SDL_GPUCommandBuffer *cb = SDL_AcquireGPUCommandBuffer(s_dev);
     if (!cb) { rt_log("hires-gpu: no command buffer: %s", SDL_GetError()); reset_lists(); return false; }
     const size_t vb = s_verts.n * sizeof(GVtx), pb = s_prims.n * sizeof(GPrim);
-    const size_t voff = 0, poff = (vb + 255) & ~(size_t)255, aoff = (poff + pb + 255) & ~(size_t)255;
+    const size_t fvb = s_fverts.n * sizeof(FVtx), fpb = s_fprims.n * sizeof(FPrim);
+    const size_t voff = 0, poff = (vb + 255) & ~(size_t)255, fvoff = (poff + pb + 255) & ~(size_t)255,
+                 fpoff = (fvoff + fvb + 255) & ~(size_t)255, aoff = (fpoff + fpb + 255) & ~(size_t)255;
     const size_t total = aoff + s_arena.n;
     SDL_GPUCopyPass *cp = NULL;
     SDL_GPURenderPass *rp = NULL;
-    if (vb || pb || s_arena.n) {
+    if (vb || pb || fvb || fpb || s_arena.n) {
         s_up = ensure_tbuf(s_up, &s_up_cap, (u32)total, SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
         u8 *m = SDL_MapGPUTransferBuffer(s_dev, s_up, true);
         if (!m) { rt_log("hires-gpu: map: %s", SDL_GetError()); SDL_CancelGPUCommandBuffer(cb); reset_lists(); return false; }
         if (vb) memcpy(m + voff, s_verts.p, vb);
         if (pb) memcpy(m + poff, s_prims.p, pb);
+        if (fvb) memcpy(m + fvoff, s_fverts.p, fvb);
+        if (fpb) memcpy(m + fpoff, s_fprims.p, fpb);
         if (s_arena.n) memcpy(m + aoff, s_arena.p, s_arena.n);
         SDL_UnmapGPUTransferBuffer(s_dev, s_up);
         cp = SDL_BeginGPUCopyPass(cb);
@@ -1304,6 +1537,18 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
             s_pbuf = ensure_buffer(s_pbuf, &s_pbuf_cap, (u32)pb, SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ);
             SDL_GPUTransferBufferLocation src = { s_up, (u32)poff };
             SDL_GPUBufferRegion dst = { s_pbuf, 0, (u32)pb };
+            SDL_UploadToGPUBuffer(cp, &src, &dst, true);
+        }
+        if (fvb) {
+            s_fvbuf = ensure_buffer(s_fvbuf, &s_fvbuf_cap, (u32)fvb, SDL_GPU_BUFFERUSAGE_VERTEX);
+            SDL_GPUTransferBufferLocation src = { s_up, (u32)fvoff };
+            SDL_GPUBufferRegion dst = { s_fvbuf, 0, (u32)fvb };
+            SDL_UploadToGPUBuffer(cp, &src, &dst, true);
+        }
+        if (fpb) {
+            s_fpbuf = ensure_buffer(s_fpbuf, &s_fpbuf_cap, (u32)fpb, SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ);
+            SDL_GPUTransferBufferLocation src = { s_up, (u32)fpoff };
+            SDL_GPUBufferRegion dst = { s_fpbuf, 0, (u32)fpb };
             SDL_UploadToGPUBuffer(cp, &src, &dst, true);
         }
     }
@@ -1323,15 +1568,24 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
                 SDL_PushGPUVertexUniformData(cb, 0, vk, sizeof vk);
             }
             if (st->key != cur_key) {
-                SDL_BindGPUGraphicsPipeline(rp, s_pipe[s_hp][st->key]);
-                SDL_GPUBufferBinding vbb = { s_vbuf, 0 };
-                SDL_BindGPUVertexBuffers(rp, 0, &vbb, 1);
-                SDL_BindGPUFragmentStorageBuffers(rp, 0, &s_pbuf, 1);
-                SDL_GPUTextureSamplerBinding tsb[3] = { { s_temp, s_samp }, { s_puttex, s_samp }, { s_vramtex, s_samp } };
-                SDL_BindGPUFragmentSamplers(rp, 0, tsb, 3);
+                if (st->key < NKEYS) {
+                    SDL_BindGPUGraphicsPipeline(rp, s_pipe[s_hp][st->key]);
+                    SDL_GPUBufferBinding vbb = { s_vbuf, 0 };
+                    SDL_BindGPUVertexBuffers(rp, 0, &vbb, 1);
+                    SDL_BindGPUFragmentStorageBuffers(rp, 0, &s_pbuf, 1);
+                    SDL_GPUTextureSamplerBinding tsb[3] = { { s_temp, s_samp }, { s_puttex, s_samp }, { s_vramtex, s_samp } };
+                    SDL_BindGPUFragmentSamplers(rp, 0, tsb, 3);
+                } else {
+                    SDL_BindGPUGraphicsPipeline(rp, s_fpipe[s_hp][st->key - NKEYS]);
+                    SDL_GPUBufferBinding vbb = { s_fvbuf, 0 };
+                    SDL_BindGPUVertexBuffers(rp, 0, &vbb, 1);
+                    SDL_BindGPUFragmentStorageBuffers(rp, 0, &s_fpbuf, 1);
+                    SDL_GPUTextureSamplerBinding tsb = { s_vramtex, s_samp };
+                    SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
+                }
                 cur_key = st->key;
             }
-            int k = st->key % 5;
+            int k = (st->key % NKEYS) % 5;
             FragU fu = { s_Sx, s_Sy, s_ox, s_oy, k ? 1 : 0, k ? k - 1 : 0, s_rx, s_ry, s_rw, s_rh, s_hp, 0 };
             SDL_PushGPUFragmentUniformData(cb, 0, &fu, sizeof fu);
             SDL_DrawGPUPrimitives(rp, st->count, 1, st->first, 0);
@@ -1422,7 +1676,7 @@ static void release_target(void)
 static void be_destroy_force(void)
 {
     reset_lists();
-    for (int k = 0; k < NKEYS; k++) s_gv[k].n = 0;
+    for (int k = 0; k < NGKEYS; k++) s_gv[k].n = 0;
     memset(s_gm, 0, sizeof s_gm);
     s_gused = 0;
     s_put_n = 0;
@@ -1576,6 +1830,8 @@ static SDL_GPUShader *make_shader(const char *entry, SDL_GPUShaderStage stage, u
         { "fs_prim", s_spv_fs_prim, s_dxil_fs_prim, sizeof s_spv_fs_prim, sizeof s_dxil_fs_prim },
         { "vs_full", s_spv_vs_full, s_dxil_vs_full, sizeof s_spv_vs_full, sizeof s_dxil_vs_full },
         { "fs_present", s_spv_fs_present, s_dxil_fs_present, sizeof s_spv_fs_present, sizeof s_dxil_fs_present },
+        { "vs_fast", s_spv_vs_fast, s_dxil_vs_fast, sizeof s_spv_vs_fast, sizeof s_dxil_vs_fast },
+        { "fs_fast", s_spv_fs_fast, s_dxil_fs_fast, sizeof s_spv_fs_fast, sizeof s_dxil_fs_fast },
     };
     if (s_shfmt != SDL_GPU_SHADERFORMAT_MSL) {
         for (size_t i = 0; i < sizeof mods / sizeof mods[0]; i++)
@@ -1751,18 +2007,23 @@ void hires_gpu_shutdown(void)
     be_destroy_force();
     for (int h = 0; h < 2; h++)
         for (int k = 0; k < NKEYS; k++)
-            if (s_pipe[h][k]) { SDL_ReleaseGPUGraphicsPipeline(s_dev, s_pipe[h][k]); s_pipe[h][k] = NULL; }
+            for (int f = 0; f < 2; f++) {
+                SDL_GPUGraphicsPipeline **pp = f ? &s_fpipe[h][k] : &s_pipe[h][k];
+                if (*pp) { SDL_ReleaseGPUGraphicsPipeline(s_dev, *pp); *pp = NULL; }
+            }
     if (s_present_pipe) SDL_ReleaseGPUGraphicsPipeline(s_dev, s_present_pipe);
     if (s_samp) SDL_ReleaseGPUSampler(s_dev, s_samp);
     if (s_vramtex) SDL_ReleaseGPUTexture(s_dev, s_vramtex);
     if (s_present) SDL_ReleaseGPUTexture(s_dev, s_present);
     if (s_vbuf) SDL_ReleaseGPUBuffer(s_dev, s_vbuf);
     if (s_pbuf) SDL_ReleaseGPUBuffer(s_dev, s_pbuf);
+    if (s_fvbuf) SDL_ReleaseGPUBuffer(s_dev, s_fvbuf);
+    if (s_fpbuf) SDL_ReleaseGPUBuffer(s_dev, s_fpbuf);
     if (s_up) SDL_ReleaseGPUTransferBuffer(s_dev, s_up);
     if (s_down) SDL_ReleaseGPUTransferBuffer(s_dev, s_down);
     s_present_pipe = NULL; s_samp = NULL; s_vramtex = s_present = NULL;
-    s_vbuf = s_pbuf = NULL; s_up = s_down = NULL;
-    s_vbuf_cap = s_pbuf_cap = s_up_cap = s_down_cap = 0;
+    s_vbuf = s_pbuf = s_fvbuf = s_fpbuf = NULL; s_up = s_down = NULL;
+    s_vbuf_cap = s_pbuf_cap = s_fvbuf_cap = s_fpbuf_cap = s_up_cap = s_down_cap = 0;
     s_pw = s_ph = 0;
     s_dirty_present = true;
     s_present_x = s_present_y = -1;
@@ -1787,8 +2048,32 @@ bool hires_gpu_software_adapter(void)
 }
 
 static bool create_pipelines(SDL_GPUDevice *dev, SDL_GPUTextureFormat fmt, SDL_GPUShader *vs, SDL_GPUShader *fs,
-                             SDL_GPUShader *pvs, SDL_GPUShader *pfs)
+                             SDL_GPUShader *pvs, SDL_GPUShader *pfs, SDL_GPUShader *fvs, SDL_GPUShader *ffs)
 {
+    {   /* fast precision: the same blend states, FVtx vertices */
+        SDL_GPUVertexBufferDescription vbd = { .slot = 0, .pitch = sizeof(FVtx), .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX };
+        SDL_GPUVertexAttribute va[5] = {
+            { .location = 0, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
+            { .location = 1, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, .offset = 8 },
+            { .location = 2, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 12 },
+            { .location = 3, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, .offset = 20 },
+            { .location = 4, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_UINT, .offset = 24 },
+        };
+        for (int k = 0; k < 2 * NKEYS; k++) {
+            SDL_GPUColorTargetDescription cd = { .format = k >= NKEYS ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : fmt };
+            blend_for_key(k % NKEYS, &cd.blend_state);
+            SDL_GPUGraphicsPipelineCreateInfo pi = {
+                .vertex_shader = fvs, .fragment_shader = ffs,
+                .vertex_input_state = { .vertex_buffer_descriptions = &vbd, .num_vertex_buffers = 1,
+                                        .vertex_attributes = va, .num_vertex_attributes = 5 },
+                .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+                .rasterizer_state = { .fill_mode = SDL_GPU_FILLMODE_FILL, .cull_mode = SDL_GPU_CULLMODE_NONE },
+                .target_info = { .color_target_descriptions = &cd, .num_color_targets = 1 },
+            };
+            s_fpipe[k / NKEYS][k % NKEYS] = SDL_CreateGPUGraphicsPipeline(dev, &pi);
+            if (!s_fpipe[k / NKEYS][k % NKEYS]) { rt_log("hires-gpu: fast pipeline %d: %s", k, SDL_GetError()); return false; }
+        }
+    }
     SDL_GPUVertexBufferDescription vbd = { .slot = 0, .pitch = sizeof(GVtx), .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX };
     SDL_GPUVertexAttribute va[2] = {
         { .location = 0, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
@@ -1859,9 +2144,11 @@ static bool init_on(SDL_GPUDevice *dev)
     SDL_GPUShader *fs = make_shader("fs_prim", SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1, 1);
     SDL_GPUShader *pvs = make_shader("vs_full", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 0);
     SDL_GPUShader *pfs = make_shader("fs_present", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 1);
-    const bool ok = vs && fs && pvs && pfs && create_pipelines(dev, fmt, vs, fs, pvs, pfs);
-    SDL_GPUShader *sh[4] = { vs, fs, pvs, pfs };
-    for (int i = 0; i < 4; i++)
+    SDL_GPUShader *fvs = make_shader("vs_fast", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 1);
+    SDL_GPUShader *ffs = make_shader("fs_fast", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1, 1);
+    const bool ok = vs && fs && pvs && pfs && fvs && ffs && create_pipelines(dev, fmt, vs, fs, pvs, pfs, fvs, ffs);
+    SDL_GPUShader *sh[6] = { vs, fs, pvs, pfs, fvs, ffs };
+    for (int i = 0; i < 6; i++)
         if (sh[i]) SDL_ReleaseGPUShader(dev, sh[i]);
     if (!ok) return false;
     SDL_GPUSamplerCreateInfo sci = { .min_filter = SDL_GPU_FILTER_NEAREST, .mag_filter = SDL_GPU_FILTER_NEAREST,
@@ -1873,8 +2160,9 @@ static bool init_on(SDL_GPUDevice *dev)
     s_vramtex = make_tex(SDL_GPU_TEXTUREFORMAT_R16_UINT, VRAM_W, VRAM_H, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     if (!s_samp || !s_vramtex) { rt_log("hires-gpu: %s", SDL_GetError()); return false; }
     s_inited = true;
-    rt_log("hires-gpu: SDL_GPU device ready (%s, driver %s, %s shaders%s; %s)", s_apis[s_api].title, drv,
+    rt_log("hires-gpu: SDL_GPU device ready (%s, driver %s, %s shaders%s; %s; %s precision)", s_apis[s_api].title, drv,
            s_shfmt == SDL_GPU_SHADERFORMAT_MSL ? "MSL" : s_shfmt == SDL_GPU_SHADERFORMAT_DXIL ? "DXIL" : "SPIR-V",
-           s_force_edge ? ", exact edge test on every triangle" : "", *s_devname ? s_devname : "unnamed adapter");
+           s_force_edge ? ", exact edge test on every triangle" : "", *s_devname ? s_devname : "unnamed adapter",
+           s_fast ? "fast" : "exact");
     return true;
 }
