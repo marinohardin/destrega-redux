@@ -418,6 +418,52 @@ guard band (the runtime extends full-width fills / rects; these are polygons).
   so the command type is the builder selector, not the GPU code. Packet buffers:
   800c03cc -> 8011f424 and 800c03d0 -> 8012b7e4.
 
+### Stage builders in full: the audit model (verified (HLR phase 0 A))
+
+`--hlr audit` (`runtime/hlr/hlr_audit.c`, around the real `stage_render` pass in
+`overrides/widescreen.c`) re-runs every stage builder on a host GTE state (`gte_exec_on`) and
+compares the predicted packets word by word with the scene OT after the original ran. 0 mismatched
+packets on all 12 VS stages, practice and story (table below), so the rules here are exact:
+- **Visibility** (80043fd4, read in full): flags & 4: 4 bounding points (RTPT + RTPS), hidden if
+  every point has x < -256 or x >= 257, or y < -120 or y >= 121 (min/max over the points; x
+  bounds are `WS_IMM`); flags & 1: a sphere, MVMVA, hidden unless MAC3 > 0; neither: visible.
+  Then hidden if flags & 0x4000, or flags & 8 without flags & 0x8000, or (mode < 2 and
+  flags & 0x40), or (mode == 2 and flags & 0x100); mode = stage_render's a0. Object 0 is always
+  drawn. Packet buffer gp+0x5e8 (OT index 0) / gp+0x5e4 (index 1); the normal-index and
+  pre-lit colour streams are offsets from gp+0x5cc (800c03b4, `stage_normals`); gp = 800bfde8.
+- **Per polygon**: reject if max x < -254, min x >= 255, max y < -118 or min y >= 119 (screen is
+  centred, OFX = OFY = 0, so pixel = 256 + sx, 120 + sy), and if SZ < 400 (near cull).
+- **OT slot** (2048 slots, reverse; base `r32(0x800c0724 + idx * 0x14)`, idx = scratch
+  1f800000), from the polygon's SZ (unsigned compares): sz < near (1f80000c): sz * 341 /
+  (near + 1); sz < mid (1f800010): ((sz - near) << 10) / (mid - (near - 1)) + 341; sz < far
+  (1f800008): (sz - mid) * 683 / (far - (mid - 1)) + 1365; else 2047.
+- **IR0 quirks** (the depth-cue factor used for the colours; each matters for exact colours):
+  lit GT3 strips (0x34) keep the IR0 of the strip's first RTPT for the whole strip; lit GT4 strips
+  (0x3c) read IR0 when the colour is computed (after the last RTPS); independent quads save IR0
+  after the RTPT, before the 4th vertex's RTPS.
+- Strip fans: triangles alternate the carried vertex (`idx ^= 2`), SZ per vertex.
+- **Not modelled: objects with flag 0x2000** (800426c4 / 800433c4 via 800423e0 / 80042fec):
+  they subdivide polygons. When gp+0x5bc is non-zero, stage_render's prologue reserves two
+  areas of the packet buffer for them, at offsets gp+0x5dc (quads, 20 x 52 bytes) and gp+0x5d4
+  (tris, 20 x 40 bytes; -1 = none) (likely: prologue read; the sizes bound every alt packet seen,
+  verified by the audit). The audit treats their packets as an "alt" range and
+  stops at them; any link into that range is counted separately. Seen on gate (10 objects),
+  castle1 (605 objects, 2417 packets), remains (622 / 494) and story (168 / 49).
+
+| scenario | packets checked | mismatched | alt (0x2000) packets |
+|---|---:|---:|---:|
+| hills / cave / villa / canyon | 37,192 / 42,677 / 101,333 / 260,330 | 0 | 0 |
+| gate / castle1 / castle2 / throne | 84,654 / 68,154 / 154,356 / 103,154 | 0 | 0 / 2417 / 0 / 0 |
+| remains / hamlet / shrine / fortress | 51,206 / 98,884 / 145,636 / 131,040 | 0 | 494 / 0 / 0 / 0 |
+| practice / story / practice_milena repro | 60,408 / 494,731 / 32,370 | 0 | 0 / 49 / 0 |
+
+Each run: scenario frames + 600 (story 16200), `--no-interp --verify-overrides`; also 0
+unexplained packets, 0 missing, 0 OT slot heads different. Story's two GT4 packets that link to
+an alt packet (frames 3851/3852) are the only links into alt ranges. A deliberately broken
+builder produced mismatches (the probe sees errors). Per-frame `--state-hash` with `--hlr audit`
+on equals off (vs_hills 3700 frames; vs_castle1 widescreen 2x3 4100 frames; the Milena repro 3966
+frames).
+
 ### Fog, depth cue and lights per stage (verified (phase 1))
 
 `stage_env_setup` (8003fa44) runs once per stage, before the fight loop, with the stage index
@@ -865,6 +911,29 @@ floors; Milena's forehead and eye polygons jumping between shapes during her idl
   vertex positions over time), which is outside "presentation only"; PGXP cannot recover precision
   the game never had. Mitigations that do stay presentation-only: a lower render scale or
   Texture Filtering > Off makes it less visible, nothing removes it.
+- **Bone chain and where the jitter comes from** (HLR phase 0 B / C, `tools/hlr_probe.py` on
+  `--ram-snap` dumps of the repro, frames 3870-3965, 48 game updates).
+  - Layout (verified: probe, all parts of both fighters in 67 snapshots, 2479 parts, 18626 chain
+    links): fighter +0xf0 part count, +0xf4 part array (0x70 each), part word 0 -> a
+    GsCOORDINATE2-like struct: +0 flg, +4 local MATRIX (t at +0x18), +0x24 workm (t at +0x38),
+    +0x44 param pointer (points at struct + 0x50: scale VECTOR 0x1000 x 3, rotate SVECTOR at
+    +0x10), +0x48 super (chain ends at a root struct). The structs are 0x16c apart (the param
+    block and more follow inline). **workm = super.workm x coord exactly**, with `>> 12`
+    (arithmetic) for rotation and translation plus the parent translation (max difference 0).
+    +0x4c is not a reliable `sub` link (garbage on leaf bones: guess). The param rotate angles do
+    **not** reproduce the local matrices in any Euler order or sign (error >= 364/4096): the
+    locals come from the animation data, the param block is stale or unused (likely).
+  - Head screen position (203 vertices of P1 in the head box at the first update; H = 856;
+    precise float projection) per update, mean per-vertex step / successive-step cosine of the
+    head centroid: game `workm` 0.224 px / -0.33; float product of the same local matrices
+    0.186 / -0.56; EMA alpha 0.5: 0.122 / 0.23 (lag < 1 update); EMA 0.3: 0.083 / 0.29 (lag ~1
+    update = 33 ms); centred 3-tap average 0.114 / 0.42 and 5-tap 0.082 / 0.57 (needs 1 / 2
+    updates of look-ahead); linear prediction 0.5 / 1 update ahead 0.407 / 0.600 (worse); EMA
+    0.3 then predict 1 update: 0.136 / -0.17. Float vs integer chain differ by 0.29 px mean.
+  - So (verified for this repro): the chain's integer rounding is **not** the source. The jitter
+    is already in the local matrices the animation produces (negative step cosine: the head
+    moves back and forth around a path). Re-deriving the chain in float removes 17 % of the
+    step; only temporal smoothing reduces it, and extrapolation amplifies it.
 
 ## Memory card
 

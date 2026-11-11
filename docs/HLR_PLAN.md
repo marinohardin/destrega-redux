@@ -19,7 +19,35 @@ Terms: "HLR" = this renderer; "original path" = 1x GPU (`gpu.c`) + hi-res backen
 - **Motion: predict ahead** (question 2): `--hlr-motion extrap` is the default, offline and in
   netplay. No added latency.
 - **All work on the `feature/hlr` branch**, merged to main only with approval.
-- Open: questions 3-8 of section 8.
+- **Texture modding / texture packs, later** (question 5; 2026-11-11): not implemented now, but
+  the design must keep it easy. Every texture is named by a fingerprint of its content (texels +
+  CLUT), stable and independent of its VRAM position; the texture-cache key and the material path
+  get one single place where a replacement texture could be substituted (section 4.4,
+  "Replacement hook"). Dumped textures are never committed.
+- Open: questions 3, 4, 6-8 of section 8.
+
+## Phase 0 results (2026-11-11, `feature/hlr`)
+
+- **A. Stage packet audit: GO.** `--hlr audit` (`runtime/hlr/hlr_audit.c`, read-only, around the
+  real `stage_render` pass) predicts every stage packet with `gte_exec_on` on a host GTE and
+  compares words, links and OT slot heads: **0 mismatched, 0 unexplained, 0 missing** on all 12 VS
+  stages, practice and story (1.9 M packets in all; per stage in NOTES "Stage builders in full").
+  Remaining for phase 2a: the 0x2000 subdivision builders (800426c4 / 800433c4) are not modelled;
+  they are recognised as alt ranges (gate 10 objects, castle1 2417 packets, remains 494, story 49).
+  Per-frame `--state-hash` with the probe on equals off (vs_hills, vs_castle1 widescreen 2x3, the
+  Milena repro), all with `--no-interp --verify-overrides`.
+- **C. Bone layout: verified.** `workm = super.workm x coord` exactly (integer `>> 12`), over
+  every part of both fighters in 67 dumps (`tools/hlr_probe.py coords`). Corrections below.
+- **B. Head jitter: `float` fails, plain prediction makes it worse; only smoothing helps.**
+  Milena repro, 48 updates, 203 head vertices (`tools/hlr_probe.py jitter`), mean per-vertex
+  step / successive-step cosine: game 0.224 px / -0.33; float chain 0.186 / -0.56 (-17 %, still
+  back and forth); EMA 0.3 0.083 / 0.29 (lag ~1 update = 33 ms); centred 5-tap 0.082 (2 updates
+  look-ahead); linear prediction 1 update ahead 0.600 (2.7x worse); EMA 0.3 + predict 1 update
+  0.136 (-39 %, ~0 lag). The jitter is in the animation's local matrices, not in the chain's
+  rounding. **Consequence for the "predict ahead" decision**: extrapolating raw `workm` amplifies
+  the jitter; `--hlr-motion extrap` must extrapolate a smoothed bone signal (EMA + prediction, or
+  a one-euro filter) to stay steady without latency. `--hlr-bones float` is dropped; `smooth`
+  becomes the only option against the shimmer (user decision whether it may be on by default).
 
 ## 1. Executive summary
 
@@ -361,6 +389,10 @@ code: the capture reads the GTE registers, not the camera variables.
   per update in a random direction; a depth test does not help (PR #35). The HLR renders from
   the same `workm`, so by default it shows the same jitter. Three options behind `--hlr-bones`:
   - `game` (default until proven otherwise): use `workm` as the game computed it.
+  - **Phase 0 corrections (verified)**: the coord structs are 0x16c apart, `param` (+0x44) points
+    inline at struct + 0x50 and its rotate angles do not reproduce the local matrix (stale or
+    unused: likely), +0x4c is not a reliable `sub`; `workm` is the exact integer product. The
+    `float` option below measured only -17 % and is dropped (Phase 0 results, B).
   - `float`: re-derive each part's world matrix from the chain of local matrices. **Guess**: the
     0x50-byte struct is a real libgs `GsCOORDINATE2` {flg +0, coord MATRIX +4 (m at +4, t at
     +0x18), workm MATRIX +0x24, param +0x44, super +0x48, sub +0x4c}: the camera's 800cc670 /
@@ -412,7 +444,10 @@ verified (NOTES table); the capture reads them from the GTE registers at `stage_
   (and `[display] hlr_tex_dir`) loads `<hash>.png` of any size into a per-entry 2D texture with
   its own mips; the fragment shader scales u/v by the replacement's size / 256. Nothing
   game-derived is ever committed (`.gitignore` the default folders; `tools/pr_check.sh` can grep
-  for PNGs under `runtime/` / `tools/` as a guard).
+  for PNGs under `runtime/` / `tools/` as a guard). Per the decision above, the fingerprint is
+  computed from the decoded texels + CLUT (never from page / CLUT coordinates), and one function
+  (`material_texture(key) -> layer or replacement`) is the only place both the cache and the
+  material path get a texture from, so a pack only plugs in there.
 
 ### 4.5 Translucency, effects, shadows, order
 
