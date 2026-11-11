@@ -836,6 +836,35 @@ floors; Milena's forehead and eye polygons jumping between shapes during her idl
   flips at 1x. A renderer fix needs a per-pixel depth test for character meshes in the hi-res
   target (PGXP w as depth), i.e. a depth buffer in both backends and the shadow packets; see
   "Cleanup priority" item 10.
+- **The depth test was tried and does not help** (verified: prototype + measurement, branch
+  `feature/char-depth`, software backend only). Character faces (all three vertices PGXP-precise,
+  `cull`-tagged, opaque) were drawn with a per-pixel test on screen-linear depth `1 - 64/w` (ties
+  to the later face); any other write reset the stored depth, so painter's order against stage,
+  HUD and semi-transparent primitives was kept; the buffer was cleared at every linked-list DMA.
+  Per-frame state hashes were byte-identical on and off (presentation only), and the test did
+  real work: ~939k faces tested, 638k hi-res pixels hidden by a nearer face over the repro. But
+  head flips stayed at **2.86 % (max 5.36) off vs 2.93 % (max 5.49) on**, with nearly identical
+  per-update values. On the practice_milena replay, `tools/flicker_metric.py` gave 1.271 vs 1.274
+  at frame 8400 and 2.464 vs 2.473 at frame 9600. The on and off pictures differ in only 0.2-0.4 %
+  of head pixels: thin lines on the eye contour and armour seams. The few OT slot swaps above are
+  real, but they are not what the eye sees.
+- **What the shimmer actually is: sub-pixel jitter of the whole head** (verified: per-vertex log of
+  the precise positions of the ~300 head vertices over 41 updates, frames 3880-3960). Each
+  update moves a vertex by 0.24 px on average (p99 0.68), and the direction is uncorrelated from
+  one update to the next: the cosine between successive steps of the whole head averages 0.00 and
+  swings between -0.93 and +0.50. So the head wobbles in place rather than following a smooth
+  breathing path. A per-update 2D affine fit of the head explains most of each step (residual
+  0.10 px mean), so the jitter is common to the head, not per-vertex rounding. At 4x6, 0.25 px at
+  1x is one or two hi-res pixels, so every high-contrast texture edge of the hair, eyes and armour
+  toggles. That matches the flip-accumulation maps, which follow texture edges rather than face
+  boundaries. At 1x the integer positions mostly stay put (second difference p50 0), so the PS1
+  hides it; PGXP's sub-pixel precision exposes it.
+  Source (guess): integer quantisation in the bone chain, either 12-bit rotation matrices or
+  integer bone translations in view space. One view unit at the head's w ~2870 is a fraction of a
+  pixel. Removing it would mean smoothing what the game computes (filtering bone matrices or
+  vertex positions over time), which is outside "presentation only"; PGXP cannot recover precision
+  the game never had. Mitigations that do stay presentation-only: a lower render scale or
+  Texture Filtering > Off makes it less visible, nothing removes it.
 
 ## Memory card
 
@@ -1193,13 +1222,10 @@ Highest value first. Move items to "done" with the PR that did them.
    `analysis/idle_loops.txt` with its proof saves host CPU without touching emulated state.
    Needs: what the loop reads, and that only an event can change it.
 
-10. **Depth-tested character meshes in the hi-res target** (presentation only; see "Floor tile
-   seams and face shimmer"): the remaining face shimmer is OT slot order flipping between
-   overlapping faces of one fighter while their precise depth order holds. Drawing the
-   80036138 / 800363c8 faces (and the char_mesh.c extras) with a depth test on PGXP w, within
-   one fighter's slot range, would remove it. Needs a depth target in hires.c and both GPU
-   shader sources, a rule for faces without w, and keeping the exact precision bit-identical
-   between backends.
+10. ~~Depth-tested character meshes in the hi-res target~~: tried, no measurable gain (see "Floor
+   tile seams and face shimmer"). The prototype (software backend, `--char-depth on|off`) is on
+   branch `feature/char-depth`, unmerged. The remaining face shimmer is sub-pixel jitter of the
+   whole head, not draw order.
 
 Done:
 - `sphere_vs_poly` (`800465a4`), PR #3.
