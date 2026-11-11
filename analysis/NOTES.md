@@ -170,6 +170,20 @@ headless RAM dump at fight frame 4201 of `tools/fight_script.py` (Celia's stage,
 read with a small script that walks the GsOT headers and ordering-table chains. "probe" below
 means that dump. Addresses are in `symbols.txt`.
 
+**Phase-1 runtime check** (render-phase1 branch). A temporary probe was built into a
+`-DDESTREGA_COVERAGE=ON` build and then removed. It logged:
+- calls of named functions per frame, with their arguments, return address, scratch idx and cycle count;
+- every GTE control-register write (`ctc2`), with the writing function and its caller;
+- all 32 GTE control registers at the entry of chosen functions;
+- RAM ranges at function entry;
+- every node of every GPU linked-list DMA, with the guest function that last wrote each packet
+  word (the shadow call-stack top at `mem_w32/16/8`) and that function's caller;
+- vblanks, save-state saves and restores.
+
+The runs were `tools/fight_script.py` to frame 4201, every VS-stage scenario of
+`tools/scenarios.py`, `story`, the 12 `practice_<char>` replays, and a `--savestate-rewind 37:5` run.
+Facts below marked *verified (phase 1)* come from those logs; the rest keep their earlier level.
+
 ### Libraries
 
 The game renders with Psy-Q **libgs** on top of libgpu / libgte (likely: function shapes match
@@ -187,15 +201,16 @@ packets (likely: decompilation).
 `fight_round_loop` (8002beb0) runs one game update per pass (30 Hz in fights, see Pitfalls in
 AGENTS.md). Order of the render-relevant calls (likely: decompilation, call order read in full):
 
-1. Logic: fighter updates, collision, `camera_update` (80088408: modes 1-3 through a table at
-   gp+0x460, else the follow camera `camera_from_fighters` 8003f214), `fighter_ot_depth_range`
-   (80035594).
+1. Logic: fighter updates, collision, `camera_update` (80088408: modes 1-3 through the mode
+   variable `camera_mode` 800c0248 = gp+0x460, not a table, else the follow camera
+   `camera_from_fighters` 8003f214), `fighter_ot_depth_range` (80035594).
 2. `hud_update` (8007d25c): health / gauge bars (8007c178, 8007c3f8) and mode-specific parts.
 3. `background_prims_add` (8003e32c): adds the two sky / ground prims to OT D.
 4. `stage_render` (80044210).
 5. `fighters_render` (80037280): ticks the dynamic light (`dyn_light_tick` 80033860), then per
    fighter `fighter_shadow_render` (8007ec5c), `fighter_render` (80037144), then 8007ccdc
-   (bookkeeping, mode 6 / mode 0; not examined).
+   (not a renderer: it writes no packets, verified (phase 1); with `game_mode` 800e3794 == 6 it
+   updates per-fighter counters at *(800e3440 + 772), likely).
 6. `fighter_effects_render` (8004cb04): per-fighter magic / projectiles.
 7. `effects_render` (80052240), then `particle_burst_render` (800511bc) and
    `particle_sets_render` (80051b58).
@@ -211,7 +226,7 @@ two per OT for the two buffers, stride 0x14; plus the code that clears and links
 | OT | GsOT headers | slots | used for |
 |----|--------------|-------|----------|
 | D  | 800c4748     | 4     | background (sky gradient + ground colour) |
-| B  | 800c4860     | 4     | org 800c06c0; empty in the probe, use unknown |
+| B  | 800c4860     | 4     | org 800c06c0; empty in fights; title menu and character select (GT4 from 8008a930, 8004df70, ...; verified (phase 1)) |
 | C  | 800c0720     | 2048  | the 3D scene: stage, characters, shadows, effects |
 | A  | 800c4770     | 16    | HUD and other 2D |
 | root | 800c47b8   | 8     | org 800c06e0 / 800c0700: the OT that is drawn |
@@ -229,13 +244,60 @@ packet record holds two copies of its packet (GT3 at record + idx*0x28, GT4 at +
 stage packets in two whole buffers at gp+0x5e8 / gp+0x5e4) (likely: decompilation; the
 character layout is verified by `char_mesh.c`).
 
-**Present** (likely: decompilation): the VBlank callback `vblank_callback` (80027268) handles
-the pads and the memory card, and on every second vblank, if `frame_ready` is set, calls
-`ResetGraph(1)`, `PutDispEnv(800c0698 + idx*0x14)`, `PutDrawEnv(800c05d8 + idx*0x5c)`,
-`GsDrawOt`/`DrawOTag` of the root OT of buffer idx, flips idx and clears / links the OTs of the
-new buffer (80026828). So the **GPU draw is started from interrupt context**, one vblank after
-the game finished building the frame; the next update builds into the other buffer while it is
-drawn. 800266ec / 800269fc are other frame-end variants (menus; not examined).
+**Present** (verified (phase 1)): the VBlank callback `vblank_callback` (80027268) runs in
+interrupt context (sp 800bf1xx, return address 8009bf58) and handles the pads and the memory
+card. At the **first vblank after `frame_ready` is set** (the vblank's parity does not matter),
+it does the following:
+1. `ResetGraph(1)`.
+2. `PutDispEnv(800c0698 + idx*0x14)`.
+3. `PutDrawEnv(800c05d8 + idx*0x5c)`, which is its own one-packet DMA from 0c05f4 / 0c0650.
+4. `GsDrawOt` of the root OT of buffer idx (header 800c47b8 / 800c47cc; DMA from 0c06fc / 0c071c).
+5. 80026828 flips idx and clears / links the OTs of the new buffer.
+
+So the **GPU draw starts in interrupt context**, and the next update builds into the other
+buffer while this one is drawn. 800266ec / 800269fc are other frame-end variants: menus, and one
+draw during the stage load (GsDrawOt return address 800269ec).
+
+**One fight update straddles a vblank** (verified (phase 1), `fight_script` and every VS
+stage). The vblank draws are 2 apart, and the update runs in two halves:
+- **First half**, right after the draw, inside the same vblank interval: `camera_update` ->
+  `camera_from_fighters` -> 80093d08 / `SetGeomScreen` (H) -> `GsSetRefView2` (called at
+  8003f64c), then `background_prims_add`, `stage_render` and `fighters_render` (shadow +
+  fighter per fighter). The second fighter can run past the next vblank.
+- The **odd vblank** callback only reads the pads (`frame_ready` is clear).
+- **Second half**: 8007ccdc, `fighter_effects_render` 8004cb04, `effects_render` 80052240
+  (800511bc, 80051b58), `hud_render` 8007b874, `frame_submit` 80026628, `frame_wait` 800266bc.
+
+The frame built while idx = i is drawn with idx = i at the next draw.
+
+**Buffer pairing for a capture** (verified (phase 1)):
+- A capture made into buffer i during an update is presented at the next `vblank_callback`
+  draw of root OT i. Key the capture on (idx, update counter), not on "the last capture".
+- **Save states** are taken and restored at the vblank **between the two halves**: that is
+  the safe point, the one where the game waits in `vsync_wait`. With `--savestate-rewind 37:5`,
+  the first draw after a restore shows a frame whose first half (camera, stage, characters) was
+  built before the snapshot, in the timeline being restored. A host-side capture made after
+  the snapshot belongs to a later update, so it is stale. Proven in the log: after the restore,
+  the draw's buffer held a capture from an update that the restored timeline never reached.
+- So the capture (`HlFrame[2]`) must be saved and restored with every snapshot, as a
+  presentation-only side-car that is not hashed. The alternative is to drop it on restore and
+  draw that one frame from packets.
+- Netplay re-simulation is safe: it re-runs at least 3 vblanks, so it re-captures before the
+  draw it presents.
+
+**Widescreen** (verified (phase 1)): `stage_render_orig` runs twice per update. First comes
+the sandboxed wide pass (`g_bus_sandbox` set, `g_widescreen_cull` on), then the real pass. A
+capture must take exactly one of them: the real pass, or the wide pass instead of the extras.
+
+**Loads** (verified (phase 1), VS Hills run, frame numbers from boot):
+- Character select at 60 Hz, `frame_submit` called from 80067b88.
+- No draws at all during the load gap (frames 2169-2192).
+- One draw at 2193 through the 800269xx variant.
+- 60 Hz load screens from 8008c7b4 (2197-2386).
+- `stage_env_setup` (8003fa44) at 2435, `fight_round_loop` at 2486.
+- First `stage_render` at 2487, first fight draw at 2489.
+
+A capture is only meaningful between the first `stage_render` and the end of the fight loop.
 `setup_draw_disp_envs` (800275bc, param p): `SetDefDrawEnv` / `SetDefDispEnv` for two buffers
 of 512 x (240 - 2p) at y 0 and 240.
 
@@ -261,6 +323,28 @@ guard band (the runtime extends full-width fills / rects; these are polygons).
   diag(0x1000, 0x0a00, 0x1000): the camera matrix carries a **Y scale of 0.625** (the
   512x240 display's pixel aspect folded into the matrix). 800ed4a8 holds an identity rotation
   (verified: probe), used by the effects.
+- **Verified (phase 1)**:
+  - `camera_update` switches on `camera_mode` 800c0248:
+    - 1 -> 80087114 / 800876c0, the round intro (Hills frames 2487-2625; practice too). It runs
+      `camera_from_fighters` and then `camera_apply` 8003e52c, which calls GsSetRefView2 a
+      second time.
+    - 2 -> 80087a00 and 3 -> 80087fe4: never seen in any run.
+    - else (0) -> only `camera_from_fighters`.
+  - `camera_apply` does `RotMatrix(800cc5c8 -> 800cc674)` + `TransMatrix(800cc5d0)`, then
+    `RotMatrix(800cc5b0 -> 800cc624)` + `TransMatrix(800cc5b8)`, zeroes the flags 800cc620 /
+    800cc670, and calls `GsSetRefView2(800cc5e0)`.
+  - 800cc670 is the camera's GsCOORDINATE2; its super is 800cc620.
+  - 800cc620 is a "rig" GsCOORDINATE2 (angles 800cc5b0, translation 800cc5b8, sub = 800cc670).
+    It is the identity in every observed frame. This is the "second camera matrix 800cc624".
+  - GsRVIEW2 800cc5e0 = {vp = (0, 0, vpz), vr = 0, rz = 0}. vpz (800cc5e8) is e.g. -8099 in a
+    fight and -22920 in the intro.
+  - **At every stage-builder entry, the GTE RT/TR equal GsWSMATRIX 800ed4c8 exactly**, in modes
+    0 and 1. Example: RT rows (0x1002, 0, 0), (0, 0x08a2, -0x050d), (0, 0x0815, 0x0dd1),
+    TR (-885, 1248, 11655). The Y row norm is 0.625.
+  - OFX = OFY = 0, ZSF3 = 0x155, ZSF4 = 0x100.
+  - H is set once per update through 80093d08 -> `SetGeomScreen`, within 0x342..0x3b7 over the
+    runs (0x398/0x399 at the fight_script frames).
+  - A capture can read the camera as GsWSMATRIX + H at `stage_render` entry, whatever the mode.
 - OFX/OFY are 0 (see above); H 0x38a..0x3bb in fights; there is no separate projection matrix.
   A 3D renderer gets the PS1 projection exactly as: view = WS * world, sx = H * x / z,
   sy = H * y / z (y already scaled by 0.625), screen centre (256, 120).
@@ -287,8 +371,57 @@ guard band (the runtime extends full-width fills / rects; these are polygons).
   0x3c808080 with IR0 from the projection: lit and **depth-cued**. **0x35 / 0x3d** take
   pre-lit vertex colours (4 words per quad) and run DPCT + DPCS with the projection's IR0:
   vertex colour **depth-cued** only (80041c14 read in full). Depth cueing blends toward the GTE
-  far colour FC with IR0 = DQB + DQA * H / SZ; where FC / DQA / DQB / BK are set was not found
-  (not in stage_render; a GTE control-register probe would show it).
+  far colour FC with IR0 = DQB + DQA * H / SZ; FC / DQA / DQB / BK are set once per stage, see
+  "Fog, depth cue and lights per stage" below.
+- **Verified (phase 1)**: RAM dump at fight_script frame 4201. The root (800c03b8 -> 80119230)
+  holds 18 objects. The {data offset, packet offset, normal-index offset, flags} entries and the
+  command words {type, polygon count, strip count} decode as described: types 0x35 / 0x3d, sane
+  counts, flags 0 / 1 / 4 / 0x20. The builders write packet codes 0x34 / 0x3c (writer tracking),
+  so the command type is the builder selector, not the GPU code. Packet buffers:
+  800c03cc -> 8011f424 and 800c03d0 -> 8012b7e4.
+
+### Fog, depth cue and lights per stage (verified (phase 1))
+
+`stage_env_setup` (8003fa44) runs once per stage, before the fight loop, with the stage index
+(< 12). It calls:
+- `SetFogNear` (80095088). a0 = the s16 at `stage_fog_near` 800b1cf4[stage] (0x8000 for an
+  index >= 12), a1 = 800. It writes DQA through 80095f20; DQB is always 0x01400000.
+- 80044748.
+- `stage_lights_setup` (8003f814) with the 4-byte record `stage_light_records` 800b1cac +
+  stage*4 = {light count, light-set index into 800b1bbc (12 bytes per light), far-colour
+  index into 800b1c7c (4-byte RGB -> `SetFarColor` 80095f58), back-colour index into 800b1ca0
+  (-> `SetBackColor` 80095f38)}. That calls 80033c60, which builds the stage light matrix
+  800cc6e0 and the light colour matrix 800cc6c0.
+
+Boot defaults: DQA 0xffffef9e, FC 0. Values seen in the `ctc2` log of each VS-stage
+scenario. FC is (R, G, B); "0" = never written, stays at the boot value 0. "std" = the
+default light set. "Builders" = stage builders seen in 4 fight vblanks. Prelit = 8004163c /
+80041c14.
+
+| Stage | FC | BK | DQA | Builders | LLM / LCM (ctc2 words) |
+|-------|----|----|-----|----------|------------------------|
+| Hills | 0x500 x3 | 0x400 | 0xe334 | lit 80040820 / 80040e98 | LLM 0ab6f930 0000f644, LCM 0c8c diagonal |
+| Cave | 0x990, 0x990, 0xa50 | 0x320 | 0xcccd | prelit | LLM 0090fc4b 0fe70f8d 01b8ffc1 0503fffd fffffff9, LCM 07f707f7 07f704c4 04c407f7 07f707f7 000004c4 |
+| Villa | 0 | 0x400 | 0xcccd | prelit | std |
+| Canyon | 0 | 0x400 | 0xcccd | prelit | std |
+| Gate | 0 | 0x400 | 0xcccd | prelit | std |
+| Castle 1 | 0x990 x3 | 0x400 | 0xcccd | prelit + 800433c4 | LLM 0b96f564 f6330302 054b0b7b, LCM 100007f7 07f70000 00001000 10000666 |
+| Castle 2 | 0 | 0x400 | 0xcccd | prelit | std |
+| Throne | 0xf70, 0xf40, 0xf20 | 0x400 | 0xcccd | F3 / F4 + prelit | LLM 0aabf558 0aaa0556 05550aaa, LCM 06660666 06660000 00000666 06160616 |
+| Remains | 0, 0, 0xa0 | 0x400 | 0xe19a | prelit + 800426c4 + 800433c4 | LLM 0e7dfca6 000005e5, LCM 1000 diagonal |
+| Hamlet | 0 | 0x400 | 0xcccd | F3 + prelit | LLM 0629f614 09e10aef 0af6062d, LCM 0ccc diagonal |
+| Shrine | 0x40, 0xa0, 0x140 | 0x320 | 0xcccd | prelit | LLM 0a36f607 00000739, LCM 999 / 999 / 7f7 |
+| Fortress | 0 | 0x400 | 0xcccd | prelit | std |
+
+How to read the table:
+- Only Hills uses the lit builders (0x34 / 0x3c commands, NCDT / NCDS), so only Hills needs
+  the stage light matrices. The prelit stages use DPCT / DPCS, so they need only FC and the
+  depth cue IR0 = DQB + DQA * H / SZ.
+- Stages whose FC stays 0 fade toward black at distance.
+- BK only matters for the lit builders.
+- The character renderer rewrites LLM / LCM / RT per bone part (80036b0c, 800338d8, 800367d8
+  in the `ctc2` log), so the stage values above hold only inside `stage_render`.
+- A capture reads them from the GTE control registers at `stage_render` entry.
 - Visibility: object 0 always drawn; others through `stage_object_visible` (80043fd4: bounding
   box projected, x +-257 / y +-121; or the sphere through MVMVA, rejected if IR3 < 1; a
   debug "SIZE %d" print is compiled in). Flags hide objects: 0x4000; 8 without 0x8000; 0x40 in
@@ -348,11 +481,30 @@ guard band (the runtime extends full-width fills / rects; these are polygons).
 (likely: decompilation)
 - All effects are 3D points projected by the GTE, drawn as **view-aligned billboards**: the
   rotation is the identity 800ed4a8, the translation WS * position, so offsets are in screen
-  space at the effect's depth. Primitive builders: `effect_billboard_tri` (80055b70: one GT3
-  (tag length 9) from 3 vertices at +0x50..+0x64 plus a reference point at +0x68, OT slot from
-  the minimum SZ) and `effect_billboard_tri_mode` (80056704: GT3 (tag 8) plus a 1-word draw-mode
-  prim linked into the same slot). The rest of the 80055820..80057100 family are variants (lit
-  ones use NCDS / NCCS).
+  space at the effect's depth.
+- **Corrected (phase 1)**, from the packet codes the DMA saw with writer tracking:
+  - `effect_billboard_quad` (80055b70) is an **FT4** quad: 9 words (RTPT + RTPS), codes
+    0x2c-0x2f, mostly 0x2e / 0x2f. It is not a GT3.
+  - `effect_quad_mode` (80056704) is a **G4** quad (gouraud, untextured; 0x38 / 0x3a, 8 words),
+    not a GT3, plus a 1-word draw-mode prim in the same slot.
+- 80055b70 picks its OT slot from the minimum SZ through the 3-segment map. The breakpoints are
+  1f80000c (near), 1f800010 (mid) and 1f800008 (far); at fight frame 4201 they were 0x17d0,
+  0x1c36 and 0x54f3:
+  - sz*341 / (near+1);
+  - 341 + (sz-near)*1024 / (mid-near+1);
+  - 1365 + (sz-mid)*683 / (far-mid+1);
+  - else 2047.
+
+  It does **no x / y / near culling** (likely: read in full).
+- The other builders of the 80055820..80057100 family, by the packet codes they produced
+  (verified (phase 1)):
+  - 80055820 / 800559b0: FT3 raw semi (0x27).
+  - 80055d48: FT4 (0x2f).
+  - 80055f54: GT4 semi (0x3e / 0x3f).
+  - 80056348 / 8005650c: G3 (0x30 / 0x32).
+  - 80056908: G4 semi (0x3a).
+  - 80056b40: F3 (0x20).
+  - Lit variants use NCDS / NCCS (likely).
 - Containers: `magic_block_render` (8004e794, one 0x854-byte block per fighter at 800e2398,
   enabled at +0x7b0: 6 sub-objects of 0xb0 through 80056704, 8 of 0x84 through 80055b70);
   `effect_lists_render` (8004d7ec: 20 objects of 0x108 at *800c048c and 20 of 0x104 at
@@ -364,8 +516,81 @@ guard band (the runtime extends full-width fills / rects; these are polygons).
   into the P1/P2 overlay slots, i.e. per-character code; verified: probe, all entries are
   0x8001xxxx), and `fighter_effects_render` runs overlay functions when the character id % 14
   == 3 (not examined).
+- **Per-character effect code (verified (phase 1))**, from the 12 `practice_<char>` replays
+  (the whole command battery; P2 is an idle Celia, MSEREA2):
+  - **Shared calls, every fighter, every update:**
+    - `fighter_effects_render` calls the P1 overlay exports 80010028 / 80010074 and the P2 ones
+      8001a290 / 8001a2dc.
+    - 8004c4a4 calls 80010004 / 8001004c and 8001a26c / 8001a2b4, then 8004e0e8 (one e1 per
+      fighter).
+    - 8004c60c calls overlay functions through pointers, which write draw-mode (e1) prims.
+  - **The overlays write no polygon packets themselves**, only e1 draw-mode words. Every
+    effect polygon in the scene OT comes from a main-exe builder of the 80055820..80057100
+    family, called by the overlay function.
+  - So a capture of the **~12 shared builders** covers every character's projectiles. Only
+    the overlay's e1 draw-mode words (tpage / semi mode) must be followed too.
+
+  | Character (P1 overlay) | Builders called from its overlay |
+  |------------------------|----------------------------------|
+  | Anjie (MANZEAL) | 80055b70 |
+  | Celia (MSEREA) | 80056704, 80055820, 80056348, 80055d48, 800559b0 |
+  | Cougar (MKUGA) | 80056704 (0x38 / 0x3a), 80055b70, 80056348, 8005650c |
+  | Doyle (MDOIL) | 80055b70, 80056704, 80056348 |
+  | Falma (MFALMA) | 80056704, 80055b70, 80056348, 80056908 |
+  | Gradd (MGRAD) | 80055b70, 80056704 |
+  | Laon (MLAON) | 80056908, 80055b70, 80055f54, 8005650c |
+  | Milena (MMILENA) | 80055b70, 80056704, 8005650c, 80056348, 80056908, 80056b40 (via 800573c8) |
+  | Reyus (MREUS) | 80056704, 80055b70, 80056908, 8005650c |
+  | Rohzen (MROSEN) | 80055b70 |
+  | Tieme (MTEEM) | 80056704, 80055b70, 80055d48 |
+  | Zauber (MZAUBER) | 80055b70, 80056704, 80055820, 80056348 |
+
+- Effect count in one frame (fight_script 4201): 80055b70 x21, from 8004e794 x2 and 8004d7ec
+  x1. Over the practice runs: thousands of effect packets per character.
 - Fading is done through the vertex colour, which works with additive (B+F) and subtractive
   (B-F) blending; B-F dominates the game's semi-transparent triangles (GPU counts above).
+
+### Packet attribution: which function wrote each drawn packet (verified (phase 1))
+
+For every node of the GPU linked-list DMA, the probe recorded which guest function last wrote
+the node's words: the shadow call-stack top at `mem_w32/16/8`, plus its caller.
+
+**fight_script frame 4200** (one drawn frame): every one of the **971 scene-OT (C) packets**
+has a known producer.
+
+| Producer | Code | Packets |
+|----------|------|---------|
+| `char_mesh_quads_to_ot` 800363c8 | 0x3c | 464 |
+| `char_mesh_tris_to_ot` 80036138 | 0x34 | 245 |
+| `fighter_shadow_render` 8007ec5c | 0x36 | 128 |
+| stage 80041c14 | 0x3c | 102 |
+| `effect_billboard_quad` 80055b70 | 0x2f | 21 |
+| stage 8004163c | 0x34 | 11 |
+
+The other OTs in that frame:
+- OT A: 8006bf00 (0x64 sprites), 8004df40 (0x2c / 0x2d), the bars 8007c178 / 8007c3f8, and an
+  e1 from 80093168.
+- OT D: 8003e11c (0x38 at 800cc510, 0x28 at 800cc540).
+- Root: a 0x80 VRAM-copy packet at 800b8594 (static data in the executable), plus the DR
+  e3 word of the draw environment from 800913c4.
+
+Over whole runs (all VS stages, story, 12 practice replays), the scene OT also gets:
+- the stage builders 800401f8 (F4), 8003fcb8 (F3), 80040820 / 80040e98 (lit, Hills), 800426c4
+  and 800433c4;
+- the effect builders listed under "Effects";
+- e1 draw-mode prims from the overlays and from 8004e0e8.
+
+No packet in any run came from a function outside these lists.
+
+**Packet addresses overlap between producers.** All packet buffers are on the heap. At frame
+4200:
+- characters 0x13e528-0x1f9eb8;
+- shadows 0x19b4b8-0x1fe510;
+- stage 0x12d670-0x137488;
+- effects 0x116930-0x14c2e8.
+
+So a capture must record the **exact packet addresses** of each item it captures (record +
+idx * stride), not address ranges per producer.
 
 ### Draw order: where a depth buffer would change the picture
 
@@ -389,14 +614,23 @@ The PS1 picture is the painter's order of the scene OT; a depth-buffered rendere
 
 ### Not found / open (rendering)
 
-- Where the GTE far colour / depth-cue parameters (FC, DQA, DQB) and back colour BK are set
-  per stage (a ctc2 probe of registers 21-23 and 27-28 would answer it).
-- OT B's producer (empty at the probe); 8007ccdc; the second camera matrix at 800cc624;
-  `fighter_effects_render`'s overlay path.
-- Story EVENTOVL scenes: they use `stage_render` too (AGENTS.md), but their character / camera
-  code in the overlay was not read.
+Resolved in phase 1:
+- FC / DQA / DQB / BK and the stage lights: `stage_env_setup`, see the table above.
+- OT B: menus only.
+- 8007ccdc: not a renderer.
+- The second camera matrix 800cc624: the identity rig coordinate.
+- `fighter_effects_render`'s overlay path: overlays call the shared builders.
+
+Still open:
+- Story EVENTOVL scenes use `stage_render` and the stage builders (800401f8, 8003fcb8 and
+  800433c4 seen in `story`), but which overlay code sets their camera was not extracted.
+- Camera modes 2 and 3 never ran in any of the runs.
 - The stage data on disc (DATA.BNS stage packs) was not decoded; only the in-RAM layout.
-- Effect culling (if any) was not examined: effects may pop at the widescreen edges.
+- Effect culling: 80055b70 has none (read in full). The other builders and the containers were
+  not read for it; effects may pop at the widescreen edges.
+- The character bone-part layout (0x70-byte parts, `workm`) is still *likely*. Phase 1 only
+  checked that the per-part LLM / LCM / RT writes happen, and which functions write the
+  character packets.
 
 ## Fight state (what gameplay is made of)
 

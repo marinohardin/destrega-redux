@@ -1,10 +1,11 @@
 # High-level renderer: replacement plan
 
-Status: **plan only** (phase 1 = research, done; nothing here is implemented). The game facts
+Status: **plan only**. Nothing here is implemented. Phase 1 is done: the decompilation
+research, then a runtime check, recorded in the "Phase 1 result" section below. The game facts
 this plan relies on, with their confidence levels, are in `analysis/NOTES.md` "Rendering
-pipeline (for a high-level renderer)" and `analysis/symbols.txt`. Facts marked *likely* there
-come from decompilation that has not been checked at runtime; the first step of each phase
-below is to check them.
+pipeline (for a high-level renderer)" and `analysis/symbols.txt`. The facts phase 2 needs are
+now *verified* at runtime. Facts still *likely* there come from decompilation that has not been
+checked at runtime; the first step of each later phase is to check them.
 
 ## Goal
 
@@ -26,9 +27,13 @@ on and one with it off must give byte-identical `--state-hash` files.
   8007ec5c + `fighter_render` 80037144 per fighter), effects (8004cb04, 80052240, 800511bc,
   80051b58), HUD (8007b874, OT A), `frame_submit` (80026628).
 - Five libgs ordering tables per buffer, linked into a root OT and drawn in the order
-  **background (D), B, scene (C, 2048 slots, back to front), HUD (A)**. The draw is started from
-  the **VBlank callback** (80027268) one vblank later, while the next update builds into the
-  other buffer (packets and OTs are double-buffered by scratch 1f800000).
+  **background (D), B (menus only), scene (C, 2048 slots, back to front), HUD (A)**. The draw
+  is started from the **VBlank callback** (80027268) at the first vblank after `frame_submit`,
+  while the next update builds into the other buffer (packets and OTs are double-buffered by
+  scratch 1f800000).
+- An update straddles a vblank: camera, background, stage and characters right after the draw;
+  then effects, HUD and `frame_submit` after the next (pads-only) vblank. Save states are taken
+  at that middle vblank (see "Phase 1 result").
 - Camera: libgs `GsSetRefView2` -> world-to-screen matrix GsWSMATRIX 800ed4c8, which contains a
   0.625 Y scale (display pixel aspect); projection H from `SetGeomScreen`, screen offset 0
   (centre 256,120).
@@ -43,7 +48,12 @@ on and one with it off must give byte-identical `--state-hash` files.
 - Shadows: a 45-vertex, 64-triangle mesh draped on the stage floor per fighter, subtractive
   semi-transparency, grey by height.
 - Effects: view-aligned billboards (identity rotation, translation = WS * position), mostly
-  semi-transparent, fading through vertex colour; projectiles call per-character overlay code.
+  semi-transparent, fading through vertex colour. They are FT4 / G4 / G3 / FT3 / GT4 / F3
+  primitives from about 12 main-exe builders (80055820..80057100). The per-character overlay
+  code calls those same builders and only adds draw-mode (e1) words of its own.
+- Fog and lights: set once per stage by `stage_env_setup` (8003fa44) from tables in the
+  executable (FC, DQA, BK, stage light matrices; DQB constant). Only Hills uses lit stage
+  polygons.
 
 ## Architecture
 
@@ -77,9 +87,19 @@ Per frame, per buffer index:
 
 Captured data must be double-buffered like the game's packets: the frame drawn at vblank N was
 built during the update before, so capture into `HlFrame[idx]` and render `HlFrame[idx]` when
-the root OT of idx is drawn. Save states and rollback: the captured frame is presentation
-state, rebuilt on the next update; after a load, show nothing captured until the next capture
-(or fall back to packets for that frame), like `hires_reseed`.
+the root OT of idx is drawn.
+
+**Save states and rollback** (corrected by phase 1): snapshots are taken at the vblank in the
+**middle** of an update. At that point the stage and characters of the frame to be drawn next
+are already built, but effects and HUD are not. After a restore, the next draw shows a frame
+whose first half was built before the snapshot. A capture rebuilt after the restore would
+miss it, and "the last capture" would be from a later update (seen in a
+`--savestate-rewind` run).
+
+So `HlFrame[2]` must be saved into and restored from every snapshot, as a presentation-only
+side-car: not hashed, not part of the netplay identity. The alternative is to drop it on
+restore and fall back to packets for the frame drawn next. Netplay re-simulation re-runs at
+least 3 vblanks, so it re-captures before the frame it presents.
 
 ### Backend interface (sketch)
 
@@ -149,8 +169,10 @@ back by the guest.
   fixed 4:3 polygons), a small separate fix.
 - Anything not captured (unknown packets in OT C, OT B) keeps drawing through hi-res, so a
   missing capture shows as today's picture, not as a hole.
-- Story EVENTOVL scenes: capture `stage_render` there too once checked; their overlay
-  character code is unexplored, so it stays on packets until read.
+- Story EVENTOVL scenes: they use `stage_render` and the same stage builders (seen in the
+  `story` run), so the stage capture works there. Their camera code is in the overlay and not
+  traced, but the capture reads GsWSMATRIX + H, not the camera variables. Their character code
+  stays on packets until read.
 
 ### Why not draw from the packets with a depth buffer
 
@@ -183,8 +205,10 @@ free, without the sandboxed shadow pass).
   through the guest GTE (no GTE flag or register side effects).
 - Packet suppression is in the hi-res forwarding only; the 1x GPU draws everything and the GPU
   timing (DMA length, busy time) is unchanged.
-- Host state the capture keeps across frames (`HlFrame[2]`) is presentation-only, not in save
-  states, and must be registered with `widescreen_add_state_hook` if the wide pass can touch it
+- Host state the capture keeps across frames (`HlFrame[2]`) is presentation-only. It is carried
+  in save states as a side-car that is not hashed, so the frame drawn after a restore pairs
+  correctly (see "Save states and rollback"). It must be registered with
+  `widescreen_add_state_hook` if the wide pass can touch it
   (the widescreen shadow pass runs stage_render twice: capture only the real run, or capture
   the wide run instead of producing extras).
 - Tests: the existing determinism scripts with the new renderer on (`--state-hash` equal to
@@ -193,58 +217,112 @@ free, without the sandboxed shadow pass).
   depth buffer) and compare it with the hi-res target at 1x1, which proves the capture found
   every packet with the right vertices, UVs and colours before switching to the real 3D mode.
 
-## Phases
+## Phase 1 result (runtime check)
 
-1. **Ground truth** (small): GTE control-register probe for FC / DQA / DQB / BK and the light
-   matrices per stage; verify the *likely* layouts at runtime (stage root and command words,
-   bone part structs, shadow and effect records) with `--ram-dump` and a temporary probe; check
-   the OT B producer and the EVENTOVL scenes. Exit: the NOTES facts used below are *verified*.
-2. **Stage** (medium): capture from `stage_render` (all builders, the 0x2000 variants, UV
-   animation, object flags); camera; stage lights and depth cue. Suppress stage packets in
-   hi-res. Exit: PS1-exact compare mode matches the hi-res target; the 3D mode renders the stage
-   with a depth buffer; widescreen fills the margins from the full mesh (the shadow pass can
-   then be retired for the stage, behind an option first).
-3. **Characters** (medium-large): bone matrices from the part structs, bone-space vertices and
-   normals, per-part light matrices and the dynamic light, attachments, `char_mesh_chains`
-   (800367d8, not understood yet: biggest unknown of this phase). Replaces the char_mesh.c face
-   rebuilding (no integer-degenerate faces exist in float). Exit: compare mode, then 3D mode.
-4. **Shadows** (small): capture the 45-vertex draped mesh as a decal.
-5. **Effects** (large, long tail): the billboard family (14 builders), the five containers, the
-   projectile overlay code per character (12 characters x overlays). Do the shared builders
-   first; leave unknown ones on packets (they still draw, without depth).
+A temporary probe in a coverage build (removed again; method in NOTES.md "Rendering pipeline")
+logged the following:
+- render-function calls;
+- GTE control-register writes;
+- GTE registers at chosen function entries;
+- every GPU linked-list node, with the guest function that wrote it;
+- vblanks and save-state events.
+
+The runs were: `fight_script` to frame 4201, every VS stage, `story`, the 12 `practice_<char>`
+replays, and a `--savestate-rewind` run.
+
+| Item | Result |
+|------|--------|
+| Frame structure, OT / buffer pairing | **Confirmed**, two corrections. (1) The draw happens at the first vblank after `frame_ready`; vblank parity does not matter. (2) An update runs in two halves around a pads-only vblank: camera / stage / characters before it, effects / HUD / submit after it. The frame built under idx i is drawn with idx i. **New**: save states are taken at that middle vblank, so a capture must be part of the snapshot (see "Save states and rollback"). Widescreen runs `stage_render_orig` twice per update (sandboxed wide pass, then the real one). Loading screens: there are no draws in the load gap, and one draw goes through a frame-end variant. |
+| Camera | **Confirmed**, with a correction. The GTE RT/TR at every stage-builder entry equal GsWSMATRIX 800ed4c8, in both camera modes seen (0 = follow, 1 = round intro). OFX/OFY 0; H per update through `SetGeomScreen`. **Correction**: the modes come from a mode variable (800c0248), not a table. The "second camera matrix" 800cc624 belongs to an identity rig coordinate. Modes 2 and 3 never ran. |
+| Fog, depth cue, BK, lights | **Found** (was unknown). `stage_env_setup` 8003fa44 sets them per stage from tables 800b1cac / 800b1bbc / 800b1c7c / 800b1ca0 / 800b1cf4. DQB is constant. NOTES has the values for all 12 stages. Only Hills uses the lit stage builders. |
+| Stage | **Confirmed**: the root, object entries and command words decode in a RAM dump. A command's type selects the builder; the builders write GPU codes 0x34 / 0x3c. The stage builders seen per stage are in NOTES. Near plane, OT rule and UV animation were not re-checked at runtime: they stay *likely*, from code read in full. DATA.BNS on disc: **unknown** (not needed, since the capture reads RAM). |
+| Characters | **Partly**: the producers (800363c8 / 80036138) and the per-part LLM / LCM / RT writes were seen. The bone-part layout stays *likely* (the face-list layout is verified by `char_mesh.c`). |
+| Effects | **Corrected**: 80055b70 is an FT4 quad and 80056704 a G4 quad, not GT3s. 80055b70 does no culling. **Projectiles**: every character overlay calls the same ~12 main-exe builders and only adds e1 draw-mode words. So capturing the shared builders covers all 12 characters; there is no per-character capture code. |
+| Packet attribution | **100 %** of the 971 scene-OT packets of a fight frame have a known producer (characters 709, shadows 128, stage 113, effects 21). Across all runs there are no unknown producers. Packet addresses of different producers interleave on the heap, so suppression needs exact addresses per item. |
+| OT B, 8007ccdc | OT B is empty in fights; the title menu and character select use it. 8007ccdc writes no packets (fighter counters, game mode 6). |
+
+## Phases (revised after phase 1)
+
+1. **Ground truth**: done (above). Left over: the camera of the EVENTOVL scenes, camera modes 2
+   and 3, the bone-part layout, culling in the effect containers. Each is checked at the start
+   of the phase that needs it.
+2. **Stage** (medium):
+   - Capture from `stage_render`, reading the camera (GsWSMATRIX + H) and the fog / lights from
+     the GTE control registers at its entry.
+   - Builders: 0x34/0x3c lit, 0x35/0x3d prelit, F3 / F4, and the 0x2000 variants 800426c4 /
+     800433c4. Also UV animation and the object flags.
+   - Capture the real pass only in widescreen.
+   - Snapshot side-car for `HlFrame[2]`.
+   - Exact packet-address suppression.
+   - The PS1-exact compare mode.
+
+   **One to two weeks**, unchanged. The camera and fog unknowns are gone; the side-car is new
+   work (a few days, in savestate.c's presentation hooks).
+3. **Characters** (medium-large), **two to three weeks**, unchanged: bone matrices, per-part
+   lights, `char_mesh_chains`.
+4. **Shadows** (small): days.
+5. **Effects**: **two to three weeks**, was "several weeks, mostly reading overlay code".
+   Capture the ~12 builders of the 80055820..80057100 family (inputs: the object's world
+   points, the identity rotation 800ed4a8, colours, UVs / CLUT / tpage). Also follow the
+   preceding e1 draw-mode words (8004e0e8, overlay e1 writers) for semi modes. No overlay code
+   has to be read.
 6. **Polish** (open-ended): background widened for widescreen, texture replacement hooks,
    better lighting options, MSAA (the 3D pass need not be bit-exact against software).
 
-Rough effort: phase 1 a few days; phase 2 one to two weeks; phase 3 two to three weeks;
-phase 4 days; phase 5 several weeks, mostly reading overlay code; plus the backend itself
-(SDL_GPU pipeline with depth, three shader formats as for hires_gpu: MSL, SPIR-V, DXIL), one to
-two weeks.
+Plus the backend: an SDL_GPU pipeline with depth, in three shader formats as for hires_gpu
+(MSL, SPIR-V, DXIL), **one to two weeks**. Total from phase 2 to a full fight scene: about
+7-10 weeks; the stage alone (phase 2 + backend) about 3-4 weeks.
 
 ## Risks
 
-- **Timing of capture vs draw**: capture runs in the update, the draw from the VBlank IRQ one
-  vblank later, and rollback / save-state loads re-run updates without presenting. Pairing the
-  right `HlFrame` with the right DMA must use the buffer index and a frame counter, not "the
-  last capture". Getting it wrong shows a frame from the wrong update (one-frame stutter).
-- **Packet-to-item mapping**: suppression must match exactly; a packet suppressed without a
-  replacement leaves a hole, one not suppressed is drawn twice. The PS1-exact compare mode is
-  the safeguard.
-- **Effects in overlays**: per-character projectile code lives in the P1/P2 overlay slots; each
-  needs its own capture (or stays on packets). Mixing packet-drawn effects (no depth) with a
-  depth-buffered scene can look wrong where they overlap geometry.
+Resolved by phase 1:
+- **Fog / lights unknown**: set per stage from executable tables, and readable from the GTE
+  control registers at `stage_render` entry.
+- **Camera modes / second matrix**: the GTE camera at the builders equals GsWSMATRIX in every
+  mode seen; the second matrix is an identity rig coordinate.
+- **Packet-to-item mapping**: every drawn scene packet has a known producer (writer tracking at
+  DMA time). Effects have no hidden per-character builders.
+- **Effects in overlays**: the overlays only call the shared builders. (Mixing packet-drawn
+  leftovers with a depth-buffered scene is no longer expected for effects.)
+
+Remaining:
+- **Snapshot pairing** (new, concrete): `HlFrame[2]` must travel with save states, or the first
+  frame after every rewind / netplay rollback that restores to the mid-update point draws a
+  wrong frame. It needs a presentation-only side-car hook in savestate.c, which is not hashed.
+- **Widescreen double pass**: capture the real pass and use the full mesh for the margins, or
+  keep the extras path until the stage capture replaces it.
+- **Exact packet addresses**: producers' buffers interleave on the heap, so suppression must
+  use the exact packet address set of each captured item. The PS1-exact compare mode stays the
+  safeguard.
 - **GTE fidelity choices**: depth cue and lighting in float differ slightly from the GTE's
   saturating integer math; acceptable (presentation only), but the look must match.
-- **Widescreen and PGXP interplay**: the widescreen shadow pass runs `stage_render` twice per
-  update in a sandbox; the capture must ignore the sandboxed run or use it. PGXP becomes
-  unnecessary for captured geometry but stays for the rest.
-- **Story EVENTOVL scenes and camera modes 1-3** (`camera_update` table): not read; may set
-  matrices differently.
+- **Story EVENTOVL scenes, camera modes 2 / 3**: not seen at runtime; the capture reads the GTE
+  camera, so they should work, but they need a check.
 - **Backend work**: a new SDL_GPU pipeline with depth in three shader languages, tested on
   Metal, Vulkan and D3D12 like `hires_gpu.c`.
 
 ## Unknown
 
-- Where FC / DQA / DQB / BK are set (stage fog colours), and how the stage packs in DATA.BNS
-  are laid out on disc (only the RAM layout is known).
-- `char_mesh_chains` (800367d8), OT B, 8007ccdc, the second camera matrix (800cc624).
-- Whether any effect has its own culling.
+- How the stage packs in DATA.BNS are laid out on disc (only the RAM layout is known; not
+  needed for a capture).
+- `char_mesh_chains` (800367d8); the camera code of the EVENTOVL scenes; camera modes 2 and 3.
+- Culling in the effect containers (80055b70 itself has none).
+
+## Recommendation for phase 2 (stage capture): **go**
+
+Reasons:
+- Every input of the stage capture is now known and verified at runtime:
+  - the camera (GsWSMATRIX + H, the same in every observed mode);
+  - fog / depth cue / back colour / lights (per-stage tables, readable from the GTE at
+    `stage_render` entry);
+  - the in-RAM stage layout and command words;
+  - the full set of stage builders per stage.
+- Attribution is complete: every stage packet comes from one of the known builders. The
+  builder and packet record give its exact address, so suppression can be exact.
+- The pairing rule is clear (idx + update counter), and its one trap, the mid-update snapshot
+  point, is identified with a concrete fix.
+
+Conditions for phase 2:
+- The snapshot side-car (or the packet fallback for the first frame after a restore).
+- Real-pass-only capture in widescreen.
+- The PS1-exact compare mode before any 3D output.
