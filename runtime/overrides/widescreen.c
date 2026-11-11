@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "platform.h"
+#include "hlr/hlr.h"
 
 int g_widescreen;                       /* shadow pass on (frontend_set_widescreen, main.c) */
 extern int g_widescreen_cull;           /* rt.c: WS_IMM() yields the widened bound */
@@ -249,9 +250,19 @@ void widescreen_enable(bool on)
 
 /* ---- the override ------------------------------------------------------------------- */
 
+/* The pass the game sees. --hlr audit (runtime/hlr/hlr_audit.c) predicts its packets before
+ * and compares after; the probe only reads guest state. */
+static void real_pass(void)
+{
+    if (!g_hlr_audit) { f_80044210_orig(); return; }
+    hlr_audit_pre(R4);
+    f_80044210_orig();
+    hlr_audit_post();
+}
+
 static void stage_render(void)
 {
-    if (!g_widescreen || !g_hires || !g_hires_guard) { f_80044210_orig(); return; }
+    if (!g_widescreen || !g_hires || !g_hires_guard) { real_pass(); return; }
     if (!s_ll_hooked) { g_gpu_ll_hook = ll_hook; s_ll_hooked = true; }
     const u32 base = ot_base();
     u64 t0 = cpu_ns();
@@ -275,7 +286,7 @@ static void stage_render(void)
     for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].save) s_hooks[i].save();
     if (!mem_journal_begin()) {
         for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].restore) s_hooks[i].restore();
-        f_80044210_orig();
+        real_pass();
         return;
     }
     /* 2. widened pass, sealed off from interrupts and hardware */
@@ -302,7 +313,7 @@ static void stage_render(void)
     }
 
     u64 t1 = cpu_ns();
-    f_80044210_orig();
+    real_pass();
     u64 t2 = cpu_ns();
     /* 4. extras for this table */
     ok = ok && collect(&s_b, base, false);

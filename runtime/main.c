@@ -1,4 +1,5 @@
 /* Frontend: boot, SDL3 window/audio/input, headless test mode. */
+#include "hlr/hlr.h"
 #include "recomp.h"
 #include <math.h>
 #include "mdec.h"
@@ -762,6 +763,7 @@ extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g
 static void finish(void) {
     ss_finish();   /* savestate / replay / netplay reports (savestate.c) */
     void widescreen_report(void); widescreen_report();
+    hlr_audit_report();
     gpu_1x_report();
     void char_mesh_report(void); char_mesh_report();
     if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
@@ -2171,6 +2173,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--trace")) g_trace++;
         else if (!strcmp(argv[i], "--no-interp")) g_no_interp = 1;
         else if (!strcmp(argv[i], "--no-idle-skip")) g_idle_skip = 0;
+        else if (!strcmp(argv[i], "--hlr") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "audit")) g_hlr_audit = 1;
+            else if (strcmp(m, "off")) { fprintf(stderr, "--hlr: unknown mode '%s' (audit|off)\n", m); return 2; }
+        }
         else if (!strcmp(argv[i], "--verify-overrides")) { g_verify_overrides = 1; atexit(override_report); }
         else if (!strcmp(argv[i], "--profile")) s_profile_on = 1;
         else if (!strcmp(argv[i], "--watch") && i + 1 < argc && s_watch_n < 8) s_watch[s_watch_n++] = (u32)strtoul(argv[++i], 0, 16);
