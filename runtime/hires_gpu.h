@@ -52,7 +52,13 @@ SDL_GPUTexture *hires_gpu_present(const HiresView *v);
 
 /* Counters since start: submitted command buffers, render passes, draw calls,
  * primitives, VRAM-texture uploads (texels), target copies (VRAM->VRAM copy ops). */
-typedef struct { unsigned long long submits, passes, draws, prims, edge_tris, vram_up_texels, tcopies, readbacks, tris, persp_tris; } HiresGpuStats;
+typedef struct { unsigned long long submits, passes, draws, prims, edge_tris, vram_up_texels, tcopies, readbacks, tris, persp_tris, fast_prims; } HiresGpuStats;
 void hires_gpu_get_stats(HiresGpuStats *st);
+/* Precision of triangles and rects (presentation only): exact (default, bit-identical to the
+ * software backend) or fast (hardware rasterization / interpolation, approximate; see "Fast
+ * precision" in hires_gpu.c). Takes effect for the next primitive: switch between frames and
+ * re-seed the target (hires_reconfigure in main.c). */
+void hires_gpu_set_fast(bool on);
+bool hires_gpu_get_fast(void);
 
 #endif

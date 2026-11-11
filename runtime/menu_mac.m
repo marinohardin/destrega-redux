@@ -250,6 +250,11 @@ void menu_init(void) {
             add(ren, @(gt[i]), [@"renderer=" stringByAppendingString:@(gn[i])], nil, 0);
         [ren addItem:[NSMenuItem separatorItem]];
         add(ren, @"Software", @"renderer=software", nil, 0);
+        /* GPU precision (radio pair; presentation only): exact = bit-identical to Software, fast =
+         * hardware interpolation (approximate, quicker); applies whenever a GPU API runs */
+        [ren addItem:[NSMenuItem separatorItem]];
+        add(ren, @"Exact", @"gpu-precision=exact", nil, 0);
+        add(ren, @"Fast (Approximate)", @"gpu-precision=fast", nil, 0);
         NSMenuItem *renItem = [[NSMenuItem alloc] initWithTitle:@"Renderer" action:nil keyEquivalent:@""];
         renItem.submenu = ren;
         [view insertItem:renItem atIndex:1];

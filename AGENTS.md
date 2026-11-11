@@ -739,7 +739,8 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   menu after File; F9 too): action `widescreen[=on|off]`, see "Widescreen".
 - **View > Renderer**: the graphics APIs this platform offers (Metal, Vulkan on the Mac; Direct3D 12,
   Vulkan on Windows), a separator, Software; radio check marks, unavailable APIs greyed out. Action
-  `renderer[=software|gpu|metal|vulkan|d3d12|compare]`, see "Graphics APIs".
+  `renderer[=software|gpu|metal|vulkan|d3d12|compare]`, see "Graphics APIs". Then a separator and
+  Exact / Fast (Approximate): `gpu-precision[=exact|fast]`, see "Fast GPU precision".
 - **View > Resolution** (Mac and Windows; radio check marks): **Auto** (default) / 4×6 (Sharpest) /
   2×3 (Balanced) / 1×1 (Original). Auto renders at 4x6 (2048x1440 for the usual 512x240 display, plus
   the guard band in widescreen) whatever the window size, more only if the window needs it and
@@ -869,17 +870,17 @@ folder as `destrega.pak`; `--data-dir` moves it). Written atomically (temp file,
 key, auto|off|NxM, is still read when `resolution` is absent), max_scale, widescreen (absent = on in
 a window), renderer (software|gpu|metal|vulkan|d3d12; gpu = the
 platform's default API, as written by older builds; an API this platform does not offer is logged and
-ignored), fullscreen, window (WxH points);
+ignored), gpu_precision (exact|fast), fullscreen, window (WxH points);
 `[netplay]` port, delay, join_address, port_mapping (on|off); `[player1]` / `[player2]` device, device_name, stick,
 deadzone, `key.<button>`, `pad.<button>` (buttons: up down left right cross circle square triangle
 l1 r1 l2 r2 start select; empty = unbound; keys absent = default).
 
 - **Command-line flags win for that run and are never written back**: each flag locks its key
   (`settings_lock`), so a View toggle cannot save it either. `--widescreen` / `--no-widescreen`,
-  `--renderer`, `--scale` (locks `scale` and `resolution`), `--max-scale`, `--window`.
+  `--renderer`, `--gpu-precision`, `--scale` (locks `scale` and `resolution`), `--max-scale`, `--window`.
 - **Headless runs never read or write a settings file** unless given `--settings FILE`; tests stay
   hermetic. `--no-settings` makes a windowed run use defaults and write nothing (the Wine netplay
-  test uses it). View toggles that persist: Widescreen, Renderer (not `compare`), Resolution, Full Screen, window
+  test uses it). View toggles that persist: Widescreen, Renderer (not `compare`), GPU precision, Resolution, Full Screen, window
   size (not while full screen or maximised).
 - Netplay defaults moved from NSUserDefaults (`NetplayPort`, `NetplayJoinAddress`, `NetplayDelay`) /
   `HKCU\Software\Destrega\Netplay` (`Port`, `JoinAddress`, `Delay`) to `[netplay]`: copied once when
@@ -1375,6 +1376,72 @@ with every mode on). Options are plain global setters/getters in `hires.h`
   Windowed GPU emu + present: 960x720 window (4x6) default 14.1 vs all off 12.4, `--ssaa 2`
   49.1; 640x480 (3x4) default 10.3, `--ssaa 2` (6x8) 24.6; 1280x720 16:9 (4x6) default 17.6.
   So explicit 2x SSAA does not hold 60 Hz on this machine at these window sizes, hence the cap.
+
+## Fast GPU precision (`--gpu-precision exact|fast`; View > Renderer > Exact / Fast)
+
+A second precision for the GPU renderer, next to the bit-exact one. **Exact stays the default.**
+Fast draws triangles and rects with the hardware rasterizer and interpolators instead of exact
+plane equations: ~4x faster on Metal and ~7x on MoltenVK in the fight (below), approximate
+(not bit-identical to software), and presentation only like the rest of hi-res: per-frame
+`--state-hash` equal to a software run (Metal, Vulkan, and Direct3D 12 under CrossOver, Hills
+replay 4500 frames, 4x6 widescreen xbr full colour).
+
+- **Where**: `runtime/hires_gpu.c` (header comment "Fast precision"; `fast_tri`, the `s_fast`
+  branches of `be_tri` / `be_rect`; MSL `vs_fast` / `fs_fast`) and `runtime/shaders/hires_fast.glsl`
+  (Vulkan + D3D12; `python3 tools/gen_spirv.py` and `tools/gen_dxil.py` now build both GLSL files,
+  `--src hires_fast` one of them; `gen_dxil.py --check-fresh` checks both headers).
+- **What is approximate**: coverage (the GPU's fill rule and sub-pixel snapping on float vertices:
+  polygon edges, shared-edge ties), u/v (float interpolation: texel choice at exact ties; vertex
+  u/v are shifted to hires.c's sample point and the perspective case uses clip w = 1 / q there, so
+  it is close; hires.c itself computes perspective exactly only every 8 pixels), gouraud colour
+  (float, screen-linear, no clamp to the 1x colour range). **Exact as before**: fills, CPU->VRAM
+  uploads, VRAM copies, lines (the game draws none), the seed, 24-bit FMV (1x fallback), the
+  guard band and shadow packets (same paths, only the triangles inside them are fast).
+- **Mask bit**: as in exact, the target's alpha: set-mask writes alpha 1, check-mask is the blend
+  factor ONE_MINUS_DST_ALPHA (the same 10 blend pipelines, keys NKEYS..2*NKEYS-1). The game never
+  sets or checks the mask.
+- **Semi-transparency**: the same fixed-function blends and the same two-pass split of textured
+  primitives (opaque texels, then STP texels), so blending is exact given the same input colour.
+- **Texture decode**: in the fragment shader from the R16_UINT 1x VRAM texture (the same dirty-block
+  upload): texture window, 4/8-bit CLUT or 15-bit, texel 0 transparent, then the exact backend's
+  integer modulation / raw / dither (only when hires.c dithers) / filters (bilinear, xbr with the
+  same weights), sample point = interpolated u/v - 0.5, clamped to the 1x-sampled UV range.
+- **Batching**: 28-byte vertices and 32-byte records (instead of 272-byte GPrim records); the same
+  group / tile-mask ordering as exact (exact and fast keys share it, so command order holds).
+- **Switching**: `--gpu-precision` (locks the setting), `[display] gpu_precision = exact|fast` in
+  `settings.ini`, menu action `gpu-precision[=exact|fast]` (none = toggle; between frames, re-seeds
+  the target with `hires_reseed`; allowed during netplay). Mac and Windows: View > Renderer, after
+  Software, a radio pair "Exact" / "Fast (Approximate)" (applies whenever a GPU API runs). The log
+  line `hires-gpu: SDL_GPU device ready (...; fast precision)` and the exit line `... N primitives
+  in fast precision` say what ran.
+- **Compare mode** (works with either precision): a `hires-compare-steps:` line per range (after `hires-compare:`, separate prefix so its parsers are untouched) gives
+  the pixels off by > 1 / > 2 / > 4 15-bit steps (1 step = 8 of 255), the mean absolute error per
+  channel and PSNR, and the worst frame for the tolerance. `--compare-tol PCT[:STEPS]` (STEPS 1, 2
+  or 4, default 4): exit 6 if a fight frame has more than PCT% of its pixels off by more than STEPS.
+  `--compare-dump DIR` (+ `--compare-dump-max N`, default 4) writes `frame_F_software.png`,
+  `_gpu.png` and `_diff.png` (|a - b| x 4) of the first compared fight frames; tile them with
+  `tools/contact_sheet.py`.
+- **Results** (Hills replay, frames 3700-4500, 4x6 widescreen 3834x2328, xbr, full colour, PGXP on,
+  every 10th frame): fight 14.8% of pixels differ at all, **0.135% by > 1 step, 0.057% > 2, 0.019%
+  > 4**, mean abs error 0.13 of 255, PSNR 49.2 dB; worst frame 0.05% > 4 steps. 15-bit nearest
+  (headless defaults, PGXP on): 0.081 / 0.041 / 0.016%, PSNR 46.0 dB. The differences are thin
+  lines along polygon edges (the diff images look like a faint wireframe) and single texels.
+  Metal, MoltenVK and D3D12 (CrossOver) give the same statistics within noise.
+- **Unit test**: `test_hires_gpu fast [API]` (CTest `hires_gpu_fast`): the random GP0 streams in four
+  modes (nearest; bilinear; xbr + full; full + 2x SSAA) at 1x1 / 2x2 / 4x6 with and without guard
+  band, plus PGXP affine and perspective packets, against a generous tolerance (<= 3% of pixels
+  > 4 steps and mean abs error <= 3 of 255 per compare; worst seen 1.8% / 1.9 on Metal, 2.1% / 2.2
+  on D3D12). Random streams are much harsher than the game (huge random u/v gradients, noise
+  textures). An off-by-one-texel u/v fails 24 of 48 checks; a missing transparent-texel discard
+  is not caught (random textures almost never hold texel 0). Its PGXP pass now uses
+  `gpu_shadow_packet_in_area`: plain shadow packets were not drawn at all without a guard band, so
+  the exact test's PGXP cases had compared empty targets (still 0 differing pixels now that they draw).
+- **Speed** (headless, `tools/quick_check.sh`'s bench configuration, M1 Pro, load 4.5-8, three
+  A/B rounds back to back, fight segment 3700-4500 ms/frame emulation + hi-res): Metal exact 4.9,
+  **fast 1.16**; Vulkan (MoltenVK) exact 9.8, **fast 1.3**. Windowed Metal (3834x2328 px, 4x6, widescreen, xbr, full colour): exact emu 1.22 + present 2.55 = 3.77 ms/frame, fast 1.11 + 0.15 = 1.27 (host busy 16% -> 7%).
+- Not done: no fast lines (rare), no fast path for the exact backend's 1x1 `--hires-verify` (fast is
+  never bit-exact), not run on a native Vulkan / D3D12 driver (only MoltenVK and vkd3d) or by a
+  person in the menus.
 
 ## Widescreen (`--widescreen`; default on in a window, off headless)
 

@@ -7,6 +7,10 @@
  * gpu_shadow_packet: exact with affine texturing, within a small budget with perspective (the
  * software backend uses double, the shader 2^-38 fixed point; see AGENTS.md "PGXP").
  *
+ * `fast [API]` runs the same streams with the GPU backend in fast precision (hardware
+ * rasterization and interpolation, hires_gpu.c "Fast precision"): not exact, so it checks a
+ * generous tolerance instead (pixels off by more than 4 15-bit steps, mean abs error).
+ *
  * Needs an SDL_GPU device (Metal, or Vulkan: real hardware, MoltenVK, or Mesa lavapipe on CI);
  * exits 77 (CTest "skipped") when there is none. argv[1] = auto|metal|vulkan|d3d12 (one API), or
  * switch: shut down and restart the backend on every available API in turn, comparing each time.
@@ -173,6 +177,27 @@ static void compare(const char *what, u64 max_diff)
     printf("  %-34s %8llu px compared, %llu differ\n", what, (unsigned long long)c.pixels, (unsigned long long)c.diff);
 }
 
+/* fast precision: limits per compare (see run_fast) */
+static bool s_fast_mode;
+static double s_fast_big4_max = 3.0, s_fast_mae_max = 3.0;   /* % of pixels > 4 steps; of 255 per channel */
+static double s_fast_worst_big4, s_fast_worst_mae;
+static void compare_tol(const char *what)
+{
+    HiresCompare c;
+    bool ok = hires_compare(&c);
+    CHECK(ok, "%s: compare failed (no shadow target?)", what);
+    if (!ok || !c.pixels) return;
+    const double big4 = 100.0 * (double)c.diff_big4 / (double)c.pixels, mae = (double)c.sum_abs / (3.0 * (double)c.pixels);
+    if (big4 > s_fast_worst_big4) s_fast_worst_big4 = big4;
+    if (mae > s_fast_worst_mae) s_fast_worst_mae = mae;
+    CHECK(big4 <= s_fast_big4_max && mae <= s_fast_mae_max,
+          "%s: fast precision out of tolerance: %.3f%% of pixels off by > 4 steps (max %.2f), mean abs error %.3f (max %.2f)",
+          what, big4, s_fast_big4_max, mae, s_fast_mae_max);
+    printf("  %-34s %8llu px, %6.3f%% differ, > 1 step %.3f%%, > 4 steps %.3f%%, MAE %.3f\n", what,
+           (unsigned long long)c.pixels, 100.0 * (double)c.diff / (double)c.pixels,
+           100.0 * (double)c.diff_big / (double)c.pixels, big4, mae);
+}
+
 static bool setup(int sx, int sy, int guard)
 {
     gpu_init();
@@ -212,7 +237,8 @@ static void run_scale(int sx, int sy, int guard, int n)
         else if (k == 8) line();
         else misc();
     }
-    compare(what, 0);
+    if (s_fast_mode) compare_tol(what);
+    else compare(what, 0);
 }
 
 /* PGXP: the same random triangles, sent as presentation-only packets with sub-pixel vertices
@@ -248,10 +274,11 @@ static void run_pgxp(int sx, int sy, bool persp, int n, u64 budget)
             }
         }
         pgxp_new_batch();
-        gpu_shadow_packet(w, k, pp);
+        gpu_shadow_packet_in_area(w, k, pp);   /* drawn inside the draw area (no guard band here) */
     }
     hires_set_perspective(true);
-    compare(what, budget);
+    if (s_fast_mode) compare_tol(what);
+    else compare(what, budget);
 }
 
 int main(int argc, char **argv)
@@ -285,6 +312,42 @@ int main(int argc, char **argv)
         hires_set_scale(0, 0);
         hires_gpu_shutdown();
         CHECK(hires_gpu_api() < 0, "shutdown left the backend initialised");
+        printf("test_hires_gpu: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (!strcmp(drv, "fast")) {
+        /* fast precision: the same streams and modes, checked against a tolerance */
+        drv = argc > 2 ? argv[2] : "auto";
+        if (!hires_gpu_set_driver(drv)) {
+            if (hires_gpu_api_from_name(drv) >= 0) { printf("SKIP: %s is not offered on this platform\n", drv); return 77; }
+            printf("usage: test_hires_gpu fast [auto|metal|vulkan|d3d12]\n");
+            return 2;
+        }
+        if (!hires_gpu_init(NULL)) { printf("SKIP: no usable SDL_GPU device (%s)\n", drv); return 77; }
+        hires_gpu_set_fast(true);
+        s_fast_mode = true;
+        static const int fsc[][2] = { { 1, 1 }, { 2, 2 }, { 4, 6 } };
+        static const Mode fmodes[] = {
+            { HIRES_TEX_NEAREST, false, 1, "" },          { HIRES_TEX_BILINEAR, false, 1, "bilinear" },
+            { HIRES_TEX_XBR, true, 1, "xbr full" },       { HIRES_TEX_NEAREST, true, 2, "full ssaa2" },
+        };
+        for (size_t m = 0; m < sizeof fmodes / sizeof fmodes[0]; m++) {
+            s_mode = fmodes[m];
+            for (size_t i = 0; i < sizeof fsc / sizeof fsc[0]; i++) {
+                if (s_mode.ssaa > 1 && fsc[i][0] * fsc[i][1] > 8) continue;
+                run_scale(fsc[i][0], fsc[i][1], 0, 1200);
+                run_scale(fsc[i][0], fsc[i][1], 88, 1200);
+            }
+        }
+        s_mode = MODE_DEFAULT;
+        hires_set_tex_filter(HIRES_TEX_NEAREST); hires_set_colour(false); hires_set_ssaa(1);
+        run_pgxp(2, 2, false, 600, 0);
+        run_pgxp(4, 6, true, 600, 0);
+        hires_set_backend(NULL, NULL);
+        hires_set_scale(0, 0);
+        hires_gpu_set_fast(false);
+        printf("test_hires_gpu fast: worst %.3f%% of pixels > 4 steps, worst mean abs error %.3f\n",
+               s_fast_worst_big4, s_fast_worst_mae);
         printf("test_hires_gpu: %d passed, %d failed\n", g_pass, g_fail);
         return g_fail ? 1 : 0;
     }

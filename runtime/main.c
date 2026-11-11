@@ -1,5 +1,6 @@
 /* Frontend: boot, SDL3 window/audio/input, headless test mode. */
 #include "recomp.h"
+#include <math.h>
 #include "mdec.h"
 #include "memcard.h"
 #include "menu.h"
@@ -131,7 +132,16 @@ static SDL_GPUTexture *s_gputex_src;       /* GPU texture wrapped by s_gputex */
 static SDL_Texture *s_gputex;
 static int s_compare_every = 30;           /* --compare-every N */
 static double s_compare_max = -1;          /* --compare-max PCT: fail if a fight frame differs more */
-static struct { u64 frames, exact, px, diff, big, mask; double worst; u64 worst_frame; } s_cmp[2];
+static double s_compare_tol = -1;          /* --compare-tol PCT[:STEPS]: fail if a fight frame has more than */
+static int s_compare_tol_steps = 4;        /*   PCT% of its pixels off by more than STEPS 15-bit steps */
+static const char *s_compare_dump;         /* --compare-dump DIR: software / GPU / difference PNGs */
+static int s_compare_dump_max = 4;         /* --compare-dump-max N: fight frames dumped */
+static int s_compare_dumped;
+static struct { u64 frames, exact, px, diff, big, big2, big4, mask, sum_abs, sum_sq; double worst, worst_tol;
+                u64 worst_frame, worst_tol_frame; } s_cmp[2];
+/* --gpu-precision exact|fast (settings display.gpu_precision, View > Renderer > Exact / Fast):
+ * the GPU backend's triangles and rects bit-exact or with hardware interpolation (hires_gpu.c) */
+static bool s_precision_given;
 
 static void wav_header(FILE *f, u32 bytes) {
     u32 hdr[11] = {0x46464952, 36 + bytes, 0x45564157, 0x20746d66, 16, 0x00020001, 44100,
@@ -216,6 +226,33 @@ static void write_png(const char *path, const u32 *rgba, int w, int h) {
     png_chunk(f, "IEND", NULL, 0);
     fclose(f);
     free(raw); free(z);
+}
+
+/* --compare-dump DIR: the software and GPU targets of a compared fight frame and their
+ * difference (|a - b| x 4 per channel, on black), as frame_F_software.png / _gpu.png / _diff.png;
+ * tools/contact_sheet.py tiles them */
+static void compare_dump(void) {
+    u32 *a, *b;
+    int w, h;
+    if (!hires_compare_images(&a, &b, &w, &h)) return;
+    char p[600];
+    snprintf(p, sizeof p, "%s/frame_%06llu_software.png", s_compare_dump, (unsigned long long)s_frame);
+    write_png(p, a, w, h);
+    snprintf(p, sizeof p, "%s/frame_%06llu_gpu.png", s_compare_dump, (unsigned long long)s_frame);
+    write_png(p, b, w, h);
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        u32 o = 0xFF000000u;
+        for (int sh = 0; sh < 24; sh += 8) {
+            int d = abs((int)((a[i] >> sh) & 255) - (int)((b[i] >> sh) & 255)) * 4;
+            o |= (u32)(d > 255 ? 255 : d) << sh;
+        }
+        a[i] = o;
+    }
+    snprintf(p, sizeof p, "%s/frame_%06llu_diff.png", s_compare_dump, (unsigned long long)s_frame);
+    write_png(p, a, w, h);
+    free(a);
+    free(b);
+    s_compare_dumped++;
 }
 
 /* Convert a hi-res view to RGBA8888 (R in the low byte, as ABGR8888 on little endian), SSAA
@@ -783,16 +820,29 @@ static void finish(void) {
     if (s_renderer == R_COMPARE) {
         for (int k = 0; k < 2; k++) {
             if (!s_cmp[k].frames) continue;
+            const double px = (double)s_cmp[k].px;
+            const double mse = (double)s_cmp[k].sum_sq / (3.0 * px);
             rt_log("hires-compare: %s: %llu frames compared, %llu identical; %llu of %llu pixels differ (%.5f%%), "
                    "%llu by more than 1 step in a channel, %llu in the mask bit only; worst frame %llu: %.4f%%",
                    k ? "fight" : "all", (unsigned long long)s_cmp[k].frames, (unsigned long long)s_cmp[k].exact,
                    (unsigned long long)s_cmp[k].diff, (unsigned long long)s_cmp[k].px,
-                   100.0 * (double)s_cmp[k].diff / (double)s_cmp[k].px, (unsigned long long)s_cmp[k].big,
+                   100.0 * (double)s_cmp[k].diff / px, (unsigned long long)s_cmp[k].big,
                    (unsigned long long)s_cmp[k].mask, (unsigned long long)s_cmp[k].worst_frame, s_cmp[k].worst);
+            rt_log("hires-compare-steps: %s: (1 step = 8 of 255): > 1 %.4f%%, > 2 %.4f%%, > 4 %.4f%% of pixels; "
+                   "mean abs error %.4f of 255 per channel, PSNR %.2f dB; worst frame > %d steps %llu: %.4f%%",
+                   k ? "fight" : "all", 100.0 * (double)s_cmp[k].big / px, 100.0 * (double)s_cmp[k].big2 / px,
+                   100.0 * (double)s_cmp[k].big4 / px, (double)s_cmp[k].sum_abs / (3.0 * px),
+                   mse > 0 ? 10.0 * log10(255.0 * 255.0 / mse) : 99.0, s_compare_tol_steps,
+                   (unsigned long long)s_cmp[k].worst_tol_frame, s_cmp[k].worst_tol);
         }
         if (s_compare_max >= 0 && (!s_cmp[1].frames || s_cmp[1].worst > s_compare_max)) {
             rt_log("hires-compare: FAIL: worst fight frame %.4f%% > %.4f%% (or no fight frames compared)",
                    s_cmp[1].worst, s_compare_max);
+            rc = 6;
+        }
+        if (s_compare_tol >= 0 && (!s_cmp[1].frames || s_cmp[1].worst_tol > s_compare_tol)) {
+            rt_log("hires-compare: FAIL: worst fight frame has %.4f%% of its pixels off by more than %d steps > %.4f%% "
+                   "(or no fight frames compared)", s_cmp[1].worst_tol, s_compare_tol_steps, s_compare_tol);
             rc = 6;
         }
     }
@@ -802,10 +852,11 @@ static void finish(void) {
         double n = st.submits ? (double)st.submits : 1;
         rt_log("hires-gpu: %llu submits, %.1f render passes / %.1f draws / %.0f primitives per submit "
                "(%llu triangles coverage-tested in the shader), "
-               "%llu VRAM texels uploaded, %llu VRAM copies, %llu readbacks",
+               "%llu VRAM texels uploaded, %llu VRAM copies, %llu readbacks; %llu primitives in fast precision",
                (unsigned long long)st.submits, st.passes / n, st.draws / n, st.prims / n,
                (unsigned long long)st.edge_tris,
-               (unsigned long long)st.vram_up_texels, (unsigned long long)st.tcopies, (unsigned long long)st.readbacks);
+               (unsigned long long)st.vram_up_texels, (unsigned long long)st.tcopies, (unsigned long long)st.readbacks,
+               (unsigned long long)st.fast_prims);
     }
     for (int k = 0; k <= s_seg_n; k++) {
         if (!s_seg[k].frames) continue;
@@ -934,13 +985,19 @@ void frontend_vblank(void) {
         HiresCompare c;
         if (hires_compare(&c) && c.pixels) {
             double pct = 100.0 * (double)c.diff / (double)c.pixels;
+            const u64 over = s_compare_tol_steps <= 1 ? c.diff_big : s_compare_tol_steps <= 2 ? c.diff_big2 : c.diff_big4;
+            double tol = 100.0 * (double)over / (double)c.pixels;
             for (int k = 0; k < 2; k++) {
                 if (k && s_frame < s_fight_from) continue;
                 s_cmp[k].frames++;
                 if (!c.diff) s_cmp[k].exact++;
                 s_cmp[k].px += c.pixels; s_cmp[k].diff += c.diff; s_cmp[k].big += c.diff_big; s_cmp[k].mask += c.mask_diff;
+                s_cmp[k].big2 += c.diff_big2; s_cmp[k].big4 += c.diff_big4;
+                s_cmp[k].sum_abs += c.sum_abs; s_cmp[k].sum_sq += c.sum_sq;
                 if (pct > s_cmp[k].worst || !s_cmp[k].worst_frame) { s_cmp[k].worst = pct; s_cmp[k].worst_frame = s_frame; }
+                if (tol > s_cmp[k].worst_tol || !s_cmp[k].worst_tol_frame) { s_cmp[k].worst_tol = tol; s_cmp[k].worst_tol_frame = s_frame; }
             }
+            if (s_compare_dump && s_frame >= s_fight_from && s_compare_dumped < s_compare_dump_max) compare_dump();
             if (c.diff && g_trace)
                 rt_log("hires-compare: frame %llu: %llu pixels differ (%.4f%%), %llu by > 1, first at target (%d,%d)",
                        (unsigned long long)s_frame, (unsigned long long)c.diff, pct,
@@ -1209,6 +1266,7 @@ static void settings_apply(const char *dir) {
     if (s_max_scale_given) settings_lock("display", "max_scale");
     if (s_ws_given) settings_lock("display", "widescreen");
     if (s_renderer_given) settings_lock("display", "renderer");
+    if (s_precision_given) settings_lock("display", "gpu_precision");
     if (s_win_set) settings_lock("display", "window");
     if (s_opt_filter >= 0) settings_lock("display", "tex_filter");
     if (s_opt_full >= 0) settings_lock("display", "smooth_colours");
@@ -1242,6 +1300,10 @@ static void settings_apply(const char *dir) {
         else if (strcmp(v, "software") && strcmp(v, "gpu"))
             rt_log("settings: display.renderer: software, gpu or a graphics API (metal, vulkan, d3d12)");
     }
+    if (!s_precision_given && (v = settings_get("display", "gpu_precision"))) {
+        if (!strcmp(v, "fast") || !strcmp(v, "exact")) hires_gpu_set_fast(!strcmp(v, "fast"));
+        else rt_log("settings: display.gpu_precision: exact or fast");
+    }
     if (!s_win_set && (v = settings_get("display", "window"))) {
         if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
     }
@@ -1266,6 +1328,7 @@ static void settings_note_view(const char *name) {
     if (!strcmp(name, "widescreen")) settings_set_bool("display", "widescreen", s_ws_req);
     else if (!strcmp(name, "renderer") && s_renderer != R_COMPARE) settings_set("display", "renderer", renderer_name(s_renderer));
     else if (!strcmp(name, "resolution")) settings_set("display", "resolution", resolution_name());
+    else if (!strcmp(name, "gpu-precision")) settings_set("display", "gpu_precision", hires_gpu_get_fast() ? "fast" : "exact");
     else if (!strcmp(name, "tex-filter")) settings_set("display", "tex_filter", hires_tex_filter_name(hires_get_tex_filter()));
     else if (!strcmp(name, "smooth-colours")) settings_set_bool("display", "smooth_colours", hires_get_colour());
     else if (!strcmp(name, "ssaa") && s_ssaa_chosen) {
@@ -1349,6 +1412,12 @@ static void usage(void) {
         "                        metal or vulkan (macOS: MoltenVK via the Vulkan loader)\n"
         "  --compare-every N     compare mode: compare the targets every N frames (default 30)\n"
         "  --compare-max PCT     compare mode: exit non-zero if a fight frame differs in more than PCT%% of pixels\n"
+        "  --compare-tol PCT[:STEPS]  compare mode: exit non-zero if a fight frame has more than PCT%% of its\n"
+        "                        pixels off by more than STEPS (1, 2 or 4; default 4) 15-bit steps (fast precision)\n"
+        "  --compare-dump DIR    compare mode: software / GPU / difference PNGs of compared fight frames\n"
+        "  --compare-dump-max N  how many fight frames --compare-dump writes (default 4)\n"
+        "  --gpu-precision P     GPU renderer: exact (default; bit-identical to software) or fast\n"
+        "                        (hardware interpolation, approximate; View > Renderer > Exact / Fast)\n"
         "  --widescreen          16:9 fights: wider stage culling + hi-res guard band (menus/FMV stay 4:3;\n"
         "                        needs hi-res; the window aspect picks 4:3..16:9; default window 1280x720;\n"
         "                        default on in a window, off headless;\n"
@@ -1777,6 +1846,7 @@ bool frontend_view_checked(const char *action, bool *checked) {
     if (n == 10 && !strncmp(action, "resolution", n) && *arg) { *checked = !strcmp(arg, resolution_name()); return true; }
     if (n == 14 && !strncmp(action, "smooth-colours", n)) { *checked = hires_get_colour(); return true; }
     if (n == 4 && !strncmp(action, "ssaa", n) && *arg) { *checked = atoi(arg) == hires_get_ssaa(); return true; }
+    if (n == 13 && !strncmp(action, "gpu-precision", n) && *arg) { *checked = !strcmp(arg, "fast") == hires_gpu_get_fast(); return true; }
     return false;
 }
 
@@ -1853,6 +1923,15 @@ static void menu_run(const char *name, const char *arg) {
         else if (a >= 0) renderer_switch(R_GPU, a);
         else if (!*arg) renderer_switch(s_renderer == R_SOFTWARE ? R_GPU : R_SOFTWARE, -1);
         else rt_log("menu: renderer: software, gpu, metal, vulkan, d3d12 or compare");
+    }
+    else if (!strcmp(name, "gpu-precision")) {   /* View > Renderer > Exact / Fast; none = toggle */
+        if (*arg && strcmp(arg, "exact") && strcmp(arg, "fast")) rt_log("menu: gpu-precision: exact or fast");
+        else {
+            hires_gpu_set_fast(*arg ? !strcmp(arg, "fast") : !hires_gpu_get_fast());
+            hires_reseed();   /* presentation only: the next frame starts from the 1x VRAM */
+            rt_log("hires-gpu: %s precision at frame %llu%s", hires_gpu_get_fast() ? "fast" : "exact",
+                   (unsigned long long)s_frame, s_renderer == R_SOFTWARE ? " (used when the GPU renderer runs)" : "");
+        }
     }
     else if (!strcmp(name, "fullscreen"))   /* View > Enter/Exit Full Screen; arg on/off, none/toggle */
         fullscreen_set(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
@@ -2057,6 +2136,23 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--compare-every") && i + 1 < argc) s_compare_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--compare-max") && i + 1 < argc) s_compare_max = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--compare-tol") && i + 1 < argc) {
+            const char *t = argv[++i], *c = strchr(t, ':');
+            s_compare_tol = atof(t);
+            if (c) s_compare_tol_steps = atoi(c + 1);
+            if (s_compare_tol_steps != 1 && s_compare_tol_steps != 2 && s_compare_tol_steps != 4) {
+                fprintf(stderr, "--compare-tol: PCT[:STEPS], STEPS 1, 2 or 4\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--compare-dump") && i + 1 < argc) s_compare_dump = argv[++i];
+        else if (!strcmp(argv[i], "--compare-dump-max") && i + 1 < argc) s_compare_dump_max = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gpu-precision") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "exact") && strcmp(v, "fast")) { fprintf(stderr, "--gpu-precision: exact or fast\n"); return 1; }
+            hires_gpu_set_fast(!strcmp(v, "fast"));
+            s_precision_given = true;
+        }
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
             s_state_hash = fopen(argv[++i], "wb");
             if (!s_state_hash) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
