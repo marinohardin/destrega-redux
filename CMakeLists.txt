@@ -187,6 +187,9 @@ if(DESTREGA_TESTS)
   # View > Renderer's API switch: shut down / restart the backend on every available API in turn
   add_test(NAME hires_gpu_switch COMMAND test_hires_gpu switch WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(hires_gpu_switch PROPERTIES SKIP_RETURN_CODE 77)
+  # fast precision (--gpu-precision fast): the same streams within a tolerance
+  add_test(NAME hires_gpu_fast COMMAND test_hires_gpu fast auto WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(hires_gpu_fast PROPERTIES SKIP_RETURN_CODE 77)
   if(APPLE)   # MoltenVK, when the Vulkan loader is installed (Homebrew vulkan-loader + molten-vk)
     add_test(NAME hires_gpu_vulkan COMMAND test_hires_gpu vulkan WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     set_tests_properties(hires_gpu_vulkan PROPERTIES SKIP_RETURN_CODE 77)

@@ -877,8 +877,11 @@ static inline u32 srange(int lo, int hi) { return ((u32)lo & 0xFFFFu) | ((u32)hi
  * the exact path (pixel centres on the 1x grid scaled), but the GPU's own fill rule and sub-pixel
  * snapping. Attributes: hires.c samples a hi-res pixel's u/v at the 1x point P = (X + 0.5) / S - 0.5
  * while the hardware interpolates at the pixel centre, i.e. at 1x X / S with these positions; so
- * each vertex gets the triangle's u/v at its own position + (0.5 / S - 0.5) (affine, or perspective
- * with weights 1 / w), plus the PS1's +0.5 rounding bias. Colours are not shifted (sub-pixel). */
+ * each vertex gets the triangle's u/v at its own position + (0.5 / S - 0.5), plus the PS1's +0.5
+ * rounding bias. With perspective, q = wmin / w and u*q are linear in screen space, so the vertex
+ * gets both planes at the shifted point: clip w = 1 / q', u = (u*q)' / q'; the hardware's
+ * perspective interpolation then gives exactly hires.c's u/v at P (up to float rounding).
+ * Colours are not shifted (sub-pixel). */
 static void fast_tri(const HiresPrim *p, const HiresVtx *sv[3], bool persp, u32 kf, int umin, int umax, int vmin, int vmax,
                      int xlo, int ylo, int xhi, int yhi)
 {
@@ -904,22 +907,23 @@ static void fast_tri(const HiresPrim *p, const HiresVtx *sv[3], bool persp, u32 
     FVtx v[3];
     for (int i = 0; i < 3; i++) {
         const HiresVtx *s = sv[i];
-        double uu = s->u, vv = s->v;
+        double uu = s->u, vv = s->v, wq = q[i];
         if (tex && fabs(den) > 1e-9) {
             const double px = X[i] + dx, py = Y[i] + dy;
             double l1 = ((px - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (py - Y[0])) / den;
             double l2 = ((X[1] - X[0]) * (py - Y[0]) - (px - X[0]) * (Y[1] - Y[0])) / den;
             double l0 = 1 - l1 - l2;
-            double wq = l0 * q[0] + l1 * q[1] + l2 * q[2];
-            if (wq > 1e-9) {
-                uu = (l0 * q[0] * sv[0]->u + l1 * q[1] * sv[1]->u + l2 * q[2] * sv[2]->u) / wq;
-                vv = (l0 * q[0] * sv[0]->v + l1 * q[1] * sv[1]->v + l2 * q[2] * sv[2]->v) / wq;
+            const double qs = l0 * q[0] + l1 * q[1] + l2 * q[2];
+            if (qs > 1e-9) {   /* q and u*q are screen-linear: their planes at the shifted point */
+                uu = (l0 * q[0] * sv[0]->u + l1 * q[1] * sv[1]->u + l2 * q[2] * sv[2]->u) / qs;
+                vv = (l0 * q[0] * sv[0]->v + l1 * q[1] * sv[1]->v + l2 * q[2] * sv[2]->v) / qs;
+                wq = qs;
             }
         }
         const HiresVtx *cs = gour ? s : sv[0];
         v[i].x = (float)((double)((s64)s->x * Sx) / 65536.0 - s_ox + 0.5);
         v[i].y = (float)((double)((s64)s->y * Sy) / 65536.0 - s_oy + 0.5);
-        v[i].w = persp ? (float)((double)s->w / wmin) : 1.0f;
+        v[i].w = persp ? (float)(1.0 / wq) : 1.0f;   /* clip w = 1 / q: the hardware's perspective division */
         v[i].u = (float)(uu + 0.5);
         v[i].v = (float)(vv + 0.5);
         v[i].col = (cs->r & 255) | ((cs->g & 255) << 8) | ((cs->b & 255) << 16);

@@ -175,6 +175,9 @@ void menu_init(void) {
         AppendMenuW(ren, MF_SEPARATOR, 0, NULL);
     }
     add(ren, "Software", "renderer=software");
+    AppendMenuW(ren, MF_SEPARATOR, 0, NULL);   /* GPU precision (radio pair, presentation only) */
+    add(ren, "Exact", "gpu-precision=exact");
+    add(ren, "Fast (Approximate)", "gpu-precision=fast");
     add_sub(view, "Renderer", ren);
     HMENU res = CreatePopupMenu();   /* Auto: governed 4x6; the fixed scales are never changed */
     add(res, "Auto", "resolution=auto");
