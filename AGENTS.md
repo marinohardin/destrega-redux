@@ -1438,7 +1438,7 @@ replay 4500 frames, 4x6 widescreen xbr full colour).
   the exact test's PGXP cases had compared empty targets (still 0 differing pixels now that they draw).
 - **Speed** (headless, `tools/quick_check.sh`'s bench configuration, M1 Pro, load 4.5-8, three
   A/B rounds back to back, fight segment 3700-4500 ms/frame emulation + hi-res): Metal exact 4.9,
-  **fast 1.16**; Vulkan (MoltenVK) exact 9.8, **fast 1.3**. Windowed: see the PR.
+  **fast 1.16**; Vulkan (MoltenVK) exact 9.8, **fast 1.3**. Windowed Metal (3834x2328 px, 4x6, widescreen, xbr, full colour): exact emu 1.22 + present 2.55 = 3.77 ms/frame, fast 1.11 + 0.15 = 1.27 (host busy 16% -> 7%).
 - Not done: no fast lines (rare), no fast path for the exact backend's 1x1 `--hires-verify` (fast is
   never bit-exact), not run on a native Vulkan / D3D12 driver (only MoltenVK and vkd3d) or by a
   person in the menus.
