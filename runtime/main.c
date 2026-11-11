@@ -121,6 +121,7 @@ static FILE *s_gameplay;           /* --gameplay-trace FILE */
 static u64 s_ws_wide[2];           /* widescreen: frames presented wider than 4:3 (all, fight window) */
 static const char *s_ram_snap_dir; /* --ram-snap DIR: raw RAM + scratchpad every --ram-snap-every frames */
 static u64 s_ram_snap_every = 100;
+static u64 s_ram_snap_from;     /* --ram-snap-from F: no snapshots before frame F */
 typedef struct { u64 frame; int w, h; } ResizeStep;
 static ResizeStep s_resizes[256];
 static int s_resize_n;
@@ -1049,7 +1050,7 @@ void frontend_vblank(void) {
     }
     if (s_state_hash) write_state_hash();
     if (s_gameplay) write_gameplay_trace();
-    if (s_ram_snap_dir && s_frame % s_ram_snap_every == 0) {
+    if (s_ram_snap_dir && s_frame >= s_ram_snap_from && s_frame % s_ram_snap_every == 0) {
         char p[512];
         snprintf(p, sizeof p, "%s/ram_%06llu.bin", s_ram_snap_dir, (unsigned long long)s_frame);
         FILE *f = fopen(p, "wb");
@@ -1523,6 +1524,7 @@ static void usage(void) {
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
         "  --gameplay-trace FILE per frame: fighters' health/gauge/position, round time, wins, RNG seed\n"
         "  --ram-snap DIR        write raw guest RAM + scratchpad to DIR every --ram-snap-every N frames (100)\n"
+        "  --ram-snap-from F     no --ram-snap snapshots before frame F\n"
         "  --hires-verify        at scale 1, check the hi-res target equals the 1x VRAM every frame\n"
         "  --gpu-1x MODE         auto|copy|skip|draw: 1x primitives inside the framebuffer region are not\n"
         "                        drawn into the emulated VRAM (gpu.c); copy keeps the full 1x picture for\n"
@@ -2270,6 +2272,7 @@ int main(int argc, char **argv) {
             if (!s_gameplay) { fprintf(stderr, "cannot write %s\n", argv[i]); return 1; }
         }
         else if (!strcmp(argv[i], "--ram-snap-every") && i + 1 < argc) s_ram_snap_every = strtoull(argv[++i], 0, 0);
+        else if (!strcmp(argv[i], "--ram-snap-from") && i + 1 < argc) s_ram_snap_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) {
             const char *r = argv[++i];
             s_renderer_given = true;
