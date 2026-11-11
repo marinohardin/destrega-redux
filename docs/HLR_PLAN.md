@@ -24,7 +24,11 @@ Terms: "HLR" = this renderer; "original path" = 1x GPU (`gpu.c`) + hi-res backen
   CLUT), stable and independent of its VRAM position; the texture-cache key and the material path
   get one single place where a replacement texture could be substituted (section 4.4,
   "Replacement hook"). Dumped textures are never committed.
-- Open: questions 3, 4, 6-8 of section 8.
+- **Character bones: smooth + predict by default** (question 3, after phase 0 B; 2026-11-11):
+  `--hlr-bones smooth` is the default and `--hlr-motion extrap` extrapolates the smoothed bone
+  signal (EMA + prediction or a one-euro filter, tuned in phase 3 / 6), offline and in netplay.
+  `game` (raw `workm`) stays available as an option.
+- Open: questions 4, 6-8 of section 8.
 
 ## Phase 0 results (2026-11-11, `feature/hlr`)
 
