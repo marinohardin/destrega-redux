@@ -1094,3 +1094,23 @@ const char *portmap_status_short(void) {
     plat_mutex_unlock(&s_m);
     return t;
 }
+
+int portmap_address(char *out, size_t n) {
+    plat_mutex_lock(&s_m);
+    int st = S.state, want = S.want;
+    Mapping m = S.cur;
+    plat_mutex_unlock(&s_m);
+    if (n) out[0] = 0;
+    switch (st) {
+    case ST_BUSY: return PM_RES_ASKING;
+    case ST_OK:
+        if (!m.proto || m.port != want) return PM_RES_ASKING;   /* a new port is being asked for */
+        snprintf(out, n, "%s:%d", m.ext_ip, m.ext);
+        return PM_RES_PUBLIC;
+    case ST_CGNAT:
+        if (m.proto && m.ext_ip[0]) snprintf(out, n, "%s:%d", m.ext_ip, m.ext);
+        return PM_RES_UNREACHABLE;
+    case ST_NOANSWER: case ST_REFUSED: return PM_RES_FAILED;
+    default: return PM_RES_OFF;
+    }
+}

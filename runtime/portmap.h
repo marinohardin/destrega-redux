@@ -51,6 +51,11 @@ bool portmap_tick(void);
 const char *portmap_text(void);
 /* Short form for the Netplay menu's status line ("" when not in use). */
 const char *portmap_status_short(void);
+/* The address to give the opponent, for "Copy My Address" (netplay_ui.c). PM_RES_PUBLIC: out =
+ * "A.B.C.D:PORT", the router's public address and the forwarded port; PM_RES_UNREACHABLE: out = the
+ * router's non-public address (CGNAT etc.) and port, useless from the internet; otherwise out = "". */
+enum { PM_RES_OFF, PM_RES_ASKING, PM_RES_PUBLIC, PM_RES_UNREACHABLE, PM_RES_FAILED };
+int portmap_address(char *out, size_t n);
 
 /* ---- internals, exposed for runtime/tests/test_portmap.c ---------------------------------- */
 enum { PM_ADDR_PUBLIC, PM_ADDR_CGNAT, PM_ADDR_PRIVATE, PM_ADDR_INVALID };

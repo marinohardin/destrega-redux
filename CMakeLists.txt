@@ -74,7 +74,7 @@ add_executable(destrega
   runtime/overrides/override.c runtime/overrides/collision.c runtime/menu_stub.c
   runtime/overrides/widescreen.c runtime/overrides/char_mesh.c runtime/platform.c runtime/platform_net.c
   runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c runtime/smooth.c runtime/portmap.c
-  runtime/input.c runtime/settings.c)
+  runtime/netplay_ui.c runtime/input.c runtime/settings.c)
 target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE} ${CMAKE_CURRENT_BINARY_DIR})
 # Emulation source identity for the netplay handshake (rule in tools/source_ident.py): the same
 # on every platform for the same sources.

@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 void menu_init(void) {}
-void menu_netplay_progress(const char *text) { (void)text; }
+void menu_netplay_progress(const char *text, bool copy) { (void)text; (void)copy; }
 void menu_reveal(const char *path) { (void)path; }
 bool menu_executable_path(char *out, size_t n) { return plat_executable_path(out, n); }
 void controls_open(void) { fprintf(stderr, "menu: no Controls window on this platform (use the controls-* menu actions or settings.ini)\n"); }
