@@ -50,6 +50,17 @@ void bus_write8(u32 addr, u32 v);
 void bus_write16(u32 addr, u32 v);
 void bus_write32(u32 addr, u32 v);
 
+/* Write journal (widescreen shadow pass, overrides/widescreen.c). Stores take the RAM fast path
+ * only below g_mem_wlimit: normally 0x800000 (all of RAM and its mirrors), 0 while journalling, so
+ * every RAM store then reaches bus_write*, which saves the old contents of each 256-byte block on
+ * its first write (mem_journal_note). The pass is undone without copying all of RAM, and the fast
+ * path costs one load instead of an immediate. */
+#define MEM_JOURNAL_SHIFT 8
+#define MEM_JOURNAL_BLOCKS (RAM_SIZE >> MEM_JOURNAL_SHIFT)
+extern u32 g_mem_wlimit;
+bool mem_journal_begin(void);    /* bus.c: start journalling (false: out of memory) */
+u32 mem_journal_undo(void);      /* restore every journalled block, stop; returns the block count */
+
 static inline u32 mem_r32(u32 a) {
     u32 p = a & 0x1fffffff;
     if (p < 0x800000) return *(u32 *)(g_ram + (p & 0x1ffffc));
@@ -70,19 +81,19 @@ static inline u32 mem_r8(u32 a) {
 }
 static inline void mem_w32(u32 a, u32 v) {
     u32 p = a & 0x1fffffff;
-    if (p < 0x800000) { *(u32 *)(g_ram + (p & 0x1ffffc)) = v; return; }
+    if (p < g_mem_wlimit) { *(u32 *)(g_ram + (p & 0x1ffffc)) = v; return; }
     if ((p & 0xfffffc00) == 0x1f800000) { *(u32 *)(g_scratch + (p & 0x3fc)) = v; return; }
     bus_write32(a, v);
 }
 static inline void mem_w16(u32 a, u32 v) {
     u32 p = a & 0x1fffffff;
-    if (p < 0x800000) { *(u16 *)(g_ram + (p & 0x1ffffe)) = (u16)v; return; }
+    if (p < g_mem_wlimit) { *(u16 *)(g_ram + (p & 0x1ffffe)) = (u16)v; return; }
     if ((p & 0xfffffc00) == 0x1f800000) { *(u16 *)(g_scratch + (p & 0x3fe)) = (u16)v; return; }
     bus_write16(a, v);
 }
 static inline void mem_w8(u32 a, u32 v) {
     u32 p = a & 0x1fffffff;
-    if (p < 0x800000) { g_ram[p & 0x1fffff] = (u8)v; return; }
+    if (p < g_mem_wlimit) { g_ram[p & 0x1fffff] = (u8)v; return; }
     if ((p & 0xfffffc00) == 0x1f800000) { g_scratch[p & 0x3ff] = (u8)v; return; }
     bus_write8(a, v);
 }

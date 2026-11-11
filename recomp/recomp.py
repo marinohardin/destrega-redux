@@ -8,6 +8,7 @@ Inputs (relative to the project root):
   analysis/rea_list_procedures_main.json     REA list_procedures export (main)
   analysis/overlays/<NAME>.procs.json        REA procedure exports (overlays)
   analysis/extra_seeds.txt                   optional extra entries: "<hex addr> [overlay]"
+  analysis/idle_loops.txt                    idle-loop fast-forward points (main exe)
 Outputs:
   gen/main_XX.c, gen/ovl_<NAME>.c, gen/table.c, gen/report.txt
 """
@@ -78,6 +79,29 @@ def overrides():
             line = line.split('#')[0].split()
             if line:
                 res.add(int(line[0], 16))
+    return res
+
+
+def idle_loops(img):
+    """analysis/idle_loops.txt: `<backward branch> <helper> <loop start> <fnv1a of the loop words>`.
+    The helper (runtime/recomp.h) knows the loop's exact instructions, so the words from the loop
+    start through the branch's delay slot must hash to the recorded value."""
+    path = 'analysis/idle_loops.txt'
+    res = {}
+    if os.path.exists(path):
+        for n, line in enumerate(open(path), 1):
+            f = line.split('#')[0].split()
+            if not f:
+                continue
+            br, helper, start, want = int(f[0], 16), f[1], int(f[2], 16), int(f[3], 16)
+            i = img.ins(br)
+            if i.op not in ('beq', 'bne', 'blez', 'bgtz', 'bltz', 'bgez') or i.target != start:
+                raise SystemExit(f'{path}:{n}: {br:08x} is not a branch back to {start:08x}')
+            data = b''.join(img.word(a).to_bytes(4, 'little') for a in range(start, br + 8, 4))
+            if fnv1a(data) != want:
+                raise SystemExit(f'{path}:{n}: loop {start:08x}..{br:08x} hash {fnv1a(data):08x}, '
+                                 f'expected {want:08x}')
+            res[br] = helper
     return res
 
 
@@ -196,6 +220,7 @@ def main():
     an = Analyzer(main_img, *MAIN_CODE, seeds)
     main_funcs = an.run()
     codegen.WS_PATCHES = widescreen_patches(main_img)
+    codegen.IDLE_LOOPS = idle_loops(main_img)
     main_names = {e: f'f_{e:08x}' for e in main_funcs}
     report.append(f'main: {len(main_funcs)} functions, '
                   f'{sum(len(f.insns) for f in main_funcs.values())} instructions')
@@ -233,6 +258,11 @@ def main():
         raise SystemExit('analysis/widescreen_cull.txt: not in recompiled code: ' +
                          ' '.join(f'{a:08x}' for a in sorted(missing)))
     report.append(f'main: {len(codegen.WS_EMITTED)} widescreen culling patch points')
+    missing = set(codegen.IDLE_LOOPS) - codegen.IDLE_EMITTED
+    if missing:
+        raise SystemExit('analysis/idle_loops.txt: not in recompiled code: ' +
+                         ' '.join(f'{a:08x}' for a in sorted(missing)))
+    report.append(f'main: {len(codegen.IDLE_EMITTED)} idle-loop fast-forward points')
     for n in range(0, len(chunks), FUNCS_PER_FILE):
         write_file(f'{args.out}/main_{n // FUNCS_PER_FILE:02d}.c', chunks[n:n + FUNCS_PER_FILE])
     for e, f in sorted(main_funcs.items()):

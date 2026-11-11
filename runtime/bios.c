@@ -507,6 +507,11 @@ static void bios_c0(u32 fn) {
 }
 
 void bios_call(u32 vec) {
+    extern int g_bus_sandbox;
+    extern u32 g_bus_sandbox_hits;
+    /* widescreen shadow pass: the BIOS keeps host-side state and writes RAM directly (not
+     * journalled), so a call rejects the pass like a hardware access (bus.c sandbox) */
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     u32 fn = g_cpu.r[9] & 0xff;
     if (g_trace) rt_log("bios: %02X:%02x a0=%08x a1=%08x a2=%08x ra=%08x", vec, fn, g_cpu.r[4], g_cpu.r[5], g_cpu.r[6], g_cpu.r[31]);
     g_cpu.cycles += 200;

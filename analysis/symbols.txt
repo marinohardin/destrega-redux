@@ -134,6 +134,7 @@
 800961f8  func   RotMatrix                  likely    rea        libgte; camera angles 800cc5c8 -> 800cc674
 8009b4f8  func   VSync                      likely    code       libetc VSync(mode): reads a pointer at 800be17c (GPUSTAT/counter, guess) and the vblank count 800bf2b4, waits in vsync_wait (8009b670); frame_sync calls it
 8009b670  func   vsync_wait                 likely    code       libetc VSync helper: spins while the vblank count at 800bf2b4 < a0, timeout counter a1<<15 (prints via 80099328 on timeout); also verified/trace: innermost guest function at the VSync-wait vblank of every 30 Hz fight update (--ss-stats: 2100 of 4200 fight vblanks, one host context)
+8009b698  label  vsync_wait_loop            verified  test       loop body 8009b698..8009b6f0 (14 insns: --timeout at sp+16, == -1 -> timeout path; then vblank count 800bf2b4 < a0 -> again); fast-forwarded by runtime idle_vsync_wait (analysis/idle_loops.txt): per-frame state hashes identical with and without on 5 replays, ~6400 iterations per frame skipped
 8009b8bc  func   ResetCallback              verified  code       libetc; setjmps into 800be224 and passes it to HookEntryInt
 8009b924  label  resetcallback_irq_resume   verified  test       setjmp return point resumed on every IRQ; seeded as its own native entry (extra_seeds.txt)
 8009b994  func   irq_dispatcher             verified  code       libetc interrupt dispatcher; ends in ReturnFromException (C longjmp in rt.c)
@@ -152,6 +153,7 @@
 800b6158  data   shadow_pair_table          likely    rea        36 vertex pairs whose midpoints complete the 45-vertex shadow mesh
 800b6264  data   shadow_grid_offsets        likely    rea        3x3 grid offsets of the shadow mesh (stretched by the feet spread)
 800be224  data   resetcallback_jmpbuf       verified  code       setjmp buffer used for IRQ hook (HookEntryInt)
+800bf2b4  data   vsync_counter              verified  test       libetc VSync count (vblanks), read by VSync 8009b4f8 / vsync_wait 8009b670; changed only from the VBlank interrupt (no CPU store between events: skipping vsync_wait iterations up to the next event leaves every per-frame state hash unchanged)
 800bfe28  data   char_base_rgb              likely    rea        u32 RGB+code loaded into the GTE before NCCT/NCCS of the character mesh
 800c0248  data   camera_mode                verified  probe      gp+0x460: camera mode for camera_update (0 follow, 1 round intro, 2/3 not seen)
 800c0298  data   frame_ready                likely    rea        set by frame_submit, consumed by vblank_callback (draw the root OT)

@@ -124,23 +124,44 @@ void pgxp_check_tri(const PgxpVert *const q[3], const u32 sxy[3])
 
 /* ---- snapshot for the widescreen shadow pass (widescreen_add_state_hook) ----
  * The wide pass runs guest code whose hooks move tags and produce pool vertices; all of it is
- * put back so the real pass sees exactly what it would without widescreen. Tags (registers, GTE
- * FIFO, the per-word table) are copied; pool entries and the recent-word set are journalled
- * while the snapshot is open (their old values, replayed backwards on restore). */
+ * put back so the real pass sees exactly what it would without widescreen. Registers, the GTE
+ * FIFO and the scratchpad / I/O tags are copied; RAM word tags are journalled in blocks
+ * (pgxp_wslot_other, reached for RAM tag writes while the RAM write journal is open: the first
+ * write to a block saves it); pool entries and the recent-word set are journalled while the
+ * snapshot is open (their old values, replayed backwards on restore). */
 typedef struct { u32 t, slot, recent; PgxpVert v; } PgxpUndo;
-static u32 *s_mem_bak;
+#define PGXP_JOURNAL_WORDS (1u << PGXP_JOURNAL_SHIFT)
+static u8 s_jbits[PGXP_JOURNAL_BLOCKS / 8];
+static u32 *s_mem_bak;                  /* RAM tag blocks, at their own offsets */
+static u32 s_jlist[PGXP_JOURNAL_BLOCKS], s_jn;
+static u32 s_other_bak[PGXP_IO_SLOT + 1 - PGXP_RAM_WORDS];   /* scratchpad + I/O tags */
 static u32 s_reg_bak[32], s_gte_bak[3], s_next_bak;
 static u64 s_stat_new_bak;
 static PgxpUndo *s_undo;
 static size_t s_undo_n, s_undo_cap;
 static bool s_snap;
 
+u32 pgxp_wslot_other(u32 p)
+{
+    if (p >= 0x800000) return PGXP_IO_SLOT;
+    const u32 slot = (p & 0x1ffffc) >> 2;   /* RAM, journal open */
+    const u32 b = slot >> PGXP_JOURNAL_SHIFT;
+    if (s_snap && !((s_jbits[b >> 3] >> (b & 7)) & 1)) {
+        s_jbits[b >> 3] |= (u8)(1u << (b & 7));
+        s_jlist[s_jn++] = b;
+        memcpy(s_mem_bak + (size_t)b * PGXP_JOURNAL_WORDS, g_pgxp_mem + (size_t)b * PGXP_JOURNAL_WORDS,
+               PGXP_JOURNAL_WORDS * sizeof(u32));
+    }
+    return slot;
+}
+
 void pgxp_snapshot_save(void)
 {
     if (!g_pgxp) return;
-    if (!s_mem_bak) s_mem_bak = malloc(sizeof g_pgxp_mem);
+    if (!s_mem_bak) s_mem_bak = malloc(PGXP_RAM_WORDS * sizeof(u32));
     if (!s_mem_bak) return;
-    memcpy(s_mem_bak, g_pgxp_mem, sizeof g_pgxp_mem);
+    s_jn = 0;
+    memcpy(s_other_bak, g_pgxp_mem + PGXP_RAM_WORDS, sizeof s_other_bak);
     memcpy(s_reg_bak, g_pgxp_reg, sizeof s_reg_bak);
     memcpy(s_gte_bak, g_pgxp_gte, sizeof s_gte_bak);
     s_next_bak = s_next;
@@ -158,7 +179,14 @@ void pgxp_snapshot_restore(void)
         g_pgxp_pool[u->t] = u->v;
         g_pgxp_recent[u->slot] = u->recent;
     }
-    memcpy(g_pgxp_mem, s_mem_bak, sizeof g_pgxp_mem);
+    for (u32 i = 0; i < s_jn; i++) {
+        const u32 b = s_jlist[i];
+        memcpy(g_pgxp_mem + (size_t)b * PGXP_JOURNAL_WORDS, s_mem_bak + (size_t)b * PGXP_JOURNAL_WORDS,
+               PGXP_JOURNAL_WORDS * sizeof(u32));
+        s_jbits[b >> 3] = 0;
+    }
+    s_jn = 0;
+    memcpy(g_pgxp_mem + PGXP_RAM_WORDS, s_other_bak, sizeof s_other_bak);
     memcpy(g_pgxp_reg, s_reg_bak, sizeof s_reg_bak);
     memcpy(g_pgxp_gte, s_gte_bak, sizeof s_gte_bak);
     s_next = s_next_bak;

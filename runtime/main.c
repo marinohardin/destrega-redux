@@ -773,6 +773,8 @@ static void finish(void) {
                (unsigned long long)s_verify_bad_frames);
         if (s_verify_bad_frames || !s_verify_fight) rc = 3;
     }
+    rt_log("idle-skip: %s, %llu loop iterations fast-forwarded", g_idle_skip ? "on" : "off",
+           (unsigned long long)g_idle_skipped);
     if (g_pgxp_stat_tris) {
         rt_log("pgxp-check: %llu triangles with precise vertices; %llu with an on-screen vertex > 1.5 px from its integer, "
                "%llu with depth ratio > 2, %llu using a value older than 2 frames, %llu split vertices",
@@ -1470,6 +1472,7 @@ static void usage(void) {
         "  --input-log FILE      write 'frame pad1 pad2' (hex, active high) whenever a pad mask changes\n"
         "  --trace               verbose runtime logging (repeat for more)\n"
         "  --no-interp           make any MIPS-interpreter fallback fatal (testing)\n"
+        "  --no-idle-skip        run every iteration of idle loops (analysis/idle_loops.txt; A/B checks)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
     ss_usage();
 }
@@ -2056,6 +2059,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-from") && i + 1 < argc) s_dump_from = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "--trace")) g_trace++;
         else if (!strcmp(argv[i], "--no-interp")) g_no_interp = 1;
+        else if (!strcmp(argv[i], "--no-idle-skip")) g_idle_skip = 0;
         else if (!strcmp(argv[i], "--verify-overrides")) { g_verify_overrides = 1; atexit(override_report); }
         else if (!strcmp(argv[i], "--profile")) s_profile_on = 1;
         else if (!strcmp(argv[i], "--watch") && i + 1 < argc && s_watch_n < 8) s_watch[s_watch_n++] = (u32)strtoul(argv[++i], 0, 16);

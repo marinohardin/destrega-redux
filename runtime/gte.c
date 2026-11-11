@@ -203,9 +203,10 @@ static u32 gte_divide(void)
 enum { MX_RT = 0, MX_LLM = 1, MX_LCM = 2, MX_BAD = 3 };
 enum { TX_TR = 0, TX_BK = 1, TX_FC = 2, TX_NONE = 3 };
 
-/* Computes MAC1..3 = (T*1000h + M*V) SAR shift with per-step 44-bit checks.
+/* Reference form (every matrix / translation, including the garbage matrix and the FC bug).
+ * Computes MAC1..3 = (T*1000h + M*V) SAR shift with per-step 44-bit checks.
  * Returns the final 44-bit accumulators in acc[] (pre-shift). Does not set IR. */
-static void mvmva_core(int mx, const s32 v[3], int tx, int shift, s64 acc[3])
+__attribute__((noinline)) static void mvmva_generic(int mx, const s32 v[3], int tx, int shift, s64 acc[3])
 {
     for (int i = 0; i < 3; i++) {
         s64 m0, m1, m2;
@@ -242,7 +243,37 @@ static void mvmva_core(int mx, const s32 v[3], int tx, int shift, s64 acc[3])
     }
 }
 
-static void mat_vec(int mx, const s32 v[3], int tx, int shift, int lm)
+/* Same results, specialised: always inlined, so callers with a constant matrix / translation
+ * get straight-line code. Matrix elements and vector components are 16-bit signed (the
+ * registers are stored sign-extended / saturated, see gte_write_data, sat_ir), so each product
+ * is below 2^30 in magnitude; when |T*1000h| <= 2^42 no partial sum can leave the 44-bit range,
+ * the three checks set no flag and the sign extension changes nothing, so the plain sum is the
+ * same value. The garbage matrix and the FC bug take the reference form. */
+static inline __attribute__((always_inline)) void mvmva_core(int mx, const s32 v[3], int tx, int shift, s64 acc[3])
+{
+    if (mx == MX_BAD || tx == TX_FC) { mvmva_generic(mx, v, tx, shift, acc); return; }
+    const int base = (mx == MX_RT) ? C_RT : (mx == MX_LLM) ? C_LLM : C_LCM;
+    for (int i = 0; i < 3; i++) {
+        const s64 m0 = mat_el(base, i, 0), m1 = mat_el(base, i, 1), m2 = mat_el(base, i, 2);
+        s64 t = 0;
+        if (tx != TX_NONE) {
+            const int tb = (tx == TX_TR) ? C_TR : C_BK;
+            t = (s64)(s32)c[tb + i] * 4096;
+        }
+        s64 a;
+        if (__builtin_expect(t >= -(1LL << 42) && t <= (1LL << 42), 1)) {
+            a = t + m0 * v[0] + m1 * v[1] + m2 * v[2];
+        } else {
+            a = mac_chk(i + 1, t + m0 * v[0]);
+            a = mac_chk(i + 1, a + m1 * v[1]);
+            a = mac_chk(i + 1, a + m2 * v[2]);
+        }
+        set_mac(i + 1, (s32)sar64(a, shift));
+        acc[i] = a;
+    }
+}
+
+static inline __attribute__((always_inline)) void mat_vec(int mx, const s32 v[3], int tx, int shift, int lm)
 {
     s64 acc[3];
     mvmva_core(mx, v, tx, shift, acc);
@@ -499,7 +530,18 @@ void gte_command(u32 instr)
     case 0x12: {                                                /* MVMVA */
         s32 v[3];
         get_v(vx, v);
-        mat_vec(mx, v, tx, shift, lm);
+        switch (mx * 4 + tx) {   /* constant matrix / translation: specialised mvmva_core */
+        case MX_RT * 4 + TX_TR:    mat_vec(MX_RT, v, TX_TR, shift, lm); break;
+        case MX_RT * 4 + TX_BK:    mat_vec(MX_RT, v, TX_BK, shift, lm); break;
+        case MX_RT * 4 + TX_NONE:  mat_vec(MX_RT, v, TX_NONE, shift, lm); break;
+        case MX_LLM * 4 + TX_TR:   mat_vec(MX_LLM, v, TX_TR, shift, lm); break;
+        case MX_LLM * 4 + TX_BK:   mat_vec(MX_LLM, v, TX_BK, shift, lm); break;
+        case MX_LLM * 4 + TX_NONE: mat_vec(MX_LLM, v, TX_NONE, shift, lm); break;
+        case MX_LCM * 4 + TX_TR:   mat_vec(MX_LCM, v, TX_TR, shift, lm); break;
+        case MX_LCM * 4 + TX_BK:   mat_vec(MX_LCM, v, TX_BK, shift, lm); break;
+        case MX_LCM * 4 + TX_NONE: mat_vec(MX_LCM, v, TX_NONE, shift, lm); break;
+        default:                   mat_vec(mx, v, tx, shift, lm); break;
+        }
         break;
     }
     case 0x13: op_ncds(0, shift, lm); break;                    /* NCDS */

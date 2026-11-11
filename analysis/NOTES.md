@@ -125,9 +125,23 @@ Main-thread self time by area, Hills fight (verified by sampling; percentages sh
 - User configuration (GPU 4x6, 16:9, xbr, full colour, PGXP): waiting on the GPU fence 59 %,
   guest 9 %, hi-res backend 9 %, GTE 5 %, SPU 4 %, widescreen shadow pass 4 % (0.46 ms per
   pass: snapshot, wide run, restore, diff), 1x tracking 3 %. Wall time is GPU-bound there.
-- Next candidates: the widescreen shadow pass's full RAM/scratchpad copies (a write journal would
-  avoid them), the per-voice SPU loop, and the per-function `CYC`/`EVT_CHECK` overhead in the
-  generated code (must keep cycle counts identical).
+- CPU round (branch feature/cpu-round; all bit-identical: per-frame state hashes, `--wav`):
+  widescreen shadow pass with a RAM write journal (0.39-0.42 -> 0.17-0.18 ms per pass, ~38 KB
+  journalled instead of 2 MB copied twice), SPU voices that are off skipped per `spu_render` call
+  plus a vectorised reverb FIR, vsync_wait spins fast-forwarded (`analysis/idle_loops.txt`),
+  GTE matrix * vector specialised. Hills replay, process CPU: plain headless (`--gpu-1x skip`)
+  4.71-5.00 -> 3.79-3.85 s (-20%), user configuration with `--gpu-precision fast` 10.4-11.4 ->
+  8.8-9.9 s (-14%; wall time there stays GPU-bound at 1.18 ms per fight frame).
+- SPU facts (measured on the Hills replay, verified by a counting build): on average ~1.75 of the
+  24 voices play (92.7% of voice-samples are off), the SPU IRQ is never enabled, pitch modulation
+  is never used, reverb writes are on all the time.
+- The game burns ~6400 vsync_wait spins (14 instructions each) per frame waiting for the VBlank;
+  they are now skipped up to the next event.
+- Seen but not changed: the data pack is read with `fread` on the main thread (`disc.c`, one
+  16-sector zlib block per miss, XA streaming during fights): ~6% of main-thread *samples* were
+  blocked in `read` on the external drive under load (little CPU, but a stall a windowed frame
+  would feel). Reading ahead or mapping the pack would remove it. The RAM store fast path now
+  compares against a variable limit (`g_mem_wlimit`) instead of a constant: ~2% of plain CPU.
 
 ### What the render-quality modes see (runtime work, `--tex-filter` etc., AGENTS.md "Render quality")
 
@@ -1132,6 +1146,11 @@ Highest value first. Move items to "done" with the PR that did them.
    80052240, 800511bc, 80051b58). Readable versions make each one capturable as meshes +
    matrices + materials instead of packets.
 
+9. **Busy-wait loops** (beyond vsync_wait 8009b670, now fast-forwarded): CD / DMA / STR wait loops
+   (e.g. the STR wait at 0x80049e90) spin the same way; each one listed in
+   `analysis/idle_loops.txt` with its proof saves host CPU without touching emulated state.
+   Needs: what the loop reads, and that only an event can change it.
+
 Done:
 - `sphere_vs_poly` (`800465a4`), PR #3.
 
@@ -1149,3 +1168,9 @@ Done:
 - Are Gene (`MGENE*.BIN`) and Soldier reachable outside STORY (cheat, unlock)? No portrait for them.
 - Story: the first fight is lost without input; the scenario stops at its start, so later events are
   untested.
+- Hi-res worker pool hang (host runtime, not game code; verified, seen 2026-11): the headless
+  `test_governor.py` `offline92` run (`--scale auto --max-scale 2x3 --fake-load 1-9000:92`, default
+  worker threads) sometimes never finishes. Both times it was seen (on this branch and on main) it
+  stopped at frame 7125. The main thread spins in `hires.c` `par_rows`, waiting for
+  `done == nchunks`, and every worker is asleep in `worker_main`'s `cond_wait`, so a claimed chunk's
+  `done` increment is lost or the count is wrong. About 1 run in 4; cause not found.

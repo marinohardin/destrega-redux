@@ -9,11 +9,12 @@
  *
  * So the widened renderer never runs "for real". With --widescreen (and a hi-res guard band):
  *
- *   1. snapshot RAM, scratchpad, CPU and GTE;
+ *   1. snapshot scratchpad, CPU and GTE, and open the RAM write journal (psx.h g_mem_wlimit,
+ *      bus.c: the first store to each 256-byte block saves its old contents);
  *   2. run the recompiled renderer with the widened bounds (WS_IMM in the generated code,
  *      analysis/widescreen_cull.txt), interrupts held off and hardware access blocked
  *      (bus sandbox), then record every packet in the stage ordering table's 2048 slots;
- *   3. restore the snapshot and run the renderer with the original bounds: this is the run the
+ *   3. undo the journal, restore the snapshot and run the renderer with the original bounds: this is the run the
  *      game sees, bit for bit the same as without --widescreen;
  *   4. record the ordering table again; per slot, the packets of pass 2 that pass 3 does not
  *      have (compared by length and payload, not by address or link) are the "extras";
@@ -21,8 +22,13 @@
  *      target only (gpu_shadow_packet), just before the slot's own packets.
  *
  * Emulated state therefore never differs from a run without --widescreen; the full-state hash
- * test (tools/test_widescreen.sh) checks that. Costs: one extra renderer run and two 2 MB copies
- * per rendered fight frame.
+ * test (tools/test_widescreen.sh) checks that. Costs: one extra renderer run plus copying the
+ * blocks it wrote (about 38 KB of RAM and the matching PGXP tags in a fight) per rendered frame;
+ * the full 2 MB RAM + 2 MB tag copies used before took half of the 0.4 ms pass.
+ * DESTREGA_WS_JOURNAL_CHECK=1 also keeps full copies and checks every undo against them.
+ * The BIOS is blocked like hardware (bios.c): it keeps host-side state and writes RAM directly.
+ * During netplay re-simulation the pass does not run at all: netplay.c detaches g_hires for all
+ * but the last 3 re-simulated vblanks, so the first check below takes the plain renderer.
  *
  * Host-side state the generated code keeps besides guest state (e.g. PGXP precision tags) is
  * saved/restored around the wide pass through widescreen_add_state_hook() (widescreen.h).
@@ -135,7 +141,9 @@ typedef struct {
 
 static Capture s_cap[2];
 static PktList s_a, s_b;
-static u8 *s_ram_bak, *s_scr_bak;
+static u8 s_scr_bak[sizeof g_scratch];
+static bool s_ll_hooked;
+static u64 s_journal_blocks;            /* RAM blocks the wide passes wrote (and were restored) */
 static bool s_used[2];
 static u64 s_passes, s_extras, s_rejected;
 static u64 s_cost_ns;                   /* thread CPU time of the shadow pass (all but the real run) */
@@ -244,21 +252,32 @@ void widescreen_enable(bool on)
 static void stage_render(void)
 {
     if (!g_widescreen || !g_hires || !g_hires_guard) { f_80044210_orig(); return; }
-    if (!s_ram_bak) {
-        s_ram_bak = malloc(RAM_SIZE);
-        s_scr_bak = malloc(sizeof g_scratch);
-        g_gpu_ll_hook = ll_hook;
-    }
+    if (!s_ll_hooked) { g_gpu_ll_hook = ll_hook; s_ll_hooked = true; }
     const u32 base = ot_base();
     u64 t0 = cpu_ns();
-    /* 1. snapshot */
+    /* DESTREGA_WS_JOURNAL_CHECK=1 (development check): also keep full copies of RAM and the
+     * PGXP tag table and compare them after the undo */
+    static int check = -1;
+    static u8 *full;
+    static u32 *full_tags;
+    if (check < 0) {
+        const char *e = getenv("DESTREGA_WS_JOURNAL_CHECK");
+        check = e && *e == '1' && (full = malloc(RAM_SIZE)) && (full_tags = malloc(sizeof g_pgxp_mem));
+        if (check) rt_log("widescreen: checking the write journal against full copies");
+    }
+    if (check) { memcpy(full, g_ram, RAM_SIZE); memcpy(full_tags, g_pgxp_mem, sizeof g_pgxp_mem); }
+    /* 1. snapshot: CPU, GTE, scratchpad, host hooks; RAM through the write journal */
     const Cpu cpu = g_cpu;
     const u32 depth = g_depth;
     GteState gte;
     gte_save(&gte);
-    memcpy(s_ram_bak, g_ram, RAM_SIZE);
     memcpy(s_scr_bak, g_scratch, sizeof g_scratch);
     for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].save) s_hooks[i].save();
+    if (!mem_journal_begin()) {
+        for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].restore) s_hooks[i].restore();
+        f_80044210_orig();
+        return;
+    }
     /* 2. widened pass, sealed off from interrupts and hardware */
     const u32 hits = g_bus_sandbox_hits;
     g_cpu.next_event = ~0ull;
@@ -269,12 +288,19 @@ static void stage_render(void)
     g_bus_sandbox = 0;
     bool ok = g_bus_sandbox_hits == hits && collect(&s_a, base, g_pgxp);
     /* 3. restore, then the real pass */
-    memcpy(g_ram, s_ram_bak, RAM_SIZE);
+    s_journal_blocks += mem_journal_undo();
     memcpy(g_scratch, s_scr_bak, sizeof g_scratch);
     gte_restore(&gte);
     for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].restore) s_hooks[i].restore();
     g_cpu = cpu;
     g_depth = depth;
+    if (check) {
+        for (u32 i = 0; i < RAM_SIZE; i++)
+            if (full[i] != g_ram[i]) rt_fatal("widescreen: write journal missed a RAM write at %08x", 0x80000000u + i);
+        for (u32 i = 0; i < sizeof g_pgxp_mem / 4; i++)
+            if (full_tags[i] != g_pgxp_mem[i]) rt_fatal("widescreen: PGXP tag journal missed slot %u", i);
+    }
+
     u64 t1 = cpu_ns();
     f_80044210_orig();
     u64 t2 = cpu_ns();
@@ -308,6 +334,8 @@ void widescreen_report(void)
                (unsigned long long)s_passes, (unsigned long long)s_extras, (unsigned long long)s_rejected);
         if (s_passes)
             rt_log("widescreen-cost: shadow pass %.3f ms CPU per pass (snapshot, wide run, restore, diff;"
-                   " the guard-band drawing is in the hi-res totals)", s_cost_ns / 1e6 / (double)s_passes);
+                   " the guard-band drawing is in the hi-res totals); %.1f KB of RAM journalled per pass",
+                   s_cost_ns / 1e6 / (double)s_passes,
+                   (double)s_journal_blocks * (1 << MEM_JOURNAL_SHIFT) / 1024.0 / (double)s_passes);
     }
 }
