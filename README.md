@@ -1,9 +1,21 @@
-# Destrega — static recompilation (PS1 → native C)
+# Destrega Redux: an enhanced native port of Destrega
 
-The PlayStation game *Destrega* (Koei, 1998) recompiled from MIPS R3000 machine
-code into C, with a native runtime emulating the PS1 hardware (GPU software
-renderer, GTE, SPU + reverb, XA audio, MDEC FMV, CD-ROM, pads). Analysis is
-done with [REA](https://github.com/morluto/rea) (Ghidra provider).
+The PlayStation fighting game *Destrega* (Koei, 1998), statically recompiled from MIPS R3000
+machine code into C and running natively on macOS, Windows and Linux, with a runtime that
+emulates the PS1 hardware around it (GPU, GTE, SPU + reverb, XA audio, MDEC FMV, CD-ROM, pads,
+memory cards). Gameplay is the original, frame for frame; everything on top of it is new:
+
+- **Better graphics**: high-resolution rendering (up to 4x6 the original resolution, with
+  automatic scaling to what your computer can keep up with), a GPU renderer on Metal, Vulkan and
+  Direct3D 12, 16:9 widescreen fights, sub-pixel vertices and perspective-correct textures (no
+  wobble or warping), smoothed 2D and 3D textures, full-precision colour and anti-aliasing. All of
+  it is presentation only: the game itself sees exactly what a PS1 would.
+- **Rollback netplay**: online two-player matches with GGPO-style rollback (Netplay > Host Game /
+  Join Game), automatic router port opening, desync detection, and Mac <-> Windows play.
+- **A desktop app**: native menus, full screen, rebindable keyboard and controller controls,
+  save-game import / export, settings that persist.
+
+Analysis is done with [REA](https://github.com/morluto/rea) (Ghidra provider).
 
 You need your own copy of the game: the North American release (SLUS-00732)
 as a MODE2/2352 `.cue`/`.bin`. Nothing from the game is in this repository.
@@ -128,10 +140,10 @@ pad is player 2). Step far back until the charge bar turns blue to use magic.
 
 ## Status
 
-Boots, plays the intro FMV with audio, title, menus, all modes reachable,
-fights are playable (60 Hz output; fights update at 30 fps, as on the
-original). Not yet: memory-card saves (the card is reported as absent), PAL,
-GPU texture-cache quirks. Developed and tested on macOS (Apple Silicon); the
-Linux and Windows builds use the same portable C11 + SDL3 code but have not
-been tested yet. See `AGENTS.md` for internals and `tools/run_tests.sh` for
-the test suite.
+Version 0.1 (alpha). Boots, plays the intro FMV with audio, title, menus and every mode; fights,
+story, practice and VS are playable (60 Hz output; fights update at 30 fps, as on the original).
+Memory-card saves work. Rollback netplay works between Macs and between a Mac and Windows.
+Developed and tested on macOS (Apple Silicon); the Windows build is tested under Wine/CrossOver and
+the Linux build in CI (without the game). Work in progress: a native 3D renderer with a depth buffer
+and smooth 60 Hz motion (`docs/HLR_PLAN.md` on the `feature/hlr` branch). See `AGENTS.md` for
+internals and `tools/pr_check.sh` / `tools/run_tests.sh` for the tests.
