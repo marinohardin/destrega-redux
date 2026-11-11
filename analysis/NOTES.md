@@ -795,6 +795,48 @@ also there with `--pgxp off` but much worse with PGXP on.
   Whether `char_mesh_chains` (800367d8) vertices reach these face lists: guess (they are written
   to the same vertex buffer).
 
+### Floor tile seams and face shimmer (second report, 2026-11)
+
+User report (Mac, Metal, fast precision + texture cache, 4x6, xbr, full colour, 16:9, PGXP on):
+a rectangular tile grid with different brightness per block and hard seams on wide stage
+floors; Milena's forehead and eye polygons jumping between shapes during her idle breathing.
+
+- **Floor tiles are in the original art** (verified: dumps). The 1x picture (`--scale 1
+  --pgxp off`) has the same blocks and seams. Gate key frame 3300, mean RGB either side of one
+  seam (left / right): user settings 86.3/90.4/66.5 / 87.3/92.4/67.2; texture cache off,
+  nearest, PGXP off and exact precision each within ~0.5 of that; 15-bit colour ~3.5 lower in
+  every variant (truncation, expected); 1x 82.4/86.3/62.6 / 84.2/89.2/64.1. The canyon (key
+  frame 3200) is the same. The floor is built from non-seamless tiles; bilinear / xbr make the
+  seams *more noticeable* only because they remove the per-texel noise that hid them at 1x, and
+  the texture cache changes nothing visible at 4x6 (almost nothing is minified). Nothing to fix
+  in the renderer; Texture Filtering > Off is the only mitigation.
+- **Face shimmer: mostly the game's own painter's sort** (verified: probe + measurement).
+  Repro: practice_milena inputs up to frame 3560, then Right taps 3600-3660 and Down taps
+  3700-3760 (pad 1): Milena idles close up facing the camera from ~3800, head at 1x
+  (205..250, 112..152). Metric: % of head pixels changing by > 48/255 per game update, 22
+  updates over frames 3900-3940, 4x6:
+
+  | config                         | mean % | max % |
+  |--------------------------------|-------:|------:|
+  | 1x reference (`--scale 1`)     | 3.10   | 8.00  |
+  | PGXP off                       | 2.63   | 6.65  |
+  | PGXP affine / on (fast)        | 1.89   | 3.65  |
+  | PGXP on, exact precision       | 1.97   | 3.80  |
+  | on without the re-added faces  | 2.17   | 4.15  |
+  | on without the back-face skip  | 1.89   | 3.66  |
+
+  So PGXP plus the char_mesh.c extras already cut the flips ~40 % against 1x; fast vs exact and
+  the texture cache make no difference. What is left is thin edge motion (real animation) plus a
+  cluster where the fringe covers / uncovers the eye. An instrumented build compared, per
+  update, the OT slot order of every pair of overlapping front-facing faces in the head
+  (lists of ~70-150 such pairs): 0-2 pairs swap slot order per update, and in **every** swap the
+  precise (PGXP) depth order of the two faces did not change. The swaps come from the integer
+  OT slot (triangles: average SZ, quads: minimum SZ, 3-segment map 1f800008..10), which moves
+  between neighbouring slots as the breathing changes SZ by a few units; the PS1 shows the same
+  flips at 1x. A renderer fix needs a per-pixel depth test for character meshes in the hi-res
+  target (PGXP w as depth), i.e. a depth buffer in both backends and the shadow packets; see
+  "Cleanup priority" item 10.
+
 ## Memory card
 
 - Access path (verified: trace): never SIO0. A libmcrd-style library (`800a4xxx`-`800a7xxx`) calls
@@ -1150,6 +1192,14 @@ Highest value first. Move items to "done" with the PR that did them.
    (e.g. the STR wait at 0x80049e90) spin the same way; each one listed in
    `analysis/idle_loops.txt` with its proof saves host CPU without touching emulated state.
    Needs: what the loop reads, and that only an event can change it.
+
+10. **Depth-tested character meshes in the hi-res target** (presentation only; see "Floor tile
+   seams and face shimmer"): the remaining face shimmer is OT slot order flipping between
+   overlapping faces of one fighter while their precise depth order holds. Drawing the
+   80036138 / 800363c8 faces (and the char_mesh.c extras) with a depth test on PGXP w, within
+   one fighter's slot range, would remove it. Needs a depth target in hires.c and both GPU
+   shader sources, a rule for faces without w, and keeping the exact precision bit-identical
+   between backends.
 
 Done:
 - `sphere_vs_poly` (`800465a4`), PR #3.
