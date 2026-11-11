@@ -179,6 +179,17 @@ scheduler event (`frontend_vblank`: present, input, audio, 60 Hz pacing).
   The game's stack moves into the scratchpad (0x1f800000) during fights.
 - Cycle accounting: `CYC(n)` (2 cycles/insn), `EVT_CHECK()` at function entry and
   backward branches runs `rt_event()` → scheduler + IRQ delivery.
+- **Idle-loop fast-forward** (`analysis/idle_loops.txt`: `<backward branch> <helper> <loop start>
+  <fnv1a of the loop words>`; `recomp.py` checks the hash, codegen emits `helper(); EVT_CHECK();`
+  on that edge; helpers in `recomp.h`). A helper advances the loop over iterations that provably
+  only add cycles and change a counter, and never past the iteration whose `EVT_CHECK` would fire,
+  so cycles, memory, registers and PGXP tags end exactly as if every iteration had run. Only one:
+  `idle_vsync_wait` (libetc `vsync_wait` 8009b670, 14 instructions per spin while the vblank
+  count 800bf2b4 is below the target; ~6400 spins per frame, 73 M in the Hills replay). Per-frame
+  state hashes are identical with `--no-idle-skip` (runs every iteration) on five replays; the
+  exit log prints `idle-skip: on, N loop iterations fast-forwarded`. The interpreter does not
+  apply it (it only runs as a fallback). A new entry needs the same proof: list everything the
+  loop body touches and show nothing but an event can change the exit condition.
 
 ## Overlays (from REA decompilation of FUN_8004c1e8 / FUN_8003e36c / FUN_8006b35c)
 
@@ -1466,13 +1477,22 @@ unless `--widescreen` is given, so every test's hashes and dumps are unchanged.
 - **Why a shadow pass**: running the widened culling for real changes RAM (packets, OT, per-object
   animation counters) and emulated time (more instructions, longer GPU DMA), and that measurably
   changed the fight (different positions within ~2000 frames). So `stage_render` (80044210) is an
-  override (`runtime/overrides/widescreen.c`): snapshot RAM/scratchpad/CPU/GTE, run the renderer
-  with `g_widescreen_cull` on, interrupts held off (`next_event = ~0`) and hardware access
-  blocked (`g_bus_sandbox` in bus.c; any access rejects the pass), record the 2048 OT slots,
-  restore, run it again normally (the run the game sees), record again; per slot the packets the
+  override (`runtime/overrides/widescreen.c`): save scratchpad/CPU/GTE and open the RAM write
+  journal, run the renderer with `g_widescreen_cull` on, interrupts held off (`next_event = ~0`)
+  and hardware access blocked (`g_bus_sandbox` in bus.c, BIOS calls too; any access rejects the
+  pass), record the 2048 OT slots, undo the journal and restore the rest, run it again normally (the run the game sees), record again; per slot the packets the
   wide pass has and the real one lacks (compared by payload) are the extras. The GPU linked-list
   DMA calls `g_gpu_ll_hook` per node; on reaching a slot the extras are drawn into the hi-res
   target only (`gpu_shadow_packet`: no 1x drawing, no IRQ, GPU state restored).
+- **RAM write journal** (`mem_journal_begin` / `mem_journal_undo`, bus.c): the inline RAM store
+  fast path tests `p < g_mem_wlimit` (psx.h; normally 0x800000, 0 while the journal is open), so
+  during the wide pass every RAM store goes through `bus_write*`, which saves each 256-byte block
+  before its first write; the undo copies those blocks back (~38 KB per pass in a fight instead
+  of 2 MB in and out). PGXP RAM tag writes take the same detour (`pgxp_wslot`, 64-word blocks).
+  `DESTREGA_WS_JOURNAL_CHECK=1` also keeps full copies and fails (`rt_fatal`) if the undo left
+  any RAM byte or tag different. User configuration, Hills fight: 0.39 -> 0.19 ms per pass.
+  Netplay re-simulation already runs without the wide pass except in its last 3 vblanks
+  (`hires_for_resim` detaches `g_hires`, and `stage_render` only widens with a hi-res target).
 - Presentation: 16:9 (or the window's aspect, clamped to 4:3 .. 4:3 * 688/512) while the stage
   is being drawn (a `WS_IMM` evaluated within the last 6 vblanks), 4:3 otherwise; the HUD keeps
   its 4:3 layout in the centre. The render scale is picked for the widest presentation the window
@@ -1545,6 +1565,13 @@ notarization steps) is in `docs/RELEASES.md`.
   so the two backends disagreed on the last hi-res pixels of a fading line. Both now clamp the
   colour to the end colours' range (a no-op at 1x1). Found by checking the random compare test
   after every primitive (later primitives had hidden it); the game draws no lines.
+- SPU speed-ups that rely on invariants (`spu.c`): `spu_render` ticks only the voices in its
+  `live` set (on, sweeping, output != 0, or the SPU IRQ on); a new per-voice effect that can act
+  on an off voice must widen that test. The reverb output filter relies on `rv_out_hist` holding
+  0 at every even `rv_pos` (only `reverb_tick` writes it). Checks: `--wav` and `--state-hash`
+  byte-identical to the previous build on a replay.
+- GTE `mvmva_core` fast path assumes 16-bit matrix elements and vector components (the registers
+  are stored sign-extended / saturated); a change that lets wider values in must drop it.
 - Fights run at 30 updates/s by design (`f_80027218(1)` -> `VSync(2)`); not a bug.
 - Windowed pacing (`frontend_vblank` end, main.c): `s_next_tick_ns` is when the current frame
   should end. A frame more than 4 frames late restarts the clock at "now" *without* sleeping; it
