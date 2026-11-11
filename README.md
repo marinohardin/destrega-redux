@@ -15,6 +15,14 @@ memory cards). Gameplay is the original, frame for frame; everything on top of i
 - **A desktop app**: native menus, full screen, rebindable keyboard and controller controls,
   save-game import / export, settings that persist.
 
+| | |
+|---|---|
+| ![A close-range fight on the canyon stage](docs/screenshots/fight-canyon.jpg) | ![Magic projectiles on the canyon stage](docs/screenshots/magic-canyon.jpg) |
+| ![A widescreen fight on the hills stage](docs/screenshots/hills-widescreen.jpg) | ![The winner screen](docs/screenshots/winner.jpg) |
+
+*Captured from this port: GPU renderer at 4x6 the original resolution, 16:9 widescreen,
+smoothed textures and full-precision colour.*
+
 Analysis is done with [REA](https://github.com/morluto/rea) (Ghidra provider).
 
 You need your own copy of the game: the North American release (SLUS-00732)
