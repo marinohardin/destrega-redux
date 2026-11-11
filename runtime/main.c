@@ -152,6 +152,10 @@ static bool s_precision_given;
 /* --tex-cache off|on|verify[=N] (settings display.tex_cache, View > Texture Filtering > Smooth
  * Distant Textures): the fast precision's texture cache (hires_gpu.c "Texture cache") */
 static bool s_tex_cache_given;
+/* --hlr off|on|exact|audit, --hlr-parts LIST (settings display.hlr / hlr_parts, View > 3D Scene):
+ * the native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md); presentation only */
+static bool s_hlr_given, s_hlr_parts_given;
+#define HLR_WINDOW_DEFAULT HLR_OFF   /* phase 2a: off until the acceptance runs pass */
 
 static void wav_header(FILE *f, u32 bytes) {
     u32 hdr[11] = {0x46464952, 36 + bytes, 0x45564157, 0x20746d66, 16, 0x00020001, 44100,
@@ -764,7 +768,7 @@ extern u64 g_hires_stat_inline_px, g_hires_stat_par_px, g_hires_stat_par_jobs, g
 static void finish(void) {
     ss_finish();   /* savestate / replay / netplay reports (savestate.c) */
     void widescreen_report(void); widescreen_report();
-    hlr_audit_report();
+    hlr_report();
     gpu_1x_report();
     void char_mesh_report(void); char_mesh_report();
     if (g_trace) rt_log("hires-pool: triangles inline %llu (bbox px %llu), parallel %llu (bbox px %llu)", (unsigned long long)g_hires_stat_inline_jobs, (unsigned long long)g_hires_stat_inline_px, (unsigned long long)g_hires_stat_par_jobs, (unsigned long long)g_hires_stat_par_px);
@@ -1387,6 +1391,8 @@ static void settings_apply(const char *dir) {
     if (s_renderer_given) settings_lock("display", "renderer");
     if (s_precision_given) settings_lock("display", "gpu_precision");
     if (s_tex_cache_given) settings_lock("display", "tex_cache");
+    if (s_hlr_given) settings_lock("display", "hlr");
+    if (s_hlr_parts_given) settings_lock("display", "hlr_parts");
     if (s_win_set) settings_lock("display", "window");
     if (s_opt_filter >= 0) settings_lock("display", "tex_filter");
     if (s_opt_full >= 0) settings_lock("display", "smooth_colours");
@@ -1426,6 +1432,19 @@ static void settings_apply(const char *dir) {
     }
     if (!s_tex_cache_given && settings_get("display", "tex_cache"))
         hires_gpu_set_tex_cache(settings_get_bool("display", "tex_cache", true) ? HGPU_TC_ON : HGPU_TC_OFF, 0);
+    if (!s_hlr_given) {   /* View > 3D Scene: on (Native) or off (Original); headless stays off */
+        int m = s_headless ? HLR_OFF : HLR_WINDOW_DEFAULT;
+        if ((v = settings_get("display", "hlr"))) {
+            if (!strcmp(v, "on") || !strcmp(v, "off")) m = !strcmp(v, "on") ? HLR_ON : HLR_OFF;
+            else rt_log("settings: display.hlr: on or off");
+        }
+        hlr_set_mode(m);
+    }
+    if (!s_hlr_parts_given && (v = settings_get("display", "hlr_parts"))) {
+        unsigned parts;
+        if (hlr_parse_parts(v, &parts)) hlr_set_parts(parts);
+        else rt_log("settings: display.hlr_parts: all, none or a list of stage,chars,shadows,fx,story");
+    }
     if (!s_win_set && (v = settings_get("display", "window"))) {
         if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
     }
@@ -1453,6 +1472,9 @@ static void settings_note_view(const char *name) {
     else if (!strcmp(name, "resolution")) settings_set("display", "resolution", resolution_name());
     else if (!strcmp(name, "gpu-precision")) settings_set("display", "gpu_precision", hires_gpu_get_fast() ? "fast" : "exact");
     else if (!strcmp(name, "tex-cache")) settings_set_bool("display", "tex_cache", hires_gpu_get_tex_cache() != HGPU_TC_OFF);
+    else if (!strcmp(name, "hlr") && (hlr_get_mode() == HLR_OFF || hlr_get_mode() == HLR_ON))
+        settings_set("display", "hlr", hlr_mode_name(hlr_get_mode()));
+    else if (!strcmp(name, "hlr-part")) settings_set("display", "hlr_parts", hlr_parts_name(hlr_get_parts()));
     else if (!strcmp(name, "tex-filter")) settings_set("display", "tex_filter", hires_tex_filter_name(hires_get_tex_filter()));
     else if (!strcmp(name, "smooth-colours")) settings_set_bool("display", "smooth_colours", hires_get_colour());
     else if (!strcmp(name, "ssaa") && s_ssaa_chosen) {
@@ -1990,8 +2012,19 @@ bool frontend_view_checked(const char *action, bool *checked) {
     if (n == 4 && !strncmp(action, "ssaa", n) && *arg) { *checked = atoi(arg) == hires_get_ssaa(); return true; }
     if (n == 13 && !strncmp(action, "gpu-precision", n) && *arg) { *checked = !strcmp(arg, "fast") == hires_gpu_get_fast(); return true; }
     if (n == 9 && !strncmp(action, "tex-cache", n)) { *checked = hires_gpu_get_tex_cache() != HGPU_TC_OFF; return true; }
+    if (n == 3 && !strncmp(action, "hlr", n) && *arg) { *checked = !strcmp(arg, "on") == (hlr_get_mode() != HLR_OFF); return true; }
+    if (n == 8 && !strncmp(action, "hlr-part", n) && *arg) {   /* hlr-part=stage[:on] */
+        char part[16];
+        snprintf(part, sizeof part, "%.*s", (int)strcspn(arg, ":"), arg);
+        unsigned bit;
+        *checked = hlr_parse_parts(part, &bit) && (hlr_get_parts() & bit) == bit && bit;
+        return true;
+    }
     return false;
 }
+
+/* View > 3D Scene is enabled only while a GPU API is the renderer (the native pass needs one) */
+bool frontend_hlr_available(void) { return s_renderer == R_GPU; }
 
 /* View > Resolution (--menu-action resolution=auto|4x6|2x3|1x1, none = next): between frames. Auto
  * hands the scale back to apply_window_size and the governor; a fixed choice drops the governor's
@@ -2063,6 +2096,27 @@ static void menu_run(const char *name, const char *arg) {
             hires_reseed();   /* presentation only: the next frame starts from the 1x VRAM */
             rt_log("hires-gpu: %s precision at frame %llu%s", hires_gpu_get_fast() ? "fast" : "exact",
                    (unsigned long long)s_frame, s_renderer == R_SOFTWARE ? " (used when the GPU renderer runs)" : "");
+        }
+    }
+    else if (!strcmp(name, "hlr")) {   /* View > 3D Scene > Original (off) / Native (on); none = toggle */
+        int m = !strcmp(arg, "on") || !strcmp(arg, "1") ? HLR_ON
+                : !strcmp(arg, "off") || !strcmp(arg, "0") ? HLR_OFF
+                : hlr_parse_mode(arg) >= 0 ? hlr_parse_mode(arg)
+                : hlr_get_mode() == HLR_OFF ? HLR_ON : HLR_OFF;
+        hlr_set_mode(m);
+        rt_log("hlr: %s at frame %llu%s", hlr_mode_name(m), (unsigned long long)s_frame,
+               m == HLR_ON && !hlr_draws() ? " (drawn when a GPU renderer runs)" : "");
+    }
+    else if (!strcmp(name, "hlr-part")) {   /* View > 3D Scene > Stage: PART:on|off, none = toggle */
+        char part[16];
+        snprintf(part, sizeof part, "%.*s", (int)strcspn(arg, ":"), arg);
+        const char *st = strchr(arg, ':');
+        unsigned bit;
+        if (!hlr_parse_parts(part, &bit) || !bit) rt_log("menu: hlr-part: stage|chars|shadows|fx|story[:on|off]");
+        else {
+            const bool on = st ? !strcmp(st + 1, "on") || !strcmp(st + 1, "1") : !(hlr_get_parts() & bit);
+            hlr_set_parts(on ? hlr_get_parts() | bit : hlr_get_parts() & ~bit);
+            rt_log("hlr: parts %s at frame %llu", hlr_parts_name(hlr_get_parts()), (unsigned long long)s_frame);
         }
     }
     else if (!strcmp(name, "tex-cache")) {   /* View > Texture Filtering > Smooth Distant Textures; on/off, none = toggle */
@@ -2176,9 +2230,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-interp")) g_no_interp = 1;
         else if (!strcmp(argv[i], "--no-idle-skip")) g_idle_skip = 0;
         else if (!strcmp(argv[i], "--hlr") && i + 1 < argc) {
-            const char *m = argv[++i];
-            if (!strcmp(m, "audit")) g_hlr_audit = 1;
-            else if (strcmp(m, "off")) { fprintf(stderr, "--hlr: unknown mode '%s' (audit|off)\n", m); return 2; }
+            const int m = hlr_parse_mode(argv[++i]);
+            if (m < 0) { fprintf(stderr, "--hlr: off, on, exact or audit\n"); return 2; }
+            hlr_set_mode(m);
+            s_hlr_given = true;
+        }
+        else if (!strcmp(argv[i], "--hlr-parts") && i + 1 < argc) {
+            unsigned parts;
+            if (!hlr_parse_parts(argv[++i], &parts)) { fprintf(stderr, "--hlr-parts: all, none or a list of stage,chars,shadows,fx,story\n"); return 2; }
+            hlr_set_parts(parts);
+            s_hlr_parts_given = true;
         }
         else if (!strcmp(argv[i], "--verify-overrides")) { g_verify_overrides = 1; atexit(override_report); }
         else if (!strcmp(argv[i], "--profile")) s_profile_on = 1;

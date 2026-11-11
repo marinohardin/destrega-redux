@@ -54,6 +54,7 @@ SDL_GPUTexture *hires_gpu_present(const HiresView *v);
  * primitives, VRAM-texture uploads (texels), target copies (VRAM->VRAM copy ops). */
 typedef struct {
     unsigned long long submits, passes, draws, prims, edge_tris, vram_up_texels, tcopies, readbacks, tris, persp_tris, fast_prims;
+    unsigned long long externals;   /* HiresBackend.external passes run */
     /* texture cache (fast precision): lookups, found, first decodes, re-decodes after a VRAM
      * change of the page / CLUT, VRAM writes that left the content unchanged, evictions, misses
      * because every layer was in use this frame, triangles drawn from the cache, most entries

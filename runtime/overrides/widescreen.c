@@ -43,7 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "platform.h"
-#include "hlr/hlr.h"
+#include "hlr_hook.h"
 
 int g_widescreen;                       /* shadow pass on (frontend_set_widescreen, main.c) */
 extern int g_widescreen_cull;           /* rt.c: WS_IMM() yields the widened bound */
@@ -250,14 +250,14 @@ void widescreen_enable(bool on)
 
 /* ---- the override ------------------------------------------------------------------- */
 
-/* The pass the game sees. --hlr audit (runtime/hlr/hlr_audit.c) predicts its packets before
- * and compares after; the probe only reads guest state. */
+/* The pass the game sees. The native high-level renderer (hlr_hook.h, runtime/hlr/hlr_stage.c)
+ * predicts its packets before and checks / captures them after; it only reads guest state. */
 static void real_pass(void)
 {
-    if (!g_hlr_audit) { f_80044210_orig(); return; }
-    hlr_audit_pre(R4);
+    if (!g_hlr.stage_pre) { f_80044210_orig(); return; }
+    g_hlr.stage_pre(R4);
     f_80044210_orig();
-    hlr_audit_post();
+    if (g_hlr.stage_post) g_hlr.stage_post();
 }
 
 static void stage_render(void)

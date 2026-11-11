@@ -24,6 +24,7 @@
 #include "savestate.h"
 #include "hires.h"
 #include "pgxp.h"
+#include "hlr_hook.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,6 +153,7 @@ bool ss_restore(const Snapshot *s) {
     StateIO io = { .mode = SS_LOAD, .buf = s->buf, .cap = s->len };
     ss_visit_all(&io);
     pgxp_reset();                        /* presentation-only associations are stale now */
+    if (g_hlr.on_restore) g_hlr.on_restore();   /* HLR captures of the old timeline: dropped */
     if (s_reseed_hires) hires_reseed();
     u64 dt = now_ns() - t0;
     s_st_load.n++; s_st_load.ns += dt; s_st_load.bytes += io.pos;

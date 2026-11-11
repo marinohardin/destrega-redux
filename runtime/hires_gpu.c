@@ -688,10 +688,12 @@ static void *vec_push(Vec *v, size_t k)
     return r;
 }
 
-enum { ST_DRAW, ST_VRAM_UP, ST_PUT_UP, ST_TCOPY, ST_TC_UP };
+enum { ST_DRAW, ST_VRAM_UP, ST_PUT_UP, ST_TCOPY, ST_TC_UP, ST_EXTERNAL };
 /* ST_TC_UP: one mip level of a texture-cache layer (key = layer, x = level, y = 1 for the STP
  * array, w = h = level size) */
-typedef struct { int type, key; u32 first, count; int x, y, w, h; size_t off; } Step;
+typedef void (*ExtFn)(void *ctx, void *cmdbuf, void *colour_tex, int w, int h);
+/* ST_EXTERNAL: HiresBackend.external (fn, ctx), run between passes */
+typedef struct { int type, key; u32 first, count; int x, y, w, h; size_t off; ExtFn fn; void *ctx; } Step;
 
 /* ---- state -------------------------------------------------------------------------- */
 
@@ -1955,6 +1957,17 @@ static void be_fill(int x, int y, int w, int h, u16 c)
     mark_vram(x, y, w, h);
 }
 
+/* HiresBackend.external: a pass of the caller's own between this point's commands */
+static void be_external(ExtFn fn, void *ctx)
+{
+    if (!s_ready || !fn) return;
+    flush_puts();
+    close_group();
+    Step *st = add_step(ST_EXTERNAL);
+    st->fn = fn;
+    st->ctx = ctx;
+}
+
 static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, bool ms)
 {
     if (s_ready) {
@@ -2124,6 +2137,11 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
             SDL_PushGPUFragmentUniformData(cb, 0, &fu, sizeof fu);
             SDL_DrawGPUPrimitives(rp, st->count, 1, st->first, 0);
             s_st.draws++;
+        } else if (st->type == ST_EXTERNAL) {
+            if (rp) { SDL_EndGPURenderPass(rp); rp = NULL; }
+            if (cp) { SDL_EndGPUCopyPass(cp); cp = NULL; }
+            st->fn(st->ctx, cb, s_target, s_aw, s_ah);
+            s_st.externals++;
         } else {
             if (rp) { SDL_EndGPURenderPass(rp); rp = NULL; }
             if (!cp) cp = SDL_BeginGPUCopyPass(cb);
@@ -2355,7 +2373,7 @@ SDL_GPUTexture *hires_gpu_present(const HiresView *v)
 
 static const HiresBackend s_gpu = {
     "gpu", be_configure, be_tri, be_rect, be_line, be_fill, be_copy, be_put, be_view, be_read, be_destroy,
-    be_set_guard,
+    be_set_guard, be_external,
 };
 
 const HiresBackend *hires_gpu_backend(void) { return &s_gpu; }

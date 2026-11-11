@@ -150,6 +150,15 @@ void gpu_shadow_packet(const u32 *w, int n, const struct PgxpVert *const *pv);
 void gpu_shadow_packet_in_area(const u32 *w, int n, const struct PgxpVert *const *pv);
 /* GP0 word with its PGXP precision tag (runtime/pgxp.h; 0 = none). */
 void gpu_write_gp0_tag(u32 v, u32 tag);
+/* Native high-level renderer (runtime/hlr/, presentation only). While on, the GP0 words that
+ * follow run on the 1x GPU exactly as always but polygons are not forwarded to the hi-res target
+ * (and not looked up / welded for PGXP): the HLR drew them. */
+void gpu_set_node_no_hires(bool on);
+/* Draw the polygon packet w[0..n) (GP0 words, no tag) into the hi-res target only, with the PGXP
+ * tags of its words, exactly as gpu_write_gp0_tag would forward it: the same 1x-sampled UV and
+ * colour ranges (tracked without drawing), the same precise vertices. No 1x VRAM write, no
+ * statistic or guest observation, and every piece of GPU state is restored. Only polygons. */
+void gpu_hires_replay(const u32 *w, int n, const u32 *tags);
 void gpu_write_gp1(u32 v);
 u32 gpu_read_data(void);              /* GPUREAD 0x1f801810 */
 u32 gpu_read_stat(void);              /* GPUSTAT 0x1f801814 */

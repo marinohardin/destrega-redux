@@ -3,6 +3,7 @@
 #include "mdec.h"
 #include "pgxp.h"
 #include "savestate.h"
+#include "hlr_hook.h"
 
 u32 sio_read(u32 off, int size);
 void sio_write(u32 off, u32 v, int size);
@@ -219,6 +220,7 @@ static const u32 s_dma_cycles_per_word[7] = {
  * packets (runtime/overrides/widescreen.c). Must not change emulated state. */
 void (*g_gpu_ll_hook)(u32 node);
 void (*g_gpu_ll_hook2)(u32 node);   /* a second one (overrides/char_mesh.c), called after it */
+HlrHooks g_hlr;                     /* hlr_hook.h: native high-level renderer, all NULL = off */
 
 static void dma_run(int ch) {
     u32 chcr = s_dma_chcr[ch];
@@ -252,18 +254,24 @@ static void dma_run(int ch) {
             for (;;) {
                 if (g_gpu_ll_hook) g_gpu_ll_hook(a & 0x1ffffc);   /* presentation only */
                 if (g_gpu_ll_hook2) g_gpu_ll_hook2(a & 0x1ffffc);
+                /* the HLR drew its own version of this node into the hi-res target: the
+                 * words still run on the 1x GPU, they are only not forwarded (presentation) */
+                const bool no_hires = g_hlr.ll_filter && g_hlr.ll_filter(a & 0x1ffffc);
+                if (no_hires) gpu_set_node_no_hires(true);
                 u32 hdr = *(u32 *)(g_ram + (a & 0x1ffffc));
                 u32 n = hdr >> 24;
                 for (u32 i = 0; i < n; i++) {
                     u32 wa = (a + 4 + i * 4) & 0x1ffffc;
                     gpu_write_gp0_tag(*(u32 *)(g_ram + wa), g_pgxp_mem[wa >> 2]);
                 }
+                if (no_hires) gpu_set_node_no_hires(false);
                 cost += n + 1;
                 if ((hdr & 0x800000) || ++guard > 0x40000) break;
                 a = hdr & 0x1ffffc;
             }
             if (g_gpu_ll_hook) g_gpu_ll_hook(0xffffffffu);
             if (g_gpu_ll_hook2) g_gpu_ll_hook2(0xffffffffu);
+            if (g_hlr.ll_filter) g_hlr.ll_filter(0xffffffffu);
             madr = 0xffffff;
         } else if (to_ram) {
             for (u32 i = 0; i < words; i++, madr = (madr + step) & 0x1ffffc)
@@ -534,6 +542,7 @@ void bus_init(void) {
 
 /* ---- save states (savestate.h) ---------------------------------------------- */
 #include "savestate.h"
+#include "hlr_hook.h"
 void bus_state_io(StateIO *io) {
     ss_io(io, g_ram, sizeof g_ram);
     ss_io(io, g_scratch, sizeof g_scratch);

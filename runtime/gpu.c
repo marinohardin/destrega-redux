@@ -72,6 +72,8 @@ static bool s_shadow;         /* executing a presentation-only packet (gpu_shado
 static const PgxpVert *const *s_shadow_pv;   /* its precise vertices per word (or NULL) */
 static int s_shadow_side;     /* shadow packets draw only into the guard band: 0 left, 1 right */
 static bool s_shadow_in_area; /* ... but one drawn inside the draw area (gpu_shadow_packet_in_area) */
+static bool s_node_no_hires;  /* HLR: this DMA node reaches the 1x GPU only (gpu_set_node_no_hires) */
+static bool s_replay;         /* HLR: drawing into the hi-res target only (gpu_hires_replay) */
 #define SHADOW_SIDES (s_shadow && !s_shadow_in_area ? 2 : 1)
 
 /* texture window precomputed */
@@ -600,6 +602,7 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     if (c->y > maxy) maxy = c->y;
     if (maxx - minx >= 1024 || maxy - miny >= 512) return;
     if (maxy < s_clip_y1 || miny > s_clip_y2) return;
+    if (s_node_no_hires) no_hires = true;
     if (maxx < s_clip_x1 || minx > s_clip_x2 || s_shadow) {
         /* outside the 1x draw area (or a presentation-only shadow packet): nothing to draw in
          * 1x VRAM, but with a widescreen guard band the hi-res target may still show it */
@@ -640,10 +643,15 @@ static void draw_tri(const Prim *p, const Vtx *a, const Vtx *b, const Vtx *c,
     else fn = s_tri_tex[p->depth][2 + ((semi ? 4 : 0) | (gour ? 2 : 0) | (p->dither ? 1 : 0))];
     Prim q = *p;
     const bool skip = area_in_fb();
-    if (skip) { s_n_skipped++; mark_skipped(minx, miny, maxx, maxy); }
-    else { s_n_drawn++; q.px = s_vram; fn(&q, a, b, c); }
-    if (s_dvram) { q.px = s_dvram; fn(&q, a, b, c); }
-    else if (skip && (s_uv_track || s_col_track)) s_tri_trk[tex][gour](&q, a, b, c);
+    if (s_replay) {
+        /* HLR replay: the ranges the 1x draw samples (the same spans), nothing drawn or counted */
+        if (s_uv_track || s_col_track) s_tri_trk[tex][gour](&q, a, b, c);
+    } else {
+        if (skip) { s_n_skipped++; mark_skipped(minx, miny, maxx, maxy); }
+        else { s_n_drawn++; q.px = s_vram; fn(&q, a, b, c); }
+        if (s_dvram) { q.px = s_dvram; fn(&q, a, b, c); }
+        else if (skip && (s_uv_track || s_col_track)) s_tri_trk[tex][gour](&q, a, b, c);
+    }
 
     /* forward to the hi-res target after the 1x draw, with the UV range 1x actually sampled */
     if (g_hires && no_hires) { s_uv_track = false; s_col_track = false; }
@@ -733,7 +741,7 @@ static void gp0_polygon(const u32 *w)
     u32 pxy[4] = { 0 };
     int ncull = 0;                    /* vertices of a backface-culled mesh (PgxpVert.cull) */
     bool any_pv = false;
-    const bool want_pv = g_hires && g_pgxp;
+    const bool want_pv = g_hires && g_pgxp && !s_node_no_hires;
     int i = 0;
     u32 color = w[0] & 0xFFFFFF;
     u32 clut = 0;
@@ -789,7 +797,7 @@ static void gp0_polygon(const u32 *w)
     if (tex && raw) {
         for (int k = 0; k < n; k++) v[k].r = v[k].g = v[k].b = 0x80;
     }
-    if (tex && !s_shadow) observe_tex(&p);
+    if (tex && !s_shadow && !s_replay) observe_tex(&p);
     if (want_pv) {
         pgxp_check_tri(pq, pxy);
         if (quad) pgxp_check_tri(pq + 1, pxy + 1);
@@ -1250,6 +1258,41 @@ void gpu_shadow_packet(const u32 *w, int n, const PgxpVert *const *pv)
     }
     s_shadow = false;
     g_hires_shadow = false;
+    s_stat = stat; s_drawmode = drawmode; s_texwin = texwin; s_area_tl = area_tl; s_area_br = area_br;
+    s_clip_x1 = cx1; s_clip_y1 = cy1; s_clip_x2 = cx2; s_clip_y2 = cy2; s_off_x = ox; s_off_y = oy;
+    s_off_raw = off_raw;
+    s_mask_set = mset; s_mask_check = mchk;
+    s_tw_and_u = tau; s_tw_or_u = tou; s_tw_and_v = tav; s_tw_or_v = tov;
+}
+
+void gpu_set_node_no_hires(bool on) { s_node_no_hires = on; }
+
+void gpu_hires_replay(const u32 *w, int n, const u32 *tags)
+{
+    if (!g_hires || n <= 0 || n > CMD_MAX) return;
+    u32 stat = s_stat, drawmode = s_drawmode, texwin = s_texwin, area_tl = s_area_tl, area_br = s_area_br;
+    int cx1 = s_clip_x1, cy1 = s_clip_y1, cx2 = s_clip_x2, cy2 = s_clip_y2, ox = s_off_x, oy = s_off_y;
+    u32 off_raw = s_off_raw;
+    bool mset = s_mask_set, mchk = s_mask_check;
+    u32 tau = s_tw_and_u, tou = s_tw_or_u, tav = s_tw_and_v, tov = s_tw_or_v;
+    u32 tag_bak[CMD_MAX];
+    memcpy(tag_bak, s_cmd_tag, sizeof tag_bak);
+    const bool nh = s_node_no_hires;
+    s_node_no_hires = false;
+    s_replay = true;
+    for (int i = 0; i < n;) {
+        u32 cmd = w[i] >> 24;
+        int len = gp0_len(cmd);
+        if (i + len > n) break;
+        if (cmd >> 5 == 1) {
+            for (int k = 0; k < len; k++) s_cmd_tag[k] = tags ? tags[i + k] : 0;
+            gp0_polygon(&w[i]);
+        }
+        i += len;
+    }
+    s_replay = false;
+    s_node_no_hires = nh;
+    memcpy(s_cmd_tag, tag_bak, sizeof tag_bak);
     s_stat = stat; s_drawmode = drawmode; s_texwin = texwin; s_area_tl = area_tl; s_area_br = area_br;
     s_clip_x1 = cx1; s_clip_y1 = cy1; s_clip_x2 = cx2; s_clip_y2 = cy2; s_off_x = ox; s_off_y = oy;
     s_off_raw = off_raw;

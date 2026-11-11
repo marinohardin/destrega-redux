@@ -1506,7 +1506,7 @@ static void be_set_guard(int gx) { s_pend_gx = gx < 0 ? 0 : (gx > HIRES_MAX_GUAR
 
 static const HiresBackend s_soft = {
     "software", be_configure, be_tri, be_rect, be_line, be_fill, be_copy, be_put, be_view, be_view, be_destroy,
-    be_set_guard,
+    be_set_guard, NULL,   /* no external render pass: the HLR's "on" needs the GPU backend */
 };
 
 /* ---- control --------------------------------------------------------------------- */
@@ -1546,6 +1546,7 @@ static bool tee_read(int x, int y, int w, int h, HiresView *o) { return s_be->re
 static void tee_destroy(void) { s_be->destroy(); s_shadow->destroy(); }
 static const HiresBackend s_tee = {
     "tee", tee_configure, tee_tri, tee_rect, tee_line, tee_fill, tee_copy, tee_put, tee_view, tee_read, tee_destroy,
+    NULL, NULL,           /* guard band forwarded by tee_configure's callers; no external pass in compare */
 };
 
 void hires_set_backend(const HiresBackend *be, const HiresBackend *shadow)
