@@ -230,11 +230,16 @@ static void sweep_set(Sweep *s, u16 v) {
     }
 }
 
-static void sweep_tick(Sweep *s) {
-    if (!s->active) return;
+/* 50 calls per sample (both volumes of every voice and the main volume), nearly all on fixed
+ * volumes: the test is inline, the envelope step out of line. */
+__attribute__((noinline)) static void sweep_step(Sweep *s) {
     u16 v = s->reg;
     env_tick(&s->level, &s->counter, v & 0x7f, 0x7f,
              (v >> 13) & 1, (v >> 14) & 1, (v >> 12) & 1);
+}
+
+static inline void sweep_tick(Sweep *s) {
+    if (__builtin_expect(s->active, 0)) sweep_step(s);
 }
 
 static void adsr_tick(Voice *v, int vi) {
@@ -507,19 +512,32 @@ static void reverb_core(s32 inl, s32 inr, s32 *outl, s32 *outr) {
     if (rv_cur > 0x3ffff) rv_cur = rv_base;
 }
 
-/* rv_fir without its zero taps (every odd one except the centre): the same sum, half the work */
-static const u8 rv_fir_nz[21] = { 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 19, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38 };
+/* rv_fir is symmetric (rv_fir[k] == rv_fir[38 - k]), so the sum over k of rv_fir[k] * h[pos - k] is
+ * the dot product of the taps with the 39 history entries ending at pos, in ring order. Copied into
+ * a contiguous window, that is a fixed-length s16 x s32 dot product the compiler vectorises; the
+ * zero taps cost nothing there. Integer sums: the same value as tap-by-tap in any order. */
 static s32 fir39(const s16 *h, u32 pos) {
-    s32 sum = 0;
-    for (int i = 0; i < 21; i++) {
-        const int k = rv_fir_nz[i];
-        sum += rv_fir[k] * h[(pos - (u32)k) & 63];
+    const u32 b = (pos - 38) & 63;
+    s16 w[39];
+    const s16 *p = h + b;
+    if (b > 64 - 39) {
+        const u32 n1 = 64 - b;
+        memcpy(w, h + b, n1 * sizeof *w);
+        memcpy(w + n1, h, (39 - n1) * sizeof *w);
+        p = w;
     }
+    s32 sum = 0;
+    for (int j = 0; j < 39; j++) sum += rv_fir[j] * p[j];
     return sum;
 }
 
 /* One 44.1kHz reverb step: decimate input, run core at 22.05kHz,
- * zero-stuff + FIR interpolate the output. */
+ * zero-stuff + FIR interpolate the output.
+ * Output side: rv_out_hist holds 0 at every even rv_pos (the zero-stuffed half; written by this
+ * function only), and the nonzero taps of rv_fir are the even k plus the centre 19. At an even
+ * pos the even taps land on those zeros, so the sum is rv_fir[19] (0x4000) * h[pos - 19], and
+ * >> 14 gives that sample unchanged (already clamped); at an odd pos the centre tap lands on a
+ * zero and the full dot product is needed. Same result as the plain filter, half the work. */
 static void reverb_tick(s32 inl, s32 inr, s32 *outl, s32 *outr) {
     u32 p = rv_pos & 63;
     rv_in_hist[0][p] = (s16)clamp16(inl);
@@ -529,11 +547,16 @@ static void reverb_tick(s32 inl, s32 inr, s32 *outl, s32 *outr) {
         s32 dl = clamp16(fir39(rv_in_hist[0], rv_pos) >> 15);
         s32 dr = clamp16(fir39(rv_in_hist[1], rv_pos) >> 15);
         reverb_core(dl, dr, &zl, &zr);
+        rv_out_hist[0][p] = (s16)clamp16(zl);
+        rv_out_hist[1][p] = (s16)clamp16(zr);
+        *outl = clamp16(fir39(rv_out_hist[0], rv_pos) >> 14);
+        *outr = clamp16(fir39(rv_out_hist[1], rv_pos) >> 14);
+    } else {
+        rv_out_hist[0][p] = 0;
+        rv_out_hist[1][p] = 0;
+        *outl = rv_out_hist[0][(rv_pos - 19) & 63];
+        *outr = rv_out_hist[1][(rv_pos - 19) & 63];
     }
-    rv_out_hist[0][p] = (s16)clamp16(zl);
-    rv_out_hist[1][p] = (s16)clamp16(zr);
-    *outl = clamp16(fir39(rv_out_hist[0], rv_pos) >> 14);
-    *outr = clamp16(fir39(rv_out_hist[1], rv_pos) >> 14);
     rv_pos++;
 }
 
@@ -545,14 +568,17 @@ static void capture_write(u32 base, s32 v) {
     if (REG(0x1ac) & 0xc) irq_check_range(a, 2);
 }
 
-static void tick(s16 *out) {
+/* `live`: the voices that can do anything this sample (spu_render). The others are off, with
+ * fixed volumes, no SPU IRQ and output already 0, so voice_tick would only store 0 and add 0. */
+static void tick(s16 *out, u32 live) {
     s32 l = 0, r = 0, rl = 0, rr = 0;
     noise_tick();
 
     if (spucnt & 0x8000) {
         u32 pmon = voice_bits(0x190), non = voice_bits(0x194);
         u32 eon = voice_bits(0x198);
-        for (int vi = 0; vi < NUM_VOICES; vi++) {
+        for (u32 m = live; m; m &= m - 1) {
+            const int vi = __builtin_ctz(m);
             s32 vl, vr;
             voice_tick(vi, pmon, non, &vl, &vr);
             l += vl;
@@ -729,8 +755,21 @@ void spu_dma_read(u16 *dst, u32 halfwords) {
     }
 }
 
+/* Usually ~2 of the 24 voices play. A voice that is off (key-off'd envelope ended, or never
+ * keyed on), has fixed volumes and output 0 does nothing per sample while the SPU IRQ is off
+ * (voice_tick's first branch: out = 0, adds 0, sweeps idle), and stays that way for the whole
+ * call: only register writes (key on, volume sweep, IRQ enable) change it, and none happen inside
+ * spu_render. A voice that turns off during the call stays in the set: it just runs the normal
+ * path. So skipping the rest is exact. */
 void spu_render(s16 *out, int frames) {
-    for (int i = 0; i < frames; i++) tick(out + i * 2);
+    u32 live = 0;
+    const bool irq = irq_enabled();
+    for (int vi = 0; vi < NUM_VOICES; vi++) {
+        const Voice *v = &voices[vi];
+        if (irq || v->phase != PH_OFF || v->vol[0].active || v->vol[1].active || v->out)
+            live |= 1u << vi;
+    }
+    for (int i = 0; i < frames; i++) tick(out + i * 2, live);
 }
 
 void spu_push_cd_audio(const s16 *stereo, int frames) {
