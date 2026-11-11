@@ -795,7 +795,11 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   menu tracking runs inside `sendEvent`), as in any Mac app. **Start-up full screen**
   (`[display] fullscreen = on`) is entered from `menu_script_and_poll` once the window has focus
   (frame >= 10; frame 180 at the latest): entered at frame 0, before the app had finished launching,
-  the full-screen Space showed no menu bar at all. Other platforms sleep. Headless runs have no window and only log the request.
+  the full-screen Space showed no menu bar at all. **No `LSApplicationCategoryType` games in the
+  bundle** (`make_app.sh`): as a game in full screen the app gets macOS Game Mode, which deprioritises
+  other processes, among them the menu bar agent that drives full-screen menus (macOS 26+:
+  `MenuBarClientCore`): menus lagged visibly behind the mouse while the game's main thread sat idle
+  in the menu tracking loop; the same build without the category was smooth. Other platforms sleep. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
   `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `resolution[=auto|4x6|2x3|1x1]`, `fullscreen[=on|off]`,

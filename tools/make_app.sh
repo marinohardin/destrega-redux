@@ -98,7 +98,6 @@ cat > "$TMPAPP/Contents/Info.plist" <<EOF
     <key>NSHumanReadableCopyright</key><string>Runtime (c) $YEAR the Destrega Redux contributors. Destrega is (c) 1998 KOEI Co., Ltd. No game data is included; you supply your own disc image.</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>LSMinimumSystemVersion</key><string>${MINOS:-11.0}</string>
-    <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
     $ICON_KEY
