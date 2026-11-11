@@ -788,7 +788,14 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   (`menu_wait_until`, `nextEventMatchingMask` without dequeueing, then `SDL_PumpEvents` for anything
   that arrives) instead of `nanosleep`: in a full-screen Space the menu bar is drawn inside this
   process, and with the main thread asleep ~95% of every frame revealing and using the menus lagged
-  badly (windowed the system draws the menu bar, so it never showed there). Other platforms sleep. Headless runs have no window and only log the request.
+  badly (windowed the system draws the menu bar, so it never showed there). The wait is an ordinary
+  Cocoa loop (dequeue + `[NSApp sendEvent:]`, as SDL's own pump; NSApp is SDL's application
+  object); peeking without dequeuing hid the full-screen menu bar entirely. `DESTREGA_MAC_WAIT=
+  sleep|peek` selects the old variants for diagnosis. While a menu is open the game pauses (AppKit's
+  menu tracking runs inside `sendEvent`), as in any Mac app. **Start-up full screen**
+  (`[display] fullscreen = on`) is entered from `menu_script_and_poll` once the window has focus
+  (frame >= 10; frame 180 at the latest): entered at frame 0, before the app had finished launching,
+  the full-screen Space showed no menu bar at all. Other platforms sleep. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
   `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `resolution[=auto|4x6|2x3|1x1]`, `fullscreen[=on|off]`,
