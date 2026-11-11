@@ -142,6 +142,9 @@ static struct { u64 frames, exact, px, diff, big, big2, big4, mask, sum_abs, sum
 /* --gpu-precision exact|fast (settings display.gpu_precision, View > Renderer > Exact / Fast):
  * the GPU backend's triangles and rects bit-exact or with hardware interpolation (hires_gpu.c) */
 static bool s_precision_given;
+/* --tex-cache off|on|verify[=N] (settings display.tex_cache, View > Texture Filtering > Smooth
+ * Distant Textures): the fast precision's texture cache (hires_gpu.c "Texture cache") */
+static bool s_tex_cache_given;
 
 static void wav_header(FILE *f, u32 bytes) {
     u32 hdr[11] = {0x46464952, 36 + bytes, 0x45564157, 0x20746d66, 16, 0x00020001, 44100,
@@ -857,6 +860,20 @@ static void finish(void) {
                (unsigned long long)st.edge_tris,
                (unsigned long long)st.vram_up_texels, (unsigned long long)st.tcopies, (unsigned long long)st.readbacks,
                (unsigned long long)st.fast_prims);
+        if (st.tc_lookups) {
+            rt_log("hires-texcache: %llu lookups, %llu hits, %llu decodes (%.1f ms), %llu re-decodes after a VRAM change, "
+                   "%llu writes that left the texels unchanged, %llu evictions, %llu not cached (full), %llu triangles from "
+                   "the cache, at most %llu entries",
+                   (unsigned long long)st.tc_lookups, (unsigned long long)st.tc_hits, (unsigned long long)st.tc_decodes,
+                   st.tc_decode_ns / 1e6, (unsigned long long)st.tc_redecodes, (unsigned long long)st.tc_same,
+                   (unsigned long long)st.tc_evictions, (unsigned long long)st.tc_full, (unsigned long long)st.tc_prims,
+                   (unsigned long long)st.tc_max_live);
+            if (hires_gpu_get_tex_cache() == HGPU_TC_VERIFY)
+                rt_log("hires-texcache-verify: %llu entry checks, %llu STALE; %llu layers read back, %llu differing",
+                       (unsigned long long)st.tc_verified, (unsigned long long)st.tc_stale,
+                       (unsigned long long)st.tc_readbacks, (unsigned long long)st.tc_readback_bad);
+            hires_gpu_tc_diag_log();
+        }
     }
     for (int k = 0; k <= s_seg_n; k++) {
         if (!s_seg[k].frames) continue;
@@ -1267,6 +1284,7 @@ static void settings_apply(const char *dir) {
     if (s_ws_given) settings_lock("display", "widescreen");
     if (s_renderer_given) settings_lock("display", "renderer");
     if (s_precision_given) settings_lock("display", "gpu_precision");
+    if (s_tex_cache_given) settings_lock("display", "tex_cache");
     if (s_win_set) settings_lock("display", "window");
     if (s_opt_filter >= 0) settings_lock("display", "tex_filter");
     if (s_opt_full >= 0) settings_lock("display", "smooth_colours");
@@ -1304,6 +1322,8 @@ static void settings_apply(const char *dir) {
         if (!strcmp(v, "fast") || !strcmp(v, "exact")) hires_gpu_set_fast(!strcmp(v, "fast"));
         else rt_log("settings: display.gpu_precision: exact or fast");
     }
+    if (!s_tex_cache_given && settings_get("display", "tex_cache"))
+        hires_gpu_set_tex_cache(settings_get_bool("display", "tex_cache", true) ? HGPU_TC_ON : HGPU_TC_OFF, 0);
     if (!s_win_set && (v = settings_get("display", "window"))) {
         if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
     }
@@ -1329,6 +1349,7 @@ static void settings_note_view(const char *name) {
     else if (!strcmp(name, "renderer") && s_renderer != R_COMPARE) settings_set("display", "renderer", renderer_name(s_renderer));
     else if (!strcmp(name, "resolution")) settings_set("display", "resolution", resolution_name());
     else if (!strcmp(name, "gpu-precision")) settings_set("display", "gpu_precision", hires_gpu_get_fast() ? "fast" : "exact");
+    else if (!strcmp(name, "tex-cache")) settings_set_bool("display", "tex_cache", hires_gpu_get_tex_cache() != HGPU_TC_OFF);
     else if (!strcmp(name, "tex-filter")) settings_set("display", "tex_filter", hires_tex_filter_name(hires_get_tex_filter()));
     else if (!strcmp(name, "smooth-colours")) settings_set_bool("display", "smooth_colours", hires_get_colour());
     else if (!strcmp(name, "ssaa") && s_ssaa_chosen) {
@@ -1418,6 +1439,10 @@ static void usage(void) {
         "  --compare-dump-max N  how many fight frames --compare-dump writes (default 4)\n"
         "  --gpu-precision P     GPU renderer: exact (default; bit-identical to software) or fast\n"
         "                        (hardware interpolation, approximate; View > Renderer > Exact / Fast)\n"
+        "  --tex-cache M         fast precision: off, on (default) or verify[=N]: 3D textures from a cache of\n"
+        "                        decoded pages sampled with mipmaps + anisotropic filtering (View > Texture\n"
+        "                        Filtering > Smooth Distant Textures); verify re-checks every entry against\n"
+        "                        VRAM every N frames (default 60) and logs stale ones\n"
         "  --widescreen          16:9 fights: wider stage culling + hi-res guard band (menus/FMV stay 4:3;\n"
         "                        needs hi-res; the window aspect picks 4:3..16:9; default window 1280x720;\n"
         "                        default on in a window, off headless;\n"
@@ -1427,7 +1452,8 @@ static void usage(void) {
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete,\n"
         "                        widescreen[=on|off], renderer[=software|gpu|compare],\n"
         "                        resolution[=auto|4x6|2x3|1x1],\n"
-        "                        tex-filter[=nearest|bilinear|xbr], smooth-colours[=on|off], ssaa[=1..4]\n"
+        "                        tex-filter[=nearest|bilinear|xbr], smooth-colours[=on|off], ssaa[=1..4],\n"
+        "                        gpu-precision[=exact|fast], tex-cache[=on|off]\n"
         "                        (View menu; no argument = toggle / next), netplay-host=PORT[,DELAY],\n"
         "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect (Netplay menu),\n"
         "                        controls, controls-bind=P1:cross=key:Z|pad:east, controls-device=P2:keyboard,\n"
@@ -1847,6 +1873,7 @@ bool frontend_view_checked(const char *action, bool *checked) {
     if (n == 14 && !strncmp(action, "smooth-colours", n)) { *checked = hires_get_colour(); return true; }
     if (n == 4 && !strncmp(action, "ssaa", n) && *arg) { *checked = atoi(arg) == hires_get_ssaa(); return true; }
     if (n == 13 && !strncmp(action, "gpu-precision", n) && *arg) { *checked = !strcmp(arg, "fast") == hires_gpu_get_fast(); return true; }
+    if (n == 9 && !strncmp(action, "tex-cache", n)) { *checked = hires_gpu_get_tex_cache() != HGPU_TC_OFF; return true; }
     return false;
 }
 
@@ -1932,6 +1959,13 @@ static void menu_run(const char *name, const char *arg) {
             rt_log("hires-gpu: %s precision at frame %llu%s", hires_gpu_get_fast() ? "fast" : "exact",
                    (unsigned long long)s_frame, s_renderer == R_SOFTWARE ? " (used when the GPU renderer runs)" : "");
         }
+    }
+    else if (!strcmp(name, "tex-cache")) {   /* View > Texture Filtering > Smooth Distant Textures; on/off, none = toggle */
+        const bool on = !strcmp(arg, "on") || !strcmp(arg, "1") ? true
+                        : !strcmp(arg, "off") || !strcmp(arg, "0") ? false : hires_gpu_get_tex_cache() == HGPU_TC_OFF;
+        hires_gpu_set_tex_cache(on ? HGPU_TC_ON : HGPU_TC_OFF, 0);
+        rt_log("hires-gpu: texture cache %s at frame %llu%s", on ? "on" : "off", (unsigned long long)s_frame,
+               hires_gpu_get_fast() ? "" : " (used in fast precision)");
     }
     else if (!strcmp(name, "fullscreen"))   /* View > Enter/Exit Full Screen; arg on/off, none/toggle */
         fullscreen_set(!strcmp(arg, "on") || !strcmp(arg, "1") ? true
@@ -2152,6 +2186,15 @@ int main(int argc, char **argv) {
             if (strcmp(v, "exact") && strcmp(v, "fast")) { fprintf(stderr, "--gpu-precision: exact or fast\n"); return 1; }
             hires_gpu_set_fast(!strcmp(v, "fast"));
             s_precision_given = true;
+        }
+        else if (!strcmp(argv[i], "--tex-cache") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "off")) hires_gpu_set_tex_cache(HGPU_TC_OFF, 0);
+            else if (!strcmp(v, "on")) hires_gpu_set_tex_cache(HGPU_TC_ON, 0);
+            else if (!strncmp(v, "verify", 6) && (!v[6] || (v[6] == '=' && atoi(v + 7) > 0)))
+                hires_gpu_set_tex_cache(HGPU_TC_VERIFY, v[6] ? atoi(v + 7) : 0);
+            else { fprintf(stderr, "--tex-cache: off, on or verify[=N]\n"); return 1; }
+            s_tex_cache_given = true;
         }
         else if (!strcmp(argv[i], "--state-hash") && i + 1 < argc) {
             s_state_hash = fopen(argv[++i], "wb");

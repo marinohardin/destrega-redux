@@ -21,7 +21,7 @@ PATH (the Linux release of microsoft/DirectXShaderCompiler validates and signs b
 
 Resource registers follow SDL_GPU's D3D12 convention, which is the SPIR-V one with set = space:
 vertex uniforms b0 space1; fragment textures t0..t2 + samplers s0..s2 space2, the primitive
-storage buffer t3 space2 (hires_fast.glsl: one texture, t0 / s0, and the buffer t1), fragment
+storage buffer t3 space2 (hires_fast.glsl too: VRAM t0 / s0, texture cache arrays t1, t2), fragment
 uniforms b0 space3. Vertex inputs are TEXCOORD<location>.
 """
 import hashlib

@@ -237,7 +237,7 @@ static void run_scale(int sx, int sy, int guard, int n)
         else if (k == 8) line();
         else misc();
     }
-    if (s_fast_mode) compare_tol(what);
+    if (s_fast_mode) { hires_gpu_tc_check(); compare_tol(what); }
     else compare(what, 0);
 }
 
@@ -325,6 +325,7 @@ int main(int argc, char **argv)
         }
         if (!hires_gpu_init(NULL)) { printf("SKIP: no usable SDL_GPU device (%s)\n", drv); return 77; }
         hires_gpu_set_fast(true);
+        hires_gpu_set_tex_cache(HGPU_TC_VERIFY, 1);   /* texture cache on, every entry re-checked */
         s_fast_mode = true;
         static const int fsc[][2] = { { 1, 1 }, { 2, 2 }, { 4, 6 } };
         static const Mode fmodes[] = {
@@ -341,6 +342,19 @@ int main(int argc, char **argv)
         }
         s_mode = MODE_DEFAULT;
         hires_set_tex_filter(HIRES_TEX_NEAREST); hires_set_colour(false); hires_set_ssaa(1);
+        {
+            HiresGpuStats st;
+            hires_gpu_get_stats(&st);
+            printf("  texture cache: %llu triangles, %llu decodes, %llu re-decodes, %llu evictions, %llu entry checks, "
+                   "%llu stale, %llu layers read back, %llu differing\n", st.tc_prims, st.tc_decodes, st.tc_redecodes,
+                   st.tc_evictions, st.tc_verified, st.tc_stale, st.tc_readbacks, st.tc_readback_bad);
+            CHECK(st.tc_prims > 0 && st.tc_redecodes > 0 && st.tc_verified > 0 && st.tc_readbacks > 0,
+                  "texture cache: not exercised");
+            CHECK(st.tc_stale == 0 && st.tc_readback_bad == 0, "texture cache: stale entries or GPU layers differ");
+        }
+        /* PGXP: interpolation precision against hires.c's planes; their random UVs (the whole page
+         * across 60 px) are minified noise, which mipmaps average by design: cache off */
+        hires_gpu_set_tex_cache(HGPU_TC_OFF, 0);
         run_pgxp(2, 2, false, 600, 0);
         run_pgxp(4, 6, true, 600, 0);
         hires_set_backend(NULL, NULL);

@@ -9,8 +9,9 @@
  * into runtime/shaders/hires_fast_dxil.h: regenerate both after an edit. Entry points:
  *   VS_FAST / FS_FAST      triangles and rects into the 15-bit or RGBA8 target
  *
- * Resource sets (SDL_GPU SPIR-V convention): vertex uniforms set 1; the VRAM texture set 2
- * binding 0, the primitive storage buffer set 2 binding 1, fragment uniforms set 3.
+ * Resource sets (SDL_GPU SPIR-V convention): vertex uniforms set 1; set 2: the VRAM texture
+ * binding 0, the texture cache's colour and STP arrays bindings 1 and 2 (hires_gpu.c "Texture
+ * cache"), the primitive storage buffer binding 3; fragment uniforms set 3.
  */
 #version 450
 
@@ -37,7 +38,9 @@ void main()
 #if defined(FS_FAST)
 struct FPrim { uint kf, tp, clut, tw, clip0, clip1, ur, vr; };   /* = FPrim in hires_gpu.c */
 layout(set = 2, binding = 0) uniform usampler2D t_vram;
-layout(std430, set = 2, binding = 1) readonly buffer FPrims { FPrim prims[]; };
+layout(set = 2, binding = 1) uniform sampler2DArray t_tcc;
+layout(set = 2, binding = 2) uniform sampler2DArray t_tcs;
+layout(std430, set = 2, binding = 3) readonly buffer FPrims { FPrim prims[]; };
 layout(std140, set = 3, binding = 0) uniform FU { int sx, sy, ox, oy, pass, mode, rx, ry, rw, rh, p0, p1; } u;
 layout(location = 0) in vec2 v_uv;
 layout(location = 1) noperspective in vec3 v_col;
@@ -130,6 +133,7 @@ uvec4 tex_out(ivec4 t, int cr, int cg, int cb, bool raw, bool dith, int d, int h
 
 void main()
 {
+    vec2 gx = dFdx(v_uv), gy = dFdy(v_uv);   /* texture cache LOD: before any discard */
     FPrim p = prims[v_prim];
     int X = int(gl_FragCoord.x) + u.ox, Y = int(gl_FragCoord.y) + u.oy;
     int cx1 = int(p.clip0 << 16) >> 16, cy1 = int(p.clip0 >> 16), cx2 = int(p.clip1 << 16) >> 16, cy2 = int(p.clip1 >> 16);
@@ -146,7 +150,24 @@ void main()
         uint depth = (kf >> 9) & 3u;
         ivec4 t8;
         int ulo = int(p.ur << 16) >> 16, uhi = int(p.ur) >> 16, vlo = int(p.vr << 16) >> 16, vhi = int(p.vr) >> 16;
-        if ((kf & (3u << 22)) != 0u) {   /* filter sample point: without the rounding bias */
+        if ((kf & (1u << 24)) != 0u) {   /* texture cache: layer p.tp, premultiplied, mipmapped */
+            vec2 cuv = clamp(v_uv, vec2(float(ulo) + 0.5, float(vlo) + 0.5), vec2(float(uhi) + 0.5, float(vhi) + 0.5));
+            vec4 tc;
+            float st = 0.0;
+            bool stp = (kf & (1u << 26)) != 0u;
+            if ((kf & (1u << 25)) != 0u && max(length(gx), length(gy)) <= 1.0) {   /* filter off, magnified */
+                ivec3 ip = ivec3(ivec2(clamp(floor(cuv), 0.0, 255.0)), int(p.tp));
+                tc = texelFetch(t_tcc, ip, 0);
+                if (stp) st = texelFetch(t_tcs, ip, 0).r;
+            } else {
+                vec3 c3 = vec3(cuv * (1.0 / 256.0), float(p.tp));
+                tc = textureGrad(t_tcc, c3, gx * (1.0 / 256.0), gy * (1.0 / 256.0));
+                if (stp) st = textureGrad(t_tcs, c3, gx * (1.0 / 256.0), gy * (1.0 / 256.0)).r;
+            }
+            if (tc.a < 0.5) discard;   /* transparent when opaque texels cover less than half */
+            ivec3 c8 = min(ivec3(tc.rgb / tc.a * 8160.0 + 0.5), ivec3(7936));   /* c5 << 3 / 255 * 8160 = c5 << 8 */
+            t8 = ivec4(c8, st * 2.0 >= tc.a ? 1 : 0);   /* STP: majority of the opaque coverage */
+        } else if ((kf & (3u << 22)) != 0u) {   /* filter sample point: without the rounding bias */
             vec2 s = v_uv - 0.5, f0 = floor(s);
             int iu = int(f0.x), iv = int(f0.y), fu = min(int((s.x - f0.x) * 256.0), 255), fv = min(int((s.y - f0.y) * 256.0), 255);
             clamp_axis(iu, fu, ulo, uhi);

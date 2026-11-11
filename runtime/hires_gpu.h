@@ -52,7 +52,16 @@ SDL_GPUTexture *hires_gpu_present(const HiresView *v);
 
 /* Counters since start: submitted command buffers, render passes, draw calls,
  * primitives, VRAM-texture uploads (texels), target copies (VRAM->VRAM copy ops). */
-typedef struct { unsigned long long submits, passes, draws, prims, edge_tris, vram_up_texels, tcopies, readbacks, tris, persp_tris, fast_prims; } HiresGpuStats;
+typedef struct {
+    unsigned long long submits, passes, draws, prims, edge_tris, vram_up_texels, tcopies, readbacks, tris, persp_tris, fast_prims;
+    /* texture cache (fast precision): lookups, found, first decodes, re-decodes after a VRAM
+     * change of the page / CLUT, VRAM writes that left the content unchanged, evictions, misses
+     * because every layer was in use this frame, triangles drawn from the cache, most entries
+     * live, CPU decode time; verify mode: entries checked, stale entries, GPU layers read back,
+     * read-back layers differing from a fresh decode */
+    unsigned long long tc_lookups, tc_hits, tc_decodes, tc_redecodes, tc_same, tc_evictions, tc_full, tc_prims,
+        tc_max_live, tc_decode_ns, tc_verified, tc_stale, tc_readbacks, tc_readback_bad;
+} HiresGpuStats;
 void hires_gpu_get_stats(HiresGpuStats *st);
 /* Precision of triangles and rects (presentation only): exact (default, bit-identical to the
  * software backend) or fast (hardware rasterization / interpolation, approximate; see "Fast
@@ -60,5 +69,14 @@ void hires_gpu_get_stats(HiresGpuStats *st);
  * re-seed the target (hires_reconfigure in main.c). */
 void hires_gpu_set_fast(bool on);
 bool hires_gpu_get_fast(void);
+/* Texture cache of the fast precision (hires_gpu.c "Texture cache"): textured 3D triangles sample
+ * a decoded copy of their (page, CLUT, depth, texture window) with mipmaps and anisotropic
+ * filtering instead of the raw VRAM. Verify: also re-check every entry against VRAM and read one
+ * layer back from the GPU every `every` frames, logging stale ones. No effect in exact precision. */
+enum { HGPU_TC_OFF = 0, HGPU_TC_ON, HGPU_TC_VERIFY };
+void hires_gpu_set_tex_cache(int mode, int every);
+int hires_gpu_get_tex_cache(void);
+void hires_gpu_tc_diag_log(void);   /* DESTREGA_TC_DIAG=1 histograms (exit) */
+void hires_gpu_tc_check(void);      /* the verify-mode check now (tests; submits pending work first) */
 
 #endif
