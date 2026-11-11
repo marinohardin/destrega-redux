@@ -16,7 +16,7 @@
 # Never edit a line to raise its confidence without new evidence; correct or delete wrong lines.
 
 1f800000  data   scr_buffer_index           likely    rea        scratchpad u32: current double-buffer index (0/1); selects ot_pointer_table entry
-1f800008  data   scr_ot_depth_bounds        likely    rea        scratchpad u32 x3 (1f800008 far, 1f80000c near, 1f800010 mid): 3-segment SZ -> OT index mapping (0x155 / 0x400 / 0x2ab slots)
+1f800008  data   scr_ot_depth_bounds        verified  probe      scratchpad u32 x3 (1f800008 far, 1f80000c near, 1f800010 mid): 3-segment SZ -> OT index mapping (0x155 / 0x400 / 0x2ab slots); fight frame 4201 at stage_render entry: far 0x54f3, near 0x17d0, mid 0x1c36; also used by effect_billboard_quad
 80010000  data   overlay_slot_p1            verified  agents-md  P1 overlay load address (Mxxx.BIN, EVENT_SP.BIN, OPTOVL.BIN); file copied verbatim, code at file+4
 8001a268  data   overlay_slot_p2            verified  agents-md  P2 overlay load address (Mxxx2.BIN, EVENTOVL.BIN)
 8001a284  func   -                          verified  test       [MROSEN2] first function of P2 Rohzen (4 entries a284/a2b4/a2e4/a314 vs a26c/a29c/a2cc/a2fc of the others); was not recompiled until main-data slot pointers became seeds; scenario vs_villa
@@ -26,8 +26,9 @@
 800266bc  func   frame_wait                 likely    rea        VSync(800c02a4 ? 2 : 0) after frame_submit
 80026768  func   ot_compact_empty           likely    rea        skips runs of empty slots in the 2048-slot scene OT (length 11) before drawing
 80026828  func   ot_clear_and_link          likely    rea        per buffer idx: ClearOTagR on OT A/B/C/D/root, GsSortOt A,B,C,D into root (points 1,3,2,4)
+800269ec  label  -                          verified  probe      return address of a GsDrawOt call in a frame-end variant (800269xx; NOTES "800269fc"): one draw during the stage load (Hills, frame 2193 of a VS run), before the 60 Hz load screens of 8008c7b4
 80027218  func   frame_sync                 likely    agents-md  f_80027218(1) -> VSync(2); why fights update at 30/s
-80027268  func   vblank_callback            likely    rea        pads, memory card; every 2nd vblank with frame_ready: ResetGraph(1), PutDispEnv, PutDrawEnv, GsDrawOt(root), flip 1f800000, 80026828; the GPU draw starts in interrupt context
+80027268  func   vblank_callback            verified  probe      pads, memory card; at the FIRST vblank after frame_ready (parity does not matter): ResetGraph(1), PutDispEnv(800c0698/6ac), PutDrawEnv(800c05d8/634), GsDrawOt(root 800c47b8/7cc), then 80026828 flips 1f800000 and clears / links the OTs; runs in IRQ context (sp 800bf1xx, ra 8009bf58); the GPU draw starts there
 800275bc  func   setup_draw_disp_envs       likely    rea        SetDefDrawEnv/SetDefDispEnv x2: 512 x (240 - 2*a0) at y 0 / 240
 80028c70  func   sound_pan_from_screen_x    likely    rea        projects a 3D point (GTE RTPS) and derives left/right volumes from screen x (|x| <= 256, |y| <= 120); audio, not culling - not widened; also verified/code: contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 8002905c  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
@@ -37,6 +38,7 @@
 8002c820  func   fight_match_loop           likely    rea        sets up fighter_p1/p2 (800c9938/800c9b14), loops fight_round_loop until the match ends; on the fight call stack (trace); also verified/trace: on the fight call stack, see 8002beb0
 80033860  func   dyn_light_tick             likely    rea        counts dyn_light 800c9d20's timer down, clears it at 0; called by fighters_render
 800338d8  func   bone_light_matrices        likely    rea        per bone part: GTE light matrix from char_lights (light 0 = dyn_light direction from the bone position, colour scaled by timer/duration) + colour matrix
+80033c60  func   stage_light_matrices       likely    probe      called by stage_lights_setup 8003f814: builds the stage light matrix 800cc6e0 and light colour matrix 800cc6c0 from the stage's light set (800b1bbc); values per stage in NOTES "Fog, depth cue and lights"
 80035594  func   fighter_ot_depth_range     likely    rea        projects both fighters; sets the OT depth mapping bounds 1f80000c/1f800010 (x culling +-257, y +-121 vs screen); render state only, not widened; also verified/code: contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 80036138  func   char_mesh_tris_to_ot       likely    rea        character mesh: NCLIP backface test, depth -> OT index (3-segment mapping), links 0x34 packets; no screen-bounds culling; also verified/override (runtime/overrides/char_mesh.c, face list read at every call): a0 = block {+0 face records (0x5c each), +4 ordering table, +8 count (decremented to 0), +0x10 vertex buffer, +0x14 lit-colour buffer}; record +0x50 s16 A, s16 C, +0x54 s16 B, s16 colour index A, +0x58 s16 colour C, s16 colour B; keeps a face iff NCLIP(A,C,B) > 0 on the integer SXY (a degenerate face is dropped); GT3 packet (0x34) at record +0 / +0x28 (double buffer, scratch 1f800000), UV words +0xc/+0x18/+0x24 never written here and equal in both halves; OT slot from (SZa+SZb+SZc)/3 unsigned
 800363c8  func   char_mesh_quads_to_ot      likely    rea        quad version of 80036138 (0x3c packets); innermost frame of the fight call stack (trace); also verified/trace: innermost frame of the fight call stack seen at the end of headless runs; also verified/override: records 0x78 bytes, +0x68 s16 A, B, +0x6c s16 C, D, +0x70/+0x74 colour indices; keeps a quad iff NCLIP(D,B,C) < 0 or NCLIP(A,B,C) > 0 (integer); GT4 packet at record +0 / +0x34, colour words copied whole (code byte from the lit buffer), OT slot from the minimum SZ (signed compares)
@@ -45,12 +47,16 @@
 80037144  func   fighter_render             likely    rea        per fighter: bone matrices (800338d8), char_mesh_render for the body and an optional attachment (+0x1a0); on the fight call stack (trace); also verified/trace: on the fight call stack, see 8002beb0
 80037280  func   fighters_render            likely    rea        dyn_light_tick, then per fighter: fighter_shadow_render (8007ec5c), fighter_render, 8007ccdc; also guess/trace: on the fight call stack
 80037360  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
+8003e11c  func   -                          verified  probe      writer of the OT D background quads 800cc510 (0x38) / 800cc540 (0x28) in fights (writer tracking)
 8003e32c  func   background_prims_add       likely    rea        adds the sky gradient quad 800cc510 and the ground quad 800cc540 to OT D (org 800c474c + idx*0x14)
 8003e36c  func   overlay_loader_b           likely    rea        one of the three overlay loaders (memcpy file into P1/P2 slot); which files it loads: unconfirmed
+8003e52c  func   camera_apply               verified  probe      RotMatrix(800cc5c8 -> 800cc674) + TransMatrix(800cc5d0), RotMatrix(800cc5b0 -> 800cc624) + TransMatrix(800cc5b8), zeroes the flags 800cc620 / 800cc670, GsSetRefView2(800cc5e0); called by camera mode 1 (round intro) after camera_from_fighters
 8003e758  func   camera_follow_clamp        likely    rea        clamps/smooths the follow-camera target (+-8000, step 0x28); used by camera_from_fighters
 8003e988  func   camera_vpz_smooth          guess     rea        smooths the view point z 800cc5e8 (with 8003ebb0)
 8003ebb0  func   -                          verified  code       contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 8003f214  func   camera_from_fighters       likely    rea        follow camera: angles 800cc5c8, translation 800cc5d0, H via 80093d08 from the fighters' distance, RotMatrix/TransMatrix, GsSetRefView2(800cc5e0)
+8003f814  func   stage_lights_setup         verified  probe      a0 = 4-byte record 800b1cac + stage*4 {light count, light-set index (800b1bbc, 12 bytes per light), far-colour index (800b1c7c -> SetFarColor), back-colour index (800b1ca0 -> SetBackColor)}; calls 80033c60
+8003fa44  func   stage_env_setup            verified  probe      per stage index (< 12) before the fight loop: SetFogNear(800b1cf4[stage] or 0x8000, 800), 80044748, stage_lights_setup(800b1cac + stage*4)
 8003fcb8  func   stage_prims_0x20           likely    rea        stage polygon builder (flat tri); per-polygon x culling +-255 (widened by WS_IMM), y +-119, near SZ > 0x18f; also verified/code: contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 800401f8  func   stage_prims_0x28           likely    rea        stage polygon builder (flat quad); culling as 8003fcb8; also verified/code: contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
 80040820  func   stage_prims_0x34           likely    rea        stage polygon builder (gouraud textured tri); culling as 8003fcb8; also verified/code: contains GTE RTPS/RTPT (generated code); none of its vertices reached the GPU in fight frames 3700-4400 of tools/fight_script.py
@@ -67,21 +73,41 @@
 800465a4  func   sphere_vs_poly             verified  override   moving sphere vs stage collision polygons; readable version runtime/overrides/collision.c, checked by --verify-overrides
 80049e90  label  str_wait_loop              verified  trace      libpress STR playback wait loop; stuck here when MDEC/CD DMA completions race
 8004c1e8  func   overlay_loader_a           likely    rea        one of the three overlay loaders; see 8003e36c. Also on the guest call stack (8004be10 > 8004c1e8 > 80039cd8 > 8002c51c > 8002c820) when a VS fight overlay is loaded (verified: trace of the 8001a284 miss)
-8004cb04  func   fighter_effects_render     likely    rea        per fighter: overlay effect code (char id % 14 == 3), magic_block_render, projectiles via 800b356c, effect_lists_render
+8004c4a4  func   -                          verified  probe      every fight update: calls the P1 overlay exports 80010004 / 8001004c and the P2 ones 8001a26c / 8001a2b4, then 8004e0e8; also code
+8004c60c  func   -                          verified  probe      calls per-character overlay functions through pointers (jalr); those write draw-mode prims (e1) into the scene OT next to their effects (every character overlay, practice replays)
+8004cb04  func   fighter_effects_render     likely    rea        per fighter: overlay effect code (char id % 14 == 3), magic_block_render, projectiles via 800b356c, effect_lists_render; also verified/code: calls the P1 overlay exports 80010028 / 80010074 and the P2 ones 8001a290 / 8001a2dc
 8004d7ec  func   effect_lists_render        likely    rea        20 objects of 0x108 at *800c048c and 20 of 0x104 at *800c0490
+8004df40  func   -                          verified  probe      writes FT4 0x2c / 0x2d into OT A (HUD) in fights
+8004df70  func   -                          verified  probe      writes GT4 0x3c into OT B on the title menu and the character select
+8004e0e8  func   -                          verified  probe      writes one draw-mode prim (e1) into the scene OT per fighter per update; called from 8004c4a4
 8004e794  func   magic_block_render         likely    rea        per-fighter block 800e2398 + i*0x854 (enabled +0x7b0): 6 x 80056704 (0xb0), 8 x 80055b70 (0x84)
 800511bc  func   particle_burst_render      likely    rea        bursts at 800dd5f8 (stride 0x1138); grey fades by 8 per update
 80051b58  func   particle_sets_render       likely    rea        2x2 sets of 24 particles at 800da178..; fade 0x14 per update; u/v flipbook
 80052240  func   effects_render             likely    rea        16 effect objects of 0x8c at 800e1ad8, update functions table 800b5448
-80055b70  func   effect_billboard_tri       verified  probe      RTPT family 80055820..80057100 (14 small functions, 1 RTPT each, some + RTPS / NCDS 4a486012); few fight vertices; 80056348 8005650c 80056704 80056908 80056b40 of the family also produced some (PGXP producer probe); also likely/rea: one GT3 (tag 9) billboard, 3 vertices at +0x50..+0x64 + reference point +0x68, OT slot from min SZ
-80056704  func   effect_billboard_tri_mode  likely    rea        GT3 (tag 8) billboard + a 1-word draw-mode prim in the same OT slot; part of the 80055820..80057100 family
+80055820  func   -                          verified  probe      effect builder: FT3 raw semi (0x27) into the scene OT; called from overlay code (Celia MSEREA, Zauber MZAUBER)
+800559b0  func   -                          verified  probe      effect builder: FT3 raw semi (0x27); called from Celia's overlay (MSEREA)
+80055b70  func   effect_billboard_quad      verified  probe      FT4 billboard (9 words: RTPT + RTPS, code 0x2c-0x2f, mostly 0x2e/0x2f) into the scene OT (writer tracking; renamed from effect_billboard_tri: it is not a GT3); OT slot = min SZ through the 3-segment map (1f80000c/10/08), no x/y/near culling (likely: code read in full); called by magic_block_render, effect_lists_render, effects_render, particle_burst_render and the character overlays; family 80055820..80057100
+80055d48  func   -                          verified  probe      effect builder: FT4 semi (0x2f); called from overlay code (Celia, Tieme)
+80055f54  func   -                          verified  probe      effect builder: GT4 textured semi (0x3e / 0x3f); called from Laon's overlay (MLAON)
+80056348  func   -                          verified  probe      effect builder: G3 (gouraud, untextured; 0x30 / 0x32); called from overlay code
+8005650c  func   -                          verified  probe      effect builder: G3 (0x30 / 0x32); called from overlay code
+80056704  func   effect_quad_mode           verified  probe      G4 (gouraud, untextured; 0x38 / 0x3a) + a 1-word draw-mode prim in the same OT slot (writer tracking; was effect_billboard_tri_mode "GT3 tag 8": 8 words = G4); called by magic_block_render and overlay code
+80056908  func   -                          verified  probe      effect builder: G4 semi (0x3a); called from overlay code (Laon, Falma, Reyus, Milena)
+80056b40  func   -                          verified  probe      effect builder: F3 (0x20); called from 800573c8 (Milena's overlay path)
 8006acc4  func   -                          verified  trace      on the fight call stack, see 8002beb0
 8006b35c  func   overlay_loader_c           likely    rea        one of the three overlay loaders, and on the fight call stack right under main
+8006bf00  func   -                          verified  probe      writes sprites (0x64) into OT A (HUD) in fights
 8007b874  func   hud_render                 likely    rea        2D HUD into OT A (org 800c4774 + idx*0x14)
+8007ccdc  func   -                          verified  probe      not a renderer: called from fighters_render, writes no packets; with game_mode 800e3794 == 6 updates per-fighter counters at *(800e3440 + 772) (likely: code)
 8007d25c  func   hud_update                 likely    rea        per game_mode HUD logic: health/gauge bars 8007c178 / 8007c3f8 and mode-specific parts
 8007d6f4  func   round_timer_and_judge      likely    rea        advances round_time by 2 per update, ends the round on time limit (30/60/99 s by time_limit_setting) or KO, counts round wins
 8007ec5c  func   fighter_shadow_render      likely    rea        45-vertex ground-draped shadow mesh (ground_height), 64 semi GT3 (0x36) into the scene OT; also verified/probe: RTPS in a loop, ~10% of fight GTE vertices; 128 x 0x36 in the scene OT at fight frame 4201 (2 fighters)
-80088408  func   camera_update              likely    rea        camera modes 1-3 through a table at gp+0x460, else resets 800cc5b0..d8 and calls camera_from_fighters
+80087114  func   camera_mode1               verified  probe      camera mode 1 (800c0248 == 1, the round intro; with 800876c0): camera_from_fighters then camera_apply 8003e52c
+800876c0  func   camera_mode1_b             verified  probe      second function of camera mode 1 (round intro)
+80087a00  func   camera_mode2               likely    code       camera mode 2 (800c0248 == 2); not seen at runtime
+80087fe4  func   camera_mode3               likely    code       camera mode 3 (800c0248 == 3); not seen at runtime
+80088408  func   camera_update              verified  probe      switches on the mode variable 800c0248 (gp+0x460; not a table): 1 -> 80087114 / 800876c0, 2 -> 80087a00, 3 -> 80087fe4, else camera_from_fighters (at 80088564); modes 0 and 1 observed
+8008a930  func   -                          verified  probe      writes GT4 0x3c into OT B on the title menu and the character select
 8008d198  func   rand                       verified  code       Psy-Q rand(): seed = seed * 0x41c64e6d + 12345, returns (seed >> 16) & 0x7fff
 8008d1c8  func   srand                      verified  code       Psy-Q srand(): stores a0 into rand_seed
 8008ff28  func   ResetGraph                 likely    rea        libgpu; called with 1 from vblank_callback before every frame's draw
@@ -89,15 +115,21 @@
 80090790  func   ClearOTagR                 likely    rea        libgpu reverse ordering-table clear; used by ot_clear_and_link for every OT
 80090908  func   PutDrawEnv                 likely    rea        libgpu; drawenv 800c05d8 + idx*0x5c
 80090ad4  func   PutDispEnv                 likely    rea        libgpu; dispenv 800c0698 + idx*0x14
+800913c4  func   -                          verified  probe      writes the DR e3 (draw area) word of the draw environment packet
 80092fa8  func   AddPrim                    likely    rea        libgpu
+80093168  func   -                          verified  probe      writes the draw-mode prim (e1) in OT A in fights
 80093d08  func   -                          verified  probe      only calls 80095f98; the caller that changes GTE H during fights (camera zoom); also likely/rea: called by camera_from_fighters with H from the fighters' distance
 80094298  func   GsDrawOt                   likely    rea        libgs-style: DrawOTag of a GsOT's tag; draws the root OT from vblank_callback
 80094328  func   GsSortOt                   likely    rea        libgs: links a sub-OT's chain into slot (point - offset) of another OT (A/B/C/D into root)
 800945f8  func   GsSetRefView2              likely    rea        libgs: GsRVIEW2 800cc5e0 -> GsWSMATRIX 800ed4c8 (+ copy 800ed488), from the base 800ed4e8
+80095088  func   SetFogNear                 likely    probe      libgte-shaped: (a, H) -> DQA via 80095f20, DQB 0x01400000; called by stage_env_setup with 800b1cf4[stage] and 800
 800951c0  label  -                          verified  agents-md  branch target that is another branch's delay slot (tracer pitfall)
 80095c08  func   TransMatrix                likely    rea        libgte
 80095d78  func   SetRotMatrix               likely    rea        libgte
 80095e08  func   SetTransMatrix             likely    rea        libgte
+80095f20  func   SetDQA                     verified  probe      writes GTE DQA (ctc2 27); name likely (libgte)
+80095f38  func   SetBackColor               verified  probe      writes GTE BK (ctc2 13-15); name likely (libgte)
+80095f58  func   SetFarColor                verified  probe      writes GTE FC (ctc2 21-23); name likely (libgte)
 80095f98  func   SetGeomScreen              verified  probe      libgte: ctc2 H (GTE reg 26); H changes during fights between ~0x38a and 0x3bb (camera zoom); OFX/OFY stay 0
 800961f8  func   RotMatrix                  likely    rea        libgte; camera angles 800cc5c8 -> 800cc674
 8009b4f8  func   VSync                      likely    code       libetc VSync(mode): reads a pointer at 800be17c (GPUSTAT/counter, guess) and the vblank count 800bf2b4, waits in vsync_wait (8009b670); frame_sync calls it
@@ -109,6 +141,11 @@
 800a8e28  func   -                          verified  agents-md  extra seed from the original port; role not recorded
 800a9528  func   -                          verified  agents-md  extra seed from the original port; role not recorded
 800aa000-  range  text_trailing_data        verified  agents-md  data inside .text from here on; never linear-sweep
+800b1bbc  data   stage_light_sets           verified  probe      stage directional lights, 12 bytes per light (direction, colour), indexed by the stage light record
+800b1c7c  data   stage_far_colours          verified  probe      4-byte RGB per entry -> SetFarColor (GTE FC, the depth-cue colour)
+800b1ca0  data   stage_back_colours         verified  probe      entries -> SetBackColor (GTE BK)
+800b1cac  data   stage_light_records        verified  probe      12 x 4 bytes {light count, light-set index, far-colour index, back-colour index} per stage index
+800b1cf4  data   stage_fog_near             verified  probe      s16 per stage index: first argument of SetFogNear (DQA)
 800b310c  data   char_overlay_fn_table       likely    code       main-exe table of overlay function pointers, 4 per character per slot; 8004c1e8 jalr's them (Rohzen P2 pointers at 800b318c..)
 800b356c  data   projectile_fn_table        verified  probe      u32 fns indexed char*0xe0 + type*0x10 + slot*4 (bytes) for 0x1b0-byte projectile objects; all entries 0x8001xxxx = P1/P2 overlay code (index from rea: likely)
 800b5448  data   effect_update_table        likely    rea        update functions of effects_render's objects
@@ -116,9 +153,10 @@
 800b6264  data   shadow_grid_offsets        likely    rea        3x3 grid offsets of the shadow mesh (stretched by the feet spread)
 800be224  data   resetcallback_jmpbuf       verified  code       setjmp buffer used for IRQ hook (HookEntryInt)
 800bfe28  data   char_base_rgb              likely    rea        u32 RGB+code loaded into the GTE before NCCT/NCCS of the character mesh
+800c0248  data   camera_mode                verified  probe      gp+0x460: camera mode for camera_update (0 follow, 1 round intro, 2/3 not seen)
 800c0298  data   frame_ready                likely    rea        set by frame_submit, consumed by vblank_callback (draw the root OT)
 800c03b4  data   stage_normals              likely    rea        pointer: stage normal table (indices per quad vertex, NCDT/NCDS)
-800c03b8  data   stage_root                 likely    rea        gp+0x5d0: pointer to the stage object list {u32 n; {data off, packet off, normal-index off, flags} x n}
+800c03b8  data   stage_root                 verified  probe      gp+0x5d0: pointer to the stage object list {u32 n; {data off, packet off, normal-index off, flags} x n}; RAM dump at fight frame 4201: 18 objects, command words {type 0x35/0x3d, polygon count, strip count} as documented
 800c05d8  data   drawenv                    likely    rea        DRAWENV x2 (stride 0x5c)
 800c0698  data   dispenv                    likely    rea        DISPENV x2 (stride 0x14)
 800c0720  data   ot_scene                   verified  probe      GsOT header x2 (stride 0x14), length 11 = 2048 slots, org 800c0748 / 800c2748, point 2; stage, characters, shadows, effects
@@ -126,7 +164,7 @@
 800c4748  data   ot_background              verified  probe      GsOT header x2, 4 slots, point 4: sky / ground prims (drawn first)
 800c4770  data   ot_hud                     verified  probe      GsOT header x2, 16 slots, point 1: HUD and 2D (drawn last)
 800c47b8  data   ot_root                    verified  probe      GsOT header x2, 8 slots, org 800c06e0 / 800c0700: the OT the vblank callback draws
-800c4860  data   ot_b                       verified  probe      GsOT header x2, 4 slots, point 3, org 800c06c0; empty at fight frame 4201, producer unknown
+800c4860  data   ot_b                       verified  probe      GsOT header x2, 4 slots, point 3, org 800c06c0; empty in fights; used by the title menu and the character select (GT4 from 8008a930, 8004df70 and others)
 800c9938  data   fighter_p1                 verified  probe      player 1 fighter struct, 0x1dc bytes (P2 follows at 800c9b14); +0xc s16 health (200 max, falls on hits), +0xe s16 gauge, +0xa0/+0xa4/+0xa8 s32 position, +0xc8 model/camera block; also verified/trace (replays.py, 6 recorded fights): +0xc is 200 at every round start and reaches 0 exactly at the KO that ends the round; +0xe stays in 0..1800 and drops by > 100 in one update ~30 times per 3000-frame random fight (an attack's cost ~588 = 600 minus refill; refills 6 per vblank; verified movelab probe, see NOTES "Gauge, command inputs"); +0xa0..+0xa8 change as the fighters move (which axis is height: guess)
 800c9b14  data   fighter_p2                 verified  probe      player 2 fighter struct; layout as fighter_p1
 800c9cf0  data   char_lights                likely    rea        3 lights x 12 bytes (direction, colour) for the character mesh; light 0 = dyn_light
@@ -135,11 +173,15 @@
 800cb7c8  data   char_colour_buffer         likely    rea        lit vertex colours of the character mesh (NCCT results, 4 bytes each incl. the GPU code byte); faces index it
 800cc510  data   bg_sky_quad                verified  probe      gouraud quad 0x38, x -255..256, y -119..0, blue (B 0x40) to light cyan; 4:3 only
 800cc540  data   bg_ground_quad             verified  probe      flat quad 0x28, light cyan, y 0..119; 4:3 only
+800cc5b0  data   camera_rig_angles          verified  probe      SVECTOR angles of the rig coordinate 800cc620 (RotMatrix -> 800cc624 in camera_apply); zero in every observed frame
+800cc5b8  data   camera_rig_trans           verified  probe      translation of the rig coordinate 800cc620; zero in every observed frame
 800cc5c8  data   camera_angles              likely    rea        SVECTOR camera rotation (pitch -(0x80..0x280)) for RotMatrix
 800cc5d0  data   camera_trans               likely    rea        camera translation (x +-0x1ce8, z >= -0x1db0)
-800cc5e0  data   camera_rview               likely    rea        GsRVIEW2 {vp, vr, rz, super = 800cc670} passed to GsSetRefView2
-800cc6c0  data   stage_light_colour         likely    rea        GTE light colour matrix for stage_render (probe: diag 0x0c8c)
-800cc6e0  data   stage_light_matrix         likely    rea        GTE light matrix for stage_render
+800cc5e0  data   camera_rview               verified  probe      GsRVIEW2 {vp = (0, 0, vpz at 800cc5e8: e.g. -8099 in a fight, -22920 in the intro), vr = 0, rz = 0, super = 800cc670}
+800cc620  data   camera_rig_coord           verified  probe      GsCOORDINATE2 (flag, matrix 800cc624, ...): super of 800cc670, sub = 800cc670; identity in every observed frame ("the second camera matrix")
+800cc670  data   camera_coord               verified  probe      GsCOORDINATE2 of the camera (matrix 800cc674 from camera_angles / camera_trans), super 800cc620; the GsRVIEW2 super
+800cc6c0  data   stage_light_colour         verified  probe      GTE light colour matrix for stage_render, built per stage by 80033c60 (values in NOTES)
+800cc6e0  data   stage_light_matrix         verified  probe      GTE light matrix for stage_render, built per stage by 80033c60 (values in NOTES)
 800e1ad8  data   effect_objects             likely    rea        16 x 0x8c effect objects (effects_render)
 800e2398  data   magic_blocks               likely    rea        per-fighter 0x854-byte magic effect blocks (magic_block_render)
 800e344c  data   time_limit_setting         verified  watch        0..3; selects the round time limit in round_timer_and_judge (0 = 30 s, 1 = 60 s, 2 = 99 s, 3 = NO LIMIT = the default; set by OPTION > GAME OPTION > ROUND TIME, each value checked with --watch; round ends at round_time 1800 for 30 s, equal hp = draw, both get a win: timeout_* replays)
@@ -152,7 +194,7 @@
 800e7560  data   rand_seed                  verified  code       rand()/srand() seed = the game RNG state; that it picks the 1P-battle opponent/stage is likely (NOTES.md, scenarios); also verified/trace: advances during fights, also with no input (CPU AI and round-end code)
 800ed488  data   camera_matrix_copy         likely    rea        copy of GsWSMATRIX made by GsSetRefView2
 800ed4a8  data   billboard_matrix           verified  probe      identity rotation; effects use it with translation = WS * position (view-aligned billboards; use: likely/rea)
-800ed4c8  data   camera_matrix              likely    rea        libgs GsWSMATRIX written by GsSetRefView2 (Y scaled 0.625 by 800ed4e8); camera rotation + translation (MATRIX) loaded into the GTE by stage_render and the character renderers
+800ed4c8  data   camera_matrix              verified  probe      libgs GsWSMATRIX written by GsSetRefView2 (Y scaled 0.625 by 800ed4e8); equals the GTE RT/TR at every stage builder entry (camera modes 0 and 1)
 800ed4e8  data   camera_aspect_base         verified  probe      diag(0x1000, 0x0a00, 0x1000): base of GsWSMATRIX, Y scaled 0.625 (display pixel aspect); role: likely/rea
 # --- memory card (libmcrd-style library at 0x800a4xxx-0x800a7xxx, game wrappers in main_05) ---
 800a47bc  func   mcrd_exist_step              likely    rea        per-frame state machine: _card_info, retries 5x on ERROR/TIMEOUT, maps event to McErr via 800a5f2c
