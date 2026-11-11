@@ -910,3 +910,9 @@ Done:
 - Are Gene (`MGENE*.BIN`) and Soldier reachable outside STORY (cheat, unlock)? No portrait for them.
 - Story: the first fight is lost without input; the scenario stops at its start, so later events are
   untested.
+- Hi-res worker pool hang (host runtime, not game code; verified, seen 2026-11): the headless
+  `test_governor.py` `offline92` run (`--scale auto --max-scale 2x3 --fake-load 1-9000:92`, default
+  worker threads) sometimes never finishes. Both times it was seen (on this branch and on main) it
+  stopped at frame 7125. The main thread spins in `hires.c` `par_rows`, waiting for
+  `done == nchunks`, and every worker is asleep in `worker_main`'s `cond_wait`, so a claimed chunk's
+  `done` increment is lost or the count is wrong. About 1 run in 4; cause not found.
