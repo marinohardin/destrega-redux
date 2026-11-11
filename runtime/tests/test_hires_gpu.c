@@ -221,6 +221,16 @@ typedef struct { int filter; bool full; int ssaa; const char *name; } Mode;
 static const Mode MODE_DEFAULT = { HIRES_TEX_NEAREST, false, 1, "" };
 static Mode s_mode = { HIRES_TEX_NEAREST, false, 1, "" };
 
+/* "external" mode (CTest hlr_gpu): an empty HiresBackend.external pass every N primitives, as
+ * the HLR inserts one where the walk enters a captured scene table; it splits groups and render
+ * passes but must leave the target exactly as before */
+static int s_external_every, s_external_calls;
+static void external_noop(void *ctx, void *cb, void *tex, int w, int h)
+{
+    (void)ctx; (void)cb; (void)w; (void)h;
+    if (tex) s_external_calls++;
+}
+
 static void run_scale(int sx, int sy, int guard, int n)
 {
     char what[64];
@@ -236,6 +246,9 @@ static void run_scale(int sx, int sy, int guard, int n)
         else if (k < 8) rect();
         else if (k == 8) line();
         else misc();
+        /* the GPU backend is the shadow of the compare tee here: call it directly */
+        if (s_external_every && i % s_external_every == s_external_every - 1)
+            hires_gpu_backend()->external(external_noop, NULL);
     }
     if (s_fast_mode) { hires_gpu_tc_check(); compare_tol(what); }
     else compare(what, 0);
@@ -312,6 +325,28 @@ int main(int argc, char **argv)
         hires_set_scale(0, 0);
         hires_gpu_shutdown();
         CHECK(hires_gpu_api() < 0, "shutdown left the backend initialised");
+        printf("test_hires_gpu: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (!strcmp(drv, "external")) {
+        drv = argc > 2 ? argv[2] : "auto";
+        if (!hires_gpu_set_driver(drv)) {
+            if (hires_gpu_api_from_name(drv) >= 0) { printf("SKIP: %s is not offered on this platform\n", drv); return 77; }
+            printf("usage: test_hires_gpu external [auto|metal|vulkan|d3d12]\n");
+            return 2;
+        }
+        if (!hires_gpu_init(NULL)) { printf("SKIP: no usable SDL_GPU device (%s)\n", drv); return 77; }
+        s_external_every = 37;
+        static const int esc[][2] = { { 1, 1 }, { 2, 3 }, { 4, 6 } };
+        for (size_t i = 0; i < sizeof esc / sizeof esc[0]; i++) {
+            run_scale(esc[i][0], esc[i][1], 0, 800);
+            run_scale(esc[i][0], esc[i][1], 88, 800);
+        }
+        CHECK(s_external_calls > 0, "the external pass never ran");
+        printf("test_hires_gpu external: %d external passes run\n", s_external_calls);
+        hires_set_backend(NULL, NULL);
+        hires_set_scale(0, 0);
+        hires_gpu_shutdown();
         printf("test_hires_gpu: %d passed, %d failed\n", g_pass, g_fail);
         return g_fail ? 1 : 0;
     }

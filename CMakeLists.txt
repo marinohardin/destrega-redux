@@ -252,6 +252,22 @@ if(DESTREGA_TESTS)
   # fast precision (--gpu-precision fast): the same streams within a tolerance
   add_test(NAME hires_gpu_fast COMMAND test_hires_gpu fast auto WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(hires_gpu_fast PROPERTIES SKIP_RETURN_CODE 77)
+  # HLR: an empty external render pass mid-stream leaves the target unchanged
+  add_test(NAME hlr_gpu COMMAND test_hires_gpu external auto WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(hlr_gpu PROPERTIES SKIP_RETURN_CODE 77)
+  # HLR phase 2a without the disc: switches, a synthetic stage through the capture and audit,
+  # frame pairing in the linked-list filter, save-state drop, gpu.c suppression
+  add_executable(test_hlr runtime/hlr/hlr.c runtime/hlr/hlr_stage.c runtime/gte.c runtime/gpu.c
+                 runtime/hires.c runtime/pgxp.c runtime/platform.c runtime/tests/test_hlr.c)
+  target_include_directories(test_hlr PRIVATE runtime)
+  target_compile_options(test_hlr PRIVATE -O2 -Wall -Wextra)
+  if(UNIX)
+    target_link_libraries(test_hlr PRIVATE m)
+  endif()
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(test_hlr PRIVATE pthread)
+  endif()
+  add_test(NAME hlr COMMAND test_hlr WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   if(APPLE)   # MoltenVK, when the Vulkan loader is installed (Homebrew vulkan-loader + molten-vk)
     add_test(NAME hires_gpu_vulkan COMMAND test_hires_gpu vulkan WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     set_tests_properties(hires_gpu_vulkan PROPERTIES SKIP_RETURN_CODE 77)

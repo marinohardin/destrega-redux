@@ -233,6 +233,11 @@ bool hlr_ll_filter(u32 node)
     if ((ram[0] >> 24) != p->n) { S.stale_len++; return false; }
     const u32 *w = s_active->w + p->off;
     if (memcmp(ram + 1, w, (size_t)p->n * 4)) { S.stale_pkts++; return false; }
+    /* test hook: DESTREGA_HLR_TEST_DROP=N suppresses every Nth packet without drawing it, so the
+     * byte-identical checks can show they would notice a missing packet (tools/test_hlr.py) */
+    static int drop_every = -1;
+    if (drop_every < 0) { const char *e = getenv("DESTREGA_HLR_TEST_DROP"); drop_every = e ? atoi(e) : 0; }
+    if (drop_every > 0 && S.suppressed % (u64)drop_every == (u64)drop_every - 1) { S.suppressed++; return true; }
     u32 tags[16];
     for (int i = 0; i < p->n && i < 16; i++) tags[i] = g_pgxp_mem[((node + 4 + 4 * (u32)i) & 0x1ffffc) >> 2];
     gpu_hires_replay(w, p->n, tags);
