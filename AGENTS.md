@@ -754,7 +754,9 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - **View > Texture Filtering** (Off (Sharp Pixels) / Bilinear / Smooth 2D Edges + Bilinear 3D),
   **View > Smooth Colours** (checkable) and **View > Anti-aliasing** (Off / 2x / 3x / 4x), Mac and
   Windows: actions `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`;
-  see "Render quality".
+  see "Render quality". Texture Filtering ends with a separator and the check item **Smooth Distant
+  Textures (Fast Renderer)**: action `tex-cache[=on|off]` (none = toggle), the fast precision's
+  texture cache, see "Texture cache".
 - **Netplay** menu (after View): Host Game…, Join Game…, Disconnect, status line; see "Rollback netplay".
 - **View > Controls…** (both platforms) and app menu **Settings… (Cmd+,)** on macOS: the Controls
   window, see "Input, controls and settings". View toggles are saved in `settings.ini`.
@@ -775,8 +777,8 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
   `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `resolution[=auto|4x6|2x3|1x1]`, `fullscreen[=on|off]`,
-  `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`,
-  `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`,
+  `tex-filter[=nearest|bilinear|xbr]`, `smooth-colours[=on|off]`, `ssaa[=1..4]`, `gpu-precision[=exact|fast]`,
+  `tex-cache[=on|off]`, `netplay-host=PORT[,DELAY]`, `netplay-join=HOST:PORT[,DELAY]`, `netplay-disconnect`,
   `controls`, `settings`, `controls-*` (see "Input, controls and settings"),
   `menu-test=dump|click=PATH` (Windows, windowed). Headless: no dialogs (the file argument is
   required), confirmations are auto-accepted and logged, nothing opens Finder, and card actions refuse to run
@@ -870,14 +872,15 @@ folder as `destrega.pak`; `--data-dir` moves it). Written atomically (temp file,
 key, auto|off|NxM, is still read when `resolution` is absent), max_scale, widescreen (absent = on in
 a window), renderer (software|gpu|metal|vulkan|d3d12; gpu = the
 platform's default API, as written by older builds; an API this platform does not offer is logged and
-ignored), gpu_precision (exact|fast), fullscreen, window (WxH points);
+ignored), gpu_precision (exact|fast), tex_cache (on|off; the fast precision's texture cache),
+fullscreen, window (WxH points);
 `[netplay]` port, delay, join_address, port_mapping (on|off); `[player1]` / `[player2]` device, device_name, stick,
 deadzone, `key.<button>`, `pad.<button>` (buttons: up down left right cross circle square triangle
 l1 r1 l2 r2 start select; empty = unbound; keys absent = default).
 
 - **Command-line flags win for that run and are never written back**: each flag locks its key
   (`settings_lock`), so a View toggle cannot save it either. `--widescreen` / `--no-widescreen`,
-  `--renderer`, `--gpu-precision`, `--scale` (locks `scale` and `resolution`), `--max-scale`, `--window`.
+  `--renderer`, `--gpu-precision`, `--tex-cache`, `--scale` (locks `scale` and `resolution`), `--max-scale`, `--window`.
 - **Headless runs never read or write a settings file** unless given `--settings FILE`; tests stay
   hermetic. `--no-settings` makes a windowed run use defaults and write nothing (the Wine netplay
   test uses it). View toggles that persist: Widescreen, Renderer (not `compare`), GPU precision, Resolution, Full Screen, window
@@ -1300,6 +1303,9 @@ with every mode on). Options are plain global setters/getters in `hires.h`
   log says `hires: texture filter F, C colour, ssaa N (in use N, render scale WxH) at frame F`.
 
 ### Texture smoothing (`--tex-filter nearest|bilinear|xbr`)
+- The fast GPU precision adds mipmapped, anisotropic 3D textures on top of these filters (the
+  texture cache, "Fast GPU precision" > "Texture cache"; View > Texture Filtering > Smooth Distant
+  Textures (Fast Renderer)). Everything below describes the exact path and the uncached fast path.
 - Filtering happens **after the CLUT lookup**, on the 15-bit texels, with integer weights summing
   to 65536 (`tex_combine` / `tcomb`), result in 5.8 fixed point; modulation, raw texture, dither and
   semi-transparency then work as before (a single texel `t << 8` gives exactly the old result).
@@ -1442,6 +1448,76 @@ replay 4500 frames, 4x6 widescreen xbr full colour).
 - Not done: no fast lines (rare), no fast path for the exact backend's 1x1 `--hires-verify` (fast is
   never bit-exact), not run on a native Vulkan / D3D12 driver (only MoltenVK and vkd3d) or by a
   person in the menus.
+
+### Texture cache (`--tex-cache off|on|verify[=N]`; fast precision only)
+
+3D textured triangles of the fast path sample a cache of decoded textures with mipmaps and
+anisotropic filtering instead of decoding 1x VRAM texels in the shader. The exact path never uses
+it (stays bit-identical). Header comment "Texture cache" in `hires_gpu.c` has the details.
+
+- **Key** = (texture page, CLUT position, depth 4/8/15-bit, texture window); for 15-bit pages the
+  CLUT is ignored. Each entry is one layer of a 256x256 2D-array texture: premultiplied RGBA8
+  (texel 0 = alpha 0, so transparent texels never bleed into filtering) plus an R8 array with the
+  STP-bit coverage (the two-pass semi-transparency split reads it: STP where coverage >= half the
+  alpha). Decoded on the CPU from the 1x VRAM with the texture window applied, mips are 2x2 box
+  averages of the premultiplied texels (alpha-correct), made on the CPU too (identical on every
+  API; `SDL_GenerateMipmapsForGPUTexture` exists on Metal / Vulkan / D3D12 but always does every
+  layer of the texture and filters straight colour). The fragment shader un-premultiplies, discards
+  below alpha 0.5 and rescales to the exact path's 5.8 texel (`rgb / a * 8160`), so modulation,
+  raw texture, dither and blending run unchanged.
+- **Filtering**: trilinear + anisotropic sampler (`DESTREGA_TC_LEVELS` 1-9, default 4;
+  `DESTREGA_TC_ANISO` 1-16, default 16; anisotropy is a sampler field everywhere, on Vulkan it also
+  needs SDL's anisotropy device feature, on by default), gradients from the un-clamped u/v, then the
+  u/v clamp to the 1x-sampled range as before. `--tex-filter nearest` reads level 0 when magnified
+  and uses the mips when minified. **2D primitives** (rects, `hires_tri_is_2d`) never use the cache:
+  xbr's 2D rule and the HUD stay as they were.
+- **Page edges / bleed**: layers are whole 256x256 pages, mips are built over the page and clamped
+  at its border (no wrap). Within a page, sub-texture u/v rectangles are packed at 1-texel
+  granularity (66 % of triangles have an odd edge, 87 % not a multiple of 4; NOTES.md), so a level
+  >= 1 at a sub-texture border mixes in its neighbour. Measured cost: none visible at 4x6, where
+  > 99 % of textured pixels are magnified and levels >= 3 are used by < 0.001 % of pixels; that is
+  why levels stop at 4 (2 and 9 levels give the same picture). Per-sub-texture mips would need the
+  game's rectangles, which only a high-level renderer has (docs/HIGH_LEVEL_RENDERER.md).
+- **Validity / invalidation**: every 1x VRAM write (upload, fill, copy, and anything `mark_vram`
+  sees) stamps a 16x16 block and a 64x256 tile with a write clock; an entry whose page or CLUT
+  blocks are newer than its decode is re-hashed (FNV of the page rows / CLUT) and re-decoded only
+  if the texels really changed. Texture windows are part of the key. Bounded: 128 layers (~55 MB
+  with mips, `DESTREGA_TC_LAYERS`), LRU eviction of entries not used in the current frame; a full
+  cache sends the triangle down the uncached path. `be_configure` (reseed / scale change) clears it.
+- **Verify** (`--tex-cache verify[=N]`, default every 60 frames): re-hashes every entry the stamps
+  call clean and logs `tex-cache: STALE ...`, and reads one layer back from the GPU per round,
+  comparing colour and STP with a fresh decode. Exit lines `hires-texcache:` (lookups, decodes,
+  re-decodes, evictions, entries) and `hires-texcache-verify:`. `DESTREGA_TC_DIAG=1` adds the key
+  depth / window counts, u/v alignment and a texels-per-pixel histogram.
+- **Switching**: `--tex-cache` (locks the setting), `[display] tex_cache = on|off`, menu action
+  `tex-cache[=on|off]` (none = toggle, between frames, allowed in netplay). Mac and Windows: View >
+  Texture Filtering > "Smooth Distant Textures (Fast Renderer)" (check mark). Default **on**.
+- **Results** (Hills match replay, 11530 frames, 4x6 widescreen xbr full colour, verify every 10 /
+  30 frames): replay state hashes match (Metal and Vulkan, so presentation only); 76 entries, 76
+  decodes (33 ms in all), 43 re-decodes between rounds, 0 evictions, 0 STALE, read-backs 0
+  differing. Compare vs software (fight 3700-3950, every 10th frame): cache off 0.084 % of pixels
+  > 1 step / 0.0173 % > 4, PSNR 50.3 dB; on 0.114 % / 0.0243 %, 48.9 dB (no mips 0.084 % /
+  0.0173 %; mips without anisotropy 0.142 % / 0.0288 %): mips move distant texels towards their
+  average, which the point-sampling software reference does not do. Shimmer (frame-to-frame
+  change not explained by a supersampled software reference, 8-bit units, fight rows): at 4x6
+  cache on = off within noise (Hills 0.413 / 0.409, canyon 0.036 / 0.037) because almost nothing
+  is minified; with `--tex-filter nearest` 3.34 vs 4.14 (software nearest). It pays off at the
+  governor's lower scales (reference: software xbr at 4x the scale with `--ssaa 4`; shimmer S /
+  error E, off -> on): canyon 2x3 S 0.053 -> 0.046, E 0.842 -> 0.720 (software xbr 0.054 / 0.773);
+  Hills 2x3 unchanged (0.090 / 0.264 -> 0.090 / 0.268); Hills 1x1 S 0.121 -> 0.096, E 0.735 ->
+  0.538 (software xbr 0.124 / 0.737). Mips do most of it (1x1 without mips 0.114 / 0.554),
+  anisotropy keeps oblique floors sharp (1x1 without it E 0.760).
+- **Speed** (quick_check bench configuration, fast precision, headless Hills replay frames
+  3000-4000, three A/B rounds back to back, load 15-20 from other work): Metal 1.17 -> 1.11
+  ms/frame, Vulkan (MoltenVK) 1.34 -> 1.22 (a second set at load 32-52: Metal 1.19 -> 1.10, Vulkan
+  1.32 -> 1.16). The texel decode moves out of the shader; decoding is ~0.4 ms per new page,
+  a few dozen pages per stage. Default on for that reason and for the lower scales.
+- **Unit test**: `test_hires_gpu fast` runs with `--tex-cache verify` every frame (CTest
+  `hires_gpu_fast`) and requires cached triangles, re-decodes, checks and read-backs, 0 stale and 0
+  differing; the PGXP packets run with the cache off (random full-page u/v are minified noise, where
+  mips are legitimately far from point sampling).
+- Not done: per-sub-texture mips, 2D primitives, 15-bit pages are cached but the game draws none
+  in 3D, GPU-side decode (the CPU decode is 0.4 ms per page), a native Vulkan / D3D12 driver.
 
 ## Widescreen (`--widescreen`; default on in a window, off headless)
 

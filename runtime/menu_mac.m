@@ -276,6 +276,9 @@ void menu_init(void) {
         add(tf, @"Off (Sharp Pixels)", @"tex-filter=nearest", nil, 0);
         add(tf, @"Bilinear", @"tex-filter=bilinear", nil, 0);
         add(tf, @"Smooth 2D Edges + Bilinear 3D", @"tex-filter=xbr", nil, 0);
+        /* texture cache of the Fast renderer precision: mipmapped, anisotropic 3D textures (check mark) */
+        [tf addItem:[NSMenuItem separatorItem]];
+        add(tf, @"Smooth Distant Textures (Fast Renderer)", @"tex-cache", nil, 0);
         NSMenuItem *tfItem = [[NSMenuItem alloc] initWithTitle:@"Texture Filtering" action:nil keyEquivalent:@""];
         tfItem.submenu = tf;
         [view insertItem:tfItem atIndex:3];

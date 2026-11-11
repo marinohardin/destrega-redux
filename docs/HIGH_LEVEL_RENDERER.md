@@ -136,7 +136,17 @@ typedef struct HlBackend {
 
 Textures stay in the 1x VRAM (tpage + CLUT addressing), sampled the way `hires_gpu.c` already
 does; the backend uploads the VRAM texture area when it changes (the hi-res GPU backend already
-tracks dirty VRAM blocks). Lighting is evaluated in the vertex shader with the GTE formulas
+tracks dirty VRAM blocks). For mipmapped / anisotropic sampling, reuse the fast precision's
+**texture cache** (`hires_gpu.c` "Texture cache", AGENTS.md "Texture cache"): its key is exactly
+the texture half of `HlMaterial` plus the texture window, `(tpage x/y, depth, clut x/y, window
+word)`; one entry is the whole 256x256 page decoded as the PS1 samples it under that CLUT and
+window (premultiplied RGBA8, texel 0 = transparent, plus an STP-coverage layer), so the material's
+u/v bytes address it unchanged and the semi / raw / gouraud bits stay per draw. A material is then
+`(cache layer, semi, raw, textured, gouraud)`; `tc_lookup()` already validates the entry against
+VRAM writes (block stamps + content hash) and re-decodes it after a page or CLUT change, so the
+high-level backend needs no invalidation of its own. Per-face UV rectangles are not tile-aligned
+(66 % of the fight's triangles have an odd edge), so mip levels are limited (4) rather than
+per-tile; a renderer that knows the stage's texture atlas layout could cut sub-rectangles instead. Lighting is evaluated in the vertex shader with the GTE formulas
 (NCDS/NCDT: colour = lerp(RGB * (BK + LCM * clamp(LLM * n)), FC, IR0); NCCS/NCCT without the
 depth cue); exact integer GTE results are not needed because nothing in the target is read
 back by the guest.

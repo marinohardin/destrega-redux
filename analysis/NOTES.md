@@ -92,6 +92,30 @@ Evidence that nothing else changed (verified):
 - Rasterizing these pixels was 49 % of the main thread in a plain 1x run and 14 % in the user
   configuration (macOS `sample`).
 
+### Textures and CLUTs over a fight (texture cache work, AGENTS.md "Texture cache")
+
+Counted by the fast GPU path's texture cache (`hires_gpu.c`, `DESTREGA_TC_DIAG=1`), Hills match
+replay `match_gradd_celia_hills` (11530 frames, 4x6 widescreen), plus the 12 VS stage scenarios:
+- Distinct (texture page, CLUT, depth, texture window) combinations of 3D (non-2D) textured
+  triangles: 76 over the whole match (67 4-bit, 9 8-bit, **0 15-bit**); 30-42 per VS stage from
+  boot to the key frame. (verified: cache counters)
+- **No texture window is ever set** for these triangles (window word = identity in every key).
+  (verified: same run, 0 keys with a window; 2D primitives were not counted)
+- Texture pages are rewritten **between rounds / at the match end only**, never during a round:
+  43 re-decodes in the match, all "page changed", at frames ~7006-7128 (round 2 -> 3 transition),
+  7480-7540 and 8332 / 8516 (pages 640-960 x 0/256, many CLUTs on page 960,0). No re-decode was
+  caused by a CLUT rewrite; 17 uploads rewrote texels with identical values. 0 re-decodes in each
+  VS stage scenario up to its key frame. (verified: cache log, verify mode with 0 stale entries)
+- Vertex u/v rectangles of 3D triangles are mostly not aligned to anything: largest power of two
+  dividing all u/v edges = 1 for 66 %, 2 for 21 %, >= 4 for 13 % (triangles). Texture atlases are
+  packed at single-texel granularity, so a mip level of a page mixes neighbouring sub-textures at
+  sub-texture borders. (verified: counter)
+- At 4x6 stage and character textures are **magnified**: over the match 36.2 G textured pixels
+  sample < 1 texel per pixel, 71.6 M 1-2, 12.4 M 2-4, 1.26 M 4-8, 50 K 8-16, 719 >= 16 (area
+  estimate per triangle). Every stage > 99 % magnified; canyon (vs_canyon) has the most minified
+  pixels (8.9 M at 1-2, 1.3 M at 2-4), then shrine. (verified: counter) So at 4x6 the distant
+  texture shimmer is small; it grows at the governor's lower scales (2x3, 1x1). (likely)
+
 ### Host profile after the performance work (macOS `sample`, M1 Pro, machine under load)
 
 Main-thread self time by area, Hills fight (verified by sampling; percentages shift with load):

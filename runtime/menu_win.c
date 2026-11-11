@@ -190,6 +190,8 @@ void menu_init(void) {
     add(tf, "Off (Sharp Pixels)", "tex-filter=nearest");
     add(tf, "Bilinear", "tex-filter=bilinear");
     add(tf, "Smooth 2D Edges + Bilinear 3D", "tex-filter=xbr");
+    AppendMenuW(tf, MF_SEPARATOR, 0, NULL);   /* texture cache of the Fast precision (check mark) */
+    add(tf, "Smooth Distant Textures (Fast Renderer)", "tex-cache");
     add_sub(view, "Texture Filtering", tf);
     add(view, "Smooth Colours", "smooth-colours");
     HMENU aa = CreatePopupMenu();

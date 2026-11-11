@@ -114,6 +114,45 @@
  *   operations and the fragment shader has no 64-bit or exact rational math. Group keys
  *   NKEYS..2*NKEYS-1 are the fast pipelines; they share the group / tile-mask ordering, so
  *   exact and fast primitives (e.g. a fill between them) keep command order.
+ *
+ * Texture cache (fast precision only; --tex-cache off|on|verify[=N], hires_gpu_set_tex_cache;
+ * AGENTS.md "Texture cache"). Textured 3D triangles (not hires_tri_is_2d: those, and every rect,
+ * keep the VRAM decode above so the xbr 2D path is unchanged) sample a decoded copy of their
+ * texture instead of the raw VRAM, with real GPU filtering: trilinear mipmaps + anisotropy.
+ * - Key (= one material's texture for the high-level renderer, docs/HIGH_LEVEL_RENDERER.md):
+ *   page origin, depth (4 / 8 / 15-bit), CLUT origin (4/8-bit only) and the texture window word.
+ *   One entry = the whole 256x256 page as the PS1 samples it under that window and CLUT: u/v
+ *   0..255 map to the layer's texels, so the vertex u/v need no change.
+ * - Storage: layer FPrim.tp (replaces the page origin in the record when F_TC is set) of two 2D
+ *   arrays, s_tc_layers (128) x 256 x 256, s_tc_levels (4) mip levels: RGBA8 premultiplied
+ *   (texel 0 = (0,0,0,0), else the 5-bit channels as c << 3 and alpha 255) and R8 = coverage of
+ *   texels with bit 15 (STP). 128 layers = 44 MB + 11 MB; created on first use.
+ * - Mips: 2x2 averages of the premultiplied values on the CPU (tc_decode), so transparent texels
+ *   add no colour (no dark fringe) and alpha is the opaque coverage. The shader divides by alpha,
+ *   discards below half coverage (the rule of the exact filters) and takes the STP bit as the
+ *   majority of the opaque coverage (st * 2 >= a); then the usual integer modulation / blend
+ *   inputs. Not SDL_GenerateMipmapsForGPUTexture: it rebuilds every layer of the array (all 128
+ *   on each decode) and its filter is the API's (not alpha-aware, different per API).
+ * - Page edges / bleed: a polygon's UV rectangle rarely aligns with mip blocks (DESTREGA_TC_DIAG,
+ *   Hills match: 66 % of the cached triangles have an odd edge, 87 % one not on a multiple of 4), so a block may mix the polygon's texels with
+ *   the neighbouring tile's. Level count is the bound: 4 levels = blocks of at most 8x8 texels,
+ *   and the sample is clamped to the record's UV range (texel centres) as in the exact filters.
+ *   At 4x6 more than 99 % of the 3D-textured pixels are magnified and levels >= 3 (8x8 blocks,
+ *   above 8 texels per render pixel) cover < 0.001 % of them (every VS stage), so 4 vs 9 levels
+ *   compare equal to the 4th digit against software. Per-tile sub-rectangles would need a layer
+ *   (or an atlas slot) per UV rectangle instead of per page.
+ * - Validity: every VRAM write stamps the 16x16 blocks it touches (mark_vram, be_put:
+ *   s_bst / s_tst per 64x256 page tile); an entry compares the stamps of its page tiles and CLUT
+ *   blocks with the clock it was last checked at, and only then hashes the page / CLUT area: a
+ *   changed hash re-decodes the layer (uploads go after the draws recorded so far, which saw the
+ *   old texels), an equal one only advances the clock. So uploads, fills, VRAM copies and CLUT
+ *   rewrites are exact; a new texture window is a new key. Cleared on reconfigure.
+ * - Eviction: least recently used by frame (be_view); an entry used in the current frame is never
+ *   evicted (its layer is referenced by recorded draws); if none is free the primitive takes the
+ *   uncached path (tc_full).
+ * - Verify (--tex-cache verify=N): every N frames every entry whose stamps say "unchanged" is
+ *   re-hashed (a mismatch = a write the tracking missed: STALE), and one layer per round is read
+ *   back from the GPU and compared with a fresh decode.
  */
 #include "hires_gpu.h"
 #include "shaders/hires_spirv.h"
@@ -149,6 +188,10 @@ enum { K_TRI = 0, K_RECT, K_FILL, K_COPY, K_PUT, K_LINEPX, K_SEED };
 #define F_PERSP (1u << 21)      /* PGXP: perspective-correct u/v from the pf planes */
 #define F_BILIN (1u << 22)      /* texture filter: bilinear (hires.c samp_bilinear) */
 #define F_XBR (1u << 23)        /* texture filter: 2D edge-aware (hires.c samp_xbr) */
+/* fast precision, texture cache ("Texture cache" below): */
+#define F_TC (1u << 24)         /* texels from cache layer FPrim.tp, sampled with mipmaps + anisotropy */
+#define F_TCNEAR (1u << 25)     /* magnified: the nearest texel (texture filter off) */
+#define F_TCSTP (1u << 26)      /* the entry has texels with bit 15: sample the STP array too */
 
 /* pipeline keys: 0 opaque, 1..4 semi-transparency mode 0..3; +5 = with mask check */
 #define NKEYS 10
@@ -572,7 +615,9 @@ static const char s_msl[] =
 "  }\n"
 "  return tcomb(t, w, n, o); }\n"
 "fragment float4 fs_fast(FVO in [[stage_in]], constant FU &u [[buffer(0)]], device const FPrim *prims [[buffer(1)]],\n"
-"    texture2d<ushort> vram [[texture(0)]]) {\n"
+"    texture2d<ushort> vram [[texture(0)]], texture2d_array<float> tcc [[texture(1)]], texture2d_array<float> tcs [[texture(2)]],\n"
+"    sampler tsm [[sampler(1)]]) {\n"
+"  float2 gx = dfdx(in.uv), gy = dfdy(in.uv);\n"   /* texture cache LOD: before any discard */
 "  device const FPrim &p = prims[in.prim];\n"
 "  int X = int(in.pos.x) + u.ox, Y = int(in.pos.y) + u.oy;\n"
 "  int cx1 = int(p.clip0 << 16) >> 16, cy1 = int(p.clip0 >> 16), cx2 = int(p.clip1 << 16) >> 16, cy2 = int(p.clip1 >> 16);\n"
@@ -586,7 +631,20 @@ static const char s_msl[] =
 "  if (tex) {\n"
 "    uint depth = (kf >> 9) & 3u; int4 t8;\n"
 "    int ulo = int(p.ur << 16) >> 16, uhi = int(p.ur) >> 16, vlo = int(p.vr << 16) >> 16, vhi = int(p.vr) >> 16;\n"
-"    if ((kf & (3u << 22)) != 0u) {\n"   /* filter sample point: without the rounding bias */
+"    if ((kf & (1u << 24)) != 0u) {\n"   /* texture cache: layer p.tp, premultiplied, mipmapped (header comment) */
+"      float2 cuv = clamp(in.uv, float2(float(ulo) + 0.5, float(vlo) + 0.5), float2(float(uhi) + 0.5, float(vhi) + 0.5));\n"
+"      float4 tc; float st = 0.0; bool stp = (kf & (1u << 26)) != 0u;\n"
+"      if ((kf & (1u << 25)) != 0u && max(length(gx), length(gy)) <= 1.0) {\n"   /* filter off, magnified: nearest texel */
+"        uint2 ip = uint2(clamp(floor(cuv), 0.0, 255.0));\n"
+"        tc = tcc.read(ip, p.tp, 0); if (stp) st = tcs.read(ip, p.tp, 0).r;\n"
+"      } else {\n"
+"        gradient2d g = gradient2d(gx * (1.0 / 256.0), gy * (1.0 / 256.0));\n"
+"        tc = tcc.sample(tsm, cuv * (1.0 / 256.0), p.tp, g); if (stp) st = tcs.sample(tsm, cuv * (1.0 / 256.0), p.tp, g).r;\n"
+"      }\n"
+"      if (tc.a < 0.5) discard_fragment();\n"   /* transparent when opaque texels cover less than half */
+"      int3 c8 = min(int3(tc.rgb / tc.a * 8160.0 + 0.5), int3(7936));\n"   /* 5.8 fixed point: c5 << 3 / 255 * 8160 = c5 << 8 */
+"      t8 = int4(c8, st * 2.0 >= tc.a ? 1 : 0);\n"   /* STP: majority of the opaque coverage */
+"    } else if ((kf & (3u << 22)) != 0u) {\n"   /* filter sample point: without the rounding bias */
 "      float2 s = in.uv - 0.5, f0 = floor(s);\n"
 "      int iu = int(f0.x), iv = int(f0.y), fu = min(int((s.x - f0.x) * 256.0), 255), fv = min(int((s.y - f0.y) * 256.0), 255);\n"
 "      clamp_axis(iu, fu, ulo, uhi); clamp_axis(iv, fv, vlo, vhi);\n"
@@ -630,7 +688,9 @@ static void *vec_push(Vec *v, size_t k)
     return r;
 }
 
-enum { ST_DRAW, ST_VRAM_UP, ST_PUT_UP, ST_TCOPY };
+enum { ST_DRAW, ST_VRAM_UP, ST_PUT_UP, ST_TCOPY, ST_TC_UP };
+/* ST_TC_UP: one mip level of a texture-cache layer (key = layer, x = level, y = 1 for the STP
+ * array, w = h = level size) */
 typedef struct { int type, key; u32 first, count; int x, y, w, h; size_t off; } Step;
 
 /* ---- state -------------------------------------------------------------------------- */
@@ -706,6 +766,27 @@ static u64 block_cols(int x, int w)
     return m;
 }
 
+/* Texture-cache write stamps ("Texture cache" below): a clock bumped on every VRAM write, and per
+ * 16x16 block / per 64x256 page tile the clock of its last write. An entry checked at clock t is
+ * known current while none of its blocks has a newer stamp. */
+static u64 s_wclock = 1;
+static u64 s_bst[32][64];   /* [block row][block column] */
+static u64 s_tst[2][16];    /* [y / 256][x / 64]: the newest stamp of the tile's blocks */
+
+static void tc_stamp(u64 cm, int by0, int by1)
+{
+    const u64 c = ++s_wclock;
+    for (int by = by0; by <= by1; by++) {
+        u64 m = cm;
+        while (m) {
+            const int b = __builtin_ctzll(m);
+            m &= m - 1;
+            s_bst[by & 31][b] = c;
+            s_tst[(by & 31) >> 4][b >> 2] = c;
+        }
+    }
+}
+
 static void mark_vram(int x, int y, int w, int h)
 {
     if (w <= 0 || h <= 0 || g_hires_shadow) return;   /* guard-band packets never touch VRAM */
@@ -713,6 +794,7 @@ static void mark_vram(int x, int y, int w, int h)
     int by0 = (y & 511) >> 4, by1 = ((y & 511) + imin(h, VRAM_H) - 1) >> 4;
     if (by1 - by0 >= 31) { by0 = 0; by1 = 31; }
     for (int by = by0; by <= by1; by++) s_dirty[by & 31] |= cm;
+    tc_stamp(cm, by0, by1);
 }
 
 static size_t arena_alloc(size_t n)
@@ -788,6 +870,409 @@ static void tex_need(const HiresPrim *p, int u0, int u1, int v0, int v1)
     int x0 = (int)p->tp_x + (u0 >> sh), x1 = (int)p->tp_x + (u1 >> sh);
     ensure_vram(x0, (int)p->tp_y + v0, x1 - x0 + 1, v1 - v0 + 1);
     if (p->depth < 2) ensure_vram((int)p->clut_x, (int)p->clut_y, p->depth == 0 ? 16 : 256, 1);
+}
+
+/* ---- texture cache (fast precision; header comment "Texture cache") ----------------------------- */
+
+#define TC_DIM 256
+#define TC_MAX_LEVELS 9
+#define TC_MAX_LAYERS 256
+static int s_tc_mode = HGPU_TC_ON;          /* HGPU_TC_OFF / ON / VERIFY */
+static int s_tc_verify_every = 60;          /* verify: frames between checks */
+static int s_tc_layers = 128;               /* entries = array layers (DESTREGA_TC_LAYERS) */
+static int s_tc_levels = 4;                 /* mip levels: blocks up to 8x8 texels (DESTREGA_TC_LEVELS) */
+static int s_tc_aniso = 16;                 /* sampler max anisotropy, 1 = off (DESTREGA_TC_ANISO) */
+static bool s_tc_diag;                      /* DESTREGA_TC_DIAG=1: re-decode log, UV alignment / LOD histograms */
+static SDL_GPUTexture *s_tccol, *s_tcstp;   /* RGBA8 and R8 2D arrays, s_tc_layers x 256 x 256, s_tc_levels */
+static SDL_GPUTexture *s_tcdummy;           /* 1x1x1 array bound while the cache has no arrays */
+static SDL_GPUSampler *s_tcsamp;
+static bool s_tc_failed;                    /* the arrays could not be created: cache off */
+
+typedef struct {
+    u32 tp, clut, tw;     /* key: page origin x | y << 16, CLUT origin (0 for 15-bit), texture window (FPrim.tw) */
+    int depth;            /* key: 0 = 4-bit, 1 = 8-bit, 2 = 15-bit */
+    bool live, stp;       /* stp: some texel has bit 15 */
+    int next;             /* hash chain */
+    u64 checked;          /* s_wclock when the content was last known to equal VRAM */
+    u64 page_h, clut_h;   /* hashes of the VRAM it was decoded from */
+    u64 last_frame;       /* LRU (s_tc_frame) */
+} TcEntry;
+static TcEntry s_tc[TC_MAX_LAYERS];
+static int s_tc_bucket[512];
+static u64 s_tc_frame = 1;                  /* be_view count */
+static u64 s_tc_alignh[9], s_tc_lodh[6], s_tc_lodpx[6];   /* DESTREGA_TC_DIAG */
+static u64 s_tc_newdepth[3], s_tc_newwin;                  /* DESTREGA_TC_DIAG: new keys by depth, with a window */
+static int s_tc_verify_next;                /* verify: next layer read back */
+
+static inline int tc_page_cols(int depth) { return depth == 0 ? 64 : depth == 1 ? 128 : 256; }
+
+static u64 tc_hash_rows(int x, int y, int w, int h)
+{
+    u64 hv = 0x9E3779B97F4A7C15ull ^ ((u64)x << 32) ^ ((u64)y << 16) ^ (u64)w;
+    for (int j = 0; j < h; j++) {
+        const u16 *r = s_vram + (size_t)((y + j) & 511) * VRAM_W;
+        for (int i = 0; i < w; i += 4) {   /* w is a multiple of 4 (16, 64, 128, 256) */
+            u64 v;
+            const int xx = (x + i) & 1023;
+            if (xx + 4 <= VRAM_W) memcpy(&v, r + xx, 8);
+            else v = (u64)r[xx] | (u64)r[(xx + 1) & 1023] << 16 | (u64)r[(xx + 2) & 1023] << 32 | (u64)r[(xx + 3) & 1023] << 48;
+            hv = (hv ^ v) * 0x100000001B3ull;
+            hv ^= hv >> 29;
+        }
+    }
+    return hv;
+}
+static u64 tc_page_hash(const TcEntry *e) { return tc_hash_rows((int)(e->tp & 0xFFFF), (int)(e->tp >> 16), tc_page_cols(e->depth), TC_DIM); }
+static u64 tc_clut_hash(const TcEntry *e)
+{
+    return e->depth < 2 ? tc_hash_rows((int)(e->clut & 0xFFFF), (int)(e->clut >> 16), e->depth == 0 ? 16 : 256, 1) : 0;
+}
+
+/* newest write stamp of the entry's page tiles / CLUT blocks */
+static u64 tc_page_stamp(const TcEntry *e)
+{
+    const int tx = (int)(e->tp & 0xFFFF) >> 6, ty = ((int)(e->tp >> 16) & 511) >> 8, n = tc_page_cols(e->depth) >> 6;
+    u64 s = 0;
+    for (int i = 0; i < n; i++) if (s_tst[ty][(tx + i) & 15] > s) s = s_tst[ty][(tx + i) & 15];
+    return s;
+}
+static u64 tc_clut_stamp(const TcEntry *e)
+{
+    if (e->depth >= 2) return 0;
+    const int bx = (int)(e->clut & 0xFFFF) >> 4, by = ((int)(e->clut >> 16) & 511) >> 4, n = e->depth == 0 ? 1 : 16;
+    u64 s = 0;
+    for (int i = 0; i < n; i++) if (s_bst[by][(bx + i) & 63] > s) s = s_bst[by][(bx + i) & 63];
+    return s;
+}
+
+/* The 15-bit texel the PS1 samples at (u, v) for this key (texture window, CLUT): what hires.c /
+ * the fast shader's f_fetch read from VRAM. */
+static inline u16 tc_texel(const TcEntry *e, u32 u, u32 v)
+{
+    u = (u & (e->tw & 0xFF)) | ((e->tw >> 8) & 0xFF);
+    v = (v & ((e->tw >> 16) & 0xFF)) | (e->tw >> 24);
+    const u32 tpx = e->tp & 0xFFFF, row = ((e->tp >> 16) + v) & 511, cx = e->clut & 0xFFFF, cy = e->clut >> 16;
+    const u16 *r = s_vram + (size_t)row * VRAM_W;
+    if (e->depth == 0) return s_vram[(size_t)cy * VRAM_W + ((cx + ((r[(tpx + (u >> 2)) & 1023] >> ((u & 3) * 4)) & 0xF)) & 1023)];
+    if (e->depth == 1) return s_vram[(size_t)cy * VRAM_W + ((cx + ((r[(tpx + (u >> 1)) & 1023] >> ((u & 1) * 8)) & 0xFF)) & 1023)];
+    return r[(tpx + u) & 1023];
+}
+
+/* Level 0 as stored: premultiplied RGBA8 with the 5-bit channels as c << 3 (so the shader gets
+ * c << 8 back exactly from an unfiltered texel), alpha 0 for texel 0 (transparent) and 255 else;
+ * STP coverage 255 for opaque texels with bit 15. Returns whether any texel has bit 15. */
+static bool tc_decode0(const TcEntry *e, u32 *col, u8 *stp)
+{
+    bool any = false;
+    for (u32 v = 0; v < TC_DIM; v++)
+        for (u32 u = 0; u < TC_DIM; u++) {
+            const u16 t = tc_texel(e, u, v);
+            const size_t i = (size_t)v * TC_DIM + u;
+            if (!t) { col[i] = 0; stp[i] = 0; continue; }
+            col[i] = (u32)(t & 31) << 3 | (u32)((t >> 5) & 31) << 11 | (u32)((t >> 10) & 31) << 19 | 0xFF000000u;
+            stp[i] = (t & 0x8000) ? 255 : 0;
+            any |= (t & 0x8000) != 0;
+        }
+    return any;
+}
+
+/* Decode the entry from the current VRAM and queue the upload of all its levels to its layer
+ * (after the draws recorded so far, which sampled the old content). Mip levels are 2x2 averages of
+ * the premultiplied values: transparent texels add no colour (no dark fringe), alpha is the
+ * coverage and the STP array the coverage of bit-15 texels. Computed here, not with
+ * SDL_GenerateMipmapsForGPUTexture: that regenerates every layer of the array, and doing it on
+ * the CPU gives the same levels on Metal, Vulkan and Direct3D 12. */
+static void tc_decode(TcEntry *e, int layer)
+{
+    const u64 t0 = SDL_GetTicksNS();
+    close_group();
+    size_t ocol[TC_MAX_LEVELS], ostp[TC_MAX_LEVELS];
+    for (int l = 0, d = TC_DIM; l < s_tc_levels; l++, d >>= 1) {
+        ocol[l] = arena_alloc((size_t)d * d * 4);
+        ostp[l] = arena_alloc((size_t)d * d);
+    }
+    u8 *base = s_arena.p;   /* arena_alloc may move it: take the pointer after all allocations */
+    e->stp = tc_decode0(e, (u32 *)(base + ocol[0]), base + ostp[0]);
+    for (int l = 1, d = TC_DIM / 2; l < s_tc_levels; l++, d >>= 1) {
+        const u8 *pc = base + ocol[l - 1], *ps = base + ostp[l - 1];
+        u8 *nc = base + ocol[l], *ns = base + ostp[l];
+        const int pd = d * 2;
+        for (int y = 0; y < d; y++)
+            for (int x = 0; x < d; x++) {
+                const size_t a = ((size_t)(2 * y) * pd + 2 * x), b = a + pd;
+                for (int c = 0; c < 4; c++)
+                    nc[((size_t)y * d + x) * 4 + c] = (u8)((pc[a * 4 + c] + pc[a * 4 + 4 + c] + pc[b * 4 + c] + pc[b * 4 + 4 + c] + 2) >> 2);
+                ns[(size_t)y * d + x] = (u8)((ps[a] + ps[a + 1] + ps[b] + ps[b + 1] + 2) >> 2);
+            }
+    }
+    for (int l = 0, d = TC_DIM; l < s_tc_levels; l++, d >>= 1)
+        for (int k = 0; k < 2; k++) {
+            Step *st = add_step(ST_TC_UP);
+            st->key = layer; st->x = l; st->y = k; st->w = st->h = d; st->off = k ? ostp[l] : ocol[l];
+        }
+    e->page_h = tc_page_hash(e);
+    e->clut_h = tc_clut_hash(e);
+    e->checked = s_wclock;
+    s_st.tc_decode_ns += SDL_GetTicksNS() - t0;
+}
+
+static inline u32 tc_bucket(u32 tp, u32 clut, u32 tw, int depth)
+{
+    u32 h = tp * 0x9E3779B1u ^ clut * 0x85EBCA77u ^ tw * 0xC2B2AE3Du ^ (u32)depth * 0x27D4EB2Fu;
+    return (h ^ (h >> 15)) & 511;
+}
+static void tc_unlink(int i)
+{
+    TcEntry *e = &s_tc[i];
+    int *pp = &s_tc_bucket[tc_bucket(e->tp, e->clut, e->tw, e->depth)];
+    while (*pp >= 0 && *pp != i) pp = &s_tc[*pp].next;
+    if (*pp == i) *pp = e->next;
+    e->live = false;
+}
+static void tc_clear(void)
+{
+    memset(s_tc, 0, sizeof s_tc);
+    for (int i = 0; i < 512; i++) s_tc_bucket[i] = -1;
+}
+
+static bool tc_alloc_arrays(void)
+{
+    if (s_tccol) return true;
+    if (s_tc_failed) return false;
+    SDL_GPUTextureCreateInfo ti = { .type = SDL_GPU_TEXTURETYPE_2D_ARRAY, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                                    .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = TC_DIM, .height = TC_DIM,
+                                    .layer_count_or_depth = (u32)s_tc_layers, .num_levels = (u32)s_tc_levels };
+    s_tccol = SDL_CreateGPUTexture(s_dev, &ti);
+    ti.format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+    s_tcstp = s_tccol ? SDL_CreateGPUTexture(s_dev, &ti) : NULL;
+    if (!s_tcstp) {
+        rt_log("hires-gpu: texture cache: cannot allocate %d layers: %s; texture cache off", s_tc_layers, SDL_GetError());
+        if (s_tccol) SDL_ReleaseGPUTexture(s_dev, s_tccol);
+        s_tccol = NULL;
+        s_tc_failed = true;
+        return false;
+    }
+    tc_clear();
+    return true;
+}
+
+/* Layer holding (page, CLUT, depth, window) of this textured primitive, decoded and current; -1:
+ * not cached (cache off or full: every layer is in use this frame), the caller samples VRAM. */
+static int tc_lookup(const HiresPrim *p)
+{
+    if (!tc_alloc_arrays()) return -1;
+    const int depth = p->depth >= 2 ? 2 : p->depth;
+    const u32 tp = (p->tp_x & 1023) | (p->tp_y & 511) << 16;
+    const u32 clut = depth < 2 ? ((p->clut_x & 1023) | (p->clut_y & 511) << 16) : 0;
+    const u32 tw = (p->tw_and_u & 0xFF) | ((p->tw_or_u & 0xFF) << 8) | ((p->tw_and_v & 0xFF) << 16) | ((p->tw_or_v & 0xFF) << 24);
+    const u32 bk = tc_bucket(tp, clut, tw, depth);
+    s_st.tc_lookups++;
+    for (int i = s_tc_bucket[bk]; i >= 0; i = s_tc[i].next) {
+        TcEntry *e = &s_tc[i];
+        if (e->tp != tp || e->clut != clut || e->tw != tw || e->depth != depth) continue;
+        if (e->checked != s_wclock) {   /* VRAM was written since: did it touch this entry's texels? */
+            const bool pn = tc_page_stamp(e) > e->checked, cn = tc_clut_stamp(e) > e->checked;
+            if (pn || cn) {
+                if ((pn && tc_page_hash(e) != e->page_h) || (cn && tc_clut_hash(e) != e->clut_h)) {
+                    if (s_tc_diag && s_st.tc_redecodes < 200)
+                        rt_log("tex-cache: re-decode page %u,%u depth %d CLUT %u,%u (%s changed) frame %llu",
+                               tp & 0xFFFF, tp >> 16, depth, clut & 0xFFFF, clut >> 16, pn ? "page" : "CLUT",
+                               (unsigned long long)s_tc_frame);
+                    tc_decode(e, i);
+                    s_st.tc_redecodes++;
+                } else s_st.tc_same++;
+            }
+            e->checked = s_wclock;
+        }
+        e->last_frame = s_tc_frame;
+        s_st.tc_hits++;
+        return i;
+    }
+    int pick = -1;   /* a free layer, else the least recently used one not used this frame */
+    for (int i = 0; i < s_tc_layers; i++) {
+        if (!s_tc[i].live) { pick = i; break; }
+        if (s_tc[i].last_frame < s_tc_frame && (pick < 0 || s_tc[i].last_frame < s_tc[pick].last_frame)) pick = i;
+    }
+    if (pick < 0) { s_st.tc_full++; return -1; }
+    TcEntry *e = &s_tc[pick];
+    if (e->live) { tc_unlink(pick); s_st.tc_evictions++; }
+    e->tp = tp; e->clut = clut; e->tw = tw; e->depth = depth;
+    e->live = true;
+    e->next = s_tc_bucket[bk];
+    s_tc_bucket[bk] = pick;
+    e->last_frame = s_tc_frame;
+    tc_decode(e, pick);
+    s_st.tc_decodes++;
+    if (s_tc_diag) {
+        s_tc_newdepth[depth]++;
+        if (tw != 0x00FF00FFu) {
+            s_tc_newwin++;
+            rt_log("tex-cache: texture window and %02x/%02x or %02x/%02x on page %u,%u depth %d (frame %llu)", tw & 0xFF,
+                   (tw >> 16) & 0xFF, (tw >> 8) & 0xFF, tw >> 24, tp & 0xFFFF, tp >> 16, depth, (unsigned long long)s_tc_frame);
+        }
+    }
+    int live = 0;
+    for (int i = 0; i < s_tc_layers; i++) live += s_tc[i].live;
+    if ((u64)live > s_st.tc_max_live) s_st.tc_max_live = (u64)live;
+    return pick;
+}
+
+static SDL_GPUTransferBuffer *s_tcdown;
+static u32 s_tcdown_cap;
+static void wait_fence(SDL_GPUFence **f);
+static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, int px, int py);
+
+/* Sampler and the placeholder array; the cache arrays themselves are created on first use. */
+static bool tc_init(SDL_GPUDevice *dev)
+{
+    const char *e;
+    if ((e = SDL_getenv("DESTREGA_TC_LAYERS")) && *e) s_tc_layers = SDL_clamp(atoi(e), 8, TC_MAX_LAYERS);
+    if ((e = SDL_getenv("DESTREGA_TC_LEVELS")) && *e) s_tc_levels = SDL_clamp(atoi(e), 1, TC_MAX_LEVELS);
+    if ((e = SDL_getenv("DESTREGA_TC_ANISO")) && *e) s_tc_aniso = SDL_clamp(atoi(e), 1, 16);
+    s_tc_diag = (e = SDL_getenv("DESTREGA_TC_DIAG")) && *e && *e != '0';
+    SDL_GPUSamplerCreateInfo sci = { .min_filter = SDL_GPU_FILTER_LINEAR, .mag_filter = SDL_GPU_FILTER_LINEAR,
+                                     .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
+                                     .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+                                     .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+                                     .address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+                                     .min_lod = 0, .max_lod = (float)(s_tc_levels - 1),
+                                     .max_anisotropy = (float)s_tc_aniso, .enable_anisotropy = s_tc_aniso > 1 };
+    s_tcsamp = SDL_CreateGPUSampler(dev, &sci);
+    SDL_GPUTextureCreateInfo ti = { .type = SDL_GPU_TEXTURETYPE_2D_ARRAY, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                                    .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = 1, .height = 1,
+                                    .layer_count_or_depth = 1, .num_levels = 1 };
+    s_tcdummy = SDL_CreateGPUTexture(dev, &ti);
+    tc_clear();
+    return s_tcsamp && s_tcdummy;
+}
+
+/* --tex-cache verify: every entry whose page and CLUT were not written since it was last known
+ * current must still hash to what it was decoded from (else the write tracking missed a write:
+ * STALE); and one layer per round is read back from the GPU and compared with a fresh decode of
+ * the VRAM (upload path, layer bookkeeping). Called after the frame's command buffer was submitted. */
+static void tc_verify(void)
+{
+    for (int i = 0; i < s_tc_layers; i++) {
+        TcEntry *e = &s_tc[i];
+        if (!e->live || tc_page_stamp(e) > e->checked || tc_clut_stamp(e) > e->checked) continue;
+        s_st.tc_verified++;
+        const bool pb = tc_page_hash(e) != e->page_h, cb = tc_clut_hash(e) != e->clut_h;
+        if (pb || cb) {
+            s_st.tc_stale++;
+            rt_log("tex-cache: STALE entry layer %d page %u,%u depth %d CLUT %u,%u: %s changed without a tracked write "
+                   "(frame %llu)", i, e->tp & 0xFFFF, e->tp >> 16, e->depth, e->clut & 0xFFFF, e->clut >> 16,
+                   pb ? "page" : "CLUT", (unsigned long long)s_tc_frame);
+        }
+    }
+    int layer = -1;
+    for (int k = 0; k < s_tc_layers && layer < 0; k++) {
+        const int i = (s_tc_verify_next + k) % s_tc_layers;
+        const TcEntry *e = &s_tc[i];
+        if (e->live && tc_page_stamp(e) <= e->checked && tc_clut_stamp(e) <= e->checked &&
+            tc_page_hash(e) == e->page_h && tc_clut_hash(e) == e->clut_h) layer = i;
+    }
+    if (layer < 0) return;
+    s_tc_verify_next = layer + 1;
+    const u32 nc = TC_DIM * TC_DIM * 4, ns = TC_DIM * TC_DIM;
+    if (!s_tcdown || s_tcdown_cap < nc + ns) {
+        if (s_tcdown) SDL_ReleaseGPUTransferBuffer(s_dev, s_tcdown);
+        SDL_GPUTransferBufferCreateInfo ti = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = nc + ns };
+        s_tcdown = SDL_CreateGPUTransferBuffer(s_dev, &ti);
+        s_tcdown_cap = s_tcdown ? nc + ns : 0;
+        if (!s_tcdown) return;
+    }
+    SDL_GPUCommandBuffer *cb = SDL_AcquireGPUCommandBuffer(s_dev);
+    if (!cb) return;
+    SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cb);
+    for (int k = 0; k < 2; k++) {
+        SDL_GPUTextureRegion src = { .texture = k ? s_tcstp : s_tccol, .layer = (u32)layer, .w = TC_DIM, .h = TC_DIM, .d = 1 };
+        SDL_GPUTextureTransferInfo dst = { .transfer_buffer = s_tcdown, .offset = k ? nc : 0 };
+        SDL_DownloadFromGPUTexture(cp, &src, &dst);
+    }
+    SDL_EndGPUCopyPass(cp);
+    SDL_GPUFence *f = SDL_SubmitGPUCommandBufferAndAcquireFence(cb);
+    if (!f) return;
+    wait_fence(&f);
+    const u8 *m = SDL_MapGPUTransferBuffer(s_dev, s_tcdown, false);
+    if (!m) return;
+    u32 *col = malloc(nc);
+    u8 *stp = malloc(ns);
+    if (col && stp) {
+        tc_decode0(&s_tc[layer], col, stp);
+        s_st.tc_readbacks++;
+        size_t bad = 0;
+        for (size_t i = 0; i < TC_DIM * TC_DIM; i++) {
+            u32 g;
+            memcpy(&g, m + i * 4, 4);
+            bad += g != col[i] || m[nc + i] != stp[i];
+        }
+        if (bad) {
+            s_st.tc_readback_bad++;
+            rt_log("tex-cache: layer %d on the GPU differs from VRAM in %zu texels (frame %llu)", layer, bad,
+                   (unsigned long long)s_tc_frame);
+        }
+    }
+    free(col);
+    free(stp);
+    SDL_UnmapGPUTransferBuffer(s_dev, s_tcdown);
+}
+
+void hires_gpu_set_tex_cache(int mode, int every)
+{
+    s_tc_mode = mode < HGPU_TC_OFF || mode > HGPU_TC_VERIFY ? HGPU_TC_ON : mode;
+    if (every > 0) s_tc_verify_every = every;
+}
+int hires_gpu_get_tex_cache(void) { return s_tc_mode; }
+void hires_gpu_tc_check(void)
+{
+    if (!s_ready || !s_tccol) return;
+    submit(false, 0, 0, 0, 0, false, 0, 0);
+    tc_verify();
+}
+
+/* DESTREGA_TC_DIAG: how the cached triangles' vertex UV rectangles align to power-of-two blocks
+ * (mip bleed) and their texel-per-pixel ratio at the render scale (which mip levels they use). */
+static void tc_diag_tri(const HiresVtx *v, int Sx, int Sy)
+{
+    int u0 = (int)v[0].u, u1 = u0, w0 = (int)v[0].v, w1 = w0;
+    for (int k = 1; k < 3; k++) {
+        u0 = imin(u0, (int)v[k].u); u1 = imax(u1, (int)v[k].u);
+        w0 = imin(w0, (int)v[k].v); w1 = imax(w1, (int)v[k].v);
+    }
+    /* end alignment: the polygon's last u is the tile's last texel (u1 + 1) or its edge (u1) */
+    const int a0 = __builtin_ctz((u32)u0 | 256), a1 = imax(__builtin_ctz((u32)(u1 + 1) | 256), __builtin_ctz((u32)u1 | 256));
+    const int a2 = __builtin_ctz((u32)w0 | 256), a3 = imax(__builtin_ctz((u32)(w1 + 1) | 256), __builtin_ctz((u32)w1 | 256));
+    s_tc_alignh[imin(imin(a0, a1), imin(a2, a3))]++;
+    const double sa = fabs((double)(v[1].x - v[0].x) * (v[2].y - v[0].y) - (double)(v[2].x - v[0].x) * (v[1].y - v[0].y)) /
+                      (65536.0 * 65536.0) * Sx * Sy;
+    const double ta = fabs((double)((int)v[1].u - (int)v[0].u) * ((int)v[2].v - (int)v[0].v) -
+                           (double)((int)v[2].u - (int)v[0].u) * ((int)v[1].v - (int)v[0].v));
+    int b = 0;
+    if (sa > 0 && ta > 0) {
+        const double lod = 0.5 * log2(ta / sa);
+        b = lod < 0 ? 0 : lod < 1 ? 1 : lod < 2 ? 2 : lod < 3 ? 3 : lod < 4 ? 4 : 5;
+    }
+    s_tc_lodh[b]++;
+    s_tc_lodpx[b] += (u64)(sa / 2);
+}
+
+void hires_gpu_tc_diag_log(void)
+{
+    if (!s_tc_diag) return;
+    rt_log("tex-cache-diag: new keys: %llu 4-bit, %llu 8-bit, %llu 15-bit; %llu with a texture window",
+           (unsigned long long)s_tc_newdepth[0], (unsigned long long)s_tc_newdepth[1], (unsigned long long)s_tc_newdepth[2],
+           (unsigned long long)s_tc_newwin);
+    rt_log("tex-cache-diag: vertex UV rectangle alignment (largest 2^k dividing all edges), cached triangles: "
+           "1:%llu 2:%llu 4:%llu 8:%llu 16:%llu 32:%llu 64:%llu 128:%llu 256:%llu",
+           (unsigned long long)s_tc_alignh[0], (unsigned long long)s_tc_alignh[1], (unsigned long long)s_tc_alignh[2],
+           (unsigned long long)s_tc_alignh[3], (unsigned long long)s_tc_alignh[4], (unsigned long long)s_tc_alignh[5],
+           (unsigned long long)s_tc_alignh[6], (unsigned long long)s_tc_alignh[7], (unsigned long long)s_tc_alignh[8]);
+    rt_log("tex-cache-diag: texels per render pixel (area estimate), triangles / pixels: "
+           "<1 (magnified) %llu / %llu, 1-2 %llu / %llu, 2-4 %llu / %llu, 4-8 %llu / %llu, 8-16 %llu / %llu, >=16 %llu / %llu",
+           (unsigned long long)s_tc_lodh[0], (unsigned long long)s_tc_lodpx[0], (unsigned long long)s_tc_lodh[1],
+           (unsigned long long)s_tc_lodpx[1], (unsigned long long)s_tc_lodh[2], (unsigned long long)s_tc_lodpx[2],
+           (unsigned long long)s_tc_lodh[3], (unsigned long long)s_tc_lodpx[3], (unsigned long long)s_tc_lodh[4],
+           (unsigned long long)s_tc_lodpx[4], (unsigned long long)s_tc_lodh[5], (unsigned long long)s_tc_lodpx[5]);
 }
 
 /* ---- groups --------------------------------------------------------------------------- */
@@ -915,11 +1400,12 @@ static inline u32 srange(int lo, int hi) { return ((u32)lo & 0xFFFFu) | ((u32)hi
  * perspective interpolation then gives exactly hires.c's u/v at P (up to float rounding).
  * Colours are not shifted (sub-pixel). */
 static void fast_tri(const HiresPrim *p, const HiresVtx *sv[3], bool persp, u32 kf, int umin, int umax, int vmin, int vmax,
-                     int xlo, int ylo, int xhi, int yhi)
+                     int xlo, int ylo, int xhi, int yhi, int layer)
 {
     const int Sx = s_Sx, Sy = s_Sy;
     u32 idx;
     FPrim *f = new_fprim(&idx, p, kf);
+    if (layer >= 0) f->tp = (u32)layer;   /* F_TC: the cache layer instead of the page origin */
     f->ur = srange(umin, umax);
     f->vr = srange(vmin, vmax);
     double X[3], Y[3], q[3] = { 1, 1, 1 };
@@ -1012,6 +1498,7 @@ static void be_put(int x, int y, u16 v, bool mc, bool ms)
 {
     x &= 1023; y &= 511;
     s_dirty[y >> 4] |= 1ull << (x >> 4);
+    s_bst[y >> 4][x >> 4] = s_tst[y >> 8][x >> 6] = ++s_wclock;
     if (!s_ready) return;
     if (x < s_rx || y < s_ry || x >= s_rx + s_rw || y >= s_ry + s_rh) return;
     u32 *d = &s_put[(size_t)(y - s_ry) * s_rw + (x - s_rx)];
@@ -1117,19 +1604,27 @@ static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
             vmin = imin(vmin, (int)o[k][4]); vmax = imax(vmax, (int)o[k][4]);
         }
     }
-    if (tex) tex_need(p, umin, umax, vmin, vmax);
-
     const bool dith = dither_on(p);
     const int filt = tex ? hires_get_tex_filter() : HIRES_TEX_NEAREST;
     if (s_fast) {
         u32 kf = base_flags(p, K_TRI, tex) | (gour ? F_GOUR : 0) | (dith ? F_DITHER : 0) |
                  ((Sx > 1 || Sy > 1 || precise) ? F_CLAMP : 0);
-        if (filt != HIRES_TEX_NEAREST)
-            kf |= F_CLAMP | ((filt == HIRES_TEX_XBR && hires_tri_is_2d(vin)) ? F_XBR : F_BILIN);
+        const bool is2d = tex && hires_tri_is_2d(vin);
+        int layer = -1;
+        if (tex && s_tc_mode != HGPU_TC_OFF && !is2d && (layer = tc_lookup(p)) >= 0) {
+            /* texture cache: mipmapped + anisotropic sampling of the decoded page; no VRAM texels */
+            kf |= F_TC | F_CLAMP | (filt == HIRES_TEX_NEAREST ? F_TCNEAR : 0) | (s_tc[layer].stp ? F_TCSTP : 0);
+            s_st.tc_prims++;
+            if (s_tc_diag) tc_diag_tri(vin, Sx, Sy);
+        } else {
+            if (tex) tex_need(p, umin, umax, vmin, vmax);
+            if (filt != HIRES_TEX_NEAREST) kf |= F_CLAMP | ((filt == HIRES_TEX_XBR && is2d) ? F_XBR : F_BILIN);
+        }
         const HiresVtx *sv[3] = { a, b, c };
-        fast_tri(p, sv, persp, kf, umin, umax, vmin, vmax, xlo, ylo, xhi, yhi);
+        fast_tri(p, sv, persp, kf, umin, umax, vmin, vmax, xlo, ylo, xhi, yhi, layer);
         return;
     }
+    if (tex) tex_need(p, umin, umax, vmin, vmax);
     (void)frac;
     u32 idx;
     GPrim *g = new_prim(&idx);
@@ -1616,8 +2111,11 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
                     SDL_GPUBufferBinding vbb = { s_fvbuf, 0 };
                     SDL_BindGPUVertexBuffers(rp, 0, &vbb, 1);
                     SDL_BindGPUFragmentStorageBuffers(rp, 0, &s_fpbuf, 1);
-                    SDL_GPUTextureSamplerBinding tsb = { s_vramtex, s_samp };
-                    SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
+                    /* 0: raw VRAM (uncached textures), 1 / 2: texture cache colour / STP arrays */
+                    SDL_GPUTextureSamplerBinding tsb[3] = { { s_vramtex, s_samp },
+                                                            { s_tccol ? s_tccol : s_tcdummy, s_tcsamp },
+                                                            { s_tcstp ? s_tcstp : s_tcdummy, s_tcsamp } };
+                    SDL_BindGPUFragmentSamplers(rp, 0, tsb, 3);
                 }
                 cur_key = st->key;
             }
@@ -1633,6 +2131,12 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
                 SDL_GPUTextureLocation src = { .texture = s_target, .x = 0, .y = (u32)st->y };
                 SDL_GPUTextureLocation dst = { .texture = s_temp, .x = 0, .y = (u32)st->y };
                 SDL_CopyGPUTextureToTexture(cp, &src, &dst, (u32)s_tw, (u32)st->h, 1, false);
+            } else if (st->type == ST_TC_UP) {
+                SDL_GPUTextureTransferInfo src = { .transfer_buffer = s_up, .offset = (u32)(aoff + st->off),
+                                                   .pixels_per_row = (u32)st->w, .rows_per_layer = (u32)st->h };
+                SDL_GPUTextureRegion dst = { .texture = st->y ? s_tcstp : s_tccol, .mip_level = (u32)st->x,
+                                             .layer = (u32)st->key, .w = (u32)st->w, .h = (u32)st->h, .d = 1 };
+                SDL_UploadToGPUTexture(cp, &src, &dst, false);
             } else {
                 SDL_GPUTextureTransferInfo src = { .transfer_buffer = s_up, .offset = (u32)(aoff + st->off),
                                                    .pixels_per_row = (u32)st->w, .rows_per_layer = (u32)st->h };
@@ -1763,6 +2267,7 @@ static bool be_configure(const u16 *vram1x, int sx, int sy, int rx, int ry, int 
     s_vram = hires_seed_vram(vram1x);
     ensure_vram(0, 0, VRAM_W, VRAM_H);
     s_vram = vram1x;   /* the texture source from now on; the seed picture may be freed after this call */
+    tc_clear();        /* every entry is decoded again from this VRAM */
     u32 idx;
     GPrim *g = new_prim(&idx);
     g->kf = K_SEED;
@@ -1811,6 +2316,8 @@ static bool be_view(int x, int y, int w, int h, HiresView *out)
 {
     if (!view_rect(x, y, w, h, out)) return false;
     submit(false, 0, 0, 0, 0, false, 0, 0);   /* one command buffer per presented frame */
+    s_tc_frame++;
+    if (s_tc_mode == HGPU_TC_VERIFY && s_tccol && s_tc_frame % (u64)s_tc_verify_every == 0) tc_verify();
     return true;
 }
 
@@ -2049,6 +2556,14 @@ void hires_gpu_shutdown(void)
             }
     if (s_present_pipe) SDL_ReleaseGPUGraphicsPipeline(s_dev, s_present_pipe);
     if (s_samp) SDL_ReleaseGPUSampler(s_dev, s_samp);
+    if (s_tcsamp) SDL_ReleaseGPUSampler(s_dev, s_tcsamp);
+    if (s_tccol) SDL_ReleaseGPUTexture(s_dev, s_tccol);
+    if (s_tcstp) SDL_ReleaseGPUTexture(s_dev, s_tcstp);
+    if (s_tcdummy) SDL_ReleaseGPUTexture(s_dev, s_tcdummy);
+    if (s_tcdown) SDL_ReleaseGPUTransferBuffer(s_dev, s_tcdown);
+    s_tcsamp = NULL; s_tccol = s_tcstp = s_tcdummy = NULL; s_tcdown = NULL;
+    s_tc_failed = false;
+    tc_clear();
     if (s_vramtex) SDL_ReleaseGPUTexture(s_dev, s_vramtex);
     if (s_present) SDL_ReleaseGPUTexture(s_dev, s_present);
     if (s_vbuf) SDL_ReleaseGPUBuffer(s_dev, s_vbuf);
@@ -2181,7 +2696,7 @@ static bool init_on(SDL_GPUDevice *dev)
     SDL_GPUShader *pvs = make_shader("vs_full", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 0);
     SDL_GPUShader *pfs = make_shader("fs_present", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 1);
     SDL_GPUShader *fvs = make_shader("vs_fast", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 1);
-    SDL_GPUShader *ffs = make_shader("fs_fast", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1, 1);
+    SDL_GPUShader *ffs = make_shader("fs_fast", SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1, 1);
     const bool ok = vs && fs && pvs && pfs && fvs && ffs && create_pipelines(dev, fmt, vs, fs, pvs, pfs, fvs, ffs);
     SDL_GPUShader *sh[6] = { vs, fs, pvs, pfs, fvs, ffs };
     for (int i = 0; i < 6; i++)
@@ -2195,6 +2710,7 @@ static bool init_on(SDL_GPUDevice *dev)
     s_samp = SDL_CreateGPUSampler(dev, &sci);
     s_vramtex = make_tex(SDL_GPU_TEXTUREFORMAT_R16_UINT, VRAM_W, VRAM_H, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     if (!s_samp || !s_vramtex) { rt_log("hires-gpu: %s", SDL_GetError()); return false; }
+    if (!tc_init(dev)) { rt_log("hires-gpu: texture cache: %s", SDL_GetError()); return false; }
     s_inited = true;
     rt_log("hires-gpu: SDL_GPU device ready (%s, driver %s, %s shaders%s; %s; %s precision)", s_apis[s_api].title, drv,
            s_shfmt == SDL_GPU_SHADERFORMAT_MSL ? "MSL" : s_shfmt == SDL_GPU_SHADERFORMAT_DXIL ? "DXIL" : "SPIR-V",
