@@ -550,3 +550,5 @@ bool menu_test(const char *cmd) {
     return false;
 }
 #endif
+
+bool menu_wait_until(unsigned long long deadline_ns) { (void)deadline_ns; return false; }

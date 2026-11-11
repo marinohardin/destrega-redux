@@ -1167,7 +1167,7 @@ void frontend_vblank(void) {
     const u64 extra = netplay_pace_extra_ns();
     if (s_next_tick_ns == 0 || now > s_next_tick_ns + frame_ns * 4) s_next_tick_ns = now + extra;
     else s_next_tick_ns += frame_ns + extra;
-    if (s_next_tick_ns > now) SDL_DelayNS(s_next_tick_ns - now);
+    if (s_next_tick_ns > now && !menu_wait_until(s_next_tick_ns)) SDL_DelayNS(s_next_tick_ns - now);
     t_prev_end = SDL_GetTicksNS();
     t_sleep += t_prev_end - now;
 }
@@ -1341,6 +1341,7 @@ static void settings_apply(const char *dir) {
         else rt_log("settings: display.ssaa: 1 (off) to %d", HIRES_MAX_SSAA);
     }
     s_fs_start = !s_headless && settings_get_bool("display", "fullscreen", false);
+    input_set_virtual_only(s_headless);
     input_init();
     atexit(settings_save_at_exit);
 }
@@ -2006,6 +2007,15 @@ static void menu_run(const char *name, const char *arg) {
 }
 
 static void menu_script_and_poll(void) {
+    /* Start-up full screen waits until the app is up: entered at frame 0 (before the app had
+     * finished launching and its window had focus), macOS's full-screen Space showed no menu bar at
+     * all, while the same switch a second later keeps it reachable at the top of the screen.
+     * At least 10 vblanks and focus, or frame 180 whatever happens. */
+    if (s_fs_start && s_win && s_frame >= 10 &&
+        ((SDL_GetWindowFlags(s_win) & SDL_WINDOW_INPUT_FOCUS) || s_frame >= 180)) {
+        s_fs_start = false;
+        fullscreen_set(true);
+    }
     for (int i = 0; i < s_menu_script_n; i++)
         if (s_menu_script[i].frame == s_frame) frontend_menu_action(s_menu_script[i].name, s_menu_script[i].arg);
     while (s_menu_q_n) {
@@ -2393,7 +2403,7 @@ int main(int argc, char **argv) {
         s_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
         if (s_audio) SDL_ResumeAudioStreamDevice(s_audio);
         menu_init();   /* File menu; windowed only. Headless runs have no menus. */
-        if (s_fs_start) fullscreen_set(true);
+        /* display.fullscreen = on: entered from menu_script_and_poll once the window has focus */
     }
 
     memset(&g_cpu.r, 0, sizeof g_cpu.r);

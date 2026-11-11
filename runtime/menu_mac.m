@@ -10,6 +10,10 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <SDL3/SDL.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 #include "menu.h"
 #include "widescreen.h"
 #include "settings.h"
@@ -191,7 +195,44 @@ static NSMenuItem *add(NSMenu *m, NSString *title, NSString *action, NSString *k
     return it;
 }
 
+static bool s_menus_built;
+
+/* How the pacing wait runs (DESTREGA_MAC_WAIT, for diagnosis): "dispatch" (default) is a normal
+ * Cocoa event loop, the same as SDL's own pump: dequeue each event and [NSApp sendEvent:] it (NSApp
+ * is SDL's SDLApplication, so SDL sees every event exactly as from SDL_PumpEvents) until the
+ * deadline; "peek" waits for an event without dequeuing it and lets SDL_PumpEvents take it (hid the
+ * full-screen menu bar completely); "sleep" is the old SDL_DelayNS. */
+static int wait_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DESTREGA_MAC_WAIT");
+        mode = (e && !strcmp(e, "sleep")) ? 0 : (e && !strcmp(e, "peek")) ? 2 : 1;
+        if (e) fprintf(stderr, "menu: pacing wait mode %s\n", mode == 0 ? "sleep" : mode == 2 ? "peek" : "dispatch");
+    }
+    return mode;
+}
+
+bool menu_wait_until(unsigned long long deadline_ns) {
+    if (!s_menus_built) return false;
+    const int mode = wait_mode();
+    if (mode == 0) return false;
+    @autoreleasepool {
+        for (int spins = 0;; spins++) {
+            const Uint64 now = SDL_GetTicksNS();
+            if (now >= deadline_ns) return true;
+            if (spins > 1000) { SDL_DelayNS(deadline_ns - now); return true; }
+            NSDate *until = [NSDate dateWithTimeIntervalSinceNow:(double)(deadline_ns - now) / 1e9];
+            NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until
+                                                inMode:NSDefaultRunLoopMode dequeue:(mode == 1)];
+            if (!ev) continue;
+            if (mode == 1) [NSApp sendEvent:ev];
+            else SDL_PumpEvents();
+        }
+    }
+}
+
 void menu_init(void) {
+    s_menus_built = true;
     @autoreleasepool {
         s_target = [DestregaMenu new];
         NSMenu *file = [[NSMenu alloc] initWithTitle:@"File"];

@@ -784,7 +784,22 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   keeps the menu bar reachable by moving the mouse to the top (SDL's default hides it entirely
   when full screen is entered through `SDL_SetWindowFullscreen`, i.e. every path here). The hi-res auto scale follows the new pixel size in `present_frame` like any resize
   (widescreen and both renderers included); the log shows `fullscreen: entered/left, window WxH
-  px` and the new `render scale`. Headless runs have no window and only log the request.
+  px` and the new `render scale`. **macOS: the 60 Hz pacing wait runs the Cocoa run loop**
+  (`menu_wait_until`, `nextEventMatchingMask` without dequeueing, then `SDL_PumpEvents` for anything
+  that arrives) instead of `nanosleep`: in a full-screen Space the menu bar is drawn inside this
+  process, and with the main thread asleep ~95% of every frame revealing and using the menus lagged
+  badly (windowed the system draws the menu bar, so it never showed there). The wait is an ordinary
+  Cocoa loop (dequeue + `[NSApp sendEvent:]`, as SDL's own pump; NSApp is SDL's application
+  object); peeking without dequeuing hid the full-screen menu bar entirely. `DESTREGA_MAC_WAIT=
+  sleep|peek` selects the old variants for diagnosis. While a menu is open the game pauses (AppKit's
+  menu tracking runs inside `sendEvent`), as in any Mac app. **Start-up full screen**
+  (`[display] fullscreen = on`) is entered from `menu_script_and_poll` once the window has focus
+  (frame >= 10; frame 180 at the latest): entered at frame 0, before the app had finished launching,
+  the full-screen Space showed no menu bar at all. **No `LSApplicationCategoryType` games in the
+  bundle** (`make_app.sh`): as a game in full screen the app gets macOS Game Mode, which deprioritises
+  other processes, among them the menu bar agent that drives full-screen menus (macOS 26+:
+  `MenuBarClientCore`): menus lagged visibly behind the mouse while the game's main thread sat idle
+  in the menu tracking loop; the same build without the category was smooth. Other platforms sleep. Headless runs have no window and only log the request.
 - Test hook: `--menu-action FRAME:NAME[=ARG]` (repeatable) runs the same handlers on that frame:
   `load=FILE`, `reveal-game`, `reveal-saves`, `save-import=FILE`, `save-export=FILE`, `save-delete`,
   `widescreen[=on|off]`, `renderer[=software|gpu|compare]`, `resolution[=auto|4x6|2x3|1x1]`, `fullscreen[=on|off]`,
@@ -872,6 +887,8 @@ the left stick is mapped to the D-pad, never reported as analog.
   `input_handle_event` path (SDL virtual controllers: `pad-add:N[:ps4|xbox]`, `pad-remove:N`,
   `pad-down:N:south`, `pad-up`, `pad-axis:N:leftx:-0.8` (triggers 0..1), `key-down:Z`, `key-up:Z`);
   `--input-log FILE` writes `frame pad1 pad2` (hex, active high) whenever a mask changes.
+  Headless runs open only SDL virtual controllers (`input_set_virtual_only`): a physical controller
+  plugged into the test machine is logged as ignored and never reaches a pad.
 
 ### Settings file (`settings.ini`)
 
@@ -970,7 +987,10 @@ hashing all emulated state per frame).
   cores - 1) starts a worker pool. A primitive whose hi-res bbox is >= 4000 px
   (`--hires-par-min`) is split into row chunks, rasterized fork-join (the emulation thread
   takes chunks too and waits), so command order within every pixel is preserved and the result
-  is identical to serial (unit-tested, state hashes unchanged). Workers spin ~50 us after the
+  is identical to serial (unit-tested, state hashes unchanged). The job counter word holds tag, chunk count and next
+  index together (`run_chunks`): with the count in a plain field, a worker 64 jobs behind could claim
+  a chunk of the slot's next job and over-count `done`, so `par_rows` spun forever (seen ~1 in 3
+  governor runs under load). Workers spin ~50 us after the
   last job, then sleep. Smaller primitives run inline. Texture reads come from 1x VRAM while
   the emulation thread waits, so nothing races. The 1x GPU and emulated state stay on the
   emulation thread. Windowed present converts rows on the same pool and uploads only when the
