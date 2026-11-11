@@ -51,7 +51,8 @@ non-system dylib (Homebrew SDL3) relinked via `@rpath`, the icon from
 `DESTREGA_APP_SIGN`, `DESTREGA_APP_VERSION`, `DESTREGA_APP_ICON`. The icon is
 original procedural art from `tools/make_icon.py` (deterministic; needs
 Pillow, NumPy and macOS's Herculanum font). Never put game-derived art in the
-repo. Launching the bundle's binary from a non-GUI shell can stall in macOS's
+repo; the one exception (owner decision, 2026-11-11) is the few README screenshots in
+`docs/screenshots/` (captured from this port, downscaled JPEGs). Launching the bundle's binary from a non-GUI shell can stall in macOS's
 first-launch check; test it from Finder/`open`, or use the plain binary.
 
 ### Windows and Linux
