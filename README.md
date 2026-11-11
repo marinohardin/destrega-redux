@@ -1,9 +1,6 @@
-# Destrega Redux: an enhanced native port of Destrega
+# Destrega Redux: an enhanced online native port
 
-The PlayStation fighting game *Destrega* (Koei, 1998), statically recompiled from MIPS R3000
-machine code into C and running natively on macOS, Windows and Linux, with a runtime that
-emulates the PS1 hardware around it (GPU, GTE, SPU + reverb, XA audio, MDEC FMV, CD-ROM, pads,
-memory cards). Gameplay is the original, frame for frame; everything on top of it is new:
+The PlayStation fighting game *Destrega* (Koei, 1998), with frame-for-frame identical gameplay, better graphics, widescreen, and online rollback netplay.
 
 - **Better graphics**: high-resolution rendering (up to 4x6 the original resolution, with
   automatic scaling to what your computer can keep up with), a GPU renderer on Metal, Vulkan and
