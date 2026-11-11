@@ -60,9 +60,23 @@ static inline void pgxp_lw(int rt, u32 a)
 {
     if (g_pgxp) g_pgxp_reg[rt] = g_pgxp_mem[pgxp_slot(a)];
 }
+/* Slot for a tag write. While the RAM write journal is open (psx.h g_mem_wlimit = 0: the widescreen
+ * shadow pass) RAM tag writes leave the fast path too: pgxp_wslot_other() then saves the RAM tag
+ * block on its first write (PGXP_JOURNAL_SHIFT words per block), so the pass's snapshot does not
+ * copy the whole table. It also returns the I/O sink slot for non-memory addresses. */
+#define PGXP_JOURNAL_SHIFT 6
+#define PGXP_JOURNAL_BLOCKS (PGXP_RAM_WORDS >> PGXP_JOURNAL_SHIFT)
+u32 pgxp_wslot_other(u32 p);
+static inline u32 pgxp_wslot(u32 a)
+{
+    u32 p = a & 0x1fffffff;
+    if (p < g_mem_wlimit) return (p & 0x1ffffc) >> 2;
+    if ((p & 0xfffffc00) == 0x1f800000) return PGXP_RAM_WORDS + ((p & 0x3fc) >> 2);
+    return pgxp_wslot_other(p);
+}
 static inline void pgxp_sw(u32 a, int rt)
 {
-    if (g_pgxp) g_pgxp_mem[pgxp_slot(a)] = rt ? g_pgxp_reg[rt] : 0;
+    if (g_pgxp) g_pgxp_mem[pgxp_wslot(a)] = rt ? g_pgxp_reg[rt] : 0;
 }
 static inline void pgxp_mov(int rd, int rs)
 {
@@ -80,7 +94,7 @@ static inline void pgxp_mfc2(int rt, int rd)
 }
 static inline void pgxp_swc2(u32 a, int rd)
 {
-    if (g_pgxp) g_pgxp_mem[pgxp_slot(a)] = pgxp_gte_tag(rd);
+    if (g_pgxp) g_pgxp_mem[pgxp_wslot(a)] = pgxp_gte_tag(rd);
 }
 /* After gte_write_data(reg, ...) (which shifts the tag FIFO on an SXYP write and
  * clears the written entry): attach the source's tag. */

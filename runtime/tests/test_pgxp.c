@@ -21,6 +21,7 @@ u32 bus_read32(u32 a) { (void)a; return 0; }
 void bus_write8(u32 a, u32 v) { (void)a; (void)v; }
 void bus_write16(u32 a, u32 v) { (void)a; (void)v; }
 void bus_write32(u32 a, u32 v) { (void)a; (void)v; }
+u32 g_mem_wlimit = 0x800000;
 void irq_raise(int bit) { (void)bit; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
 

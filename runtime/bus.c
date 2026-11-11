@@ -7,6 +7,7 @@
 u32 sio_read(u32 off, int size);
 void sio_write(u32 off, u32 v, int size);
 #include <string.h>
+#include <stdlib.h>
 
 u8 g_ram[RAM_SIZE];
 u8 g_scratch[1024];
@@ -416,6 +417,50 @@ static void io_write(u32 p, u32 v, int size) {
     if (size == 4) s_io_misc[(off & 0xfff) >> 2] = v;
 }
 
+/* RAM write journal (psx.h g_mem_wlimit; used by the widescreen shadow pass). While it is open,
+ * RAM stores leave the inline fast path and come here; the first write to a block copies the
+ * block's old contents into s_mj_save at the same offset and records the block, and
+ * mem_journal_undo() copies the recorded blocks back. Only stores through mem_w8/16/32 are seen:
+ * the caller must make sure nothing else writes RAM meanwhile (the bus sandbox blocks DMA and
+ * the BIOS). */
+u32 g_mem_wlimit = 0x800000;
+static u8 s_mj_bits[MEM_JOURNAL_BLOCKS / 8];
+static u8 *s_mj_save;
+static u32 s_mj_list[MEM_JOURNAL_BLOCKS], s_mj_n;
+
+static void mem_journal_note(u32 p) {
+    const u32 b = (p & 0x1fffff) >> MEM_JOURNAL_SHIFT;
+    if ((s_mj_bits[b >> 3] >> (b & 7)) & 1) return;
+    s_mj_bits[b >> 3] |= (u8)(1u << (b & 7));
+    s_mj_list[s_mj_n++] = b;
+    const size_t off = (size_t)b << MEM_JOURNAL_SHIFT;
+    memcpy(s_mj_save + off, g_ram + off, (size_t)1 << MEM_JOURNAL_SHIFT);
+}
+
+bool mem_journal_begin(void) {
+    if (!s_mj_save && !(s_mj_save = malloc(RAM_SIZE))) return false;
+    s_mj_n = 0;
+    g_mem_wlimit = 0;
+    return true;
+}
+
+u32 mem_journal_undo(void) {   /* returns the number of blocks restored */
+    g_mem_wlimit = 0x800000;
+    for (u32 i = 0; i < s_mj_n; i++) {
+        const u32 b = s_mj_list[i];
+        const size_t off = (size_t)b << MEM_JOURNAL_SHIFT;
+        memcpy(g_ram + off, s_mj_save + off, (size_t)1 << MEM_JOURNAL_SHIFT);
+        s_mj_bits[b >> 3] = 0;
+    }
+    u32 n = s_mj_n;
+    s_mj_n = 0;
+    return n;
+}
+
+/* a RAM store while the journal is open (never reached otherwise: the inline fast path takes it) */
+#define JOURNALLED_RAM_STORE(p, stmt) \
+    if (__builtin_expect((p) < 0x800000, 0) && g_mem_wlimit == 0) { mem_journal_note(p); stmt; return; }
+
 /* Sandbox (widescreen shadow pass): guest code must not reach hardware; accesses are
  * dropped (reads return 0) and counted so the caller can reject the pass. */
 int g_bus_sandbox;
@@ -445,18 +490,21 @@ u32 bus_read8(u32 a) {
     return 0;
 }
 void bus_write32(u32 a, u32 v) {
-    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     u32 p = a & 0x1fffffff;
+    JOURNALLED_RAM_STORE(p, *(u32 *)(g_ram + (p & 0x1ffffc)) = v)
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     if (p >= 0x1f801000 && p < 0x1f802000) io_write(p, v, 4);
 }
 void bus_write16(u32 a, u32 v) {
-    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     u32 p = a & 0x1fffffff;
+    JOURNALLED_RAM_STORE(p, *(u16 *)(g_ram + (p & 0x1ffffe)) = (u16)v)
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     if (p >= 0x1f801000 && p < 0x1f802000) io_write(p, v & 0xffff, 2);
 }
 void bus_write8(u32 a, u32 v) {
-    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     u32 p = a & 0x1fffffff;
+    JOURNALLED_RAM_STORE(p, g_ram[p & 0x1fffff] = (u8)v)
+    if (__builtin_expect(g_bus_sandbox, 0)) { g_bus_sandbox_hits++; return; }
     if (p >= 0x1f801000 && p < 0x1f802000) io_write(p, v & 0xff, 1);
 }
 
