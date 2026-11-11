@@ -60,7 +60,7 @@ def files(root):
                 continue
             out.append(rel)
     for rel in ("analysis/extra_seeds.txt", "analysis/overrides.txt", "analysis/widescreen_cull.txt",
-                "analysis/rea_list_procedures_main.json"):
+                "analysis/idle_loops.txt", "analysis/rea_list_procedures_main.json"):
         if os.path.isfile(os.path.join(root, rel)):
             out.append(rel)
     return sorted(out)

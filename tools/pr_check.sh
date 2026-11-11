@@ -23,7 +23,7 @@
 #   menus     runtime/menu*, settings*, input*, controls_*, main.c, their test tools:
 #             test_menu.sh, test_input.py, test_governor.py (if present)
 #   core      every other runtime/*.c|h, runtime/overrides/, recomp/, analysis/overrides.txt,
-#             extra_seeds.txt, rea_*.json, overlays/, CMakeLists.txt, scenarios / replays tools:
+#             extra_seeds.txt, idle_loops.txt, rea_*.json, overlays/, CMakeLists.txt, scenarios / replays tools:
 #             4 scenarios (stage fight, story, options, practice), 3 replays, test_savestate.sh
 #   Anything else (docs, other tools, runtime/tests/, runtime/win/) adds nothing.
 # Usage: tools/pr_check.sh [--all-groups] [--group NAME]... [--base REF] [--dry-run]
@@ -69,7 +69,7 @@ classify() { # path -> group (or nothing)
     tools/test_menu.sh|tools/test_input.py|tools/test_governor.py) echo menus ;;
     runtime/tests/*|runtime/win/*) ;;
     runtime/*.c|runtime/*.h|runtime/overrides/*|recomp/*) echo core ;;
-    analysis/overrides.txt|analysis/extra_seeds.txt|analysis/rea_*.json|analysis/overlays/*|CMakeLists.txt) echo core ;;
+    analysis/overrides.txt|analysis/extra_seeds.txt|analysis/idle_loops.txt|analysis/rea_*.json|analysis/overlays/*|CMakeLists.txt) echo core ;;
     tools/scenarios.py|tools/scenario_expect.json|tools/replays.py|tools/replays/*|tools/test_savestate.sh|tools/fight_script.py) echo core ;;
   esac
 }

@@ -57,6 +57,7 @@ else()
     COMMAND ${Python3_EXECUTABLE} recomp/recomp.py --out gen
     DEPENDS ${RECOMP_PY} ${ANALYSIS_JSON} ${CMAKE_SOURCE_DIR}/analysis/extra_seeds.txt
             ${CMAKE_SOURCE_DIR}/analysis/overrides.txt
+            ${CMAKE_SOURCE_DIR}/analysis/idle_loops.txt
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Recompiling MIPS code to C")
 

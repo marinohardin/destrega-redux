@@ -71,6 +71,39 @@ extern u32 g_ws_cull_hits;
 #define WS_IMM(orig, wide) (__builtin_expect(g_widescreen_cull, 0) ? (g_ws_cull_hits++, (wide)) : (orig))
 #define EVT_CHECK() do { if (__builtin_expect(g_cpu.cycles >= g_cpu.next_event, 0)) rt_event(); } while (0)
 
+/* Idle-loop fast-forward (analysis/idle_loops.txt: `<backward branch> <helper>`; codegen emits
+ * `helper(); EVT_CHECK();` on that edge). A helper may only advance the loop over iterations
+ * that provably do the same thing and in which no event fires: same cycles, same memory, same
+ * registers and PGXP tags as running them one by one, so emulated state stays bit-identical.
+ * --no-idle-skip (g_idle_skip = 0) runs every iteration (A/B checks); g_idle_skipped counts. */
+extern int g_idle_skip;
+extern u64 g_idle_skipped;
+
+/* vsync_wait 8009b670, loop 8009b698..8009b6f0 (libetc VSync's wait):
+ *   do { if (--timeout == -1) { timeout path; break; } } while (vsync_counter (800bf2b4) < target);
+ * timeout lives at sp+16; 14 instructions per iteration, CYC(8) + CYC(6) before the EVT_CHECK on the
+ * backward branch. Nothing but an event (the VBlank IRQ) changes vsync_counter, so between events
+ * an iteration only decrements the timeout. Called at the backward branch: this iteration is done
+ * (timeout != -1, counter < target) and its EVT_CHECK has not run. Skips n iterations so that we
+ * stand at iteration i+n's EVT_CHECK, with n chosen so that the EVT_CHECKs of iterations i..i+n-1
+ * would not fire (cycles + 28 j < next_event, j < n) and no skipped decrement reaches -1 (n <= timeout).
+ * R2 (= 1) and R3 (= -1) end every iteration with the same values; the PGXP tags of R2 and of
+ * the timeout word are the same after every complete iteration (lw/sw of one word, then lw of
+ * the counter). */
+static inline void idle_vsync_wait(void) {
+    const u64 per = 14 * CYCLES_PER_INSN;
+    const u64 c = g_cpu.cycles, ne = g_cpu.next_event;
+    if (!g_idle_skip || c >= ne) return;
+    u64 n = (ne - c - 1) / per + 1;   /* iterations i .. i+n-1 do not fire; i+n may */
+    const u32 a = R29 + 16;
+    const u32 timeout = mem_r32(a);
+    if (n > timeout) n = timeout;
+    if (!n) return;
+    g_cpu.cycles = c + n * per;
+    mem_w32(a, timeout - (u32)n);
+    g_idle_skipped += n;
+}
+
 static inline void op_div(u32 a, u32 b) {
     s32 n = (s32)a, d = (s32)b;
     if (d == 0) {

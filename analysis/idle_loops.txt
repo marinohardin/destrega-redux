@@ -1,0 +1,5 @@
+# Idle-loop fast-forward points (recomp/recomp.py idle_loops, helpers in runtime/recomp.h).
+# <backward branch> <helper> <loop start> <fnv1a of the loop words through the branch's delay slot>
+# The helper skips iterations that provably change nothing but the cycle count and a counter,
+# never past an event: emulated state stays bit-identical (--no-idle-skip runs every iteration).
+8009b6f0 idle_vsync_wait 8009b698 9b35c31a   # vsync_wait 8009b670: spin until vsync_counter 800bf2b4 >= target

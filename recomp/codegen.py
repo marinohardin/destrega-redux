@@ -14,6 +14,10 @@ from mips import REG
 # `rs < WS_IMM(orig, wide)`, which is the original comparison unless --widescreen is on.
 WS_PATCHES = {}
 WS_EMITTED = set()
+# Idle-loop fast-forward (analysis/idle_loops.txt, loaded by recomp.py): backward-branch address
+# -> hand-written helper (runtime/recomp.h) run before that edge's EVT_CHECK.
+IDLE_LOOPS = {}
+IDLE_EMITTED = set()
 
 
 def fname(addr, ovl_tag=''):
@@ -195,6 +199,9 @@ class FuncEmitter:
     def goto(self, src, t):
         # backward edges are where long-running loops live: poll events there
         if t <= src:
+            if src in IDLE_LOOPS and not self.ovl_tag:
+                IDLE_EMITTED.add(src)
+                return f'{{ {IDLE_LOOPS[src]}(); EVT_CHECK(); goto L_{t:08x}; }}'
             return f'{{ EVT_CHECK(); goto L_{t:08x}; }}'
         return f'goto L_{t:08x};'
 

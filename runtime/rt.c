@@ -11,6 +11,8 @@ int g_trace;
 u32 g_callstack[1024];
 u32 g_depth;
 
+int g_idle_skip = 1;      /* idle-loop fast-forward (recomp.h idle_*; --no-idle-skip) */
+u64 g_idle_skipped;
 int g_widescreen_cull;   /* --widescreen: widened stage culling bounds (WS_IMM, recomp.h) */
 u32 g_ws_cull_hits;
 
