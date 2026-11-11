@@ -53,6 +53,13 @@ EXCLUDE = {
     # every frame's state hash with a plain run)
     "runtime/smooth.c", "runtime/smooth.h",
 }
+# EXCLUDE runtime/hlr/ (the native high-level renderer, docs/HLR_PLAN.md): presentation only. It is
+# left out by not scanning the directory (files() lists runtime/ and runtime/overrides/ only). The
+# covered side of it is small and stays covered: runtime/hlr_hook.h (the hook table, NULL while the
+# HLR is off) and its call sites in bus.c, gpu.c, savestate.c and overrides/widescreen.c. The hooks
+# only read guest state; tools/test_hlr.py proves per-frame state hashes equal with the HLR on and
+# off, and test_netplay.py lan_hlr plays a session with the HLR on one peer only.
+HLR_DIR_NOT_SCANNED = "runtime/hlr"
 
 
 def files(root):

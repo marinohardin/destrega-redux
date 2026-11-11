@@ -117,6 +117,7 @@ static void update_items(void) {
             set_text(it->id, frontend_fullscreen() ? "Exit Full Screen\tAlt+Enter" : "Enter Full Screen\tAlt+Enter");
         if (!strcmp(name, "widescreen")) checked = frontend_widescreen();
         frontend_view_checked(it->action, &checked);
+        if (!strncmp(name, "hlr", 3) && !frontend_hlr_available()) enabled = false;   /* GPU renderer only */
         if (!strcmp(name, "renderer") && eq) {
             checked = !strcmp(eq + 1, frontend_renderer());
             if (!frontend_renderer_available(eq + 1)) enabled = false;   /* not on this machine */
@@ -202,6 +203,12 @@ void menu_init(void) {
     add(aa, "3x", "ssaa=3");
     add(aa, "4x", "ssaa=4");
     add_sub(view, "Anti-aliasing", aa);
+    HMENU scene = CreatePopupMenu();   /* the native high-level renderer (runtime/hlr/); GPU only */
+    add(scene, "Original", "hlr=off");
+    add(scene, "Native", "hlr=on");
+    AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
+    add(scene, "Stage", "hlr-part=stage");
+    add_sub(view, "3D Scene", scene);
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     add(view, "Enter Full Screen\tAlt+Enter", "fullscreen");
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
