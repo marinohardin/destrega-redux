@@ -85,7 +85,16 @@ typedef struct {
     u16 cmp;            /* bit i: word i predicted (tag is word 0) */
     u16 cmplo;          /* bit i: only the low half of word i predicted */
     u8 seen, sub;
+    u8 hidden;          /* native only: an object the 4:3 visibility test rejected */
+    s32 nat;            /* native polygon (s_nat), -1 = none */
 } PPkt;
+
+/* native polygons of this pass (hlr.h HlrNat; recorded when the HLR draws natively) */
+static bool s_native, s_hidden;
+static HlrNat *s_nat;
+static int s_nn, s_ncap;
+static s32 s_parent = -1;           /* a split parent's native polygon while its quarters are built */
+static u64 st_nat, st_nat_hidden, st_nat_split;
 
 static PPkt *s_p;
 static int s_np, s_cap;
@@ -118,6 +127,7 @@ static PPkt *new_pkt(u32 addr, int kind, int nw)
     PPkt *p = &s_p[s_np++];
     memset(p, 0, sizeof *p);
     p->addr = addr & 0xffffff; p->kind = (u8)kind; p->nw = (u8)nw; p->slot = -1;
+    p->hidden = s_hidden; p->nat = s_parent;
     return p;
 }
 
@@ -162,6 +172,7 @@ static int ot_slot(u32 sz)
 
 static void link(PPkt *p, int slot)
 {
+    if (s_hidden) return;
     p->slot = (s16)slot;
     p->w[0] = (s_ot_pred[slot] & 0xffffff) | (u32)k_len[p->kind] << 24;
     p->cmp |= 1;
@@ -170,8 +181,54 @@ static void link(PPkt *p, int slot)
 
 static u32 smax(u32 a, u32 b) { return (s32)a < (s32)b ? b : a; }
 
-/* ---- triangle builders (F3 8003fcb8, GT3 lit 80040820, GT3 prelit 8004163c) ------ */
+/* ---- native polygons --------------------------------------------------------------- */
 enum { C_NONE, C_LIT, C_PRELIT };
+
+/* SZ of a model vertex as RTPS computes it (world-screen matrix row 3, TRZ; clamped 0..0xffff) */
+static u32 vtx_sz(const s16 *v)
+{
+    /* control registers: c[3] = RT31 | RT32 << 16, c[4] = RT33, c[7] = TRZ */
+    const s64 m31 = (s16)G.c[3], m32 = (s16)(G.c[3] >> 16), m33 = (s16)G.c[4];
+    const s64 z = ((s64)(s32)G.c[7] * 4096 + m31 * v[0] + m32 * v[1] + m33 * v[2]) >> 12;
+    return z < 0 ? 0 : z > 0xffff ? 0xffff : (u32)z;
+}
+
+/* Record a native polygon for packet p (vertex addresses va, colour stream s) */
+static void nat_rec(PPkt *p, int col, const u32 *va, int nv, u32 s)
+{
+    if (!s_native || s_parent >= 0) return;
+    if (s_nn == s_ncap) {
+        s_ncap = s_ncap ? s_ncap * 2 : 4096;
+        s_nat = realloc(s_nat, (size_t)s_ncap * sizeof *s_nat);
+        if (!s_nat) rt_fatal("hlr-stage: out of memory");
+    }
+    HlrNat *n = &s_nat[s_nn];
+    memset(n, 0, sizeof *n);
+    p->nat = s_nn++;
+    n->nv = (u8)nv; n->kind = p->kind; n->pkt = p->addr;
+    n->shade = col == C_LIT ? HLR_SH_LIT : col == C_PRELIT ? HLR_SH_PRELIT : HLR_SH_FLAT;
+    n->flags = s_hidden ? HLR_NAT_HIDDEN : 0;
+    u32 zmax = 0;
+    for (int i = 0; i < nv; i++) {
+        n->v[i][0] = (s16)r16s(va[i]); n->v[i][1] = (s16)r16s(va[i] + 2); n->v[i][2] = (s16)r16s(va[i] + 4);
+        const u32 z = vtx_sz(n->v[i]);
+        if (z > zmax) zmax = z;
+        if (col == C_LIT) {
+            const u32 na = r32(s + 4 * (u32)i) + s_normbase;
+            n->n[i][0] = (s16)r16s(na); n->n[i][1] = (s16)r16s(na + 2); n->n[i][2] = (s16)r16s(na + 4);
+            n->col[i] = nv == 3 ? 0x34808080u : 0x3c808080u;
+        } else if (col == C_PRELIT) n->col[i] = r32(s + 4 * (u32)i);
+        else n->col[i] = r32((0x80000000u | p->addr) + 4);
+    }
+    n->zmax = (u16)zmax;
+    const int sl = ot_slot(zmax);
+    if (sl < 0) n->flags |= HLR_NAT_NEAR;
+    n->slot = (s16)(sl < 0 ? 0 : sl);
+    st_nat++;
+    if (s_hidden) st_nat_hidden++;
+}
+
+/* ---- triangle builders (F3 8003fcb8, GT3 lit 80040820, GT3 prelit 8004163c) ------ */
 
 static void tri_colour(PPkt *p, int col, u32 s, u32 ir0)
 {
@@ -199,9 +256,10 @@ static u32 build_tri(u32 *ctx, int cnt, int strips, int col)
     const int kind = f3 ? K_F3 : K_GT3, nw = f3 ? 5 : 10;
     u32 v = ctx[0], pk = ctx[1], s = ctx[2];
     int n = 0, tot = 0;
-    u32 w[13] = { 0 }, sz[3], ir0 = 0;
+    u32 w[13] = { 0 }, sz[3], ir0 = 0, va[3];
     for (; strips > 0; strips--) {
         LOADV3(v); CMD(OP_RTPT);
+        va[0] = v; va[1] = v + 8; va[2] = v + 16;
         tot += r16s(v + 6); n++;
         w[xy[0]] = DR(12); w[xy[1]] = DR(13); w[xy[2]] = DR(14);
         if (col == C_LIT) ir0 = DR(8);
@@ -210,6 +268,7 @@ static u32 build_tri(u32 *ctx, int cnt, int strips, int col)
         int idx = 0;
         for (;;) {
             PPkt *p = new_pkt(pk, kind, nw);
+            nat_rec(p, col, va, 3, s);
             for (int i = 0; i < 3; i++) { p->w[xy[i]] = w[xy[i]]; p->cmp |= 1 << xy[i]; }
             int slot = -2;
             if (on_screen(w, xy, 3)) slot = ot_slot(smax(sz[0], smax(sz[1], sz[2])));
@@ -223,15 +282,18 @@ static u32 build_tri(u32 *ctx, int cnt, int strips, int col)
             LOADV1(v); CMD(OP_RTPS);
             u32 a = w[xy[2]], b = w[xy[1]];
             w[xy[0]] = a; w[xy[1]] = b; w[xy[2]] = DR(14);
+            va[0] = va[2]; va[2] = v;
             sz[idx] = DR(19); idx ^= 2;
             v += 8;
         }
     }
     while (n < cnt) {
         LOADV3(v); CMD(OP_RTPT);
+        va[0] = v; va[1] = v + 8; va[2] = v + 16;
         v += 24; n++;
         w[xy[0]] = DR(12); w[xy[1]] = DR(13); w[xy[2]] = DR(14);
         PPkt *p = new_pkt(pk, kind, nw);
+        nat_rec(p, col, va, 3, s);
         for (int i = 0; i < 3; i++) { p->w[xy[i]] = w[xy[i]]; p->cmp |= 1 << xy[i]; }
         int slot = -2;
         if (on_screen(w, xy, 3)) slot = ot_slot(smax(DR(17), smax(DR(18), DR(19))));
@@ -280,17 +342,20 @@ static u32 build_quad(u32 *ctx, int cnt, int strips, int col)
     const int kind = f4 ? K_F4 : K_GT4, nw = f4 ? 6 : 13;
     u32 v = ctx[0], pk = ctx[1], s = ctx[2];
     int n = 0, tot = 0;
-    u32 w[13] = { 0 };
+    u32 w[13] = { 0 }, va[4], vprev;
     for (; strips > 0; strips--) {
         LOADV1(v); CMD(OP_RTPS);
         tot += r16s(v + 6);
+        vprev = v;
         v += 8;
         while (n < tot) {
             w[xy[0]] = DR(14);
             LOADV3(v); CMD(OP_RTPT);
+            va[0] = vprev; va[1] = v; va[2] = v + 8; va[3] = v + 16; vprev = v + 16;
             n++; v += 24;
             w[xy[1]] = DR(12); w[xy[2]] = DR(13); w[xy[3]] = DR(14);
             PPkt *p = new_pkt(pk, kind, nw);
+            nat_rec(p, col, va, 4, s);
             for (int i = 0; i < 4; i++) { p->w[xy[i]] = w[xy[i]]; p->cmp |= 1 << xy[i]; }
             int slot = -2;
             if (on_screen(w, xy, 4))
@@ -311,7 +376,9 @@ static u32 build_quad(u32 *ctx, int cnt, int strips, int col)
         CMD(OP_RTPS);
         v += 32;
         w[xy[3]] = DR(14);
+        va[0] = v - 32; va[1] = v - 24; va[2] = v - 16; va[3] = v - 8;
         PPkt *p = new_pkt(pk, kind, nw);
+        nat_rec(p, col, va, 4, s);
         for (int i = 0; i < 4; i++) { p->w[xy[i]] = w[xy[i]]; p->cmp |= 1 << xy[i]; }
         int slot = -2;
         if (on_screen(w, xy, 4))
@@ -327,6 +394,16 @@ static u32 build_quad(u32 *ctx, int cnt, int strips, int col)
 }
 
 /* ---- object visibility (80043fd4) ------------------------------------------------ */
+/* the flag rules alone (what the native renderer keeps: its own frustum replaces the 4:3 tests) */
+static bool flags_ok(u32 flags, u32 mode)
+{
+    if (flags & 0x4000) return false;
+    if ((flags & 8) && !(flags & 0x8000)) return false;
+    if (mode < 2) { if (flags & 0x40) return false; }
+    else if (mode == 2) { if (flags & 0x100) return false; }
+    return true;
+}
+
 static bool visible(u32 flags, u32 ptr, u32 mode)
 {
     bool vis = true;
@@ -351,11 +428,7 @@ static bool visible(u32 flags, u32 ptr, u32 mode)
             if (xmax < -256 || xmin >= 257 || ymax < -120 || ymin >= 121) vis = false;
         }
     }
-    if (flags & 0x4000) vis = false;
-    else if ((flags & 8) && !(flags & 0x8000)) vis = false;
-    if (mode < 2) { if (flags & 0x40) vis = false; }
-    else if (mode == 2) { if (flags & 0x100) vis = false; }
-    return vis;
+    return vis && flags_ok(flags, mode);
 }
 
 /* ---- independent polygons with subdivision (objects with flag 0x2000) ---------------- */
@@ -389,7 +462,7 @@ static void subv_load(int base, SubV v)
 /* 800423e0: one quarter of a subdivided triangle into the next packet of the subdivision buffer */
 static void sub_tri(SubV a, SubV b, SubV c)
 {
-    if (s_tcnt >= SUB_MAX) return;
+    if (s_tcnt >= SUB_MAX || s_hidden) return;
     subv_load(0, a); subv_load(2, b); subv_load(4, c);
     CMD(OP_RTPT);
     static const int xy[3] = { 2, 5, 8 };
@@ -413,7 +486,7 @@ static void sub_tri(SubV a, SubV b, SubV c)
 /* 80042fec: one quarter of a subdivided quad */
 static void sub_quad(SubV a, SubV b, SubV c, SubV d)
 {
-    if (s_qcnt >= SUB_MAX) return;
+    if (s_qcnt >= SUB_MAX || s_hidden) return;
     subv_load(0, a); subv_load(2, b); subv_load(4, c);
     CMD(OP_RTPT);
     u32 w[13] = { 0 };
@@ -446,6 +519,7 @@ static u32 alt_tri(u32 *ctx, int cnt, int col)
     for (int n = 0; n < cnt; n++, v += 24, pk += 40, s += 12) {
         LOADV3(v); CMD(OP_RTPT);
         PPkt *p = new_pkt(pk, K_GT3, 10);
+        { const u32 va[3] = { v, v + 8, v + 16 }; nat_rec(p, col, va, 3, s); }
         p->w[2] = DR(12); p->w[5] = DR(13); p->w[8] = DR(14);
         p->cmp |= 1 << 2 | 1 << 5 | 1 << 8;
         st_alt_tris++;
@@ -458,13 +532,15 @@ static u32 alt_tri(u32 *ctx, int cnt, int col)
         if (slot < 0) continue;
         if (b.ymax - b.ymin >= 451 || b.ymax >= 513 || b.ymin < -512) big = true;
         tri_colour(p, col, s, ir0);
-        if (!big) { link(p, slot); continue; }
+        if (!big || s_hidden) { link(p, slot); continue; }
         st_alt_split++;
         const u32 pa = 0x80000000u | p->addr;
         SubV A = subv(v, pa, 3, 0), B = subv(v + 8, pa, 6, 0), C = subv(v + 16, pa, 9, 0);
         A.col = p->w[1]; B.col = p->w[4]; C.col = p->w[7];
         SubV AB = mid(A, B), BC = mid(B, C), CA = mid(C, A);
+        if (p->nat >= 0) { s_nat[p->nat].flags |= HLR_NAT_SPLIT; s_parent = p->nat; st_nat_split++; }
         sub_tri(A, AB, CA); sub_tri(BC, AB, B); sub_tri(BC, C, CA); sub_tri(AB, BC, CA);
+        s_parent = -1;
         (void)xy;
     }
     ctx[1] = pk; ctx[2] = s;
@@ -479,6 +555,7 @@ static u32 alt_quad(u32 *ctx, int cnt, int col)
         LOADV3(v); CMD(OP_RTPT);
         LOADV1(v + 24);
         PPkt *p = new_pkt(pk, K_GT4, 13);
+        { const u32 va[4] = { v, v + 8, v + 16, v + 24 }; nat_rec(p, col, va, 4, s); }
         p->w[2] = DR(12); p->w[5] = DR(13); p->w[8] = DR(14);
         u32 ir0 = DR(8);
         CMD(OP_RTPS);
@@ -493,13 +570,15 @@ static u32 alt_quad(u32 *ctx, int cnt, int col)
         if (slot < 0) continue;
         if (b.ymax - b.ymin >= 451 || b.ymax >= 513 || b.ymin < -512) big = true;
         quad_colour(p, col, s, ir0);
-        if (!big) { link(p, slot); continue; }
+        if (!big || s_hidden) { link(p, slot); continue; }
         st_alt_split++;
         const u32 pa = 0x80000000u | p->addr;
         SubV A = subv(v, pa, 3, 0), B = subv(v + 8, pa, 6, 0), C = subv(v + 16, pa, 9, 0), D = subv(v + 24, pa, 12, 0);
         A.col = p->w[1]; B.col = p->w[4]; C.col = p->w[7]; D.col = p->w[10];
         SubV AB = mid(A, B), AC = mid(A, C), AD = mid(A, D), BD = mid(B, D), DC = mid(D, C);
+        if (p->nat >= 0) { s_nat[p->nat].flags |= HLR_NAT_SPLIT; s_parent = p->nat; st_nat_split++; }
         sub_quad(A, AB, AC, AD); sub_quad(B, AB, BD, AD); sub_quad(D, DC, BD, AD); sub_quad(C, DC, AC, AD);
+        s_parent = -1;
     }
     ctx[1] = pk; ctx[2] = s;
     return v;
@@ -510,9 +589,10 @@ static bool s_capture;              /* this pass becomes an HlrFrame (hlr_draws(
 
 void hlr_stage_pre(u32 mode)
 {
-    s_np = 0; s_valid = false;
+    s_np = 0; s_valid = false; s_nn = 0; s_hidden = false; s_parent = -1;
     st_t0 = plat_mono_ns();
     s_capture = hlr_draws() && (hlr_get_parts() & HLR_PART_STAGE);
+    s_native = s_capture && hlr_native();
     if (!s_capture && hlr_get_mode() != HLR_AUDIT) return;
     const u32 idx = s32r(SCR_IDX);
     s_ot = r32(OT_POINTERS + idx * 0x14);
@@ -549,8 +629,11 @@ void hlr_stage_pre(u32 mode)
         data += 4;
         u32 vtx = data + ncmd * 4;
         st_objs++;
-        if (o != 0 && !visible(flags, (flags & 5) ? start : vtx, mode)) continue;
-        st_objs_vis++;
+        s_hidden = false;
+        if (o != 0 && !visible(flags, (flags & 5) ? start : vtx, mode)) {
+            if (!s_native || !flags_ok(flags, mode)) continue;
+            s_hidden = true;                    /* outside the 4:3 view: native polygons only */
+        } else st_objs_vis++;
         const bool alt = (flags & 0x2000) != 0;
         if (alt) st_alt_objs++;
         u32 ctx[3] = { vtx, r32(ent + 4) + pktbuf, r32(ent + 8) + s_normbase };
@@ -568,6 +651,7 @@ void hlr_stage_pre(u32 mode)
             }
         }
     }
+    s_hidden = false;
     s_valid = true;
 }
 
@@ -597,7 +681,16 @@ static void capture(void)
             else if (p->cmp >> k & 1) words[k] = p->w[k];
             else words[k] = m;
         }
-        hlr_frame_add(f, p->addr, p->kind, words + 1, p->nw - 1);
+        HlrPkt *hp = hlr_frame_add(f, p->addr, p->kind, words + 1, p->nw - 1);
+        hp->nat = p->nat;
+    }
+    if (s_native) {
+        for (int i = 0; i < s_np; i++) {       /* the PS1's slot for the polygons it linked */
+            const PPkt *p = &s_p[i];
+            if (p->slot >= 0 && p->nat >= 0 && !p->sub) { s_nat[p->nat].flags |= HLR_NAT_LINKED; s_nat[p->nat].slot = p->slot; }
+        }
+        for (int i = 0; i < s_nn; i++) *hlr_frame_add_nat(f) = s_nat[i];
+        hlr_cam_from_gte(&f->cam, &G);
     }
     hlr_frame_commit(f);
 }
@@ -619,6 +712,7 @@ void hlr_stage_post(void)
     for (int i = 0; i < s_hcap; i++) s_hash[i] = -1;
     for (int i = 0; i < s_np; i++) {
         PPkt *p = &s_p[i];
+        if (p->hidden) continue;
         st_pkts++;
         if (p->slot < 0) { st_culled++; continue; }
         st_linked++; st_kind[p->kind]++;
@@ -679,7 +773,9 @@ void hlr_stage_post(void)
             }
         }
     if (s_capture) {
-        if (st_mismatch + st_unexpl + st_missing + st_badwalk + st_head != bad0) st_rejected++;
+        /* native drawing commits regardless: the filter only suppresses packets whose words equal
+         * the capture, everything else still reaches the hi-res target the ordinary way */
+        if (st_mismatch + st_unexpl + st_missing + st_badwalk + st_head != bad0) { st_rejected++; if (s_native) capture(); }
         else capture();
     }
     st_ns += plat_mono_ns() - st_t0;
@@ -715,6 +811,10 @@ void hlr_stage_report(void)
            " (%llu sub packets audited)",
            (unsigned long long)st_alt_objs, (unsigned long long)st_alt_tris, (unsigned long long)st_alt_quads,
            (unsigned long long)st_alt_split, (unsigned long long)st_alt_subs, (unsigned long long)st_alt_full);
+    if (st_nat)
+        rt_log("hlr-native: %llu polygons recorded (%.1f per pass), %llu of objects outside the 4:3 view, %llu split parents",
+               (unsigned long long)st_nat, (double)st_nat / (double)st_frames, (unsigned long long)st_nat_hidden,
+               (unsigned long long)st_nat_split);
     rt_log("hlr-cost: %.3f ms host time per stage pass (prediction, audit and capture; the original pass"
            " runs as before)", (double)st_ns / 1e6 / (double)st_frames);
 }

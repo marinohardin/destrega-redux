@@ -80,4 +80,34 @@ int hires_gpu_get_tex_cache(void);
 void hires_gpu_tc_diag_log(void);   /* DESTREGA_TC_DIAG=1 histograms (exit) */
 void hires_gpu_tc_check(void);      /* the verify-mode check now (tests; submits pending work first) */
 
+/* ---- for an external pass (HiresBackend.external: the native high-level renderer, runtime/hlr/) ----
+ * Everything an external pass needs to draw into the hi-res target itself. Valid while the backend
+ * is configured (between frames it can change: read it again at record time). */
+typedef struct SDL_GPUSampler SDL_GPUSampler;
+typedef struct {
+    SDL_GPUDevice *dev;
+    int api;                        /* HGPU_METAL / VULKAN / D3D12 */
+    unsigned shader_format;         /* SDL_GPUShaderFormat the device takes (MSL, SPIR-V or DXIL) */
+    int target_format;              /* SDL_GPUTextureFormat of the target (B5G5R5A1 or R8G8B8A8) */
+    bool full_colour;               /* target is RGBA8 (HIRES_FMT_RGBA8) */
+    int Sx, Sy;                     /* render scale */
+    int rx, ry, rw, rh;             /* covered 1x VRAM region */
+    int gx;                         /* guard band columns (1x) each side */
+    int ox, oy;                     /* target pixel = vram x * Sx - ox, vram y * Sy - oy */
+    int tw, th, aw, ah;             /* used / allocated target size (pixels) */
+    SDL_GPUTexture *tc_colour, *tc_stp;   /* texture cache arrays (NULL until the first lookup) */
+    SDL_GPUSampler *tc_sampler;     /* trilinear + anisotropic, clamp to edge */
+    SDL_GPUSampler *nearest;        /* nearest, clamp to edge */
+} HiresGpuInfo;
+bool hires_gpu_info(HiresGpuInfo *out);     /* false: no configured target */
+/* Texture-cache layer of (texture page, CLUT, depth 0/1/2, texture window as FPrim.tw = and_u |
+ * or_u << 8 | and_v << 16 | or_v << 24), decoded and current, at record time (a decode queues its
+ * upload before the steps that follow); -1: not cached. *content gets a fingerprint of the decoded
+ * texels (colours, transparency and STP bits; independent of where in VRAM they are), the key a
+ * texture replacement pack would use. */
+int hires_gpu_tc_layer(int depth, unsigned tp_x, unsigned tp_y, unsigned clut_x, unsigned clut_y, unsigned tw,
+                       unsigned long long *content);
+/* Called by hires_gpu_shutdown before the device goes away (release what was made on it). */
+void hires_gpu_on_shutdown(void (*fn)(void));
+
 #endif

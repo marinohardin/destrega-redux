@@ -1267,6 +1267,13 @@ void gpu_shadow_packet(const u32 *w, int n, const PgxpVert *const *pv)
 
 void gpu_set_node_no_hires(bool on) { s_node_no_hires = on; }
 
+void gpu_get_draw_env(GpuDrawEnv *e)
+{
+    e->off_x = s_off_x; e->off_y = s_off_y;
+    e->clip_x1 = s_clip_x1; e->clip_y1 = s_clip_y1; e->clip_x2 = s_clip_x2; e->clip_y2 = s_clip_y2;
+    e->tw = (s_tw_and_u & 0xFF) | (s_tw_or_u & 0xFF) << 8 | (s_tw_and_v & 0xFF) << 16 | (s_tw_or_v & 0xFF) << 24;
+}
+
 void gpu_hires_replay(const u32 *w, int n, const u32 *tags)
 {
     if (!g_hires || n <= 0 || n > CMD_MAX) return;

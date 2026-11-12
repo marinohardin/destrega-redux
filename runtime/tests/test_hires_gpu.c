@@ -37,6 +37,15 @@ void rt_log(const char *fmt, ...)
     va_end(ap);
     printf("\n");
 }
+void rt_fatal(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+    exit(1);
+}
 
 static int g_fail, g_pass;
 #define CHECK(cond, ...)                                              \

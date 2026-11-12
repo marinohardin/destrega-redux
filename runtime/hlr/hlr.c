@@ -14,6 +14,7 @@
  * external render pass (the GPU backend), which is inserted (empty) when the walk enters a
  * captured table: the place phase 2b draws the native 3D stage. */
 #include "hlr.h"
+#include "hlr_gpu.h"
 #include "../hlr_hook.h"
 #include "../hires.h"
 #include "../pgxp.h"
@@ -87,6 +88,16 @@ const char *hlr_parts_name(unsigned parts)
 
 static void on_restore(void) { S.restores++; hlr_frames_drop(); }
 
+bool hlr_native(void)
+{
+    return s_mode == HLR_ON && g_hires && g_hires->external && hlr_gpu_available();
+}
+
+bool hlr_stage_native(void)
+{
+    return (s_parts & HLR_PART_STAGE) && hlr_native();
+}
+
 void hlr_set_mode(int mode)
 {
     if (mode < HLR_OFF || mode > HLR_AUDIT) mode = HLR_OFF;
@@ -98,6 +109,7 @@ void hlr_set_mode(int mode)
     g_hlr.stage_post = hlr_stage_post;
     g_hlr.ll_filter = mode == HLR_AUDIT ? NULL : hlr_ll_filter;
     g_hlr.on_restore = on_restore;
+    g_hlr.stage_native = mode == HLR_ON ? hlr_stage_native : NULL;
 }
 
 int hlr_get_mode(void) { return s_mode; }
@@ -115,7 +127,7 @@ bool hlr_draws(void)
 /* ---- frame store ------------------------------------------------------------------------ */
 static void frame_clear(HlrFrame *f)
 {
-    f->valid = false; f->np = 0; f->nw = 0;
+    f->valid = false; f->np = 0; f->nw = 0; f->nn = 0;
 }
 
 HlrFrame *hlr_frame_begin(u32 ot)
@@ -140,7 +152,7 @@ HlrFrame *hlr_frame_begin(u32 ot)
     return f;
 }
 
-void hlr_frame_add(HlrFrame *f, u32 addr, int kind, const u32 *words, int n)
+HlrPkt *hlr_frame_add(HlrFrame *f, u32 addr, int kind, const u32 *words, int n)
 {
     if (f->np == f->pcap) {
         f->pcap = f->pcap ? f->pcap * 2 : 2048;
@@ -153,9 +165,22 @@ void hlr_frame_add(HlrFrame *f, u32 addr, int kind, const u32 *words, int n)
         if (!f->w) rt_fatal("hlr: out of memory");
     }
     HlrPkt *p = &f->p[f->np++];
-    p->addr = addr & 0x1ffffc; p->n = (u16)n; p->kind = (u16)kind; p->off = (u32)f->nw;
+    p->addr = addr & 0x1ffffc; p->n = (u16)n; p->kind = (u16)kind; p->off = (u32)f->nw; p->nat = -1;
     memcpy(f->w + f->nw, words, (size_t)n * sizeof *words);
     f->nw += n;
+    return p;
+}
+
+HlrNat *hlr_frame_add_nat(HlrFrame *f)
+{
+    if (f->nn == f->ncap) {
+        f->ncap = f->ncap ? f->ncap * 2 : 4096;
+        f->nat = realloc(f->nat, (size_t)f->ncap * sizeof *f->nat);
+        if (!f->nat) rt_fatal("hlr: out of memory");
+    }
+    HlrNat *n = &f->nat[f->nn++];
+    memset(n, 0, sizeof *n);
+    return n;
 }
 
 static inline u32 hslot(u32 addr, int cap) { return (addr * 2654435761u) & (u32)(cap - 1); }
@@ -199,6 +224,7 @@ void hlr_frames_drop(void)
 {
     for (int i = 0; i < 2; i++) if (s_fr[i].valid) { S.dropped++; frame_clear(&s_fr[i]); }
     s_active = NULL;
+    hlr_native_reset();
 }
 
 const HlrFrame *hlr_frame_get(int i) { return i >= 0 && i < 2 ? &s_fr[i] : NULL; }
@@ -212,15 +238,20 @@ static void external_noop(void *ctx, void *cmdbuf, void *colour_tex, int w, int 
 bool hlr_ll_filter(u32 node)
 {
     if (node == 0xffffffffu) {              /* end of the walk: the frame has been drawn */
+        hlr_native_end();
         if (s_active) { S.walked++; frame_clear(s_active); s_active = NULL; }
         return false;
     }
     node &= 0x1ffffc;
+    if (hlr_native_active()) return hlr_native_node(node);
     for (int i = 0; i < 2; i++) {
         HlrFrame *f = &s_fr[i];
         if (f->valid && node >= f->ot && node < f->ot + 4 * HLR_OT_SLOTS) {
             if (s_active != f) {
                 s_active = f;
+                /* on: the native 3D stage (hlr_native.c) schedules its passes into the rest of
+                 * the walk; else (exact, or no native renderer) the 2a replay below */
+                if (f->nn && hlr_native() && hlr_native_begin(f, node)) { S.externals++; return hlr_native_node(node); }
                 if (g_hires && g_hires->external) { g_hires->external(external_noop, NULL); S.externals++; }
             }
             return false;                   /* an ordering-table slot: nothing to draw */
@@ -263,4 +294,20 @@ void hlr_report(void)
            (unsigned long long)left, (unsigned long long)S.packets, (unsigned long long)S.suppressed,
            (unsigned long long)(S.stale_pkts + S.stale_len), (unsigned long long)S.stale_len,
            (unsigned long long)S.externals);
+    HlrNativeStats N;
+    hlr_native_get_stats(&N);
+    if (N.frames) {
+        HlrGpuStats G;
+        hlr_gpu_get_stats(&G);
+        rt_log("hlr-native-draw: %llu frames, %.2f passes per frame, %.0f polygons per frame drawn in 3D"
+               " (near %s, look %s, MSAA %dx); %llu culled by the camera, %llu dropped as too near, %llu stale,"
+               " %llu without texture; %llu packets suppressed; %llu walks given up; GPU %llu passes"
+               " (%llu MSAA), %llu draws, %llu triangles, %llu failed",
+               (unsigned long long)N.frames, (double)N.passes / (double)N.frames, (double)N.items / (double)N.frames,
+               hlr_get_near() == HLR_NEAR_PS1 ? "ps1" : "clip", hlr_get_look() == HLR_LOOK_PS1 ? "ps1" : "enhanced",
+               hlr_gpu_get_msaa(), (unsigned long long)N.culled, (unsigned long long)N.near_dropped,
+               (unsigned long long)N.stale, (unsigned long long)N.no_texture, (unsigned long long)N.suppressed,
+               (unsigned long long)N.desync, (unsigned long long)G.passes, (unsigned long long)G.msaa_passes,
+               (unsigned long long)G.draws, (unsigned long long)G.tris, (unsigned long long)G.failed);
+    }
 }

@@ -154,6 +154,10 @@ void gpu_write_gp0_tag(u32 v, u32 tag);
  * follow run on the 1x GPU exactly as always but polygons are not forwarded to the hi-res target
  * (and not looked up / welded for PGXP): the HLR drew them. */
 void gpu_set_node_no_hires(bool on);
+/* Read-only: the GPU's current drawing offset, draw area (inclusive, 1x pixels) and texture window
+ * (and_u | or_u << 8 | and_v << 16 | or_v << 24, as the texture cache keys it). */
+typedef struct { int off_x, off_y, clip_x1, clip_y1, clip_x2, clip_y2; u32 tw; } GpuDrawEnv;
+void gpu_get_draw_env(GpuDrawEnv *e);
 /* Draw the polygon packet w[0..n) (GP0 words, no tag) into the hi-res target only, with the PGXP
  * tags of its words, exactly as gpu_write_gp0_tag would forward it: the same 1x-sampled UV and
  * colour ranges (tracked without drawing), the same precise vertices. No 1x VRAM write, no

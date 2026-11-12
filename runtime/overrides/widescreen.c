@@ -263,6 +263,9 @@ static void real_pass(void)
 static void stage_render(void)
 {
     if (!g_widescreen || !g_hires || !g_hires_guard) { real_pass(); return; }
+    /* the native high-level renderer draws this stage in 3D with a camera that covers the guard
+     * band: no shadow pass (g_ws_cull_hits still tells the frontend a stage is being drawn) */
+    if (g_hlr.stage_native && g_hlr.stage_native()) { g_ws_cull_hits++; real_pass(); return; }
     if (!s_ll_hooked) { g_gpu_ll_hook = ll_hook; s_ll_hooked = true; }
     const u32 base = ot_base();
     u64 t0 = cpu_ns();
