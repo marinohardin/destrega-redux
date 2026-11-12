@@ -531,6 +531,62 @@ What the native stage (`--hlr on`, AGENTS.md "Native high-level renderer") learn
   Metal; its key frames differ from Metal's in 0.107 % of the pixels by 1 15-bit step at most
   (verified (runtime): `--hlr on`, both state hashes equal to `off`).
 
+### HLR phase 3: characters in native 3D
+
+What drawing the fighters natively (`--hlr on`, parts `chars`; `runtime/hlr/hlr_char.c`) learned:
+- **char_mesh_render 80036b0c is fully reproducible from RAM** (verified (audit, every call of 12
+  practice replays, vs_hills, story; synthetic model in CTest `hlr`)): a host GTE rebuilds the vertex
+  buffer 800c9d38 word for word (per part: S = WS * workm by MVMVA 0x4a49e012, TR' by MVMVA
+  0x4a480012, then RTPT / RTPS), the colour buffer 800cb7c8 (NCCT / NCCS with LLM = part +0x24,
+  LCM = part +0x44, RGBC 800bfe28: so each part has its own light colour matrix, verified by 0
+  mismatched colours), and the exact set of faces linked into each OT slot with their words.
+  Practice Milena: 613 models, 388637 vertices, 392927 colours, 494382 faces (197507 kept), all 0
+  mismatched. The vertex buffer restarts at its first entry on every call.
+- **Chains (`char_mesh_chains` 800367d8)** (likely (audit passes with this model)): model block
+  +0x14; per chain [0] part index, [1] count, then per segment a word (hi16 anchor, lo16 count)
+  and 8-byte world points, projected with WS alone and appended to the vertex buffer after the
+  parts' vertices. Hair / cloth.
+- **Face records**: tris 0x5c bytes, packet vertex order A, C, B; quads 0x78 bytes; OT slot from the
+  3-segment map (1f800008..10) of the average SZ (tris) / minimum SZ (quads) (verified (audit)).
+- **Float bones vs the game's integer SXY**: world position = workm * v / 4096 + t in float, through
+  the float camera: mean 0.89-0.92 px, max 1.7-2.4 px from the game's SXY (the integer chain and the
+  GTE's own truncation; verified (exit line)).
+- **Depth: characters write the stage's depth buffer** (decision, phase 3). Kept per-pass painter's
+  order would have kept the PS1's per-face OT order (the head flips are partly that) and phase 2b's
+  known limit (a fighter between two overlapping stage polygons). With shared depth the fighters'
+  own faces and fighter vs stage are resolved per pixel; shadows, effects and the HUD stay in
+  painter's order (their packets are "others"). Faces the game culled by its integer NCLIP but
+  that face the camera in float are drawn (no holes; char_mesh.c's PGXP extras are not needed then).
+- **Root bob is most of the jitter** (verified (DESTREGA_HLR_BONE_DIAG on the Milena repro)): with a
+  filter on the parts' matrices only, the head jitter barely changed; part 0's world translation
+  moves back and forth by a fraction of a unit each update and every other part rides on it.
+  Filtering part 0 in world space and the others relative to it fixed it.
+- **Bone filter results** (verified (measurement), Milena repro frames 3880-3950, 4x6, fast
+  precision): second difference of the projected vertices 0.193 px per update with the game's
+  bones, 0.045 with Holt smoothing (level 0.3, trend 0.15); step 0.264 -> 0.166 px. Head flips (% of
+  head pixels changing by > 48/255 per update, the metric of "Floor tile seams and face shimmer"):
+
+  | config | mean % | max % |
+  |---|---:|---:|
+  | HLR off | 2.65 | 5.25 |
+  | phase 2b (stage only) | 2.64 | |
+  | phase 3, `--hlr-bones game` | 0.93 | 2.18 |
+  | phase 3, `--hlr-bones smooth` (default) | 0.55 | 0.98 |
+
+  Smooth vs game during the practice move battery (frames 3000-3560): at most 0.33 % of the pixels
+  differ, no visible lag or tearing; 2018 filter snaps over the run (fast moves).
+- **Shadow pieces sit inside the fighter's OT range** (verified (DESTREGA_HLR_PASS_DIAG, Hills)):
+  the fighter's shadow is drawn as small semi-transparent GT3 packets (code 0x36, boxes of ~5x2 px)
+  whose OT slots fall between the slots of the same fighter's feet faces. With the native faces
+  ordered against every overlapping non-native packet, each of those pieces split the fighter into
+  another pass: 19.6 passes per frame and 10.9 ms/frame on Metal (off 4.5). The scheduler now (1)
+  tests exact GP0 boxes (2 px margin) instead of 32 px tiles and (2) lets a semi-transparent
+  non-native packet whose position lies strictly between a model's first and last linked face not
+  constrain that model's faces (they are depth-tested against each other anyway): 2.7 passes, 2.3
+  ms/frame. Consequence: such a shadow piece is ordered against the fighter as a whole (before or
+  after all of its faces) instead of between two foot faces; nothing visible in the contact sheets
+  (likely: only the 12 stage sheets and the character sheets were looked at).
+
 ### Fog, depth cue and lights per stage (verified (phase 1))
 
 `stage_env_setup` (8003fa44) runs once per stage, before the fight loop, with the stage index
@@ -972,12 +1028,10 @@ floors; Milena's forehead and eye polygons jumping between shapes during her idl
   toggles. That matches the flip-accumulation maps, which follow texture edges rather than face
   boundaries. At 1x the integer positions mostly stay put (second difference p50 0), so the PS1
   hides it; PGXP's sub-pixel precision exposes it.
-  Source (guess): integer quantisation in the bone chain, either 12-bit rotation matrices or
-  integer bone translations in view space. One view unit at the head's w ~2870 is a fraction of a
-  pixel. Removing it would mean smoothing what the game computes (filtering bone matrices or
-  vertex positions over time), which is outside "presentation only"; PGXP cannot recover precision
-  the game never had. Mitigations that do stay presentation-only: a lower render scale or
-  Texture Filtering > Off makes it less visible, nothing removes it.
+  Source: not the bone chain's integer rounding (see the next point: the jitter is already in the
+  animation's local matrices and the root translation). PGXP cannot remove it; the native
+  character renderer (HLR phase 3) filters the bones on the host, presentation only, and cuts the
+  head flips from 2.65 % to 0.55 % (see "HLR phase 3: characters in native 3D").
 - **Bone chain and where the jitter comes from** (HLR phase 0 B / C, `tools/hlr_probe.py` on
   `--ram-snap` dumps of the repro, frames 3870-3965, 48 game updates).
   - Layout (verified: probe, all parts of both fighters in 67 snapshots, 2479 parts, 18626 chain

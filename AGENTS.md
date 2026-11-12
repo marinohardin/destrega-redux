@@ -237,7 +237,7 @@ the script has the exact patterns), each a small subset:
 - **menus** (`menu_*`, `settings*`, `input*`, `controls_*`, `main.c`): `test_menu.sh` (its ~1 GB of
   scratch is deleted after a pass), `test_input.py`, `test_governor.py` when present.
 - **hlr** (`runtime/hlr/`, `hlr_hook.h`, `tools/test_hlr.py`, `runtime/tests/test_hlr.c`): CTest `hlr`,
-  `hlr_gpu`, `test_hlr.py` audit / exact / hash / rewind on a subset (castle1 remains gate, Metal), and
+  `hlr_gpu`, `test_hlr.py` audit / chars (milena, laon) / exact / hash / rewind on a subset (castle1 remains gate, Metal), and
   `test_netplay.py lan_hlr`.
 - **core** (other `runtime/*.c|h`, `runtime/overrides/`, `recomp/`, `analysis/overrides.txt`,
   `extra_seeds.txt`, procedure / overlay lists, `CMakeLists.txt`): scenarios `vs_hills`, `story`,
@@ -1773,13 +1773,16 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
 ## Native high-level renderer (`runtime/hlr/`, `--hlr`; docs/HLR_PLAN.md)
 
 Presentation only, in phases (plan and results: `docs/HLR_PLAN.md`; game facts: NOTES.md "Stage
-builders in full", "HLR phase 2a", "HLR phase 2b"). Phase 2a: the stage is captured and redrawn
-exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below).
+builders in full", "HLR phase 2a", "HLR phase 2b", "HLR phase 3"). Phase 2a: the stage is captured
+and redrawn exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below). Phase 3:
+the fighters too, in the same depth buffer (below).
 
 - **Hooks** (`runtime/hlr_hook.h`, table `g_hlr` in bus.c; all NULL = off): `stage_pre(mode)` /
   `stage_post()` around the real pass of `stage_render` (`overrides/widescreen.c real_pass`),
   `ll_filter(node)` per node of the GPU linked-list DMA (`bus.c`; `0xffffffff` = end of the walk),
-  `on_restore()` from `ss_restore`. Hooks only read guest RAM / scratchpad; GTE work runs on a copy
+  `on_restore()` from `ss_restore`, `char_pre(model, ot)` / `char_post()` around every call of
+  `char_mesh_render` 80036b0c (`overrides/char_mesh.c`, a read-only wrapper), `chars_native()` (true
+  while the faces are drawn natively: char_mesh.c then adds no PGXP extras). Hooks only read guest RAM / scratchpad; GTE work runs on a copy
   (`gte_exec_on`); they never call guest code or touch cycles, the scheduler, RAM or GPU state.
 - **Capture** (`hlr_stage.c`): predicts every stage packet (all builders incl. the 0x2000
   subdivision ones), audits the prediction against RAM and the scene OT, and a clean frame becomes
@@ -1794,9 +1797,9 @@ exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below)
 - **Modes**: `off`; `audit` (prediction + checks, draws nothing differently); `exact` (any hi-res
   backend; byte-identical to off); `on` (native 3D stage, needs the GPU renderer: Metal (MSL),
   Vulkan (SPIR-V) or Direct3D 12 (DXIL, `hlr_dxil.h` from `gen_dxil.py --src hlr`)). Default: on in a window, off headless. `--hlr-parts
-  stage|chars|shadows|fx|story|all|none` (only stage exists). Settings `[display] hlr` (on|off),
-  `hlr_parts`; menu actions `hlr[=on|off]`, `hlr-part=stage:on|off`; View > 3D Scene > Original /
-  Native, Stage (Mac, Windows; greyed unless a GPU API renders). `runtime/hlr/` is outside the
+  stage|chars|shadows|fx|story|all|none` (stage and chars exist). Settings `[display] hlr` (on|off),
+  `hlr_parts`; menu actions `hlr[=on|off]`, `hlr-part=stage|chars[:on|off]`; View > 3D Scene > Original /
+  Native, Stage, Characters, Smooth Character Motion (Mac, Windows; greyed unless a GPU API renders). `runtime/hlr/` is outside the
   netplay build identity (`source_ident.py`), `hlr_hook.h` and the call sites are inside.
 - **Native 3D stage (`on`, phase 2b)**: the capture also records every stage polygon (model
   vertices = world coordinates, normals / colours, its packet for UV / CLUT / page) of every object
@@ -1818,6 +1821,24 @@ exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below)
   software renderer / HLR off keep it. Characters, shadows, effects and the HUD stay on the
   original path and keep the PS1's order relative to each stage polygon; known limit: a character
   the PS1 drew between two overlapping stage polygons gets the order of its pass.
+- **Native characters (`on`, phase 3; `hlr_char.c`, header comment)**: every `char_mesh_render`
+  call is audited on a host GTE (vertex buffer, NCCT colours, the faces linked per OT slot and their
+  words; `hlr-chars:` exit line, must be 0 mismatched). A clean model's faces join the stage's frame:
+  world positions from the bone matrices in float, the game's vertex colours (flat lighting as the
+  PS1 lit it), textures through `material_texture`; `hlr_native.c` draws them opaque in the stage's
+  passes with depth written, float backface test per triangle (faces the integer NCLIP dropped
+  but that face the camera are drawn); their packets go to the 1x GPU only. A changed packet
+  (stale) or a model whose audit fails is drawn the original way. Shadows, effects, HUD: original.
+  Scheduling: an other constrains an item only when their boxes overlap (2 px margin), and a
+  semi-transparent other sorted in between a fighter's own faces (its shadow's pieces) does not
+  constrain that fighter (without these a Hills fight needed 19.6 passes per frame);
+  `DESTREGA_HLR_PASS_DIAG=N` logs the walk nodes that split the passes of N frames with > 6.
+  **Bone filter** `--hlr-bones game|smooth` (default smooth; settings `[display] hlr_bones`, menu
+  action `hlr-bones[=game|smooth]`, none = toggle; View > 3D Scene > Smooth Character Motion): Holt
+  smoothing of every part's matrix and translation (part 0 in world space, the others relative to
+  it), snapping on large changes, no added delay; state dropped on `on_restore`, a mode change or a
+  model not drawn for > 3 updates; never feeds back. `DESTREGA_HLR_BONE_DIAG=1|LO-HI` (libetc vblank
+  count) prints `hlr-bones-diag:` (per-update step and jitter, game vs filtered).
 - **2b switches**: `--hlr-msaa 1|2|4|8` (default 4), `--hlr-near clip|ps1` (default clip: polygons
   crossing the near plane are clipped by the GPU; ps1 drops what the PS1 dropped as too near),
   `--hlr-look enhanced|ps1` (default enhanced); settings `[display] hlr_msaa`, `hlr_near`, `hlr_look`
@@ -1834,10 +1855,13 @@ exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below)
   `hlr_gpu_vulkan` (`test_hires_gpu external [API]`: empty external passes leave GPU == software, and
   a cube through `hlr_gpu_external`: face colours, depth test, MSAA resolve, 15-bit channel order;
   `external d3d12` passes under CrossOver (vkd3d) with the same cube pixel counts as Metal and MoltenVK);
-  `tools/test_hlr.py [audit hash exact rewind]` (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`; `hash`
-  and `rewind` require the native draw line); `test_netplay.py lan_hlr`; pr_check group `hlr`.
+  `tools/test_hlr.py [audit chars hash exact rewind]` (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`,
+  `CHARS`; `chars` = the `practice_<char>` replays with `--hlr audit`, every character's move set;
+  `hash` and `rewind` require the native draw line and native character faces); CTest `hlr` also
+  audits a synthetic fighter built on the guest GTE (faults must be caught) and the bone filter; `test_netplay.py lan_hlr`; pr_check group `hlr`.
   `tools/hlr_diff.py` (not a test): every VS stage key frame off / on at 4x6 16:9, contact sheets
-  and a difference table in `build/hlr2b/diff/`. Must hold: audit 0 everywhere, state hashes on ==
+  and a difference table in `build/hlr2b/diff/`; `--chars "milena laon ..."` does the same for
+  practice replays (fighters close up). Must hold: audit 0 everywhere, state hashes on ==
   off, exact dumps byte-identical to off.
 - **Direct3D 12** (checked under CrossOver 26, vkd3d over MoltenVK; Windows build, vs_hills 4x6 16:9,
   `--no-interp --verify-overrides`): `off` / `on` / `exact` per-frame state hashes equal to each other

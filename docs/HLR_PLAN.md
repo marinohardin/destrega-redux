@@ -151,6 +151,76 @@ depth buffer (they are painted after / between passes), so phase 3 has to write 
 into the same buffer or keep per-pass ordering; a native Vulkan / D3D12 driver (D3D12 only under
 CrossOver so far); the triangle subdivision builder 800423e0 still unexercised.
 
+## Phase 3 results (2026-11-12, `feature/hlr`)
+
+What exists: `--hlr on` draws the fighters natively in 3D too (AGENTS.md "Native high-level renderer",
+NOTES.md "HLR phase 3"): `runtime/hlr/hlr_char.c` (read-only model of `char_mesh_render` 80036b0c on a
+host GTE: audit of the vertex buffer, NCCT colours and linked faces; float world positions from the
+bone matrices; the bone filter), hooks `char_pre` / `char_post` / `chars_native` around the existing
+`overrides/char_mesh.c` wrapper, character faces as items of the native passes in `hlr_native.c`.
+`--hlr-parts` now has `chars`; `--hlr-bones game|smooth` (default smooth), settings `display.hlr_bones`,
+menu action `hlr-bones`, View > 3D Scene > Characters / Smooth Character Motion. No shader change
+(the stage's pipelines draw the faces: textured, the game's vertex colours, flat shade), so SPIR-V /
+DXIL were not regenerated.
+
+**Depth decision: characters write the stage's depth buffer.** Per-pass ordering would keep the PS1's
+per-face OT order inside each fighter (part of the head flips) and phase 2b's limit (a fighter between
+two overlapping stage polygons). With shared depth the fighter's own faces and fighter vs stage are
+per pixel; shadows, effects and the HUD stay in painter's order around the passes. Two scheduling
+rules keep the passes few: only others whose boxes really overlap an item constrain it (the 32 px
+tile is just the index), and semi-transparent others sorted in between a fighter's own faces (its
+shadow's GT3 pieces among the feet) do not constrain that fighter. Before them the Hills fight needed
+19.6 passes per frame (Metal 10.9 ms/frame); after, 2.74.
+
+Acceptance:
+- Audit 0 everywhere: every `char_mesh_render` call of the 12 VS stages, practice, story and the 12
+  `practice_<char>` replays (each character's whole command battery: 7376-11075 models, ~5 M vertices
+  and colours, ~6.3 M faces per replay): 0 vertices, colours or linked faces wrong, 0 rejected models.
+  Float bones vs the game's SXY: mean 0.82-0.97 px in fights, 1.31 px in story.
+- State hash on == off per frame (`--renderer gpu --no-interp --verify-overrides`): vs_hills, vs_castle1
+  16:9, story (849 / 778 / 420 character faces per frame drawn in 3D, 0 failed GPU passes). Rewinds
+  with the HLR on: per-frame hashes equal, 68 loads (bone filter state dropped on each).
+- `--hlr exact` byte-identical to off: all 12 stages on Metal and on MoltenVK, 4:3 / 16:9, 2x3 / 4x6.
+- Netplay `lan_hlr`: ok, 5842 final frames equal on both peers and offline (194 full-state hashes); host
+  drew natively in 1600 frames (1002 polygons per frame), 64 rollback loads dropped 64 captures.
+- CTest `hlr`: a synthetic fighter (2 parts, chain, GT3 / GT4 lists) built on the guest GTE audits clean
+  in 6 poses; a wrong colour, an unlinked kept face and a wrong vertex are each caught; the bone
+  filter cuts jitter (output error 99.5 vs input 388.6), snaps on large changes, lags a ramp by
+  0.003 units.
+- Head flips (Milena repro, 4x6, fast precision; NOTES.md metric): off 2.65 % (max 5.25), phase 2b
+  2.64 %, phase 3 with the game's bones 0.93 % (max 2.18), with the bone filter 0.55 % (max 0.98):
+  target < 1 % met. Jitter (second difference of the projected vertices) 0.193 -> 0.045 px per update.
+- Timing (quick_check bench configuration: Hills replay, 3834x2328 -> 4x6, widescreen, xbr, full
+  colour, PGXP on, MSAA 4; fight segment 3700-4000, ms/frame emulation + hi-res, two rounds back to
+  back, load 59-66 from other work):
+
+  | | off | phase 2b (`bin2b`, on) | phase 3, stage only | phase 3, on |
+  |---|---:|---:|---:|---:|
+  | Metal | 4.54 / 4.28 | 2.73 / 2.59 | 2.29 / 2.20 | 2.34 / 2.22 |
+  | MoltenVK | 9.03 / 8.71 | 7.58 / 7.15 | 6.47 / 6.17 | 3.79 / 3.70 |
+
+  The fighters cost nothing measurable on Metal and save ~2.5 ms on MoltenVK (their exact-precision
+  triangles, the slowest part of the MoltenVK shader, are replaced by ~900 hardware-rasterized faces
+  in the same passes). Phase 3 stage-only is below phase 2b because of the exact box overlap.
+  Character audit + capture: part of the host cost (`hlr-cost:` covers only the stage pass).
+- Direct3D 12 (CrossOver): D3D_PLACEHOLDER
+- Contact sheets (`tools/hlr_diff.py`, off | on | |diff| x 4; Metal, 4x6 widescreen, kept under
+  `build/hlr3/`, not committed): all 12 stages (`diff/<stage>.png`, `diff/table.txt`): pixels off
+  by > 4 steps 0.25-2.71 % (Throne 7.79 %: the high-contrast carpet and floor textures, stage not fighters, by eye),
+  2.05-4.04 passes and 943-1350 native polygons per frame. Characters (`diffc/char_<c>.png`,
+  practice replays of Milena, Laon, Gradd, Celia, Reyus, Tieme at frames 4800 / 6000 / 7200 / 8400):
+  > 4 steps 0.26-0.31 %, mean abs error 4.3-4.7, 2.7-4.2 passes. Looked at by eye: fighters
+  complete (no holes or missing limbs), same pose and position as off, shading matches; the diff
+  shows outlines only (edges, a semi-transparent ground quad's rectangle under Milena where the
+  native floor below it rasterizes differently).
+
+**Not done / deviations.** Per-pixel character lighting (the faces use the game's NCCT vertex
+colours, so the dynamic hit light is right but flat-shaded per vertex); the plan's `float` bones mode
+(phase 0 C showed it removes only 17 % of the step; `game` and `smooth` exist); shadows and effects
+are still the original packets (phase 4 / 5), so a shadow piece the PS1 painted over a foot can now
+be under it; no native Vulkan / D3D12 driver; the triangle subdivision builder 800423e0 still
+unexercised.
+
 ## 1. Executive summary
 
 - **Keep the capture-not-replacement architecture of the existing plan.** Every guest render

@@ -40,12 +40,15 @@ def lock_path():
     return os.path.join(p, 'build', 'heavy-test.lock')
 
 
-CHAR_AT = (1200, 3000, 4800, 6600)      # frames after the battery start t0 = 3000 + 40 * roster index
+CHAR_STEP = 1200      # --dump-every: main.c dumps frames that are multiples of it
 
 
 def char_frames(char):
+    # four frames inside the command battery (starts at t0 = 3000 + 40 * roster index, 84 inputs
+    # 80 frames apart), multiples of CHAR_STEP from 1200 frames into it
     t0 = 3000 + 40 * scenarios.ROSTER.index(char)
-    return [t0 + d for d in CHAR_AT]
+    f0 = -(-(t0 + 1200) // CHAR_STEP) * CHAR_STEP
+    return [f0 + i * CHAR_STEP for i in range(4)]
 
 
 def run_char(out, char, mode, api, extra):
@@ -58,9 +61,15 @@ def run_char(out, char, mode, api, extra):
     cmd = ['nice', '-n', '10', BIN, '--headless', '--replay', rp.path, '--frames', str(fr[-1] + 1),
            '--renderer', api, '--hlr', mode, '--widescreen', '--window', '1280x720',
            '--resize', f'{fr[0] - 30}:3834x2328', '--dump', d, '--dump-from', str(fr[0]),
-           '--dump-every', str(fr[1] - fr[0])] + extra
+           '--dump-every', str(CHAR_STEP)] + extra
     with open(d + '.log', 'w') as f:
         rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=ROOT)
+    # --frames ends the replay early on purpose: exit 7 "stopped before the end" with 0 differing
+    # hashes is a pass; a divergence is not
+    if rc == 7:
+        log = open(d + '.log').read()
+        if 'DIVERGED' not in log and re.search(r'state hashes compared \(0 differ\)', log):
+            rc = 0
     return rc
 
 

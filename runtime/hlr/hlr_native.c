@@ -37,7 +37,10 @@
  * natively (or found invisible by the float backface / frustum test) is no longer an "other", so
  * characters no longer constrain where stage polygons go; the stage and the fighters then meet by
  * per-pixel depth, which removes the limit above for them. Shadows, effects and the HUD stay
- * others in painter's order. */
+ * others in painter's order. Two rules keep the pass count down (bracket_box): an other constrains an
+ * item only if their boxes really overlap (the tile is only the index), and a semi-transparent other
+ * that the PS1 sorted in between a fighter's own faces (the shadow's GT3 pieces among the feet) does
+ * not constrain that fighter's faces. */
 #include "hlr.h"
 #include "hlr_gpu.h"
 #include "../hires.h"
