@@ -1755,7 +1755,16 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
   identical to `gen/`. A Windows DLL cross-builds with `zig cc -target x86_64-windows-gnu`
   (exports only the entry point; not run). Under Wine / CrossOver the bundled Windows Zig cannot
   compile at all (`manifest_create Unexpected`: Wine's `NtLockFile` is incomplete; docs/RELEASES.md),
-  so the Windows first launch is untested until a real Windows machine runs it.
+  so the Windows first launch with the game is untested until a real Windows machine runs it.
+- **`--game-selftest DIR`** (needs `--data-dir`): the launcher's module build without a disc. The
+  files of DIR (C sources + `files.cmake` listing `${GEN_DIR}/...`) replace the recompiler's output
+  and the key hashes them instead of the analysis inputs and disc; then the normal compile / link /
+  load runs and the process exits (0 = built or current and loaded, `launcher: self-test passed:
+  ... built with VERSION [bundled zig|--game-cc|system]`). CI feeds it the stub sources
+  (`tools/ci/stub_gen`, which in a module build has one table entry, since an empty module is
+  refused, and traps instead of using stdio): the Windows job downloads Zig 0.17.1 (sha256 checked)
+  next to `build/launcher/destrega.exe` and requires the bundled Zig to build and load the DLL,
+  then "is current" on a second run; the Linux jobs run it with their gcc / clang.
 
 ## Releases (`docs/RELEASES.md`)
 

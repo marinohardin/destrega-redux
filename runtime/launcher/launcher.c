@@ -6,6 +6,7 @@
 #include "sha256.h"
 
 #include "../disc.h"
+#include "../game_abi.h"
 #include "../game_load.h"
 #include "../platform.h"
 #include "game_sdk.h"
@@ -52,7 +53,7 @@ static const char *const k_cflags[] = {
 
 /* ---- options -------------------------------------------------------------------------------- */
 
-static const char *s_opt_module, *s_opt_cc, *s_opt_analysis, *s_opt_recompile;
+static const char *s_opt_module, *s_opt_cc, *s_opt_analysis, *s_opt_recompile, *s_opt_selftest;
 static bool s_opt_rebuild;
 static int s_opt_jobs;
 
@@ -66,6 +67,7 @@ int launcher_parse_arg(int argc, char **argv, int i)
     if (!strcmp(a, "--recompile") && more) { s_opt_recompile = argv[i + 1]; return 2; }
     if (!strcmp(a, "--game-jobs") && more) { s_opt_jobs = atoi(argv[i + 1]); return 2; }
     if (!strcmp(a, "--rebuild-game")) { s_opt_rebuild = true; return 1; }
+    if (!strcmp(a, "--game-selftest") && more) { s_opt_selftest = argv[i + 1]; return 2; }
     return 0;
 }
 
@@ -78,12 +80,37 @@ void launcher_usage(void)
             "  --game-jobs N         parallel compiler runs (default: performance cores)\n"
             "  --rebuild-game        build the module even if the one in the data folder is current\n"
             "  --analysis-dir DIR    read the recompiler's analysis inputs from DIR instead of the built-in ones\n"
-            "  --recompile OUTDIR    write the generated C (as recomp/recomp.py would) and exit\n");
+            "  --recompile OUTDIR    write the generated C (as recomp/recomp.py would) and exit\n"
+            "  --game-selftest DIR   test (CI, no disc): build and load a module from the C files in DIR\n"
+            "                        instead of the disc's code (needs --data-dir), then exit\n");
 }
 
 /* ---- small helpers -------------------------------------------------------------------------- */
 
+/* --game-selftest DIR: the regular files of DIR (C sources, headers and a files.cmake naming the
+ * units, like the recompiler's output), sorted by name */
+static int cmp_str(const void *x, const void *y) { return strcmp(*(char *const *)x, *(char *const *)y); }
+static char **selftest_files(int *n)
+{
+    int count = 0;
+    char **g = SDL_GlobDirectory(s_opt_selftest, NULL, 0, &count);
+    *n = 0;
+    if (!g) return NULL;
+    char **out = calloc((size_t)count + 1, sizeof *out);
+    for (int i = 0; i < count; i++) {
+        char p[4400];
+        SDL_PathInfo info;
+        snprintf(p, sizeof p, "%s/%s", s_opt_selftest, g[i]);
+        if (SDL_GetPathInfo(p, &info) && info.type == SDL_PATHTYPE_FILE) out[(*n)++] = strdup(g[i]);
+    }
+    SDL_free(g);
+    qsort(out, (size_t)*n, sizeof *out, cmp_str);
+    return out;
+}
+static void free_list(char **l, int n) { for (int i = 0; i < n; i++) free(l[i]); free(l); }
+
 static char s_log_path[4096];
+static char s_selftest_cc[1200];   /* compiler + where it was found, for the self-test's line */
 static FILE *s_log;
 
 static void logf_(const char *fmt, ...)
@@ -316,6 +343,21 @@ static bool compute_key(const Compiler *c, char out[65], char *why, size_t whyn)
     key_str(&s, "destrega-game-module", "1");
     key_str(&s, "sdk", GAME_ABI_SDK_ID);
     key_str(&s, "recompiler", GAME_RECOMP_ID);
+    if (s_opt_selftest) {   /* the self-test's C files stand in for the analysis inputs and the disc */
+        int nf = 0;
+        char **files = selftest_files(&nf);
+        for (int i = 0; i < nf; i++) {
+            char p[4400];
+            size_t len = 0;
+            snprintf(p, sizeof p, "%s/%s", s_opt_selftest, files[i]);
+            char *d = slurp(p, &len);
+            if (d) key_bytes(&s, files[i], d, len);
+            free(d);
+        }
+        free_list(files, nf);
+        if (!nf) { snprintf(why, whyn, "no files in %s", s_opt_selftest); return false; }
+        goto compiler;
+    }
     const char *names[64];
     int n = recomp_analysis_inputs(names, 64);
     for (int i = 0; i < n; i++) {
@@ -343,6 +385,7 @@ static bool compute_key(const Compiler *c, char out[65], char *why, size_t whyn)
         key_bytes(&s, path, p, size);
         free(p);
     }
+compiler:
     for (int i = 0; i < c->argc; i++) key_str(&s, "cc", c->argv[i]);
     key_str(&s, "cc-version", c->version_full ? c->version_full : "");
     for (int i = 0; k_cflags[i]; i++) key_str(&s, "cflag", k_cflags[i]);
@@ -573,10 +616,25 @@ static bool run_build(Build *b)
     set_step(b, "Reading the game code from your disc");
     double t0 = now_s();
     if (!fresh_dir(gen)) return build_fail(b, "cannot create %s", gen);
-    RecompInput in = {rc_disc_file, rc_analysis_file, NULL, gen, rc_log};
     int files = 0;
-    const char *err = recomp_run(&in, &files);
-    if (err) return build_fail(b, "the recompiler failed: %s", err);
+    if (s_opt_selftest) {   /* copy the self-test's C files instead of recompiling the disc */
+        char **list = selftest_files(&files);
+        for (int i = 0; i < files; i++) {
+            char src[4400], dst[4400];
+            size_t len = 0;
+            snprintf(src, sizeof src, "%s/%s", s_opt_selftest, list[i]);
+            snprintf(dst, sizeof dst, "%s/%s", gen, list[i]);
+            char *d = slurp(src, &len);
+            bool ok = d && write_file(dst, d, len);
+            free(d);
+            if (!ok) { free_list(list, files); return build_fail(b, "cannot copy %s", src); }
+        }
+        free_list(list, files);
+    } else {
+        RecompInput in = {rc_disc_file, rc_analysis_file, NULL, gen, rc_log};
+        const char *err = recomp_run(&in, &files);
+        if (err) return build_fail(b, "the recompiler failed: %s", err);
+    }
     b->t_recomp = now_s() - t0;
     logf_("recompiled in %.2f s (%d files)", b->t_recomp, files);
     b->frac = 0.05;
@@ -686,6 +744,27 @@ static bool do_recompile(void)
     return true;
 }
 
+int launcher_selftest(const char *data_dir, bool data_dir_given)
+{
+    if (!s_opt_selftest) return -1;
+    if (!data_dir_given) {
+        fprintf(stderr, "launcher: --game-selftest needs --data-dir (it never touches the player's data folder)\n");
+        return 1;
+    }
+    int code = 1;
+    if (!launcher_prepare(data_dir, true, NULL, &code)) {
+        fprintf(stderr, "launcher: self-test FAILED\n");
+        return code ? code : 1;
+    }
+    if (s_selftest_cc[0])
+        fprintf(stderr, "launcher: self-test passed: game module built with %s and loaded (interface %u)\n",
+                s_selftest_cc, GAME_ABI_VERSION);
+    else
+        fprintf(stderr, "launcher: self-test passed: the game module was current and loaded (interface %u)\n",
+                GAME_ABI_VERSION);
+    return 0;
+}
+
 bool launcher_prepare(const char *data_dir, bool headless, void *win, int *exit_code)
 {
     *exit_code = 1;
@@ -694,14 +773,14 @@ bool launcher_prepare(const char *data_dir, bool headless, void *win, int *exit_
         return false;
     }
     const char *err;
-    if (s_opt_module) {
+    if (s_opt_module && !s_opt_selftest) {
         err = game_module_load(s_opt_module);
         if (!err) { logf_("game module %s", s_opt_module); return true; }
         show_error(win, headless, err, NULL);
         return false;
     }
     char path[4400];
-    if (!s_opt_rebuild && !s_opt_analysis && dev_module(path, sizeof path)) {
+    if (!s_opt_rebuild && !s_opt_analysis && !s_opt_selftest && dev_module(path, sizeof path)) {
         err = game_module_load(path);
         if (!err) { logf_("development game module %s", path); return true; }
         logf_("%s; using the data folder's module", err);
@@ -769,6 +848,7 @@ bool launcher_prepare(const char *data_dir, bool headless, void *win, int *exit_
     logf_("building the game module (key %.12s): compiler %s [%s], %s, %d jobs", key, b.cc.argv[0], b.cc.where,
           b.cc.version, b.jobs);
     logf_("compiler check and key in %.2f s", t_key);
+    snprintf(s_selftest_cc, sizeof s_selftest_cc, "%s [%s]", b.cc.version, b.cc.where);
 
     LauncherUI *ui = headless ? NULL : lui_open(win);
     double tb = now_s();

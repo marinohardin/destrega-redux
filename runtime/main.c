@@ -2380,6 +2380,12 @@ int main(int argc, char **argv) {
     snprintf(s_pak_path, sizeof s_pak_path, "%s", pak);
     snprintf(s_card_dir, sizeof s_card_dir, "%s%s", data_dir ? data_dir : (pref ? pref : "./"), data_dir ? "/" : "");
     s_data_dir_given = data_dir != NULL;
+#ifdef DESTREGA_GAME_MODULE
+    {   /* --game-selftest: the launcher's build path without a disc (CI) */
+        int st = launcher_selftest(s_card_dir, s_data_dir_given);
+        if (st >= 0) return st;
+    }
+#endif
     s_disc_path = disc_path;
     SDL_free(pref);
     if (getenv("DESTREGA_RESTARTED")) {

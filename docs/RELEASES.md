@@ -70,7 +70,10 @@ the launcher builds on first launch from the player's own disc and loads at star
   cache manifest with `NtLockFile`, which Wine logs as `fixme:file:NtLockFile Unimplemented yet
   parameter` and fails. A Wine limitation (real Windows implements it), so the Windows first-launch
   build cannot be tested under Wine; the launcher reports the failure cleanly (exit 1, no crash).
-  Needs a real Windows machine (or a Windows CI job that runs the bundled `zig cc`); the zip with Zig is large (~100 MB download, Zig's Windows release alone).
+  CI's Windows job now runs the bundled Zig on a real Windows runner (`--game-selftest`: compiles,
+  links and loads a module from the stub sources, no game code), so the compiler, the DLL and its
+  loading are covered; the real 50-unit game build still needs a Windows machine with the disc.
+  The zip with Zig is large (~100 MB download, Zig's Windows release alone).
 - Linux: build and run the AppImage on Linux (not done: no Linux machine with the game here).
 - Size: Zig's `lib/` holds libc headers and sources for every target (~400 MB unpacked on macOS);
   pruning it to the host target would roughly halve the download.
