@@ -341,13 +341,14 @@ void hlr_report(void)
         rt_log("hlr-native-draw: %llu frames, %.2f passes per frame, %.0f polygons per frame drawn in 3D"
                " (near %s, look %s, MSAA %dx); %llu culled by the camera, %llu dropped as too near, %llu stale,"
                " %llu without texture, %llu of skipped objects without packet words; %llu packets suppressed; %llu walks given up; GPU %llu passes"
-               " (%llu MSAA), %llu draws, %llu triangles, %llu failed",
+               " (%llu MSAA, %llu of them keeping the previous pass's samples), %llu draws, %llu triangles, %llu failed",
                (unsigned long long)N.frames, (double)N.passes / (double)N.frames, (double)N.items / (double)N.frames,
                hlr_get_near() == HLR_NEAR_PS1 ? "ps1" : "clip", hlr_get_look() == HLR_LOOK_PS1 ? "ps1" : "enhanced",
                hlr_gpu_get_msaa(), (unsigned long long)N.culled, (unsigned long long)N.near_dropped,
                (unsigned long long)N.stale, (unsigned long long)N.no_texture, (unsigned long long)N.hidden_bad,
                (unsigned long long)N.suppressed,
                (unsigned long long)N.desync, (unsigned long long)G.passes, (unsigned long long)G.msaa_passes,
+               (unsigned long long)G.msaa_kept,
                (unsigned long long)G.draws, (unsigned long long)G.tris, (unsigned long long)G.failed);
     }
 }

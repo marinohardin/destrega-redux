@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b and 3. Needs the disc.
 
-  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact rewind (default: all)
+  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact seams rewind (default: all)
   CASES="hash exact" STAGES="castle1" ...    environment selection (tools/pr_check.sh group hlr)
 
   audit   --hlr audit on all 12 VS stages, practice and story: every stage packet the game links is
@@ -21,6 +21,12 @@
           the whole command battery): the character audit reproduces every vertex, colour and face
           the game builds (hlr-chars: 0 mismatched, 0 linked differently, 0 other words, 0 bad, 0
           rejected). CHARS="milena reyus" picks the characters. (audit also checks hlr-chars.)
+  seams   vs_gate (Milena vs Doyle) in the user configuration (GPU fast precision, 4x6 16:9, xbr, full
+          colour, PGXP on, the HLR's default 4x MSAA) with a pause (Start) in the fight: --hlr on vs
+          off, tools/check_hlr_seams.py on the fight and pause frames finds no thin bright line that
+          only the HLR draws (MSAA passes that restarted from the resolve drew the floor's pass
+          boundaries around the fighters as such lines). Negative check: DESTREGA_HLR_TEST_NOKEEP=1
+          brings the old behaviour back and the check must find seams in every frame.
   rewind  --savestate-rewind 37:23 with --hlr on (GPU, 2x3) vs a plain run with the HLR off: equal
           per-frame complete-state hashes, the HLR dropped its captures on every load and drew the
           stage natively.
@@ -39,10 +45,10 @@ STAGES = ['hills', 'cave', 'villa', 'canyon', 'gate', 'castle1', 'castle2', 'thr
           'shrine', 'fortress']
 
 
-def run(tag, scn, frames, extra, env=None):
-    """One headless run of scenario scn; returns (rc, log text)."""
+def run(tag, scn, frames, extra, env=None, press=None):
+    """One headless run of scenario scn (press: its pad-1 script with more taps); returns (rc, log text)."""
     s = scenarios.SCENARIOS[scn]
-    cmd = ['nice', '-n', '10', BIN, '--headless', '--frames', str(frames), '--press', s.press()]
+    cmd = ['nice', '-n', '10', BIN, '--headless', '--frames', str(frames), '--press', press or s.press()]
     if s.dsl2:
         cmd += ['--press2', s.press2()]
     cmd += extra
@@ -229,6 +235,53 @@ def case_exact(pool):
     return list(pool.map(exact_one, items))
 
 
+# ---- seams ------------------------------------------------------------------------------------------
+SEAM_FRAMES = list(range(3300, 3461, 40))     # fight from 3300, Start pressed at 3350: paused from ~3356
+
+
+def seams_run(item):
+    mode, nokeep = item
+    tag = f'seams_{mode}' + ('_nokeep' if nokeep else '')
+    d = os.path.join(OUT, tag)
+    os.makedirs(d, exist_ok=True)
+    for f in os.listdir(d):
+        os.remove(os.path.join(d, f))
+    s = scenarios.SCENARIOS['vs_gate']
+    args = ['--renderer', 'gpu', '--gpu-precision', 'fast', '--scale', '4x6',
+            '--widescreen', '--window', '1280x720', '--tex-filter', 'xbr', '--hires-colour', 'full',
+            '--pgxp', 'on', '--hlr', mode, '--dump', d, '--dump-from', str(SEAM_FRAMES[0]),
+            '--dump-every', '40']
+    rc, log = run(tag, 'vs_gate', SEAM_FRAMES[-1] + 1, args,
+                  env={'DESTREGA_HLR_TEST_NOKEEP': '1'} if nokeep else None, press=s.press() + ',3350:8')
+    return rc, log, d
+
+
+def case_seams(pool):
+    sys.path.insert(0, os.path.join(ROOT, 'tools'))
+    import check_hlr_seams
+    res = dict(zip(['off', 'on', 'nokeep'], pool.map(seams_run, [('off', 0), ('on', 0), ('on', 1)])))
+    if any(r[0] for r in res.values()):
+        return [(False, 'seams: exit ' + ' / '.join(str(r[0]) for r in res.values()))]
+    nl = native_line(res['on'][1])
+    out = []
+    for k in ('on', 'nokeep'):
+        counts = []
+        for fr in SEAM_FRAMES:
+            f = f'frame_{fr:06d}.png'
+            counts.append(len(check_hlr_seams.seams(os.path.join(res[k][2], f), os.path.join(res['off'][2], f))))
+        if k == 'on':
+            ok = not any(counts) and nl and nl[0] > 0 and nl[2] == 0
+            out.append((ok, f'seams: vs_gate fight + pause, 4x6 16:9 fast: {sum(counts)} seams in '
+                            f'{len(counts)} frames ({" ".join(map(str, counts))}); native stage in '
+                            f'{nl[1] if nl else "?"} frames'))
+        else:
+            ok = all(counts)
+            out.append((ok, f'seams: with every MSAA pass restarted from the resolve (old behaviour): '
+                            f'{" ".join(map(str, counts))} seams per frame '
+                            f'({"noticed" if ok else "NOT NOTICED in every frame"})'))
+    return out
+
+
 # ---- rewind -----------------------------------------------------------------------------------------
 def case_rewind(pool):
     scn = 'vs_castle1'
@@ -252,7 +305,7 @@ def case_rewind(pool):
                  f'native stage in {nl[1] if nl else "?"} frames ({nl[0] if nl else "?"} polygons per frame)')]
 
 
-CASES = {'audit': case_audit, 'chars': case_chars, 'hash': case_hash, 'exact': case_exact, 'rewind': case_rewind}
+CASES = {'audit': case_audit, 'chars': case_chars, 'hash': case_hash, 'exact': case_exact, 'seams': case_seams, 'rewind': case_rewind}
 
 
 def main():
@@ -262,7 +315,7 @@ def main():
         i = args.index('-j')
         jobs = int(args[i + 1])
         del args[i:i + 2]
-    names = args or os.environ.get('CASES', 'audit chars hash exact rewind').split()
+    names = args or os.environ.get('CASES', 'audit chars hash exact seams rewind').split()
     for n in names:
         if n not in CASES:
             sys.exit(f'test_hlr: unknown case {n} ({" ".join(CASES)})')

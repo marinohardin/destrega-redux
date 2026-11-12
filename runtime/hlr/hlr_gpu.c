@@ -5,7 +5,17 @@
  *
  *   1. the pass rectangle of the target (the stage's draw area, guard band included) is brought
  *      into an offscreen colour texture: a texture copy without MSAA; with MSAA a full-rectangle
- *      draw reads the target into the multisampled texture (every sample = the target's pixel);
+ *      draw reads the target into the multisampled texture (every sample = the target's pixel).
+ *      With MSAA the multisampled texture is kept from one pass of a frame to the next, and a later
+ *      pass rewrites only the pixels whose target value differs from what the previous pass
+ *      resolved (something else was drawn there in between): the others keep their samples. If
+ *      every pass started from the resolved target instead, a pixel on an edge shared by two
+ *      polygons drawn in different passes would get the first one's partial coverage averaged
+ *      with what was under the floor (the replaced packets are not drawn), and the second pass
+ *      would then cover only its own samples: a thin line of the old background along every
+ *      boundary between passes (bright outlines on the floor around the fighters, whose shadows
+ *      split the floor into passes). The two resolve textures alternate so the blit can read the
+ *      previous one;
  *   2. the depth texture (D32 float, else D24) is cleared to 0 by the frame's first pass and
  *      loaded by the later ones (reverse Z: z_ndc = near / view z, test GREATER_OR_EQUAL, so far
  *      away is 0 and there is no far plane);
@@ -76,8 +86,11 @@ static const char s_msl[] =
 "vertex BO vs_hblit(uint vid [[vertex_id]]) {\n"
 "  BO o; o.pos = float4(vid == 1u ? 3.0 : -1.0, vid == 2u ? -3.0 : 1.0, 0.0, 1.0); return o; }\n"
 "struct BU { int4 off; };\n"
-"fragment float4 fs_hblit(BO in [[stage_in]], constant BU &u [[buffer(0)]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
-"  return t.read(uint2(int2(in.pos.xy) + u.off.xy)); }\n";
+"fragment float4 fs_hblit(BO in [[stage_in]], constant BU &u [[buffer(0)]], texture2d<float> t [[texture(0)]],\n"
+"                         texture2d<float> pv [[texture(1)]], sampler s [[sampler(0)]], sampler s1 [[sampler(1)]]) {\n"
+"  float4 c = t.read(uint2(int2(in.pos.xy) + u.off.xy));\n"
+"  if (u.off.z != 0 && all(c == pv.read(uint2(in.pos.xy)))) discard_fragment();\n"
+"  return c; }\n";
 
 enum { NBLEND = 5 };                /* opaque, modes 0..3 */
 typedef struct { int fmt, samples; SDL_GPUGraphicsPipeline *p[NBLEND], *blit; } PipeSet;
@@ -93,7 +106,8 @@ static SDL_GPUTexture *s_dummy;
 static SDL_GPUSampler *s_psamp;    /* point sampling, level 0 only (--hlr-look ps1) */
 static SDL_GPUBuffer *s_vbuf; static u32 s_vbuf_cap;
 static SDL_GPUTransferBuffer *s_tbuf; static u32 s_tbuf_cap;
-static SDL_GPUTexture *s_col, *s_msaa, *s_depth;     /* pass textures */
+static SDL_GPUTexture *s_col, *s_col2, *s_msaa, *s_depth;   /* pass textures (s_col / s_col2: resolves, alternating) */
+static u64 s_msaa_serial;         /* frame whose samples s_msaa holds (0 = none) */
 static int s_tex_w, s_tex_h, s_tex_fmt, s_tex_samples;
 static int s_msaa_req = 4;
 static HlrGpuStats S;
@@ -114,9 +128,10 @@ static void release_all(void)
     SDL_GPUShader *sh[4] = { s_vs, s_fs, s_bvs, s_bfs };
     for (int i = 0; i < 4; i++) if (sh[i]) SDL_ReleaseGPUShader(s_dev, sh[i]);
     s_vs = s_fs = s_bvs = s_bfs = NULL;
-    SDL_GPUTexture *tx[4] = { s_dummy, s_col, s_msaa, s_depth };
-    for (int i = 0; i < 4; i++) if (tx[i]) SDL_ReleaseGPUTexture(s_dev, tx[i]);
-    s_dummy = s_col = s_msaa = s_depth = NULL;
+    SDL_GPUTexture *tx[5] = { s_dummy, s_col, s_col2, s_msaa, s_depth };
+    for (int i = 0; i < 5; i++) if (tx[i]) SDL_ReleaseGPUTexture(s_dev, tx[i]);
+    s_dummy = s_col = s_col2 = s_msaa = s_depth = NULL;
+    s_msaa_serial = 0;
     s_tex_w = s_tex_h = 0;
     if (s_vbuf) SDL_ReleaseGPUBuffer(s_dev, s_vbuf);
     if (s_tbuf) SDL_ReleaseGPUTransferBuffer(s_dev, s_tbuf);
@@ -174,7 +189,7 @@ static bool ensure_device(void)
         s_vs = shader("vs_hlr", SDL_GPU_SHADERSTAGE_VERTEX, 0, 1, f);
         s_fs = shader("fs_hlr", SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1, f);
         s_bvs = shader("vs_hblit", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, f);
-        s_bfs = shader("fs_hblit", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1, f);
+        s_bfs = shader("fs_hblit", SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1, f);
         const SDL_GPUTextureUsageFlags du = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
         s_dfmt = SDL_GPUTextureSupportsFormat(s_dev, SDL_GPU_TEXTUREFORMAT_D32_FLOAT, SDL_GPU_TEXTURETYPE_2D, du)
                      ? SDL_GPU_TEXTUREFORMAT_D32_FLOAT : SDL_GPU_TEXTUREFORMAT_D24_UNORM;
@@ -287,14 +302,16 @@ static PipeSet *pipes(int fmt, int samples)
 static bool pass_textures(int w, int h, int fmt, int samples)
 {
     if (s_col && s_tex_w == w && s_tex_h == h && s_tex_fmt == fmt && s_tex_samples == samples) return true;
-    SDL_GPUTexture *tx[3] = { s_col, s_msaa, s_depth };
-    for (int i = 0; i < 3; i++) if (tx[i]) SDL_ReleaseGPUTexture(s_dev, tx[i]);
-    s_col = s_msaa = s_depth = NULL;
+    SDL_GPUTexture *tx[4] = { s_col, s_col2, s_msaa, s_depth };
+    for (int i = 0; i < 4; i++) if (tx[i]) SDL_ReleaseGPUTexture(s_dev, tx[i]);
+    s_col = s_col2 = s_msaa = s_depth = NULL;
+    s_msaa_serial = 0;
     SDL_GPUTextureCreateInfo ti = { .type = SDL_GPU_TEXTURETYPE_2D, .format = (SDL_GPUTextureFormat)fmt,
                                     .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
                                     .width = (u32)w, .height = (u32)h, .layer_count_or_depth = 1, .num_levels = 1 };
     s_col = SDL_CreateGPUTexture(s_dev, &ti);
     if (samples > 1) {
+        s_col2 = SDL_CreateGPUTexture(s_dev, &ti);
         ti.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
         ti.sample_count = sc_of(samples);
         s_msaa = SDL_CreateGPUTexture(s_dev, &ti);
@@ -303,11 +320,11 @@ static bool pass_textures(int w, int h, int fmt, int samples)
     ti.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
     ti.sample_count = sc_of(samples);
     s_depth = SDL_CreateGPUTexture(s_dev, &ti);
-    if (!s_col || !s_depth || (samples > 1 && !s_msaa)) {
+    if (!s_col || !s_depth || (samples > 1 && (!s_msaa || !s_col2))) {
         rt_log("hlr-gpu: pass textures %dx%d (%d samples): %s", w, h, samples, SDL_GetError());
-        SDL_GPUTexture *t2[3] = { s_col, s_msaa, s_depth };
-        for (int i = 0; i < 3; i++) if (t2[i]) SDL_ReleaseGPUTexture(s_dev, t2[i]);
-        s_col = s_msaa = s_depth = NULL;
+        SDL_GPUTexture *t2[4] = { s_col, s_col2, s_msaa, s_depth };
+        for (int i = 0; i < 4; i++) if (t2[i]) SDL_ReleaseGPUTexture(s_dev, t2[i]);
+        s_col = s_col2 = s_msaa = s_depth = NULL;
         s_tex_w = 0;
         return false;
     }
@@ -400,10 +417,21 @@ void hlr_gpu_external(void *ctx, void *cmdbuf, void *colour_tex, int w, int h)
             SDL_CopyGPUTextureToTexture(cp, &src, &dst, (u32)f->pw, (u32)f->ph, 1, false);
             SDL_EndGPUCopyPass(cp);
         }
+        /* with MSAA: keep the samples of this frame's previous pass (header, step 1) */
+        /* test hook: DESTREGA_HLR_TEST_NOKEEP=1 restarts every pass from the resolve (the old
+           behaviour that drew seams), so tools/test_hlr.py seams can show its check notices them */
+        static int nokeep = -1;
+        if (nokeep < 0) { const char *e = getenv("DESTREGA_HLR_TEST_NOKEEP"); nokeep = e && atoi(e); }
+        const bool keep = !nokeep && samples > 1 && f->cleared && s_msaa_serial == f->serial;
+        SDL_GPUTexture *prev = s_col, *res = s_col;
+        if (samples > 1) {   /* resolve into the texture the previous pass did not use */
+            prev = s_col; res = s_col2;
+            s_col = res; s_col2 = prev;
+        }
         SDL_GPUColorTargetInfo ct = { .texture = samples > 1 ? s_msaa : s_col,
-                                      .load_op = samples > 1 ? SDL_GPU_LOADOP_DONT_CARE : SDL_GPU_LOADOP_LOAD,
-                                      .store_op = samples > 1 ? SDL_GPU_STOREOP_RESOLVE : SDL_GPU_STOREOP_STORE,
-                                      .resolve_texture = samples > 1 ? s_col : NULL };
+                                      .load_op = keep ? SDL_GPU_LOADOP_LOAD : samples > 1 ? SDL_GPU_LOADOP_DONT_CARE : SDL_GPU_LOADOP_LOAD,
+                                      .store_op = samples > 1 ? SDL_GPU_STOREOP_RESOLVE_AND_STORE : SDL_GPU_STOREOP_STORE,
+                                      .resolve_texture = samples > 1 ? res : NULL };
         SDL_GPUDepthStencilTargetInfo dt = { .texture = s_depth, .clear_depth = 0.0f,
                                              .load_op = f->cleared ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR,
                                              .store_op = SDL_GPU_STOREOP_STORE,
@@ -414,12 +442,14 @@ void hlr_gpu_external(void *ctx, void *cmdbuf, void *colour_tex, int w, int h)
         if (!rp) { S.failed++; goto out; }
         if (samples > 1) {   /* 2. the target's pixels into every sample */
             SDL_BindGPUGraphicsPipeline(rp, pp->blit);
-            SDL_GPUTextureSamplerBinding tb = { target, gi.nearest };
-            SDL_BindGPUFragmentSamplers(rp, 0, &tb, 1);
-            const int off[4] = { f->px0, f->py0, 0, 0 };
+            SDL_GPUTextureSamplerBinding tb[2] = { { target, gi.nearest }, { prev, gi.nearest } };
+            SDL_BindGPUFragmentSamplers(rp, 0, tb, 2);
+            const int off[4] = { f->px0, f->py0, keep, 0 };
             SDL_PushGPUFragmentUniformData(cb, 0, off, sizeof off);
             SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
             S.msaa_passes++;
+            if (keep) S.msaa_kept++;
+            s_msaa_serial = f->serial;
         }
         SDL_GPUBufferBinding vb = { .buffer = s_vbuf, .offset = 0 };
         SDL_GPUTexture *tcc = gi.tc_colour ? gi.tc_colour : s_dummy, *tcs = gi.tc_stp ? gi.tc_stp : s_dummy;

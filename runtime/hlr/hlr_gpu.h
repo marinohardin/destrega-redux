@@ -61,5 +61,5 @@ void hlr_gpu_frame_unref(HlrGpuFrame *f);
 HlrVtx *hlr_gpu_frame_vtx(HlrGpuFrame *f, u32 n);   /* n more vertices at the end */
 /* HiresBackend.external callback; ctx = a malloc'd HlrGpuPass (freed here, with its draw list) */
 void hlr_gpu_external(void *ctx, void *cmdbuf, void *colour_tex, int w, int h);
-typedef struct { u64 passes, draws, tris, msaa_passes, uploads, upload_bytes, failed; } HlrGpuStats;
+typedef struct { u64 passes, draws, tris, msaa_passes, msaa_kept, uploads, upload_bytes, failed; } HlrGpuStats;
 void hlr_gpu_get_stats(HlrGpuStats *st);

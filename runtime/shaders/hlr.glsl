@@ -6,7 +6,8 @@
  * (-DPORTABLE_MUL, SPIRV-Cross HLSL, DXC) into runtime/shaders/hlr_dxil.h (Direct3D 12).
  * Entry points:
  *   VS_HLR / FS_HLR        stage polygons and background strips
- *   VS_HBLIT / FS_HBLIT    the target rectangle into every sample of the MSAA colour texture
+ *   VS_HBLIT / FS_HBLIT    the target rectangle into every sample of the MSAA colour texture (a
+ *                          later pass of a frame: only pixels that changed since the previous one)
  *
  * Resource sets (SDL_GPU SPIR-V convention): vertex uniforms set 1; fragment samplers set 2
  * (the texture cache's colour and STP arrays); fragment uniforms set 3.
@@ -103,10 +104,14 @@ void main()
 
 #if defined(FS_HBLIT)
 layout(set = 2, binding = 0) uniform sampler2D t_target;
-layout(std140, set = 3, binding = 0) uniform BU { ivec4 off; } bu;
+layout(set = 2, binding = 1) uniform sampler2D t_prev;     /* the previous pass's resolve */
+layout(std140, set = 3, binding = 0) uniform BU { ivec4 off; } bu;   /* xy: rectangle origin, z: keep */
 layout(location = 0) out vec4 o_color;
 void main()
 {
-    o_color = texelFetch(t_target, ivec2(gl_FragCoord.xy) + bu.off.xy, 0);
+    vec4 c = texelFetch(t_target, ivec2(gl_FragCoord.xy) + bu.off.xy, 0);
+    /* unchanged since the previous pass of this frame: keep the multisampled pixel's samples */
+    if (bu.off.z != 0 && all(equal(c, texelFetch(t_prev, ivec2(gl_FragCoord.xy), 0)))) discard;
+    o_color = c;
 }
 #endif

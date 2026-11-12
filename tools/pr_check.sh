@@ -24,7 +24,7 @@
 #             test_menu.sh, test_input.py, test_overlay_menu.py, test_governor.py (if present)
 #   hlr       runtime/hlr/, hlr_hook.h, tools/test_hlr.py: CTest hlr + hlr_gpu, test_hlr.py audit
 #             (castle1 remains gate, practice), chars (practice_milena, practice_laon replays),
-#             exact (the same stages, Metal), hash (vs_castle1),
+#             exact (the same stages, Metal), hash (vs_castle1), seams (vs_gate, check_hlr_seams.py),
 #             rewind, and test_netplay.py lan_hlr
 #   core      every other runtime/*.c|h, runtime/overrides/, recomp/, analysis/overrides.txt,
 #             extra_seeds.txt, idle_loops.txt, rea_*.json, overlays/, CMakeLists.txt, scenarios / replays tools:
@@ -70,7 +70,7 @@ classify() { # path -> group (or nothing)
     runtime/overrides/widescreen.c|runtime/overrides/char_mesh.c|analysis/widescreen_cull.txt) echo renderer ;;
     tools/test_hires_determinism.sh|tools/test_render_quality.sh|tools/test_widescreen.sh|tools/check_ws_*.py) echo renderer ;;
     tools/gen_spirv.py|tools/gen_dxil.py) echo renderer ;;
-    runtime/hlr/*|runtime/hlr_hook.h|tools/test_hlr.py|runtime/tests/test_hlr.c) echo hlr ;;
+    runtime/hlr/*|runtime/hlr_hook.h|tools/test_hlr.py|tools/check_hlr_seams.py|runtime/tests/test_hlr.c) echo hlr ;;
     runtime/menu*|runtime/settings*|runtime/input*|runtime/controls_*|runtime/main.c) echo menus ;;
     tools/test_menu.sh|tools/test_input.py|tools/test_overlay_menu.py|tools/test_governor.py) echo menus ;;
     runtime/tests/*|runtime/win/*) ;;
@@ -157,7 +157,7 @@ for g in $sel; do
     ;;
   hlr)
     tl_step hlr:unit ctest --test-dir build/cmake -j "$PR_JOBS" -R '^hlr' --output-on-failure
-    tl_step hlr:test_hlr env CASES="audit chars exact hash rewind" STAGES="castle1 remains gate" AUDIT_MODES=practice \
+    tl_step hlr:test_hlr env CASES="audit chars exact hash seams rewind" STAGES="castle1 remains gate" AUDIT_MODES=practice \
       CHARS="milena laon" API=metal HASH=vs_castle1 python3 tools/test_hlr.py
     tl_step hlr:netplay python3 tools/test_netplay.py -j 1 lan_hlr
     ;;
