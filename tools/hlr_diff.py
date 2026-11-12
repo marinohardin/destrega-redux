@@ -5,6 +5,10 @@ the sheets and the table. Development tool (docs/HLR_PLAN.md 2b), not part of an
 
   tools/hlr_diff.py [--stages "hills castle1"] [--api metal|vulkan] [--out DIR] [--keep] [--no-run]
                     [-j N] [EXTRA ARGS after --]
+  tools/hlr_diff.py --chars "milena laon" ...   characters (phase 3): the practice_<char> replays
+                    (tools/replays/, the whole command battery against the dummy) dumped at four
+                    moments of the battery (near and far camera), sheet <out>/char_<char>.png with
+                    off | on | difference per moment; table rows char_<char>.
 
   Per stage: <out>/<stage>_off/ and _on/ hold the dumps (deleted after the sheets unless --keep),
   <out>/<stage>.png the sheet (off | on | |difference| x 4 for the key frame and key + 20),
@@ -36,7 +40,33 @@ def lock_path():
     return os.path.join(p, 'build', 'heavy-test.lock')
 
 
+CHAR_AT = (1200, 3000, 4800, 6600)      # frames after the battery start t0 = 3000 + 40 * roster index
+
+
+def char_frames(char):
+    t0 = 3000 + 40 * scenarios.ROSTER.index(char)
+    return [t0 + d for d in CHAR_AT]
+
+
+def run_char(out, char, mode, api, extra):
+    import replays
+    rp = replays.REPLAYS[f'practice_{char}']
+    fr = char_frames(char)
+    d = os.path.join(out, f'char_{char}_{mode}')
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    cmd = ['nice', '-n', '10', BIN, '--headless', '--replay', rp.path, '--frames', str(fr[-1] + 1),
+           '--renderer', api, '--hlr', mode, '--widescreen', '--window', '1280x720',
+           '--resize', f'{fr[0] - 30}:3834x2328', '--dump', d, '--dump-from', str(fr[0]),
+           '--dump-every', str(fr[1] - fr[0])] + extra
+    with open(d + '.log', 'w') as f:
+        rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=ROOT)
+    return rc
+
+
 def run(out, stage, mode, api, extra):
+    if stage.startswith('char_'):
+        return run_char(out, stage[5:], mode, api, extra)
     scn = f'vs_{stage}'
     s = scenarios.SCENARIOS[scn]
     d = os.path.join(out, f'{stage}_{mode}')
@@ -55,9 +85,13 @@ def run(out, stage, mode, api, extra):
 def stats(out, stage):
     import numpy as np
     from PIL import Image
-    s = scenarios.SCENARIOS[f'vs_{stage}']
+    if stage.startswith('char_'):
+        ks = char_frames(stage[5:])          # evenly spaced (one --dump-every)
+    else:
+        s = scenarios.SCENARIOS[f'vs_{stage}']
+        ks = (s.key, s.key + 20)
     rows, imgs = [], []
-    for k in (s.key, s.key + 20):
+    for k in ks:
         fn = f'frame_{k:06d}.png'
         a = np.asarray(Image.open(os.path.join(out, f'{stage}_off', fn)).convert('RGB')).astype(np.int16)
         b = np.asarray(Image.open(os.path.join(out, f'{stage}_on', fn)).convert('RGB')).astype(np.int16)
@@ -108,6 +142,7 @@ def main():
     while i < len(args):
         a = args[i]
         if a == '--stages': stages = args[i + 1].split(); i += 1
+        elif a == '--chars': stages = ['char_' + c for c in args[i + 1].split()]; i += 1
         elif a == '--api': api = args[i + 1]; i += 1
         elif a == '--out': out = os.path.abspath(args[i + 1]); i += 1
         elif a == '--keep': keep = True

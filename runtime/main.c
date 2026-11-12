@@ -2053,7 +2053,10 @@ bool frontend_view_checked(const char *action, bool *checked) {
     if (n == 8 && !strncmp(action, "hlr-msaa", n) && *arg) { *checked = atoi(arg) == hlr_gpu_get_msaa(); return true; }
     if (n == 8 && !strncmp(action, "hlr-near", n) && *arg) { *checked = !strcmp(arg, "ps1") == (hlr_get_near() == HLR_NEAR_PS1); return true; }
     if (n == 8 && !strncmp(action, "hlr-look", n) && *arg) { *checked = !strcmp(arg, "ps1") == (hlr_get_look() == HLR_LOOK_PS1); return true; }
-    if (n == 9 && !strncmp(action, "hlr-bones", n) && *arg) { *checked = !strcmp(arg, "game") == (hlr_get_bones() == HLR_BONES_GAME); return true; }
+    if (n == 9 && !strncmp(action, "hlr-bones", n)) {   /* none: View > 3D Scene > Smooth Character Motion */
+        *checked = *arg ? !strcmp(arg, "game") == (hlr_get_bones() == HLR_BONES_GAME) : hlr_get_bones() == HLR_BONES_SMOOTH;
+        return true;
+    }
     if (n == 8 && !strncmp(action, "hlr-part", n) && *arg) {   /* hlr-part=stage[:on] */
         char part[16];
         snprintf(part, sizeof part, "%.*s", (int)strcspn(arg, ":"), arg);

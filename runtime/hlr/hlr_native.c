@@ -29,7 +29,15 @@
  * subdivided pieces) and a character stays in front of / behind a stage polygon exactly when the
  * PS1 drew it after / before that polygon. What this cannot express: a character the PS1 drew
  * between two stage polygons that overlap each other in depth (it would need per-pixel depth for
- * the character); such a character gets the order of the pass it falls into. */
+ * the character); such a character gets the order of the pass it falls into.
+ *
+ * Phase 3 (characters, `--hlr-parts` chars): the faces hlr_char.c attached to the frame are items
+ * like the stage polygons (position = their packet's node, or their OT slot when the game did not
+ * link them) and are drawn opaque in the same passes, writing the shared depth buffer. A face drawn
+ * natively (or found invisible by the float backface / frustum test) is no longer an "other", so
+ * characters no longer constrain where stage polygons go; the stage and the fighters then meet by
+ * per-pixel depth, which removes the limit above for them. Shadows, effects and the HUD stay
+ * others in painter's order. */
 #include "hlr.h"
 #include "hlr_gpu.h"
 #include "../hires.h"

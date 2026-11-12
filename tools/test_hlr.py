@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a and 2b. Needs the disc.
+"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b and 3. Needs the disc.
 
-  tools/test_hlr.py [CASE...] [-j N]        CASES: audit hash exact rewind (default: all)
+  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact rewind (default: all)
   CASES="hash exact" STAGES="castle1" ...    environment selection (tools/pr_check.sh group hlr)
 
   audit   --hlr audit on all 12 VS stages, practice and story: every stage packet the game links is
           predicted exactly (0 mismatched, 0 unexplained, 0 missing, 0 slot heads, 0 bad walks).
   hash    --renderer gpu --no-interp --verify-overrides, --hlr on vs off: per-frame --state-hash
           byte-identical (vs_hills 4:3 4x6, vs_castle1 16:9 4x6, story 2x3) and the stage drawn in
-          native 3D (hlr-native-draw: polygons drawn, no GPU pass failed). The key frames differ by
+          native 3D (hlr-native-draw: polygons drawn, no GPU pass failed), and the characters too
+          (hlr-native-chars: faces drawn in 3D, every model attached). The key frames differ by
           design since 2b (tools/hlr_diff.py compares them); the count is printed.
   exact   every VS stage, --hlr exact vs off on Metal and (if it loads) Vulkan: one run each that
           dumps the stage at 4:3 2x3, 16:9 2x3, 16:9 4x6 and 4:3 4x6 (View-menu actions switch
@@ -16,6 +17,10 @@
           API="metal" / API="metal vulkan" picks the APIs, STAGES="hills castle1" the stages (also
           for audit; AUDIT_MODES="practice story" the other modes audited, HASH="vs_hills story" the
           hash runs).
+  chars   --hlr audit on the 12 practice_<char> replays (tools/replays/, every character performs
+          the whole command battery): the character audit reproduces every vertex, colour and face
+          the game builds (hlr-chars: 0 mismatched, 0 linked differently, 0 other words, 0 bad, 0
+          rejected). CHARS="milena reyus" picks the characters. (audit also checks hlr-chars.)
   rewind  --savestate-rewind 37:23 with --hlr on (GPU, 2x3) vs a plain run with the HLR off: equal
           per-frame complete-state hashes, the HLR dropped its captures on every load and drew the
           stage natively.
@@ -59,6 +64,30 @@ def native_line(log):
     return (int(m.group(2)), int(m.group(1)), int(m.group(3))) if m else None
 
 
+CHARS_RE = re.compile(r'hlr-chars: (\d+) models drawn by the game, (\d+) audited; vertices (\d+), (\d+) mismatched; '
+                      r'colours (\d+), (\d+) mismatched; faces (\d+) \((\d+) kept by the game\), (\d+) linked '
+                      r'differently, (\d+) with other words; (\d+) bad models, (\d+) rejected; .*?mean ([\d.]+) px')
+
+
+def chars_audit(log):
+    """(ok, text) of the hlr-chars audit line; ok None when the run drew no character"""
+    m = CHARS_RE.search(log)
+    if not m:
+        return None, 'no character audit'
+    calls, aud, v, vb, c, cb, fa, kept, lb, wb, bad, rej = map(int, m.groups()[:12])
+    ok = calls > 0 and aud == calls and vb == cb == lb == wb == bad == rej == 0
+    return ok, (f'characters: {aud}/{calls} models audited, {v} vertices ({vb} wrong), {c} colours ({cb} wrong), '
+                f'{fa} faces ({kept} kept; {lb} linked differently, {wb} other words), {bad} bad, {rej} rejected; '
+                f'float bones vs SXY {m.group(13)} px')
+
+
+def chars_native(log):
+    """(faces per frame drawn in 3D, models attached, without a frame, other camera) or None"""
+    m = re.search(r'hlr-native-chars: (\d+) character faces per frame drawn in 3D', log)
+    a = re.search(r'hlr-chars: (\d+) models attached to a native frame, (\d+) without a frame, (\d+) with another camera', log)
+    return (int(m.group(1)), int(a.group(1)), int(a.group(2)), int(a.group(3))) if m and a else None
+
+
 def same_files(a, b):
     return os.path.exists(a) and os.path.exists(b) and filecmp.cmp(a, b, shallow=False)
 
@@ -73,9 +102,28 @@ def audit_one(scn):
     if rc or not m:
         return False, f'{scn}: exit {rc}, no audit line' if not m else f'{scn}: exit {rc}'
     pk, mis, un, fr, miss, heads, bad = map(int, m.groups())
-    ok = fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0
+    cok, ctext = chars_audit(log)
+    ok = fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0 and cok is not False
     return ok, (f'{scn}: {fr} frames, {pk} packets, {mis} mismatched, {un} unexplained, {miss} missing, '
-                f'{heads} heads, {bad} bad walks; {alt.group(1) if alt else "?"}')
+                f'{heads} heads, {bad} bad walks; {alt.group(1) if alt else "?"}; {ctext}')
+
+
+def chars_one(char):
+    import replays
+    rp = replays.REPLAYS[f'practice_{char}']
+    log_path = os.path.join(OUT, f'chars_{char}.log')
+    cmd = ['nice', '-n', '10', BIN, '--headless', '--no-interp', '--hlr', 'audit', '--replay', rp.path]
+    with open(log_path, 'w') as f:
+        rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=ROOT)
+    log = open(log_path, errors='replace').read()
+    cok, ctext = chars_audit(log)
+    return bool(cok) and rc == 0, f'practice_{char}: exit {rc}; {ctext}'
+
+
+def case_chars(pool):
+    import scenarios as S
+    chars = os.environ.get('CHARS', ' '.join(S.ROSTER)).split()
+    return list(pool.map(chars_one, chars))
 
 
 def case_audit(pool):
@@ -105,10 +153,13 @@ def hash_pair(item):
     d0, d1 = os.path.join(OUT, f'hash_{scn}_off'), os.path.join(OUT, f'hash_{scn}_on')
     dumps = sorted(f for f in os.listdir(d0) if f.startswith('frame_0'))
     ndiff = sum(not same_files(os.path.join(d0, f), os.path.join(d1, f)) for f in dumps)
-    ok = same and nl and nl[0] > 0 and nl[2] == 0 and dumps
+    cn = chars_native(log1)
+    ok = same and nl and nl[0] > 0 and nl[2] == 0 and dumps and cn and cn[0] > 0 and cn[1] > 0 and cn[3] == 0
     return ok, (f'{scn}: state hash {"identical" if same else "DIFFERS"}; native 3D stage in '
                 f'{nl[1] if nl else "?"} frames, {nl[0] if nl else "?"} polygons per frame, '
-                f'{nl[2] if nl else "?"} failed GPU passes; {ndiff} of {len(dumps)} key frames differ from off')
+                f'{nl[2] if nl else "?"} failed GPU passes; characters: {cn[0] if cn else "?"} faces per frame in 3D, '
+                f'{cn[1] if cn else "?"} models attached, {cn[2] if cn else "?"} without a frame, '
+                f'{cn[3] if cn else "?"} with another camera; {ndiff} of {len(dumps)} key frames differ from off')
 
 
 def case_hash(pool):
@@ -201,7 +252,7 @@ def case_rewind(pool):
                  f'native stage in {nl[1] if nl else "?"} frames ({nl[0] if nl else "?"} polygons per frame)')]
 
 
-CASES = {'audit': case_audit, 'hash': case_hash, 'exact': case_exact, 'rewind': case_rewind}
+CASES = {'audit': case_audit, 'chars': case_chars, 'hash': case_hash, 'exact': case_exact, 'rewind': case_rewind}
 
 
 def main():
@@ -211,7 +262,7 @@ def main():
         i = args.index('-j')
         jobs = int(args[i + 1])
         del args[i:i + 2]
-    names = args or os.environ.get('CASES', 'audit hash exact rewind').split()
+    names = args or os.environ.get('CASES', 'audit chars hash exact rewind').split()
     for n in names:
         if n not in CASES:
             sys.exit(f'test_hlr: unknown case {n} ({" ".join(CASES)})')

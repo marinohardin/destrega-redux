@@ -406,6 +406,8 @@ void menu_init(void) {
         add(scene, @"Native", @"hlr=on", nil, 0);
         [scene addItem:[NSMenuItem separatorItem]];
         add(scene, @"Stage", @"hlr-part=stage", nil, 0);
+        add(scene, @"Characters", @"hlr-part=chars", nil, 0);
+        add(scene, @"Smooth Character Motion", @"hlr-bones", nil, 0);   /* bone filter (hlr_char.c) */
         [scene addItem:[NSMenuItem separatorItem]];
         add(scene, @"Enhanced Look", @"hlr-look=enhanced", nil, 0);   /* per-pixel lighting, filtered textures */
         add(scene, @"PS1 Look", @"hlr-look=ps1", nil, 0);             /* per-vertex, point-sampled */

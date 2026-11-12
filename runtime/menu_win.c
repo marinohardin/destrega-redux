@@ -208,6 +208,8 @@ void menu_init(void) {
     add(scene, "Native", "hlr=on");
     AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
     add(scene, "Stage", "hlr-part=stage");
+    add(scene, "Characters", "hlr-part=chars");
+    add(scene, "Smooth Character Motion", "hlr-bones");
     AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
     add(scene, "Enhanced Look", "hlr-look=enhanced");
     add(scene, "PS1 Look", "hlr-look=ps1");
