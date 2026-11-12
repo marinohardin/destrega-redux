@@ -123,7 +123,7 @@ uint16_t input_map_pad(const InputPlayer *p, const PadState *s) {
 bool input_key_reserved(int sc) {
     switch (sc) {
     case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_TAB: case SDL_SCANCODE_F9: case SDL_SCANCODE_F11:
-    case SDL_SCANCODE_F12: case SDL_SCANCODE_LGUI: case SDL_SCANCODE_RGUI:
+    case SDL_SCANCODE_F10: case SDL_SCANCODE_F12: case SDL_SCANCODE_LGUI: case SDL_SCANCODE_RGUI:
         return true;
     }
     return false;
@@ -479,20 +479,29 @@ void input_handle_event(const SDL_Event *e) {
 
 void input_release_all(void) { memset(s_keys, 0, sizeof s_keys); }
 
+/* After the in-window menu closes: controller input stays away from the pads until every
+ * controller input is released (the button that chose the item must not reach the game). */
+static bool s_pad_hold;
+void input_hold_pads(void) { s_pad_hold = true; }
+
 static void read_pad(const Pad *p, PadState *s) {
     for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++) s->button[i] = SDL_GetGamepadButton(p->g, (SDL_GamepadButton)i);
     for (int i = 0; i < SDL_GAMEPAD_AXIS_COUNT; i++) s->axis[i] = SDL_GetGamepadAxis(p->g, (SDL_GamepadAxis)i);
 }
 
 void input_frame(uint16_t out[2]) {
-    for (int p = 0; p < 2; p++) {
-        uint16_t m = 0;
-        if (s_kbd[p]) m |= input_map_keys(&s_pl[p], s_keys);
+    uint16_t pm[2] = { 0, 0 };
+    for (int p = 0; p < 2; p++)
         if (s_pad_of[p] >= 0 && s_pad_of[p] < s_npads) {
             PadState st;
             read_pad(&s_pads[s_pad_of[p]], &st);
-            m |= input_map_pad(&s_pl[p], &st);
+            pm[p] = input_map_pad(&s_pl[p], &st);
         }
+    if (s_pad_hold && !pm[0] && !pm[1]) s_pad_hold = false;
+    for (int p = 0; p < 2; p++) {
+        uint16_t m = 0;
+        if (s_kbd[p]) m |= input_map_keys(&s_pl[p], s_keys);
+        if (!s_pad_hold) m |= pm[p];
         if (s_cap.armed) m = 0;   /* press-to-bind: the game does not see the input being bound */
         s_last[p] = m;
         out[p] = m;
