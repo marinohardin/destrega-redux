@@ -216,16 +216,27 @@ typedef struct {
     u32 hash;      /* FNV-1a of the original bytes in [lo, hi) (overlay check) */
 } RecompEntry;
 
+#if defined(DESTREGA_GAME_MODULE) && !defined(DESTREGA_MODULE_SIDE)
+/* module build (game_abi.h): the table lives in the game module, set by game_load.c */
+extern const RecompEntry *g_recomp_table;
+extern u32 g_recomp_count;
+#else
 extern const RecompEntry g_recomp_table[];
 extern const u32 g_recomp_count;
+#endif
 
 typedef struct {
     const char *name;  /* disc path, e.g. "OVL/MDOIL.BIN" */
     u32 load_addr;     /* address the file image is copied to */
     u32 size;
 } OverlayInfo;
+#if defined(DESTREGA_GAME_MODULE) && !defined(DESTREGA_MODULE_SIDE)
+extern const OverlayInfo *g_overlays;
+extern u32 g_overlay_count;
+#else
 extern const OverlayInfo g_overlays[];
 extern const u32 g_overlay_count;
+#endif
 
 /* Call the function at `addr` (sets nothing; caller sets $ra). */
 void rt_call(u32 addr);

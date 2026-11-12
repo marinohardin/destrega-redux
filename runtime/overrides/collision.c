@@ -11,7 +11,7 @@
  * does not change what this code sees.
  */
 #include "override.h"
-#include "gen_protos.h"
+#include "game_syms.h"
 
 /* ---- guest data layouts (byte offsets into guest RAM) --------------------- */
 

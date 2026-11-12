@@ -1261,6 +1261,23 @@ static int overlay_list(OvlDef out[32])
     return n;
 }
 
+int recomp_analysis_inputs(const char *names[], int max)
+{
+    static char ovl_names[32][64];
+    static const char *const fixed[] = {"extra_seeds.txt", "overrides.txt", "idle_loops.txt", "widescreen_cull.txt",
+                                        "rea_list_procedures_main.json"};
+    int n = 0;
+    for (int k = 0; k < 5 && n < max; k++) names[n++] = fixed[k];
+    OvlDef ovl[32];
+    int novl = overlay_list(ovl);
+    for (int k = 0; k < novl && n < max; k++) {
+        const char *b = strrchr(ovl[k].path, '/') + 1;
+        snprintf(ovl_names[k], sizeof ovl_names[k], "overlays/%.*s.procs.json", (int)(strlen(b) - 4), b);
+        names[n++] = ovl_names[k];
+    }
+    return n;
+}
+
 static bool jr_ra(const Ins *p) { return p->op == OP_JR && p->rs == 31; }
 static bool sp_prologue(const Ins *i) { return i->op == OP_ADDIU && i->rs == 29 && i->rt == 29 && i->imm < 0; }
 

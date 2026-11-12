@@ -32,9 +32,26 @@ if(DESTREGA_COVERAGE)
   add_compile_definitions(DESTREGA_COVERAGE=1)
 endif()
 
+# Game module layout (the launcher, docs/RELEASES.md option A): the executable holds no game
+# code; the recompiled game is a shared library loaded at start-up (runtime/game_abi.h). The
+# launcher builds it on the player's machine from their disc (runtime/launcher/). With
+# DESTREGA_DEV_GAME_MODULE CMake also builds it from gen/ next to the executable (development);
+# without it nothing here needs the disc or gen/ (what a launcher release is built from).
+option(DESTREGA_GAME_MODULE "Executable without game code; the game is a module built by the launcher" OFF)
+option(DESTREGA_DEV_GAME_MODULE "With DESTREGA_GAME_MODULE: also build destrega_game from gen/ (development)" ON)
+set(_need_gen ON)
+if(DESTREGA_GAME_MODULE AND NOT DESTREGA_DEV_GAME_MODULE)
+  set(_need_gen OFF)
+endif()
+if(DESTREGA_GAME_MODULE AND DESTREGA_STUB_GEN)
+  message(FATAL_ERROR "DESTREGA_GAME_MODULE builds no game code; use it without DESTREGA_STUB_GEN")
+endif()
+
 set(GEN_DIR ${CMAKE_SOURCE_DIR}/gen)
 
-if(DESTREGA_STUB_GEN)
+if(NOT _need_gen)
+  set(GEN_INCLUDE "")
+elseif(DESTREGA_STUB_GEN)
   add_library(gen STATIC tools/ci/stub_gen/stub.c)
   target_include_directories(gen PRIVATE runtime tools/ci/stub_gen)
   set(GEN_INCLUDE ${CMAKE_SOURCE_DIR}/tools/ci/stub_gen)
@@ -61,10 +78,20 @@ else()
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Recompiling MIPS code to C")
 
-  add_library(gen STATIC ${GEN_SOURCES})
-  target_include_directories(gen PRIVATE runtime gen)
-  # Generated code is huge and goto-heavy; -O1 keeps build times sane.
-  target_compile_options(gen PRIVATE -O1 -w -fno-strict-aliasing)
+  if(DESTREGA_GAME_MODULE)
+    # development module: the same objects the launcher builds (runtime/launcher/launcher.c flags)
+    add_library(destrega_game SHARED ${GEN_SOURCES} runtime/game_module.c)
+    target_include_directories(destrega_game PRIVATE runtime gen ${CMAKE_CURRENT_BINARY_DIR})
+    target_compile_options(destrega_game PRIVATE -O1 -w -fno-strict-aliasing -fvisibility=hidden
+                           -include ${CMAKE_SOURCE_DIR}/runtime/game_module_side.h)
+    set_target_properties(destrega_game PROPERTIES PREFIX "")
+    target_sources(destrega_game PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/game_sdk.h)
+  else()
+    add_library(gen STATIC ${GEN_SOURCES})
+    target_include_directories(gen PRIVATE runtime gen)
+    # Generated code is huge and goto-heavy; -O1 keeps build times sane.
+    target_compile_options(gen PRIVATE -O1 -w -fno-strict-aliasing)
+  endif()
   set(GEN_INCLUDE ${GEN_DIR})
 endif()
 
@@ -91,7 +118,39 @@ add_custom_command(
   COMMENT "Emulation source identity (netplay)")
 target_sources(destrega PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/source_ident.h)
 target_compile_options(destrega PRIVATE -Wall -Wno-unused-function -fno-strict-aliasing)
-target_link_libraries(destrega PRIVATE gen SDL3::SDL3 ZLIB::ZLIB)
+target_link_libraries(destrega PRIVATE SDL3::SDL3 ZLIB::ZLIB)
+if(DESTREGA_GAME_MODULE)
+  # module SDK + analysis inputs embedded for the launcher (ids: tools/embed_files.py)
+  file(GLOB _embed_deps CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/analysis/*.txt ${CMAKE_SOURCE_DIR}/analysis/*.json
+       ${CMAKE_SOURCE_DIR}/analysis/overlays/*.json)
+  add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/game_sdk.h ${CMAKE_CURRENT_BINARY_DIR}/game_sdk_files.c
+    COMMAND ${Python3_EXECUTABLE} tools/embed_files.py ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}
+    DEPENDS tools/embed_files.py runtime/psx.h runtime/recomp.h runtime/pgxp.h runtime/game_abi.h
+            runtime/game_module_side.h runtime/game_module.c runtime/launcher/recompiler.c
+            runtime/launcher/recompiler.h ${_embed_deps}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Embedding the game module SDK")
+  target_compile_definitions(destrega PRIVATE DESTREGA_GAME_MODULE=1)
+  target_sources(destrega PRIVATE runtime/game_load.c runtime/launcher/launcher.c runtime/launcher/proc.c
+                 runtime/launcher/sha256.c runtime/launcher/recompiler.c
+                 ${CMAKE_CURRENT_BINARY_DIR}/game_sdk_files.c ${CMAKE_CURRENT_BINARY_DIR}/game_sdk.h)
+  if(APPLE)
+    target_sources(destrega PRIVATE runtime/launcher/launcher_ui_mac.m)
+    set_source_files_properties(runtime/launcher/launcher_ui_mac.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall")
+  elseif(WIN32)
+    target_sources(destrega PRIVATE runtime/launcher/launcher_ui_win.c)
+    target_link_libraries(destrega PRIVATE comctl32)
+  else()
+    target_sources(destrega PRIVATE runtime/launcher/launcher_ui_sdl.c)
+  endif()
+  target_link_libraries(destrega PRIVATE ${CMAKE_DL_LIBS})
+  if(TARGET destrega_game)
+    add_dependencies(destrega destrega_game)
+  endif()
+else()
+  target_link_libraries(destrega PRIVATE gen)
+endif()
 if(UNIX)
   target_link_libraries(destrega PRIVATE m)
 endif()

@@ -25,4 +25,8 @@ typedef struct {
  * (if not NULL) receives the number of C files written (the compile units). */
 const char *recomp_run(const RecompInput *in, int *files_out);
 
+/* Every analysis input recomp_run() may ask for (relative to analysis/), in a fixed order, so the
+ * launcher can hash them for its module key. Returns the count; names stay valid. */
+int recomp_analysis_inputs(const char *names[], int max);
+
 #endif

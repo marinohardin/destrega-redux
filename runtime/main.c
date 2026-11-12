@@ -24,6 +24,9 @@
 
 void bus_init(void);
 #include "disc.h"
+#ifdef DESTREGA_GAME_MODULE
+#include "launcher/launcher.h"   /* game module: found or built before boot */
+#endif
 
 static SDL_Window *s_win;
 static SDL_Renderer *s_ren;
@@ -1476,6 +1479,9 @@ static void usage(void) {
         "  --no-idle-skip        run every iteration of idle loops (analysis/idle_loops.txt; A/B checks)\n"
         "  --verify-overrides    run hand-written overrides against the recompiled originals\n");
     ss_usage();
+#ifdef DESTREGA_GAME_MODULE
+    launcher_usage();
+#endif
 }
 
 /* ---- first-launch import (bring your own disc) ----------------------------------- */
@@ -2260,6 +2266,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--data-dir") && i + 1 < argc) data_dir = argv[++i];
         else if (!strcmp(argv[i], "--help")) { usage(); return 0; }
         else if ((ss_k = ss_parse_arg(argc, argv, i)) > 0) i += ss_k - 1;   /* savestate.c / replay.c */
+#ifdef DESTREGA_GAME_MODULE
+        else if ((ss_k = launcher_parse_arg(argc, argv, i)) > 0) i += ss_k - 1;
+#endif
         else disc_path = argv[i];
     }
 
@@ -2312,6 +2321,12 @@ int main(int argc, char **argv) {
         if (!s_headless) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Destrega", verr, s_win);
         return 1;
     }
+#ifdef DESTREGA_GAME_MODULE
+    {   /* load the game module, building it from this disc first if needed (runtime/launcher/) */
+        int code;
+        if (!launcher_prepare(s_card_dir, s_headless, s_win, &code)) return code;
+    }
+#endif
 
     if (!s_no_memcard) {
         /* Windowed play defaults to the user's card; headless runs only get a card when asked
