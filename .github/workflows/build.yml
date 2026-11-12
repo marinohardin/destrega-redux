@@ -257,7 +257,7 @@ jobs:
           cmake -S . -B build/launcher -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_PREFIX_PATH=$HOME/sdl3 -DDESTREGA_GAME_MODULE=ON -DDESTREGA_DEV_GAME_MODULE=OFF
           cmake --build build/launcher
           python3 tools/check_no_game_code.py build/launcher/destrega
-          LD_LIBRARY_PATH=$HOME/sdl3/lib ./build/launcher/destrega --help | grep -q -- --game-cc
+          LD_LIBRARY_PATH=$HOME/sdl3/lib ./build/launcher/destrega --help 2>&1 | grep -q -- --game-cc
           # the module build path with this job's compiler (no disc: the stub sources)
           st=$RUNNER_TEMP/selftest
           mkdir -p $st/gen
