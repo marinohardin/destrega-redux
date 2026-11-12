@@ -1614,6 +1614,59 @@ unless `--widescreen` is given, so every test's hashes and dumps are unchanged.
   registered with `widescreen_add_state_hook(save, restore)`, or the wide pass leaks into the
   real one.
 
+## Launcher and game module (`-DDESTREGA_GAME_MODULE=ON`; `runtime/launcher/`, `runtime/game_*`)
+
+Release form without game code (docs/RELEASES.md option A). The static build stays the default.
+
+- **Layout.** The executable holds the runtime only; `gen/` + `runtime/game_module.c` form a
+  shared library `destrega_game.<dylib|dll|so>`. Interface `runtime/game_abi.h`: the module
+  imports every runtime global/function the generated code touches through `GameImports` (the
+  module side compiles with `-include game_module_side.h`, which turns `g_cpu` etc. into
+  pointers; hidden visibility) and exports the table, overlays and the generated functions the
+  runtime calls (`GAME_ABI_GEN`, reached as `g_game.fn_*` via `game_syms.h`). One exported symbol
+  (`destrega_game_module_init`); the dylib links nothing but libc's memcpy. `game_load.c`
+  refuses a module whose ABI version, struct sizes, layout fingerprint (`game_abi_layout()`) or
+  SDK id (sha256 of the headers it was compiled with, `tools/embed_files.py`) differ, with a
+  plain message. **Changing a list in game_abi.h, psx.h/recomp.h/pgxp.h inlines or a struct in
+  the layout list = bump `GAME_ABI_VERSION` (the SDK id changes by itself).** A new runtime
+  global or function used by generated code must be added to the lists or the module fails to
+  link (undefined symbol) in the module build.
+- `-DDESTREGA_DEV_GAME_MODULE=ON` (default with the module layout) also builds the module from
+  `gen/` next to the executable; `OFF` = the release layout (no disc, no gen/; CI builds it).
+- **Lookup at start** (`launcher_prepare`, after `disc_verify`): `--game-module PATH` -> the
+  dev module next to the executable (skipped with `--rebuild-game` / `--analysis-dir`) -> `<data
+  dir>/game/destrega_game.<ext>` if `game/game.key` matches -> build. Key = sha256 over version
+  tag, SDK id, recompiler id, every analysis input (embedded, or `--analysis-dir DIR`),
+  SLUS_007.32 and all overlay files, compiler argv + full `--version` output, flags, target.
+  Without any compiler an existing module is still tried (the ABI check protects).
+- **Build** (worker thread; the main thread polls the UI): C recompiler (`recompiler.c`, port of
+  `recomp/*.py`; **change both**, `tools/test_recomp_c.sh` must stay byte-identical) into
+  `game/build/gen/`, the SDK headers into `game/build/sdk/`, units compiled largest first in
+  parallel (`--game-jobs N`, default the performance cores) with `-O1 -w -fno-strict-aliasing
+  -fvisibility=hidden [-fPIC]`, linked `-shared`, renamed into place, key written last.
+  Compiler: `--game-cc "CMD ..."`, `DESTREGA_ZIG`, `<exe dir>/zig/zig`, `../Resources/zig/zig`
+  (.app), then system `cc`/`clang`/`gcc`. Zig's caches stay in `game/build/zig-cache`.
+  Log `game/build/build.log`; stderr lines `launcher: ...` with the time of each step.
+- **UI**: Cocoa (`launcher_ui_mac.m`), Win32 (`launcher_ui_win.c`), SDL text (`launcher_ui_sdl.c`,
+  Linux): "Preparing the game for this computer...", determinate bar (5% recompile, compile
+  units, link), Cancel / Esc / closing the window; errors in an SDL message box with Copy Details.
+  Headless prints progress every 10%.
+- **Other options**: `--recompile OUTDIR` (C recompiler only, then exit).
+- **Determinism** (verified): a module build (CMake/clang dev module) gives per-frame
+  `--state-hash` identical to the static build on vs_hills, `vs_tieme_rohzen_villa` and
+  `1p_reyus_cpu` with `--no-interp --verify-overrides`. Netplay identity is unchanged by the
+  layout: `replay_build_id` hashes the table only, and `source_ident.py` covers
+  `runtime/launcher/recompiler.[ch]` but not the rest of `runtime/launcher/`.
+- **Tests**: `tools/test_launcher.sh [--cc CMD] [--jobs N]` (scratch data dir under
+  `build/launcher-test/`: import, first launch builds, second is cached, a changed analysis
+  input rebuilds, the original inputs rebuild again; prints step times). `tools/test_recomp_c.sh`.
+  `DESTREGA_BIN_JOIN=... tools/test_netplay.py lan` plays a launcher peer against a static one.
+- **Packaging**: `tools/package_release.sh launcher mac|win|linux --zig DIR`, `tools/make_appimage.sh`,
+  `tools/check_no_game_code.py PATH...` (also run by CI on the Linux launcher build); see
+  "Releases".
+- Measured (M1 Pro, loaded machine, system clang, 4 jobs): recompile 0.3 s, compile 50 units
+  ~46 s, link 0.3 s; cached launch: key check 0.04 s.
+
 ## Releases (`docs/RELEASES.md`)
 
 `gen/` is translated game code and is **never** published: CI has no disc, and no workflow,
@@ -1637,6 +1690,13 @@ notarization steps) is in `docs/RELEASES.md`.
   The Win32 dialogs in `menu_win.c` already use the system message font; only the manifest
   dependency was missing for the modern look. Checked under CrossOver (`--bottle destrega-test`).
 - `THIRD_PARTY_LICENSES.txt` goes into every package; update it when linking anything new.
+- **Launcher packages** (no game code; "Launcher and game module"): `package_release.sh launcher
+  mac|win|linux --zig DIR [--bin PATH]` -> `Destrega-<version>-<os>-<arch>.zip` (mac: app made by
+  `make_app.sh --zig DIR --entitlements tools/launcher.entitlements`, Zig in
+  `Contents/Resources/zig`; win: exe + DLLs + `zig/`; linux: `make_appimage.sh`, needs
+  `appimagetool` on PATH, never downloaded by the script). Refused unless the binary is a launcher
+  build and `check_no_game_code.py` passes. Zig is never committed; the dev copy lives in
+  `build/zig/`.
 
 ## Pitfalls
 
