@@ -203,7 +203,13 @@ Acceptance:
   triangles, the slowest part of the MoltenVK shader, are replaced by ~900 hardware-rasterized faces
   in the same passes). Phase 3 stage-only is below phase 2b because of the exact box overlap.
   Character audit + capture: part of the host cost (`hlr-cost:` covers only the stage pass).
-- Direct3D 12 (CrossOver): D3D_PLACEHOLDER
+- Direct3D 12 (CrossOver 26, vkd3d over MoltenVK, `build/win/destrega.exe` cross-built from
+  this branch; vs_hills scenario to its key frame, 4x6 widescreen, `--no-interp --verify-overrides`):
+  per-frame `--state-hash` of D3D12 off / on / exact and Metal off / on all identical (2920
+  frames); D3D12 exact frames byte-identical to off; D3D12 on vs Metal on: 0.18 % of pixels differ,
+  none by > 4 steps; 0 mismatched character vertices / colours, 2.09 passes and 960 polygons per
+  frame (Metal 963). Time for frames 2400-2920 (stage load + ~120 fight frames, not the bench
+  segment, load ~60-90): D3D12 off 5.15, on 5.45, exact 7.41 ms/frame; Metal off 4.01, on 3.34.
 - Contact sheets (`tools/hlr_diff.py`, off | on | |diff| x 4; Metal, 4x6 widescreen, kept under
   `build/hlr3/`, not committed): all 12 stages (`diff/<stage>.png`, `diff/table.txt`): pixels off
   by > 4 steps 0.25-2.71 % (Throne 7.79 %: the high-contrast carpet and floor textures, stage not fighters, by eye),
