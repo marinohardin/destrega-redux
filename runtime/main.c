@@ -159,6 +159,9 @@ static bool s_hlr_given, s_hlr_parts_given;
 /* --hlr-msaa N, --hlr-near clip|ps1, --hlr-look enhanced|ps1 (settings display.hlr_msaa / hlr_near /
  * hlr_look, View > 3D Scene): how the native stage is drawn (hlr_native.c, hlr_gpu.c) */
 static bool s_hlr_msaa_given, s_hlr_near_given, s_hlr_look_given;
+/* --hlr-bones game|smooth (settings display.hlr_bones): characters' bone matrices as the game made
+ * them or smoothed + predicted (hlr_char.c); presentation only */
+static bool s_hlr_bones_given;
 #define HLR_WINDOW_DEFAULT HLR_ON    /* windowed default: draws only with a GPU API (HiresBackend.external) */
 
 static void wav_header(FILE *f, u32 bytes) {
@@ -1401,6 +1404,7 @@ static void settings_apply(const char *dir) {
     if (s_hlr_msaa_given) settings_lock("display", "hlr_msaa");
     if (s_hlr_near_given) settings_lock("display", "hlr_near");
     if (s_hlr_look_given) settings_lock("display", "hlr_look");
+    if (s_hlr_bones_given) settings_lock("display", "hlr_bones");
     if (s_win_set) settings_lock("display", "window");
     if (s_opt_filter >= 0) settings_lock("display", "tex_filter");
     if (s_opt_full >= 0) settings_lock("display", "smooth_colours");
@@ -1466,6 +1470,10 @@ static void settings_apply(const char *dir) {
         if (!strcmp(v, "enhanced") || !strcmp(v, "ps1")) hlr_set_look(!strcmp(v, "ps1") ? HLR_LOOK_PS1 : HLR_LOOK_ENHANCED);
         else rt_log("settings: display.hlr_look: enhanced or ps1");
     }
+    if (!s_hlr_bones_given && (v = settings_get("display", "hlr_bones"))) {
+        if (!strcmp(v, "game") || !strcmp(v, "smooth")) hlr_set_bones(!strcmp(v, "game") ? HLR_BONES_GAME : HLR_BONES_SMOOTH);
+        else rt_log("settings: display.hlr_bones: game or smooth");
+    }
     if (!s_win_set && (v = settings_get("display", "window"))) {
         if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
     }
@@ -1503,6 +1511,7 @@ static void settings_note_view(const char *name) {
     }
     else if (!strcmp(name, "hlr-near")) settings_set("display", "hlr_near", hlr_get_near() == HLR_NEAR_PS1 ? "ps1" : "clip");
     else if (!strcmp(name, "hlr-look")) settings_set("display", "hlr_look", hlr_get_look() == HLR_LOOK_PS1 ? "ps1" : "enhanced");
+    else if (!strcmp(name, "hlr-bones")) settings_set("display", "hlr_bones", hlr_get_bones() == HLR_BONES_GAME ? "game" : "smooth");
     else if (!strcmp(name, "tex-filter")) settings_set("display", "tex_filter", hires_tex_filter_name(hires_get_tex_filter()));
     else if (!strcmp(name, "smooth-colours")) settings_set_bool("display", "smooth_colours", hires_get_colour());
     else if (!strcmp(name, "ssaa") && s_ssaa_chosen) {
@@ -2044,6 +2053,7 @@ bool frontend_view_checked(const char *action, bool *checked) {
     if (n == 8 && !strncmp(action, "hlr-msaa", n) && *arg) { *checked = atoi(arg) == hlr_gpu_get_msaa(); return true; }
     if (n == 8 && !strncmp(action, "hlr-near", n) && *arg) { *checked = !strcmp(arg, "ps1") == (hlr_get_near() == HLR_NEAR_PS1); return true; }
     if (n == 8 && !strncmp(action, "hlr-look", n) && *arg) { *checked = !strcmp(arg, "ps1") == (hlr_get_look() == HLR_LOOK_PS1); return true; }
+    if (n == 9 && !strncmp(action, "hlr-bones", n) && *arg) { *checked = !strcmp(arg, "game") == (hlr_get_bones() == HLR_BONES_GAME); return true; }
     if (n == 8 && !strncmp(action, "hlr-part", n) && *arg) {   /* hlr-part=stage[:on] */
         char part[16];
         snprintf(part, sizeof part, "%.*s", (int)strcspn(arg, ":"), arg);
@@ -2154,6 +2164,12 @@ static void menu_run(const char *name, const char *arg) {
                       : hlr_get_look() == HLR_LOOK_PS1 ? HLR_LOOK_ENHANCED : HLR_LOOK_PS1;
         hlr_set_look(m);
         rt_log("hlr: %s look at frame %llu", m == HLR_LOOK_PS1 ? "ps1" : "enhanced", (unsigned long long)s_frame);
+    }
+    else if (!strcmp(name, "hlr-bones")) {   /* characters' bones: game | smooth; none = toggle */
+        const int m = !strcmp(arg, "game") ? HLR_BONES_GAME : !strcmp(arg, "smooth") ? HLR_BONES_SMOOTH
+                      : hlr_get_bones() == HLR_BONES_GAME ? HLR_BONES_SMOOTH : HLR_BONES_GAME;
+        hlr_set_bones(m);
+        rt_log("hlr: bones %s at frame %llu", m == HLR_BONES_GAME ? "game" : "smooth", (unsigned long long)s_frame);
     }
     else if (!strcmp(name, "hlr-part")) {   /* View > 3D Scene > Stage: PART:on|off, none = toggle */
         char part[16];
@@ -2294,6 +2310,12 @@ int main(int argc, char **argv) {
             if (strcmp(m, "clip") && strcmp(m, "ps1")) { fprintf(stderr, "--hlr-near: clip or ps1\n"); return 2; }
             hlr_set_near(!strcmp(m, "ps1") ? HLR_NEAR_PS1 : HLR_NEAR_CLIP);
             s_hlr_near_given = true;
+        }
+        else if (!strcmp(argv[i], "--hlr-bones") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (strcmp(m, "game") && strcmp(m, "smooth")) { fprintf(stderr, "--hlr-bones: game or smooth\n"); return 2; }
+            hlr_set_bones(!strcmp(m, "game") ? HLR_BONES_GAME : HLR_BONES_SMOOTH);
+            s_hlr_bones_given = true;
         }
         else if (!strcmp(argv[i], "--hlr-look") && i + 1 < argc) {
             const char *m = argv[++i];

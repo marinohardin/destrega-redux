@@ -98,6 +98,12 @@ bool hlr_stage_native(void)
     return (s_parts & HLR_PART_STAGE) && hlr_native();
 }
 
+/* characters are attached to the stage's frame, so they need the stage drawn natively too */
+bool hlr_chars_native(void)
+{
+    return (s_parts & HLR_PART_CHARS) && (s_parts & HLR_PART_STAGE) && hlr_native();
+}
+
 void hlr_set_mode(int mode)
 {
     if (mode < HLR_OFF || mode > HLR_AUDIT) mode = HLR_OFF;
@@ -110,6 +116,9 @@ void hlr_set_mode(int mode)
     g_hlr.ll_filter = mode == HLR_AUDIT ? NULL : hlr_ll_filter;
     g_hlr.on_restore = on_restore;
     g_hlr.stage_native = mode == HLR_ON ? hlr_stage_native : NULL;
+    g_hlr.char_pre = hlr_char_pre;
+    g_hlr.char_post = hlr_char_post;
+    g_hlr.chars_native = mode == HLR_ON ? hlr_chars_native : NULL;
 }
 
 int hlr_get_mode(void) { return s_mode; }
@@ -127,7 +136,7 @@ bool hlr_draws(void)
 /* ---- frame store ------------------------------------------------------------------------ */
 static void frame_clear(HlrFrame *f)
 {
-    f->valid = false; f->np = 0; f->nw = 0; f->nn = 0;
+    f->valid = false; f->np = 0; f->nw = 0; f->nn = 0; f->nc = 0;
 }
 
 HlrFrame *hlr_frame_begin(u32 ot)
@@ -165,7 +174,7 @@ HlrPkt *hlr_frame_add(HlrFrame *f, u32 addr, int kind, const u32 *words, int n)
         if (!f->w) rt_fatal("hlr: out of memory");
     }
     HlrPkt *p = &f->p[f->np++];
-    p->addr = addr & 0x1ffffc; p->n = (u16)n; p->kind = (u16)kind; p->off = (u32)f->nw; p->nat = -1;
+    p->addr = addr & 0x1ffffc; p->n = (u16)n; p->kind = (u16)kind; p->off = (u32)f->nw; p->nat = -1; p->chr = -1;
     memcpy(f->w + f->nw, words, (size_t)n * sizeof *words);
     f->nw += n;
     return p;
@@ -183,9 +192,29 @@ HlrNat *hlr_frame_add_nat(HlrFrame *f)
     return n;
 }
 
+HlrChr *hlr_frame_add_chr(HlrFrame *f)
+{
+    if (f->nc == f->chcap) {
+        f->chcap = f->chcap ? f->chcap * 2 : 1024;
+        f->chr = realloc(f->chr, (size_t)f->chcap * sizeof *f->chr);
+        if (!f->chr) rt_fatal("hlr: out of memory");
+    }
+    HlrChr *c = &f->chr[f->nc++];
+    memset(c, 0, sizeof *c);
+    return c;
+}
+
+HlrFrame *hlr_frame_for_ot(u32 ot)
+{
+    ot &= 0x1ffffc;
+    for (int i = 0; i < 2; i++)
+        if (s_fr[i].valid && s_fr[i].ot == ot && &s_fr[i] != s_active) return &s_fr[i];
+    return NULL;
+}
+
 static inline u32 hslot(u32 addr, int cap) { return (addr * 2654435761u) & (u32)(cap - 1); }
 
-void hlr_frame_commit(HlrFrame *f)
+void hlr_frame_reindex(HlrFrame *f)
 {
     int need = 16;
     while (need < f->np * 2) need <<= 1;
@@ -200,6 +229,11 @@ void hlr_frame_commit(HlrFrame *f)
         while (f->hash[h] >= 0) h = (h + 1) & (u32)(f->hcap - 1);
         f->hash[h] = i;
     }
+}
+
+void hlr_frame_commit(HlrFrame *f)
+{
+    hlr_frame_reindex(f);
     f->seq = ++s_seq;
     f->valid = true;
     S.committed++;
@@ -225,6 +259,7 @@ void hlr_frames_drop(void)
     for (int i = 0; i < 2; i++) if (s_fr[i].valid) { S.dropped++; frame_clear(&s_fr[i]); }
     s_active = NULL;
     hlr_native_reset();
+    hlr_char_reset();
 }
 
 const HlrFrame *hlr_frame_get(int i) { return i >= 0 && i < 2 ? &s_fr[i] : NULL; }
@@ -282,6 +317,7 @@ void hlr_report(void)
 {
     if (s_mode == HLR_OFF && !S.captured) return;
     hlr_stage_report();
+    hlr_char_report();
     if (s_mode == HLR_AUDIT) return;
     u64 left = 0;
     for (int i = 0; i < 2; i++) if (s_fr[i].valid) left++;
@@ -299,6 +335,9 @@ void hlr_report(void)
     if (N.frames) {
         HlrGpuStats G;
         hlr_gpu_get_stats(&G);
+        if (N.chr_items || N.chr_back)
+            rt_log("hlr-native-chars: %.0f character faces per frame drawn in 3D, %.0f per frame facing away (float test)",
+                   (double)N.chr_items / (double)N.frames, (double)N.chr_back / (double)N.frames);
         rt_log("hlr-native-draw: %llu frames, %.2f passes per frame, %.0f polygons per frame drawn in 3D"
                " (near %s, look %s, MSAA %dx); %llu culled by the camera, %llu dropped as too near, %llu stale,"
                " %llu without texture, %llu of skipped objects without packet words; %llu packets suppressed; %llu walks given up; GPU %llu passes"

@@ -17,6 +17,12 @@ typedef struct HlrHooks {
     /* true: the stage is drawn natively in 3D this pass, so stage_render skips its widescreen
      * shadow pass (the native camera covers the guard band) */
     bool (*stage_native)(void);
+    /* char_mesh_render (80036b0c), around the original (overrides/char_mesh.c); mb = its a0 (the
+     * model block), ot = its a1 (the scene ordering table) */
+    void (*char_pre)(uint32_t mb, uint32_t ot);
+    void (*char_post)(void);
+    /* true: characters are drawn natively in 3D, so char_mesh.c adds no PGXP extra faces */
+    bool (*chars_native)(void);
     /* GPU linked-list DMA (bus.c), per node (RAM offset of its header) before its words are
      * written, and once with 0xffffffff at the end of the walk. Returns true when the node's
      * words must reach the 1x GPU only (the HLR drew its own version into the hi-res target). */

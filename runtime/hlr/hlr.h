@@ -15,7 +15,7 @@
 
 enum { HLR_OFF, HLR_ON, HLR_EXACT, HLR_AUDIT };
 enum { HLR_PART_STAGE = 1, HLR_PART_CHARS = 2, HLR_PART_SHADOWS = 4, HLR_PART_FX = 8, HLR_PART_STORY = 16,
-       HLR_PARTS_ALL = 31, HLR_PARTS_IMPLEMENTED = HLR_PART_STAGE };
+       HLR_PARTS_ALL = 31, HLR_PARTS_IMPLEMENTED = HLR_PART_STAGE | HLR_PART_CHARS };
 
 /* ---- switches (hlr.c) ---------------------------------------------------------------- */
 int hlr_parse_mode(const char *s);              /* -1 if invalid */
@@ -45,7 +45,23 @@ typedef struct {
     u32 off;            /* first word in HlrFrame.w */
     s32 nat;            /* native polygon it belongs to (HlrFrame.nat; a subdivision quarter: its
                          * parent), -1 = none */
+    s32 chr;            /* character face it belongs to (HlrFrame.chr), -1 = none */
 } HlrPkt;
+
+/* A character face for native 3D drawing (phase 3, hlr_char.c): world positions of its vertices
+ * (bone matrices applied in float, smoothed by --hlr-bones), the game's lit vertex colours (NCCT
+ * results) and the texture words of its packet. Every face of the mesh is listed, also those the
+ * game's integer backface test dropped; the native renderer has its own (float) backface test. */
+typedef struct {
+    float v[4][3];      /* world coordinates (the stage's: the world-screen matrix maps them) */
+    u32 col[4];         /* vertex colours 0x00BBGGRR (+ the command byte in col[0] >> 24) */
+    u16 uv[4];          /* u | v << 8 */
+    u16 clut, tpage;
+    u32 pkt;            /* RAM offset of its packet (this frame's half of the face record) */
+    u8 nv, code, linked;    /* linked: the game put it into the table this frame */
+    u8 model;           /* which char_mesh_render call of the update (0, 1, ...) */
+    s16 slot;           /* ordering-table slot (the game's rule; also for faces it dropped) */
+} HlrChr;
 
 /* A stage polygon for native 3D drawing (phase 2b), read from the stage model by the capture: the
  * builders' vertices (model coordinates are world coordinates: every object is drawn with the
@@ -77,6 +93,7 @@ typedef struct HlrFrame {
     u32 *w; int nw, wcap;
     int *hash; int hcap;
     HlrNat *nat; int nn, ncap;      /* native polygons (mode on) */
+    HlrChr *chr; int nc, chcap;     /* character faces (mode on, phase 3) */
     HlrCam cam;         /* the float camera of the pass (hlr_cam.h) */
 } HlrFrame;
 
@@ -84,6 +101,9 @@ typedef struct HlrFrame {
 HlrFrame *hlr_frame_begin(u32 ot);              /* empty frame for this table (replaces an unwalked one) */
 HlrPkt *hlr_frame_add(HlrFrame *f, u32 addr, int kind, const u32 *words, int n);
 HlrNat *hlr_frame_add_nat(HlrFrame *f);      /* a zeroed native polygon */
+HlrChr *hlr_frame_add_chr(HlrFrame *f);      /* a zeroed character face */
+HlrFrame *hlr_frame_for_ot(u32 ot);             /* the committed, not yet walked frame of that table */
+void hlr_frame_reindex(HlrFrame *f);            /* after packets were added to a committed frame */
 void hlr_frame_commit(HlrFrame *f);
 void hlr_frame_abort(HlrFrame *f);
 const HlrPkt *hlr_frame_find(const HlrFrame *f, u32 addr);
@@ -113,6 +133,7 @@ void hlr_native_reset(void);                    /* drop what is pending (save-st
 typedef struct {
     u64 frames, passes, items, culled, near_dropped, stale, no_texture, suppressed, desync, lookups;
     u64 hidden_bad;     /* polygons of objects the PS1 skipped whose packet words were never written */
+    u64 chr_items, chr_back;    /* character faces drawn natively, faces found facing away (float) */
 } HlrNativeStats;
 void hlr_native_get_stats(HlrNativeStats *st);
 
@@ -122,3 +143,24 @@ void hlr_stage_post(void);                      /* after it: audit, and the capt
 void hlr_stage_report(void);                    /* "hlr-audit: ..." */
 typedef struct { u64 frames, linked, mismatch, unexpl, missing, heads, badwalk, alt_tris, alt_quads, alt_subs; } HlrAuditStats;
 void hlr_stage_get_stats(HlrAuditStats *st);
+
+/* ---- characters (hlr_char.c, phase 3) ------------------------------------------------- */
+enum { HLR_BONES_GAME, HLR_BONES_SMOOTH };      /* --hlr-bones: the game's matrices / smoothed + predicted */
+void hlr_set_bones(int m);
+int hlr_get_bones(void);
+void hlr_char_pre(u32 mb, u32 ot);              /* char_mesh_render (80036b0c) entry: model block, scene OT */
+void hlr_char_post(void);                       /* after it: audit, and the capture when drawing natively */
+bool hlr_chars_native(void);                    /* characters are drawn natively (char_mesh.c skips its extras) */
+void hlr_char_reset(void);                      /* drop the bone filters (save-state load, mode change) */
+void hlr_char_report(void);                     /* "hlr-chars: ..." */
+typedef struct {
+    u64 calls, audited, vtx, vtx_bad, col, col_bad, faces, kept, link_bad, word_bad, bad_model;
+    u64 attached, no_frame, cam_diff, frames_bad;
+    double proj_err_sum; u64 proj_n; double proj_err_max;  /* float projection of the game's bones vs SXY */
+    u64 resets, snaps;
+} HlrCharStats;
+void hlr_char_get_stats(HlrCharStats *st);
+/* the bone filter alone (tests): x = 12 values (3x3 matrix / 4096 units, translation), returns
+ * the filtered values in out */
+typedef struct { float s[12], prev[12]; int n; } HlrBoneFilter;
+void hlr_bone_filter(HlrBoneFilter *bf, const float x[12], float out[12]);

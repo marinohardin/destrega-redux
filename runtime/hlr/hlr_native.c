@@ -43,15 +43,17 @@
 #define STRIP_G4 0x0cc510u          /* background gradient (G4, code 0x38) */
 #define STRIP_F4 0x0cc540u          /* background floor band (F4, code 0x28) */
 
-enum { W_SLOT, W_STAGE, W_STRIP, W_OTHER, W_NONE };
+enum { W_SLOT, W_STAGE, W_STRIP, W_OTHER, W_NONE, W_CHAR };
 typedef struct { u32 node; u8 kind; s32 nat; } WNode;
 typedef struct { int x0, y0, x1, y1; } IBox;      /* 1x VRAM pixels, inclusive */
-typedef struct { int pos; IBox b; } Other;
+typedef struct { int pos; IBox b; int chr; } Other;   /* chr: a character packet (-1 = none) */
 typedef struct {
     int pos, lo, hi, t;
     IBox b;
-    s32 nat;                        /* native polygon, -1 = a background strip (node index in strip) */
-    int strip;                      /* W node index of the strip */
+    s32 nat;                        /* native polygon, -1 = a strip or a character face */
+    int strip;                      /* W node index of the strip, -1 = none */
+    s32 chr;                        /* character face (HlrFrame.chr), -1 = none */
+    u8 tris;                        /* character face: its triangles that face the camera (bit 0, bit 1) */
     u32 info;                       /* layer / TEX / RAW / shade */
     int blend;                      /* -1 opaque, 0..3 semi mode */
     bool tex_semi;                  /* textured + semi: opaque texels and STP texels separately */
@@ -66,6 +68,8 @@ static int *s_tstart, *s_tlist; static int s_tlcap, s_tcap;  /* tile grid (CSR) 
 static int s_gx0, s_gy0, s_gnx, s_gny;
 static Item *s_it; static int s_ni, s_icap;
 static int *s_natpos; static int s_npcap;
+static int *s_chrpos; static int s_cpcap;
+static bool *s_chrdone; static int s_cdcap;              /* character face drawn natively (its packet suppressed) */
 static int s_slotpos[HLR_OT_SLOTS];
 static bool *s_sup; static int s_supcap;                     /* per position: suppress */
 static int *s_pt; static int s_npt, s_ptcap;                 /* pass points (positions), INF_POS = end */
@@ -194,6 +198,7 @@ static void grid_build(int x0, int y0, int x1, int y1)
             GROW(s_tlist, s_tlcap, sum + 1, 4096);
             for (int i = 0; i < s_no; i++) {
                 const IBox *b = &s_o[i].b;
+                if (b->x0 > b->x1 || b->y0 > b->y1) continue;     /* outside the pass (not counted above) */
                 const int tx0 = (b->x0 - x0) / TILE, tx1 = (b->x1 - x0) / TILE, ty0 = (b->y0 - y0) / TILE, ty1 = (b->y1 - y0) / TILE;
                 for (int ty = ty0; ty <= ty1; ty++)
                     for (int tx = tx0; tx <= tx1; tx++) s_tlist[fill[ty * s_gnx + tx]++] = s_o[i].pos;
@@ -254,6 +259,8 @@ static int cmp_pos(const void *a, const void *b)
     return x->pos < y->pos ? -1 : x->pos > y->pos;
 }
 
+static void put_strip(HlrGpuFrame *gf, const Env *e, u32 node, const int rect[4]);
+
 /* ---- vertices ------------------------------------------------------------------------------------ */
 static void put_nat(HlrGpuFrame *gf, const HlrFrame *f, const Item *it, int sel)
 {
@@ -287,6 +294,45 @@ static void put_nat(HlrGpuFrame *gf, const HlrFrame *f, const Item *it, int sel)
             v->uvr = uvr;
             v->info = info;
         }
+}
+
+/* a character face: world positions, the game's vertex colours (gouraud, no fog: NCCT has no depth cue) */
+static void put_chr(HlrGpuFrame *gf, const HlrFrame *f, const Item *it, int sel)
+{
+    const HlrChr *c = &f->chr[it->chr];
+    static const int tri[2][3] = { { 0, 1, 2 }, { 1, 3, 2 } };
+    const int ntri = (it->tris & 1) + ((it->tris >> 1) & 1);
+    HlrVtx *v = hlr_gpu_frame_vtx(gf, (u32)ntri * 3);
+    unsigned umin = 255, umax = 0, vmin = 255, vmax = 0;
+    for (int i = 0; i < c->nv; i++) {
+        const unsigned u = c->uv[i] & 0xff, w = c->uv[i] >> 8;
+        if (u < umin) umin = u;
+        if (u > umax) umax = u;
+        if (w < vmin) vmin = w;
+        if (w > vmax) vmax = w;
+    }
+    const u32 uvr = umin | umax << 8 | vmin << 16 | vmax << 24;
+    const u32 info = it->info | (u32)sel << HV_SEL_SH;
+    for (int t = 0; t < 2; t++) {
+        if (!(it->tris >> t & 1)) continue;
+        for (int k = 0; k < 3; k++, v++) {
+            const int i = tri[t][k];
+            v->pos[0] = c->v[i][0]; v->pos[1] = c->v[i][1]; v->pos[2] = c->v[i][2];
+            v->nrm[0] = v->nrm[1] = v->nrm[2] = 0.0f;
+            const u32 col = c->col[i];
+            v->col[0] = (u8)col; v->col[1] = (u8)(col >> 8); v->col[2] = (u8)(col >> 16); v->col[3] = 255;
+            v->uv[0] = (float)(c->uv[i] & 0xff) + 0.5f; v->uv[1] = (float)(c->uv[i] >> 8) + 0.5f;
+            v->uvr = uvr;
+            v->info = info;
+        }
+    }
+}
+
+static void put_item(HlrGpuFrame *gf, const HlrFrame *f, const Env *se, const int rect[4], const Item *it, int sel)
+{
+    if (it->strip >= 0) put_strip(gf, se, s_w[it->strip].node, rect);
+    else if (it->chr >= 0) put_chr(gf, f, it, sel);
+    else put_nat(gf, f, it, sel);
 }
 
 /* a background strip, widened across the pass when it spans the 4:3 draw area */
@@ -349,6 +395,9 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     for (int i = 0; i < HLR_OT_SLOTS; i++) s_slotpos[i] = -1;
     GROW(s_natpos, s_npcap, f->nn, 4096);
     for (int i = 0; i < f->nn; i++) s_natpos[i] = -1;
+    GROW(s_chrpos, s_cpcap, f->nc + 1, 1024);
+    GROW(s_chrdone, s_cdcap, f->nc + 1, 1024);
+    for (int i = 0; i < f->nc; i++) { s_chrpos[i] = -1; s_chrdone[i] = false; }
     s_nw = 0; s_no = 0; s_nfull = 0;
     u32 a = entry & 0x1ffffc;
     for (int guard = 0;; guard++) {
@@ -367,6 +416,9 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
             w->kind = W_STAGE; w->nat = p->nat;
             if (s_natpos[p->nat] < 0) s_natpos[p->nat] = s_nw;
             if (!se_set) { se = e; se_set = true; }
+        } else if (p && n == p->n && !memcmp(g_ram + a + 4, f->w + p->off, (size_t)n * 4) && p->chr >= 0) {
+            w->kind = W_CHAR; w->nat = p->chr;
+            if (s_chrpos[p->chr] < 0) s_chrpos[p->chr] = s_nw;
         } else if (w->kind != W_SLOT && n == 8 && a == STRIP_G4 && (rw(a + 4) >> 24) == 0x38) w->kind = W_STRIP;
         else if (w->kind != W_SLOT && n == 5 && a == STRIP_F4 && (rw(a + 4) >> 24) == 0x28) w->kind = W_STRIP;
         if ((w->kind == W_SLOT || w->kind == W_OTHER || w->kind == W_NONE) && n) {
@@ -375,7 +427,13 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
             if (r != BB_NONE) {
                 w->kind = W_OTHER;
                 if (r == BB_FULL) { GROW(s_full, s_fcap, s_nfull + 1, 256); s_full[s_nfull++] = s_nw; }
-                else { GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_no++; }
+                else { GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = -1; s_no++; }
+            }
+        } else if (w->kind == W_CHAR) {
+            /* an other unless the face is drawn natively (decided below, before the grid is built) */
+            IBox b;
+            if (gp0_bbox(a, (int)n, &e, &b) == BB_BOX) {
+                GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = w->nat; s_no++;
             }
         }
         if (w->kind == W_STRIP && !se_set) { se = e; se_set = true; }
@@ -396,13 +454,68 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     if (y1 > gi.ry + gi.rh - 1) y1 = gi.ry + gi.rh - 1;
     if (x0 > x1 || y0 > y1) return false;
     const int rect[4] = { x0 * gi.Sx - gi.ox, y0 * gi.Sy - gi.oy, (x1 - x0 + 1) * gi.Sx, (y1 - y0 + 1) * gi.Sy };
-    grid_build(x0, y0, x1, y1);
-
-    /* 3. items: the native polygons this pass can draw, and the strips */
-    if (s_diag < 0) { const char *d = getenv("DESTREGA_HLR_DIAG"); s_diag = d ? atoi(d) : 0; }
     const HlrCam *k = &f->cam;
     const float near = 16.0f;
     s_ni = 0;
+
+    /* 3a. character faces (phase 3): float backface test per triangle, the frustum, the texture. A
+     * face handled here is drawn natively (or found invisible) and its packet, if the game linked it,
+     * is suppressed and no longer an "other"; the rest keep their packets and stay others. */
+    for (int i = 0; i < f->nc; i++) {
+        const HlrChr *c = &f->chr[i];
+        int pos = s_chrpos[i];
+        if (pos < 0) {
+            if (c->linked) { S.stale++; continue; }        /* its packet changed: drawn the PS1 way */
+            pos = s_slotpos[c->slot] >= 0 ? s_slotpos[c->slot] : 0;
+        }
+        float sx[4], sy[4];
+        bool behind = false;
+        IBox b = { 0, 0, -1, -1 };
+        bool any = false;
+        int out_l = 0, out_r = 0, out_t = 0, out_b = 0;
+        for (int j = 0; j < c->nv; j++) {
+            float o[3];
+            hlr_cam_view(k, c->v[j], o);
+            if (o[2] <= near) { behind = true; break; }
+            hlr_cam_project(k, o, &sx[j], &sy[j]);
+            sx[j] += (float)se.offx; sy[j] += (float)se.offy;
+            out_l += sx[j] < (float)x0; out_r += sx[j] > (float)(x1 + 1); out_t += sy[j] < (float)y0; out_b += sy[j] > (float)(y1 + 1);
+            const float fx = sx[j] < -4096.0f ? -4096.0f : sx[j] > 4096.0f ? 4096.0f : sx[j];
+            const float fy = sy[j] < -4096.0f ? -4096.0f : sy[j] > 4096.0f ? 4096.0f : sy[j];
+            box_add(&b, &any, (int)floorf(fx), (int)floorf(fy));
+            box_add(&b, &any, (int)floorf(fx) + 1, (int)floorf(fy) + 1);
+        }
+        if (behind) { S.near_dropped++; continue; }         /* too near: the PS1's packet (if any) */
+        if (out_l == c->nv || out_r == c->nv || out_t == c->nv || out_b == c->nv) { S.culled++; s_chrdone[i] = true; continue; }
+        static const int tri[2][3] = { { 0, 1, 2 }, { 1, 3, 2 } };
+        u8 tris = 0;
+        for (int t = 0; t < (c->nv == 4 ? 2 : 1); t++) {
+            const int p0 = tri[t][0], p1 = tri[t][1], p2 = tri[t][2];
+            const float area = sx[p0] * sy[p1] + sx[p1] * sy[p2] + sx[p2] * sy[p0] - sx[p0] * sy[p2] - sx[p1] * sy[p0] - sx[p2] * sy[p1];
+            if (area > 0.0f) tris |= (u8)(1 << t);
+        }
+        if (!tris) { S.chr_back++; s_chrdone[i] = true; continue; }
+        const u32 tp = c->tpage, clut = c->clut;
+        MatKey key = { (int)((tp >> 7) & 3), (tp & 0xf) * 64u, ((tp >> 4) & 1) * 256u, (clut & 0x3f) * 16u, (clut >> 6) & 0x1ff, (u32)de.tw };
+        if (key.depth == 3) key.depth = 2;
+        const int layer = material_texture(&key);
+        if (layer < 0 || layer > 0xff) { S.no_texture++; continue; }
+        u32 info = (u32)HLR_SH_FLAT << HV_SHADE_SH | (u32)layer | HV_TEX | ((c->code & 1) ? HV_RAW : 0);
+        GROW(s_it, s_icap, s_ni + 1, 4096);
+        Item *it = &s_it[s_ni++];
+        memset(it, 0, sizeof *it);
+        it->pos = pos; it->b = b; it->nat = -1; it->strip = -1; it->chr = i; it->tris = tris; it->info = info;
+        it->blend = -1;
+        if (c->code & 2) { it->blend = (int)((tp >> 5) & 3); it->tex_semi = true; }
+        s_chrdone[i] = true;
+        S.chr_items++;
+    }
+    for (int i = 0; i < s_no; i++)
+        if (s_o[i].chr >= 0 && s_chrdone[s_o[i].chr]) { s_o[i].b.x0 = 1; s_o[i].b.x1 = 0; }
+    grid_build(x0, y0, x1, y1);
+
+    /* 3b. items: the native polygons this pass can draw, and the strips */
+    if (s_diag < 0) { const char *d = getenv("DESTREGA_HLR_DIAG"); s_diag = d ? atoi(d) : 0; }
     for (int i = 0; i < f->nn; i++) {
         const HlrNat *n = &f->nat[i];
         if ((n->flags & HLR_NAT_NEAR) && s_near == HLR_NEAR_PS1) { S.near_dropped++; continue; }
@@ -475,14 +588,14 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         GROW(s_it, s_icap, s_ni + 1, 4096);
         Item *it = &s_it[s_ni++];
         memset(it, 0, sizeof *it);
-        it->pos = pos; it->b = b; it->nat = i; it->strip = -1; it->info = info; it->blend = blend; it->tex_semi = tex_semi;
+        it->pos = pos; it->b = b; it->nat = i; it->strip = -1; it->chr = -1; it->info = info; it->blend = blend; it->tex_semi = tex_semi;
     }
     for (int i = 0; i < s_nw; i++)
         if (s_w[i].kind == W_STRIP) {
             GROW(s_it, s_icap, s_ni + 1, 4096);
             Item *it = &s_it[s_ni++];
             memset(it, 0, sizeof *it);
-            it->pos = i; it->nat = -1; it->strip = i; it->blend = -1;
+            it->pos = i; it->nat = -1; it->strip = i; it->chr = -1; it->blend = -1;
             it->b.x0 = x0; it->b.y0 = y0; it->b.x1 = x1; it->b.y1 = y1;
         }
     if (!s_ni) return false;
@@ -548,21 +661,20 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         d->first = gf->nv; d->blend = -1;
         for (int i = 0; i < nl; i++) {
             const Item *it = lst[i];
-            if (it->nat < 0) put_strip(gf, &se, s_w[it->strip].node, rect);
-            else if (it->blend < 0) put_nat(gf, f, it, 0);
-            else if (it->tex_semi) put_nat(gf, f, it, 1);
+            if (it->blend < 0) put_item(gf, f, &se, rect, it, 0);
+            else if (it->tex_semi) put_item(gf, f, &se, rect, it, 1);
         }
         d->count = gf->nv - d->first;
         /* semi-transparent, in walk order, one draw per run of the same mode */
         for (int i = 0; i < nl; i++) {
             const Item *it = lst[i];
-            if (it->nat < 0 || it->blend < 0) continue;
+            if (it->strip >= 0 || it->blend < 0) continue;
             d = &ps->d[ps->nd - 1];
             if (d->blend != it->blend || d->first + d->count != gf->nv) {
                 d = &ps->d[ps->nd++];
                 d->first = gf->nv; d->count = 0; d->blend = it->blend;
             }
-            put_nat(gf, f, it, it->tex_semi ? 2 : 0);
+            put_item(gf, f, &se, rect, it, it->tex_semi ? 2 : 0);
             d->count = gf->nv - d->first;
         }
         s_pp[pi] = ps;
@@ -580,7 +692,8 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     memset(drawn, 0, (size_t)f->nn);
     for (int i = 0; i < s_ni; i++) if (s_it[i].nat >= 0) drawn[s_it[i].nat] = true;
     for (int i = 0; i < s_nw; i++) {
-        s_sup[i] = (s_w[i].kind == W_STAGE && drawn[s_w[i].nat]) || s_w[i].kind == W_STRIP;
+        s_sup[i] = (s_w[i].kind == W_STAGE && drawn[s_w[i].nat]) || s_w[i].kind == W_STRIP ||
+                   (s_w[i].kind == W_CHAR && s_chrdone[s_w[i].nat]);
         if (s_sup[i]) S.suppressed++;
     }
     s_pos = 0; s_next = 0; s_on = true;
