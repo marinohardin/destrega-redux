@@ -191,15 +191,18 @@ def run_case(name, port, pace):
                 problems.append(f'{who}: refused a presentation-only action')
             if 'restart' in log.lower() and 'menu: load' in log: problems.append(f'{who}: load ran')
     if expect.get('hlr'):
-        m = re.search(r'hlr: mode on.*?(\d+) dropped \((\d+) save-state loads\).*?(\d+) drawn by the HLR, (\d+) stale', hlog)
-        if not m or 'not drawing' in hlog: problems.append('host: no HLR summary, or the HLR did not draw (GPU renderer?)')
-        elif int(m.group(3)) == 0: problems.append('host: the HLR drew no packet')
-        elif int(m.group(4)): problems.append(f'host: {m.group(4)} stale HLR packets')
+        m = re.search(r'hlr: mode on.*?(\d+) dropped \((\d+) save-state loads\)', hlog)
+        nd = re.search(r'hlr-native-draw: (\d+) frames, [\d.]+ passes per frame, (\d+) polygons per frame.*?(\d+) failed', hlog)
+        if not m or not nd or 'not drawing' in hlog: problems.append('host: no HLR summary, or the stage was not drawn natively (GPU renderer?)')
+        elif int(nd.group(2)) == 0: problems.append('host: the native stage drew no polygon')
+        elif int(nd.group(3)): problems.append(f'host: {nd.group(3)} native GPU passes failed')
         if 'hlr:' in jlog: problems.append('join: HLR summary in the plain peer')
     full = sum(1 for f in both if len(H[f]) > 1)
     dt = time.time() - t0
     msg = f'{len(both)} final frames equal on both peers and offline ({full} full-state hashes)'
-    if expect.get('hlr') and m: msg += f'; host HLR drew {m.group(3)} packets, {m.group(2)} rollback loads dropped {m.group(1)} captures'
+    if expect.get('hlr') and m and nd:
+        msg += (f'; host drew the stage natively in {nd.group(1)} frames ({nd.group(2)} polygons per frame), '
+                f'{m.group(2)} rollback loads dropped {m.group(1)} captures')
     if sh and sj:
         msg += (f'; rollbacks {int(sh["rollbacks"])}/{int(sj["rollbacks"])} (max depth {int(max(sh["max_depth"], sj["max_depth"]))}), '
                 f're-sim {max(sh["resim_ms_per_frame"], sj["resim_ms_per_frame"]):.3f} ms/vblank, '

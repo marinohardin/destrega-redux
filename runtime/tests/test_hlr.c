@@ -9,13 +9,18 @@
  *    activates it on an OT node, replays its packets, refuses stale ones, and the walk's end
  *    consumes it; a save-state load (on_restore) and a mode change drop captures;
  *  - suppression: a packet drawn by gpu_hires_replay and then sent with gpu_set_node_no_hires
- *    leaves exactly the hi-res target the plain path leaves; suppression alone draws nothing.
+ *    leaves exactly the hi-res target the plain path leaves; suppression alone draws nothing;
+ *  - float camera (phase 2b, hlr_cam.h): random cameras in the game's form (rotation with the 0.625
+ *    Y scale, translation, H, drawing offset) and vertices through the guest GTE's RTPS; the float
+ *    projection and the clip-space mapping of a 4x6 widescreen pass must land within 0.75 1x pixel
+ *    of SX/SY.
  */
 #include "psx.h"
 #include "hires.h"
 #include "pgxp.h"
 #include "hlr/hlr.h"
 #include "hlr_hook.h"
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -381,6 +386,83 @@ static void test_suppression(void)
     hires_set_scale(0, 0);
 }
 
+/* ---- float camera vs the GTE's RTPS --------------------------------------------------------- */
+static u32 s_rng = 12345;
+static int rnd(int lo, int hi) { s_rng = s_rng * 1103515245u + 12345u; return lo + (int)((s_rng >> 8) % (u32)(hi - lo + 1)); }
+
+static void test_float_camera(void)
+{
+    int checked = 0, skipped = 0, offscreen = 0, far = 0;
+    float worst = 0.0f, worst_clip = 0.0f;
+    for (int cam = 0; cam < 200; cam++) {
+        gte_init();
+        const double a = rnd(0, 6283) / 1000.0, b = rnd(-600, 600) / 1000.0;   /* yaw, pitch */
+        double m[3][3] = { { cos(a), 0, -sin(a) }, { sin(a) * sin(b), cos(b), cos(a) * sin(b) },
+                           { sin(a) * cos(b), -sin(b), cos(a) * cos(b) } };
+        for (int c = 0; c < 3; c++) m[1][c] *= 0.625;                         /* the game's Y scale */
+        s16 e[9];
+        for (int i = 0; i < 9; i++) e[i] = (s16)lrint(m[i / 3][i % 3] * 4096.0);
+        gte_write_ctrl(0, (u16)e[0] | (u32)(u16)e[1] << 16);
+        gte_write_ctrl(1, (u16)e[2] | (u32)(u16)e[3] << 16);
+        gte_write_ctrl(2, (u16)e[4] | (u32)(u16)e[5] << 16);
+        gte_write_ctrl(3, (u16)e[6] | (u32)(u16)e[7] << 16);
+        gte_write_ctrl(4, (u16)e[8]);
+        gte_write_ctrl(5, (u32)rnd(-2000, 2000));
+        gte_write_ctrl(6, (u32)rnd(-1000, 1000));
+        gte_write_ctrl(7, (u32)rnd(1500, 8000));
+        gte_write_ctrl(24, (u32)(rnd(-8, 8) << 16));
+        gte_write_ctrl(25, (u32)(rnd(-8, 8) << 16));
+        gte_write_ctrl(26, (u32)rnd(200, 700));
+        GteState gs;
+        gte_save(&gs);
+        HlrCam k;
+        hlr_cam_from_gte(&k, &gs);
+        /* a 4x6 widescreen pass: guard band 88 columns, region at x 0, drawing offset (256, 120) */
+        const float Sx = 4, Sy = 6, ox = -88 * 4, oy = 0, offx = 256, offy = 120;
+        const int rect[4] = { 0, 0, (512 + 176) * 4, 240 * 6 };
+        float p[4];
+        hlr_cam_clip(&k, offx, offy, Sx, Sy, ox, oy, rect, p);
+        for (int n = 0; n < 50; n++) {
+            const s16 v[3] = { (s16)rnd(-3000, 3000), (s16)rnd(-1500, 1500), (s16)rnd(-3000, 3000) };
+            gte_write_data(0, (u16)v[0] | (u32)(u16)v[1] << 16);
+            gte_write_data(1, (u32)(u16)v[2]);
+            gte_command(0x00080001);                                          /* RTPS, sf = 1 */
+            const u32 flag = gte_read_ctrl(31), sxy = gte_read_data(14);
+            if (flag & 0x80000000u) { skipped++; continue; }                  /* saturated, too near, overflow */
+            /* RTPS truncates (SX = floor): the GTE's pixel is [SX, SX + 1), compare with its centre */
+            const float gx = (float)(s16)sxy + 0.5f, gy = (float)(s16)(sxy >> 16) + 0.5f;
+            const float fv[3] = { v[0], v[1], v[2] };
+            float view[3], sx, sy;
+            hlr_cam_view(&k, fv, view);
+            if (!hlr_cam_project(&k, view, &sx, &sy)) { skipped++; continue; }
+            /* on screen only (16:9: 344 columns either side of the centre, 120 rows): further out
+             * the GTE's integer SZ3 / IR steps alone move SX by more (up to 3 px at |SX| ~ 1000) */
+            if (fabsf(gx) > 344.0f || fabsf(gy) > 121.0f) { offscreen++; continue; }
+            /* the GTE truncates the view position (IR1/IR2) to integers before the division: that
+             * alone moves SX/SY by up to H / z px. Within 0.75 px where it is at most 1/4 (z >= 4H,
+             * the stage's usual depths), else within 0.5 + H / z + 0.1. */
+            const float tol = view[2] >= 4.0f * k.h ? 0.75f : 0.6f + k.h / view[2];
+            const float d = fmaxf(fabsf(sx - gx), fabsf(sy - gy));
+            if (view[2] >= 4.0f * k.h && d > worst) worst = d;
+            CHECK(d <= tol, "camera %d vertex %d: float (%.3f, %.3f), GTE (%g, %g), z %.0f", cam, n, sx, sy, gx, gy, view[2]);
+            /* the clip-space form the shaders use, back to 1x screen units */
+            const float nx = p[0] * view[0] / view[2] + p[1], ny = p[2] * view[1] / view[2] + p[3];
+            const float tx = (float)rect[0] + (nx + 1.0f) * 0.5f * (float)rect[2];
+            const float ty = (float)rect[1] + (1.0f - ny) * 0.5f * (float)rect[3];
+            const float cx = (tx + ox) / Sx - offx, cy = (ty + oy) / Sy - offy;
+            const float dc = fmaxf(fabsf(cx - sx), fabsf(cy - sy));   /* vs the float projection */
+            if (dc > worst_clip) worst_clip = dc;
+            CHECK(dc <= 0.01f, "camera %d vertex %d: clip space (%.3f, %.3f), float (%.3f, %.3f)", cam, n, cx, cy, sx, sy);
+            if (view[2] >= 4.0f * k.h) far++;
+            checked++;
+        }
+    }
+    CHECK(checked > 2000, "only %d vertices projected", checked);
+    CHECK(far > 1000, "only %d vertices at z >= 4H", far);
+    printf("  %d vertices on screen (%d at z >= 4H: worst %.3f px), %d off screen, %d skipped (GTE saturation / behind);"
+           " clip space vs float %.4f px\n", checked, far, worst, offscreen, skipped, worst_clip);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -390,6 +472,7 @@ int main(int argc, char **argv)
     printf("stage audit\n"); test_stage_audit();
     printf("capture and pairing\n"); test_capture_and_pairing();
     printf("suppression\n"); test_suppression();
+    printf("float camera\n"); test_float_camera();
     printf("test_hlr: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

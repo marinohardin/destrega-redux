@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phase 2a. Needs the disc.
+"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a and 2b. Needs the disc.
 
   tools/test_hlr.py [CASE...] [-j N]        CASES: audit hash exact rewind (default: all)
   CASES="hash exact" STAGES="castle1" ...    environment selection (tools/pr_check.sh group hlr)
@@ -7,8 +7,9 @@
   audit   --hlr audit on all 12 VS stages, practice and story: every stage packet the game links is
           predicted exactly (0 mismatched, 0 unexplained, 0 missing, 0 slot heads, 0 bad walks).
   hash    --renderer gpu --no-interp --verify-overrides, --hlr on vs off: per-frame --state-hash
-          byte-identical (vs_hills 4:3 4x6, vs_castle1 16:9 4x6, story 2x3), the HLR drew packets,
-          none stale; the key frames dumped by both are byte-identical too.
+          byte-identical (vs_hills 4:3 4x6, vs_castle1 16:9 4x6, story 2x3) and the stage drawn in
+          native 3D (hlr-native-draw: polygons drawn, no GPU pass failed). The key frames differ by
+          design since 2b (tools/hlr_diff.py compares them); the count is printed.
   exact   every VS stage, --hlr exact vs off on Metal and (if it loads) Vulkan: one run each that
           dumps the stage at 4:3 2x3, 16:9 2x3, 16:9 4x6 and 4:3 4x6 (View-menu actions switch
           between frames); the dumps and state hashes must be byte-identical.
@@ -16,7 +17,8 @@
           for audit; AUDIT_MODES="practice story" the other modes audited, HASH="vs_hills story" the
           hash runs).
   rewind  --savestate-rewind 37:23 with --hlr on (GPU, 2x3) vs a plain run with the HLR off: equal
-          per-frame complete-state hashes, and the HLR dropped its captures on every load.
+          per-frame complete-state hashes, the HLR dropped its captures on every load and drew the
+          stage natively.
 
 Runs under nice, at most JOBS (default 2) game processes. Output in build/hlr_test/.
 """
@@ -49,6 +51,12 @@ def run(tag, scn, frames, extra, env=None):
 def hlr_line(log):
     m = re.search(r'hlr: mode \S+, parts \S+; .*?(\d+) packets, (\d+) drawn by the HLR, (\d+) stale', log)
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def native_line(log):
+    """(polygons per frame, frames, failed GPU passes) of the hlr-native-draw line, or None"""
+    m = re.search(r'hlr-native-draw: (\d+) frames, [\d.]+ passes per frame, (\d+) polygons per frame.*?(\d+) failed', log)
+    return (int(m.group(2)), int(m.group(1)), int(m.group(3))) if m else None
 
 
 def same_files(a, b):
@@ -92,15 +100,15 @@ def hash_pair(item):
     (rc0, _), (rc1, log1) = res['off'], res['on']
     if rc0 or rc1:
         return False, f'{scn}: exit {rc0} / {rc1}'
-    hl = hlr_line(log1)
+    nl = native_line(log1)
     same = same_files(os.path.join(OUT, f'hash_{scn}_off.hash'), os.path.join(OUT, f'hash_{scn}_on.hash'))
     d0, d1 = os.path.join(OUT, f'hash_{scn}_off'), os.path.join(OUT, f'hash_{scn}_on')
     dumps = sorted(f for f in os.listdir(d0) if f.startswith('frame_0'))
-    dsame = all(same_files(os.path.join(d0, f), os.path.join(d1, f)) for f in dumps)
-    ok = same and dsame and hl and hl[1] > 0 and hl[2] == 0 and dumps
-    return ok, (f'{scn}: state hash {"identical" if same else "DIFFERS"}, {len(dumps)} key frames '
-                f'{"identical" if dsame else "DIFFER"}; HLR drew {hl[1] if hl else "?"} of '
-                f'{hl[0] if hl else "?"} packets, {hl[2] if hl else "?"} stale')
+    ndiff = sum(not same_files(os.path.join(d0, f), os.path.join(d1, f)) for f in dumps)
+    ok = same and nl and nl[0] > 0 and nl[2] == 0 and dumps
+    return ok, (f'{scn}: state hash {"identical" if same else "DIFFERS"}; native 3D stage in '
+                f'{nl[1] if nl else "?"} frames, {nl[0] if nl else "?"} polygons per frame, '
+                f'{nl[2] if nl else "?"} failed GPU passes; {ndiff} of {len(dumps)} key frames differ from off')
 
 
 def case_hash(pool):
@@ -186,11 +194,11 @@ def case_rewind(pool):
         return [(False, f'rewind: exit {rc0} / {rc1}')]
     same = same_files(os.path.join(OUT, 'rewind_plain.txt'), os.path.join(OUT, 'rewind_hlr.txt'))
     m = re.search(r'(\d+) dropped \((\d+) save-state loads\)', log1)
-    hl = hlr_line(log1)
-    ok = same and m and int(m.group(2)) > 0 and hl and hl[1] > 0
+    nl = native_line(log1)
+    ok = same and m and int(m.group(2)) > 0 and nl and nl[0] > 0 and nl[2] == 0
     return [(ok, f'rewind: per-frame state hashes {"identical" if same else "DIFFER"}; '
                  f'{m.group(2) if m else "?"} loads, {m.group(1) if m else "?"} captures dropped, '
-                 f'HLR drew {hl[1] if hl else "?"} packets')]
+                 f'native stage in {nl[1] if nl else "?"} frames ({nl[0] if nl else "?"} polygons per frame)')]
 
 
 CASES = {'audit': case_audit, 'hash': case_hash, 'exact': case_exact, 'rewind': case_rewind}

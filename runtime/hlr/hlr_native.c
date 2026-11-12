@@ -58,6 +58,7 @@ typedef struct {
 } Item;
 
 static int s_near = HLR_NEAR_CLIP, s_look = HLR_LOOK_ENHANCED;
+static int s_diag = -1;   /* DESTREGA_HLR_DIAG: polygons still to log (-1: not read yet) */
 static WNode *s_w; static int s_nw, s_wcap;
 static Other *s_o; static int s_no, s_ocap;
 static int *s_full; static int s_nfull, s_fcap;
@@ -398,6 +399,7 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     grid_build(x0, y0, x1, y1);
 
     /* 3. items: the native polygons this pass can draw, and the strips */
+    if (s_diag < 0) { const char *d = getenv("DESTREGA_HLR_DIAG"); s_diag = d ? atoi(d) : 0; }
     const HlrCam *k = &f->cam;
     const float near = 16.0f;
     s_ni = 0;
@@ -430,6 +432,17 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         if (all_behind) { S.culled++; continue; }
         if (!behind && (out_l == n->nv || out_r == n->nv || out_t == n->nv || out_b == n->nv)) { S.culled++; continue; }
         if (behind) { b.x0 = x0; b.y0 = y0; b.x1 = x1; b.y1 = y1; }
+        if (s_diag > 0 && (long)(b.x1 - b.x0) * (b.y1 - b.y0) > (long)(x1 - x0) * (y1 - y0) / 4) {
+            s_diag--;   /* DESTREGA_HLR_DIAG=N: the first N polygons covering > 1/4 of the pass */
+            rt_log("hlr-diag: nat %d kind %d shade %d flags %x pkt %06x slot %d pos %d behind %d box %d,%d-%d,%d",
+                   i, n->kind, n->shade, n->flags, n->pkt, n->slot, pos, behind, b.x0, b.y0, b.x1, b.y1);
+            for (int j = 0; j < n->nv; j++) {
+                const float v[3] = { n->v[j][0], n->v[j][1], n->v[j][2] };
+                float o[3];
+                hlr_cam_view(k, v, o);
+                rt_log("hlr-diag:   v %d %d %d -> view %.0f %.0f %.0f", n->v[j][0], n->v[j][1], n->v[j][2], o[0], o[1], o[2]);
+            }
+        }
         u32 info = (u32)n->shade << HV_SHADE_SH;
         const u32 code = n->shade == HLR_SH_LIT ? (n->nv == 3 ? 0x34u : 0x3cu)
                        : n->shade == HLR_SH_PRELIT ? n->col[2] >> 24 : n->col[0] >> 24;
@@ -438,6 +451,17 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         if (n->kind >= 2) {
             const u32 pk = 0x80000000u | n->pkt;
             const u32 clut = rw(pk + 12) >> 16, tp = rw(pk + 24) >> 16;
+            /* an object the PS1 skipped this frame (HIDDEN: outside the 4:3 view) did not write its
+             * packets: their UV / CLUT / page words are what the buffer held from the last frame it was
+             * drawn, or never-written memory. Use them only if the command byte is the polygon's and the
+             * page is a texture page (never the framebuffer region, which the game does not texture
+             * from); else leave the polygon out (Throne: a never-drawn object sampled the framebuffer
+             * across the whole screen). */
+            if (n->flags & HLR_NAT_HIDDEN) {
+                const u32 want = n->kind == 2 ? 0x34u : 0x3cu, cb = (rw(pk + 4) >> 24) & 0xfcu;
+                const u32 tx = (tp & 0xf) * 64u, ty = ((tp >> 4) & 1) * 256u;
+                if (cb != want || (tx < (u32)(gi.rx + gi.rw) && ty < (u32)(gi.ry + gi.rh))) { S.hidden_bad++; continue; }
+            }
             const MatKey mk = { (int)((tp >> 7) & 3), (tp & 0xf) * 64u, ((tp >> 4) & 1) * 256u,
                                 (clut & 0x3f) * 16u, (clut >> 6) & 0x1ff, 0 };
             MatKey key = mk;
@@ -498,10 +522,7 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
             U->rt[r][c] = k->rt[r][c]; U->llm[r][c] = k->llm[r][c]; U->lcm[r][c] = k->lcm[r][c];
         }
         for (int c = 0; c < 3; c++) { U->tr[c] = k->tr[c]; U->bk[c] = k->bk[c]; U->fc[c] = k->fc[c] / 255.0f; }
-        U->proj[0] = 2.0f * k->h * (float)gi.Sx / (float)rect[2];
-        U->proj[1] = 2.0f * (((float)se.offx + k->ofx) * (float)gi.Sx - (float)gi.ox - (float)rect[0]) / (float)rect[2] - 1.0f;
-        U->proj[2] = -2.0f * k->h * (float)gi.Sy / (float)rect[3];
-        U->proj[3] = 1.0f - 2.0f * (((float)se.offy + k->ofy) * (float)gi.Sy - (float)gi.oy - (float)rect[1]) / (float)rect[3];
+        hlr_cam_clip(k, (float)se.offx, (float)se.offy, (float)gi.Sx, (float)gi.Sy, (float)gi.ox, (float)gi.oy, rect, U->proj);
         U->misc[0] = near;
         U->misc[1] = s_look == HLR_LOOK_ENHANCED ? 1.0f : 0.0f;
         U->misc[2] = gi.full_colour ? 0.0f : 1.0f;

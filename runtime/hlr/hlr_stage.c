@@ -404,7 +404,12 @@ static bool flags_ok(u32 flags, u32 mode)
     return true;
 }
 
-static bool visible(u32 flags, u32 ptr, u32 mode)
+/* columns beyond each 4:3 edge the presentation shows (widescreen: 88, the guard band; else 0) */
+static int s_guard;
+void hlr_set_guard(int gx) { s_guard = gx < 0 ? 0 : gx; }
+
+/* the stage renderer's per-object test; gx widens its horizontal bounds by that many columns */
+static bool visible(u32 flags, u32 ptr, u32 mode, int gx)
 {
     bool vis = true;
     if (flags & 5) {
@@ -425,7 +430,7 @@ static bool visible(u32 flags, u32 ptr, u32 mode)
                 if (y < ymin) ymin = y;
                 if (y > ymax) ymax = y;
             }
-            if (xmax < -256 || xmin >= 257 || ymax < -120 || ymin >= 121) vis = false;
+            if (xmax < -256 - gx || xmin >= 257 + gx || ymax < -120 || ymin >= 121) vis = false;
         }
     }
     return vis && flags_ok(flags, mode);
@@ -630,9 +635,14 @@ void hlr_stage_pre(u32 mode)
         u32 vtx = data + ncmd * 4;
         st_objs++;
         s_hidden = false;
-        if (o != 0 && !visible(flags, (flags & 5) ? start : vtx, mode)) {
-            if (!s_native || !flags_ok(flags, mode)) continue;
-            s_hidden = true;                    /* outside the 4:3 view: native polygons only */
+        if (o != 0 && !visible(flags, (flags & 5) ? start : vtx, mode, 0)) {
+            /* outside the 4:3 view: native polygons only, and only if the same test with the bounds
+             * widened to the presentation (the guard band) lets it through, as the widescreen shadow
+             * pass does. The test's 4 points do not bound the object: some objects that cover the
+             * view from close by are culled by it on purpose (Throne: a wall between the VS camera
+             * and the room), so "outside the view" cannot be decided by the native frustum alone. */
+            if (!s_native || !s_guard || !visible(flags, (flags & 5) ? start : vtx, mode, s_guard)) continue;
+            s_hidden = true;
         } else st_objs_vis++;
         const bool alt = (flags & 0x2000) != 0;
         if (alt) st_alt_objs++;

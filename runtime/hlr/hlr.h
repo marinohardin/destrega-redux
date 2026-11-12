@@ -54,6 +54,8 @@ typedef struct {
  * listed, also those the PS1 culled (4:3 screen bounds, too near, an object outside the 4:3 view):
  * the native renderer has its own frustum, at any aspect ratio. */
 enum { HLR_SH_FLAT, HLR_SH_LIT, HLR_SH_PRELIT };
+void hlr_set_guard(int gx);     /* widescreen guard band columns (0 in 4:3): objects the stage renderer
+                                 * culls at 4:3 are drawn natively only if they pass its test widened by gx */
 enum { HLR_NAT_LINKED = 1, HLR_NAT_SPLIT = 2, HLR_NAT_NEAR = 4, HLR_NAT_HIDDEN = 8 };
 typedef struct {
     s16 v[4][3];        /* vertices */
@@ -110,6 +112,7 @@ bool hlr_native_active(void);
 void hlr_native_reset(void);                    /* drop what is pending (save-state load, mode change) */
 typedef struct {
     u64 frames, passes, items, culled, near_dropped, stale, no_texture, suppressed, desync, lookups;
+    u64 hidden_bad;     /* polygons of objects the PS1 skipped whose packet words were never written */
 } HlrNativeStats;
 void hlr_native_get_stats(HlrNativeStats *st);
 

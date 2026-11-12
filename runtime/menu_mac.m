@@ -406,6 +406,17 @@ void menu_init(void) {
         add(scene, @"Native", @"hlr=on", nil, 0);
         [scene addItem:[NSMenuItem separatorItem]];
         add(scene, @"Stage", @"hlr-part=stage", nil, 0);
+        [scene addItem:[NSMenuItem separatorItem]];
+        add(scene, @"Enhanced Look", @"hlr-look=enhanced", nil, 0);   /* per-pixel lighting, filtered textures */
+        add(scene, @"PS1 Look", @"hlr-look=ps1", nil, 0);             /* per-vertex, point-sampled */
+        [scene addItem:[NSMenuItem separatorItem]];
+        add(scene, @"Clip Near Polygons", @"hlr-near=clip", nil, 0);
+        add(scene, @"Drop Near Polygons (PS1)", @"hlr-near=ps1", nil, 0);
+        [scene addItem:[NSMenuItem separatorItem]];
+        add(scene, @"Edge Smoothing Off", @"hlr-msaa=1", nil, 0);
+        add(scene, @"Edge Smoothing 2x", @"hlr-msaa=2", nil, 0);
+        add(scene, @"Edge Smoothing 4x", @"hlr-msaa=4", nil, 0);
+        add(scene, @"Edge Smoothing 8x", @"hlr-msaa=8", nil, 0);
         NSMenuItem *sceneItem = [[NSMenuItem alloc] initWithTitle:@"3D Scene" action:nil keyEquivalent:@""];
         sceneItem.submenu = scene;
         [view insertItem:sceneItem atIndex:6];

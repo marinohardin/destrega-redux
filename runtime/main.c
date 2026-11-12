@@ -1,5 +1,6 @@
 /* Frontend: boot, SDL3 window/audio/input, headless test mode. */
 #include "hlr/hlr.h"
+#include "hlr/hlr_gpu.h"
 #include "recomp.h"
 #include <math.h>
 #include "mdec.h"
@@ -155,6 +156,9 @@ static bool s_tex_cache_given;
 /* --hlr off|on|exact|audit, --hlr-parts LIST (settings display.hlr / hlr_parts, View > 3D Scene):
  * the native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md); presentation only */
 static bool s_hlr_given, s_hlr_parts_given;
+/* --hlr-msaa N, --hlr-near clip|ps1, --hlr-look enhanced|ps1 (settings display.hlr_msaa / hlr_near /
+ * hlr_look, View > 3D Scene): how the native stage is drawn (hlr_native.c, hlr_gpu.c) */
+static bool s_hlr_msaa_given, s_hlr_near_given, s_hlr_look_given;
 #define HLR_WINDOW_DEFAULT HLR_ON    /* windowed default: draws only with a GPU API (HiresBackend.external) */
 
 static void wav_header(FILE *f, u32 bytes) {
@@ -752,6 +756,7 @@ static void ws_apply(void) {
     s_widescreen = s_ws_req;
     s_ws_used |= s_widescreen;
     widescreen_enable(s_widescreen);
+    hlr_set_guard(s_widescreen ? WS_GUARD : 0);
     s_ws_stage = false;
     s_ws_stage_frame = 0;
     rt_log("widescreen: %s at frame %llu", s_widescreen ? "on" : "off", (unsigned long long)s_frame);
@@ -1393,6 +1398,9 @@ static void settings_apply(const char *dir) {
     if (s_tex_cache_given) settings_lock("display", "tex_cache");
     if (s_hlr_given) settings_lock("display", "hlr");
     if (s_hlr_parts_given) settings_lock("display", "hlr_parts");
+    if (s_hlr_msaa_given) settings_lock("display", "hlr_msaa");
+    if (s_hlr_near_given) settings_lock("display", "hlr_near");
+    if (s_hlr_look_given) settings_lock("display", "hlr_look");
     if (s_win_set) settings_lock("display", "window");
     if (s_opt_filter >= 0) settings_lock("display", "tex_filter");
     if (s_opt_full >= 0) settings_lock("display", "smooth_colours");
@@ -1445,6 +1453,19 @@ static void settings_apply(const char *dir) {
         if (hlr_parse_parts(v, &parts)) hlr_set_parts(parts);
         else rt_log("settings: display.hlr_parts: all, none or a list of stage,chars,shadows,fx,story");
     }
+    if (!s_hlr_msaa_given && (v = settings_get("display", "hlr_msaa"))) {
+        const int n = atoi(v);
+        if (n == 1 || n == 2 || n == 4 || n == 8) hlr_gpu_set_msaa(n);
+        else rt_log("settings: display.hlr_msaa: 1 (off), 2, 4 or 8");
+    }
+    if (!s_hlr_near_given && (v = settings_get("display", "hlr_near"))) {
+        if (!strcmp(v, "clip") || !strcmp(v, "ps1")) hlr_set_near(!strcmp(v, "ps1") ? HLR_NEAR_PS1 : HLR_NEAR_CLIP);
+        else rt_log("settings: display.hlr_near: clip or ps1");
+    }
+    if (!s_hlr_look_given && (v = settings_get("display", "hlr_look"))) {
+        if (!strcmp(v, "enhanced") || !strcmp(v, "ps1")) hlr_set_look(!strcmp(v, "ps1") ? HLR_LOOK_PS1 : HLR_LOOK_ENHANCED);
+        else rt_log("settings: display.hlr_look: enhanced or ps1");
+    }
     if (!s_win_set && (v = settings_get("display", "window"))) {
         if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
     }
@@ -1475,6 +1496,13 @@ static void settings_note_view(const char *name) {
     else if (!strcmp(name, "hlr") && (hlr_get_mode() == HLR_OFF || hlr_get_mode() == HLR_ON))
         settings_set("display", "hlr", hlr_mode_name(hlr_get_mode()));
     else if (!strcmp(name, "hlr-part")) settings_set("display", "hlr_parts", hlr_parts_name(hlr_get_parts()));
+    else if (!strcmp(name, "hlr-msaa")) {
+        char n[8];
+        snprintf(n, sizeof n, "%d", hlr_gpu_get_msaa());
+        settings_set("display", "hlr_msaa", n);
+    }
+    else if (!strcmp(name, "hlr-near")) settings_set("display", "hlr_near", hlr_get_near() == HLR_NEAR_PS1 ? "ps1" : "clip");
+    else if (!strcmp(name, "hlr-look")) settings_set("display", "hlr_look", hlr_get_look() == HLR_LOOK_PS1 ? "ps1" : "enhanced");
     else if (!strcmp(name, "tex-filter")) settings_set("display", "tex_filter", hires_tex_filter_name(hires_get_tex_filter()));
     else if (!strcmp(name, "smooth-colours")) settings_set_bool("display", "smooth_colours", hires_get_colour());
     else if (!strcmp(name, "ssaa") && s_ssaa_chosen) {
@@ -2013,6 +2041,9 @@ bool frontend_view_checked(const char *action, bool *checked) {
     if (n == 13 && !strncmp(action, "gpu-precision", n) && *arg) { *checked = !strcmp(arg, "fast") == hires_gpu_get_fast(); return true; }
     if (n == 9 && !strncmp(action, "tex-cache", n)) { *checked = hires_gpu_get_tex_cache() != HGPU_TC_OFF; return true; }
     if (n == 3 && !strncmp(action, "hlr", n) && *arg) { *checked = !strcmp(arg, "on") == (hlr_get_mode() != HLR_OFF); return true; }
+    if (n == 8 && !strncmp(action, "hlr-msaa", n) && *arg) { *checked = atoi(arg) == hlr_gpu_get_msaa(); return true; }
+    if (n == 8 && !strncmp(action, "hlr-near", n) && *arg) { *checked = !strcmp(arg, "ps1") == (hlr_get_near() == HLR_NEAR_PS1); return true; }
+    if (n == 8 && !strncmp(action, "hlr-look", n) && *arg) { *checked = !strcmp(arg, "ps1") == (hlr_get_look() == HLR_LOOK_PS1); return true; }
     if (n == 8 && !strncmp(action, "hlr-part", n) && *arg) {   /* hlr-part=stage[:on] */
         char part[16];
         snprintf(part, sizeof part, "%.*s", (int)strcspn(arg, ":"), arg);
@@ -2106,6 +2137,23 @@ static void menu_run(const char *name, const char *arg) {
         hlr_set_mode(m);
         rt_log("hlr: %s at frame %llu%s", hlr_mode_name(m), (unsigned long long)s_frame,
                m == HLR_ON && !hlr_draws() ? " (drawn when a GPU renderer runs)" : "");
+    }
+    else if (!strcmp(name, "hlr-msaa")) {   /* View > 3D Scene > Anti-aliasing: 1|2|4|8, none = off <-> 4x */
+        const int n = *arg ? atoi(arg) : hlr_gpu_get_msaa() > 1 ? 1 : 4;
+        hlr_gpu_set_msaa(n);
+        rt_log("hlr: MSAA %dx requested at frame %llu", hlr_gpu_get_msaa(), (unsigned long long)s_frame);
+    }
+    else if (!strcmp(name, "hlr-near")) {   /* View > 3D Scene: near polygons clipped / dropped (PS1); none = toggle */
+        const int m = !strcmp(arg, "ps1") ? HLR_NEAR_PS1 : !strcmp(arg, "clip") ? HLR_NEAR_CLIP
+                      : hlr_get_near() == HLR_NEAR_PS1 ? HLR_NEAR_CLIP : HLR_NEAR_PS1;
+        hlr_set_near(m);
+        rt_log("hlr: near polygons %s at frame %llu", m == HLR_NEAR_PS1 ? "dropped (ps1)" : "clipped", (unsigned long long)s_frame);
+    }
+    else if (!strcmp(name, "hlr-look")) {   /* View > 3D Scene: Enhanced / PS1 look; none = toggle */
+        const int m = !strcmp(arg, "ps1") ? HLR_LOOK_PS1 : !strcmp(arg, "enhanced") ? HLR_LOOK_ENHANCED
+                      : hlr_get_look() == HLR_LOOK_PS1 ? HLR_LOOK_ENHANCED : HLR_LOOK_PS1;
+        hlr_set_look(m);
+        rt_log("hlr: %s look at frame %llu", m == HLR_LOOK_PS1 ? "ps1" : "enhanced", (unsigned long long)s_frame);
     }
     else if (!strcmp(name, "hlr-part")) {   /* View > 3D Scene > Stage: PART:on|off, none = toggle */
         char part[16];
@@ -2234,6 +2282,24 @@ int main(int argc, char **argv) {
             if (m < 0) { fprintf(stderr, "--hlr: off, on, exact or audit\n"); return 2; }
             hlr_set_mode(m);
             s_hlr_given = true;
+        }
+        else if (!strcmp(argv[i], "--hlr-msaa") && i + 1 < argc) {
+            const int n = atoi(argv[++i]);
+            if (n != 1 && n != 2 && n != 4 && n != 8) { fprintf(stderr, "--hlr-msaa: 1 (off), 2, 4 or 8\n"); return 2; }
+            hlr_gpu_set_msaa(n);
+            s_hlr_msaa_given = true;
+        }
+        else if (!strcmp(argv[i], "--hlr-near") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (strcmp(m, "clip") && strcmp(m, "ps1")) { fprintf(stderr, "--hlr-near: clip or ps1\n"); return 2; }
+            hlr_set_near(!strcmp(m, "ps1") ? HLR_NEAR_PS1 : HLR_NEAR_CLIP);
+            s_hlr_near_given = true;
+        }
+        else if (!strcmp(argv[i], "--hlr-look") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (strcmp(m, "enhanced") && strcmp(m, "ps1")) { fprintf(stderr, "--hlr-look: enhanced or ps1\n"); return 2; }
+            hlr_set_look(!strcmp(m, "ps1") ? HLR_LOOK_PS1 : HLR_LOOK_ENHANCED);
+            s_hlr_look_given = true;
         }
         else if (!strcmp(argv[i], "--hlr-parts") && i + 1 < argc) {
             unsigned parts;
@@ -2517,6 +2583,7 @@ int main(int argc, char **argv) {
     s_ws_used = s_widescreen;
     if (s_widescreen) {
         widescreen_enable(true);
+        hlr_set_guard(WS_GUARD);
         hires_set_guard(WS_GUARD);
         if (s_opt_sx == 0 || (s_headless && s_opt_sx < 0 && !res_auto() && !s_resize_n))
             rt_log("widescreen: hi-res is off, so nothing beyond 4:3 can be shown");

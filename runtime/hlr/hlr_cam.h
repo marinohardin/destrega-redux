@@ -75,3 +75,17 @@ static inline float hlr_cam_fog(const HlrCam *k, float z)
     float f = (hd * k->dqa + k->dqb) / 16777216.0f;
     return f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f;
 }
+
+/* the clip-space projection of a render pass: target pixel = vram * S - o (hires.c), pass rectangle
+ * (px0, py0, pw, ph) in target pixels, drawing offset (offx, offy) of the stage packets.
+ * x_clip = p[0] * vx + p[1] * vz, y_clip = p[2] * vy + p[3] * vz (w = vz), i.e. NDC x = p[0] * vx / vz
+ * + p[1] maps to target pixel px0 + (x + 1) * pw / 2 = ((offx + sx) * Sx - ox), and y likewise
+ * (NDC y up, pixels down). */
+static inline void hlr_cam_clip(const HlrCam *k, float offx, float offy, float Sx, float Sy, float ox, float oy,
+                                const int rect[4], float p[4])
+{
+    p[0] = 2.0f * k->h * Sx / (float)rect[2];
+    p[1] = 2.0f * ((offx + k->ofx) * Sx - ox - (float)rect[0]) / (float)rect[2] - 1.0f;
+    p[2] = -2.0f * k->h * Sy / (float)rect[3];
+    p[3] = 1.0f - 2.0f * ((offy + k->ofy) * Sy - oy - (float)rect[1]) / (float)rect[3];
+}

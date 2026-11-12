@@ -208,6 +208,17 @@ void menu_init(void) {
     add(scene, "Native", "hlr=on");
     AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
     add(scene, "Stage", "hlr-part=stage");
+    AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
+    add(scene, "Enhanced Look", "hlr-look=enhanced");
+    add(scene, "PS1 Look", "hlr-look=ps1");
+    AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
+    add(scene, "Clip Near Polygons", "hlr-near=clip");
+    add(scene, "Drop Near Polygons (PS1)", "hlr-near=ps1");
+    AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
+    add(scene, "Edge Smoothing Off", "hlr-msaa=1");
+    add(scene, "Edge Smoothing 2x", "hlr-msaa=2");
+    add(scene, "Edge Smoothing 4x", "hlr-msaa=4");
+    add(scene, "Edge Smoothing 8x", "hlr-msaa=8");
     add_sub(view, "3D Scene", scene);
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     add(view, "Enter Full Screen\tAlt+Enter", "fullscreen");
