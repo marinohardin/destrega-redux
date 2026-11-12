@@ -912,6 +912,58 @@ floors; Milena's forehead and eye polygons jumping between shapes during her idl
   actuator table, not game intent). Port 1 was only probed in menus.
 - CD: libcd at register level; XA audio and the 5 STR movies live in `XADATA.BNS`.
 
+### CD: GetlocL and the BGM loop (the "stuck BGM" report, fixed in cdrom.c)
+
+Report: after several 1P battles on one stage the fight music became one note replayed over and
+over. Reproduced headless on the first try, with any stage and in menus too: it happens every time a
+BGM track plays to its end. Not load-related and not the host audio path (main.c's underrun pad is
+a faded copy of the block just rendered, fresh every vblank, so it cannot repeat for long).
+
+- **How the game streams and loops BGM** (verified: `--trace` CD log + `DESTREGA_XA_TRACE=1`
+  sector/GetlocL log, `tools/test_bgm_loop.py`): Setfilter(file 1, channel N), Setmode 0xc8
+  (double speed, XA-ADPCM on, filter on), Setloc to the track start, ReadS. While it streams the game
+  sends **GetlocL every 2 vblanks** and reads the MSF of the answer. Once that position is past the
+  track's end it sends Pause, the same Setloc, ReadS (one re-seek, 4-5 vblanks). The first ReadS and
+  the GetlocL polls come from `xa_bgm_tick` 800296c0, called by the vblank callback 80027268 in IRQ
+  context (verified: guest call stacks of those commands); where it keeps the track table and end
+  positions: not looked for (unknown).
+- **Track layout** (verified: disc subheaders read with Python from `disc/XADATA.BNS.raw`, plus the
+  logs): the fight BGM is one 8-channel interleave at the very start of `XADATA.BNS`, Setloc 03:30:61
+  (LBA 15661), file 1; the stage's music is a channel: Hills 5, Cave 6, Villa 1, Canyon 2, Gate 1,
+  Castle 1 5, Castle 2 6, Throne 1, Remains 7, Hamlet 1, Shrine 2, Fortress 1 (the VS scenarios'
+  character pairs; whether the channel follows the stage or a character: guess, stage). The game
+  loops it when GetlocL says 08:00:63 / 08:01:xx (the interleave plus data sectors with submode 00
+  after the audio), 8109 vblanks (135 s) after ReadS. The VS character select music is file 1 channel
+  0 at 09:21:00 (LBA 41925); it loops at 13:51:39, 8124 vblanks (135 s) after ReadS. The end
+  positions are guesses at a threshold between the last position seen before the re-seek and the
+  first one after, not values read from the game.
+- **The bug** (verified): `cdrom.c` updated GetlocL's header only when a *data* sector's INT1 was
+  delivered. XA-ADPCM sectors go to the SPU and never raise INT1, so during the whole song GetlocL
+  kept answering the last data sector read before it (a DATA.BNS / menu position below the end,
+  so harmless), until the data sectors after the audio arrived and moved it past the end. The game
+  then re-seeked to the start, but GetlocL still answered that past-the-end header (no data sector is
+  read at the track start), so the game re-seeked again 9 vblanks later, forever: the first 2-3
+  sectors of the channel (~0.15 s) replayed endlessly, until the next data read (the next match's
+  load) put a low position back into the header. A long 1P match that outlasts the 135 s track
+  hits it, which fits "after several battles".
+- **Fix**: GetlocL answers the header + subheader of the sector the drive read last, whatever its
+  type, updated at read time in `read_tick` (as real hardware and other emulators do: psx-spx
+  "GetlocL"; likely for the real drive, not tested on one). The loop then happens once per track
+  end. Gameplay is unchanged: the 16000-frame fight run has a byte-identical `--gameplay-trace`
+  before and after; the complete state hash changes only through the CD module's header field.
+- **Not modelled** (guess, unverified on hardware): GetlocL sent right after a Setloc / ReadS before
+  the first sector of the new position is read. The drive is said to answer an error there; we
+  answer the header of the last sector read before the seek. The game's first poll after its re-seek
+  comes 3 vblanks after ReadS, when our first sector has long arrived (one sector period + 20000
+  cycles), so this does not matter for the game as long as seeks stay that short.
+- Also seen, not changed: Pause / Setloc does not drop INT1s still queued from before it
+  (`s_q`); harmless here (no data INT1 is pending at the BGM re-seek).
+- Tools: `DESTREGA_XA_TRACE=1` logs every sector read (LBA, mode, submode, file, channel, coding
+  info, filter) and every GetlocL answer; `tools/xa_loop_check.py OUT.wav` finds a stuck loop in a
+  `--wav` file (normalised autocorrelation at 60-500 ms lags in 2 s windows: stuck BGM 0.99-1.0,
+  normal fight / menu music at most ~0.8); `tools/test_bgm_loop.py` (pr_check core group,
+  run_tests.sh) runs a Fortress fight and the VS character select past their loop points.
+
 - **Netplay smoothness** (measured with `tools/netplay_smooth.py`, windowed, 60 Hz, on a VS
   replay's fight; this Mac was shared with other jobs, load average 130-340 on 10 CPUs, so absolute
   numbers are poor and only back-to-back pairs compare). "Before" = `--net-sync-hard

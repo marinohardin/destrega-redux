@@ -24,7 +24,8 @@
 #             test_menu.sh, test_input.py, test_overlay_menu.py, test_governor.py (if present)
 #   core      every other runtime/*.c|h, runtime/overrides/, recomp/, analysis/overrides.txt,
 #             extra_seeds.txt, idle_loops.txt, rea_*.json, overlays/, CMakeLists.txt, scenarios / replays tools:
-#             4 scenarios (stage fight, story, options, practice), 3 replays, test_savestate.sh
+#             4 scenarios (stage fight, story, options, practice), 3 replays, test_savestate.sh,
+#             test_bgm_loop.py (BGM loop point crossed, no stuck audio)
 #   Anything else (docs, other tools, runtime/tests/, runtime/win/) adds nothing.
 # Usage: tools/pr_check.sh [--all-groups] [--group NAME]... [--base REF] [--dry-run]
 #   --all-groups   every group's subset (still light);  --group NAME   force a group (repeatable)
@@ -71,6 +72,7 @@ classify() { # path -> group (or nothing)
     runtime/*.c|runtime/*.h|runtime/overrides/*|recomp/*) echo core ;;
     analysis/overrides.txt|analysis/extra_seeds.txt|analysis/idle_loops.txt|analysis/rea_*.json|analysis/overlays/*|CMakeLists.txt) echo core ;;
     tools/scenarios.py|tools/scenario_expect.json|tools/replays.py|tools/replays/*|tools/test_savestate.sh|tools/fight_script.py) echo core ;;
+    tools/test_bgm_loop.py|tools/xa_loop_check.py) echo core ;;
   esac
 }
 BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null)
@@ -153,6 +155,7 @@ for g in $sel; do
       --out build/pr/scenarios
     tl_step core:replays python3 tools/replays.py run -j "$PR_JOBS" practice_gradd opts_handicap_recover vs_falma_reyus_cave
     tl_step core:savestate tools/test_savestate.sh
+    tl_step core:bgm_loop python3 tools/test_bgm_loop.py -j "$PR_JOBS"
     ;;
   esac
 done
