@@ -720,6 +720,16 @@ static void test_bone_filter(void)
     }
     printf("  slow motion lag %.3f units\n", lag);
     CHECK(lag < 1.0f, "slow motion followed (lag %.3f units)", lag);
+    /* a freeze (pause, hit-stop): the hold puts the output on the input at once and drops the trend,
+     * so the next updates with the same input stay there instead of coasting on */
+    hlr_bone_filter_hold(&bf, y, o);
+    CHECK(!memcmp(o, y, sizeof o), "hold: output = input");
+    float drift = 0;
+    for (int u = 0; u < 10; u++) {
+        hlr_bone_filter(&bf, y, o);
+        for (int i = 0; i < 12; i++) drift = fmaxf(drift, fabsf(o[i] - y[i]));
+    }
+    CHECK(drift == 0.0f, "nothing moves after a hold (drift %.4f)", drift);
 }
 
 int main(int argc, char **argv)

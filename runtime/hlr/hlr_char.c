@@ -36,7 +36,10 @@
  * translation > 6..40 units in one update) raises both gains towards 1, so real motion is never
  * delayed or overshot. Milena repro (frames 3880-3950, every vertex of a fighter):
  * second difference of the projected positions 0.193 px per update with the game's bones, 0.045
- * filtered (DESTREGA_HLR_BONE_DIAG=3880-3950 prints it). The filter state is dropped on a save-state load, a mode change and when a model was not drawn
+ * filtered (DESTREGA_HLR_BONE_DIAG=3880-3950 prints it). When none of a model's parts changed since
+ * its last update (pause, hit-stop, any frozen frame) every part snaps to its input and its trend
+ * is zeroed: the filter would otherwise coast on its trend and settle over several updates, so
+ * the fighters visibly kept moving after the game froze. The filter state is dropped on a save-state load, a mode change and when a model was not drawn
  * for a few updates; it never feeds back into emulated state. */
 #include "psx.h"
 #include "hlr.h"
@@ -115,7 +118,25 @@ void hlr_bone_filter(HlrBoneFilter *bf, const float x[12], float out[12])
         if (r >= 1.0f) bf->b[i] = 0.0f;
         out[i] = bf->s[i];
     }
+    memcpy(bf->x, x, sizeof bf->x);
     bf->n++;
+}
+
+void hlr_bone_filter_hold(HlrBoneFilter *bf, const float x[12], float out[12])
+{
+    memcpy(bf->s, x, sizeof bf->s); memset(bf->b, 0, sizeof bf->b); memcpy(bf->x, x, sizeof bf->x);
+    memcpy(out, x, 12 * sizeof *out);
+    bf->n++;
+    S.holds++;
+}
+
+/* the filter input of one part: workm (1.0 = 4096) and the translation (part 0: world; the others
+ * relative to part 0's, t0) */
+static void part_input(u32 coord, const float t0[3], int p, float x[12], float t[3])
+{
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) x[3 * r + c] = (float)r16s(coord + 36 + 6 * (u32)r + 2 * (u32)c) / 4096.0f;
+    t[0] = (float)r16s(coord + 56); t[1] = (float)r16s(coord + 60); t[2] = (float)r16s(coord + 64);
+    for (int c = 0; c < 3; c++) x[9 + c] = t[c] - (p ? t0[c] : 0.0f);
 }
 
 typedef struct {
@@ -229,6 +250,16 @@ void hlr_char_post(void)
     Model *mdl = f && s_bones == HLR_BONES_SMOOTH ? model_for(mb, nparts, f->seq) : NULL;
     const bool step = mdl && mdl->seq != f->seq;
     float t0[3] = { 0, 0, 0 }, t0f[3] = { 0, 0, 0 };   /* part 0's translation: raw, filtered */
+    /* frozen: every part's input equals its input at the model's last update */
+    bool frozen = step;
+    for (int p = 0; p < nparts && frozen; p++) {
+        const u32 coord = r32(parts + 0x70u * (u32)p);
+        float x[12], t[3];
+        if (!in_ram(coord) || !mdl->f[p].n) { frozen = false; break; }
+        part_input(coord, t0, p, x, t);
+        if (p == 0) memcpy(t0, t, sizeof t0);
+        if (memcmp(x, mdl->f[p].x, sizeof x)) frozen = false;
+    }
     int nv = 0, nc = 0;
     const u32 rgbc = r32(CHAR_RGBC);
     for (int p = 0; p < nparts && !bad; p++) {
@@ -283,13 +314,14 @@ void hlr_char_post(void)
             if (DR(22) != r32(CBUF + 4 * (u32)(nc + i))) { S.col_bad++; bad = true; }
         }
         /* world positions: workm * v / 4096 + t, through the bone filter */
-        float x[12], o[12];
-        for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) x[3 * r + c] = (float)r16s(coord + 36 + 6 * (u32)r + 2 * (u32)c) / 4096.0f;
-        const float t[3] = { (float)r16s(coord + 56), (float)r16s(coord + 60), (float)r16s(coord + 64) };
+        float x[12], o[12], t[3];
+        part_input(coord, t0, p, x, t);
         if (p == 0) memcpy(t0, t, sizeof t0);
-        for (int c = 0; c < 3; c++) x[9 + c] = t[c] - (p ? t0[c] : 0.0f);
         if (mdl) {
-            if (step) { hlr_bone_filter(&mdl->f[p], x, o); memcpy(mdl->out[p], o, sizeof o); }
+            if (step) {
+                if (frozen) hlr_bone_filter_hold(&mdl->f[p], x, o); else hlr_bone_filter(&mdl->f[p], x, o);
+                memcpy(mdl->out[p], o, sizeof o);
+            }
             else memcpy(o, mdl->out[p], sizeof o);
             if (p == 0) memcpy(t0f, o + 9, sizeof t0f);
             else for (int c = 0; c < 3; c++) o[9 + c] += t0f[c];
@@ -501,9 +533,10 @@ void hlr_char_report(void)
            S.proj_n ? S.proj_err_sum / (double)S.proj_n : 0.0, S.proj_err_max);
     if (hlr_get_mode() == HLR_ON)
         rt_log("hlr-chars: %llu models attached to a native frame, %llu without a frame, %llu with another camera;"
-               " bones %s (%llu filter snaps, %llu resets)",
+               " bones %s (%llu filter snaps, %llu part updates held while frozen, %llu resets)",
                (unsigned long long)S.attached, (unsigned long long)S.no_frame, (unsigned long long)S.cam_diff,
-               s_bones == HLR_BONES_GAME ? "game" : "smooth", (unsigned long long)S.snaps, (unsigned long long)S.resets);
+               s_bones == HLR_BONES_GAME ? "game" : "smooth", (unsigned long long)S.snaps, (unsigned long long)S.holds,
+               (unsigned long long)S.resets);
     if (S.dg_n)
         rt_log("hlr-bones-diag: %llu vertex updates; step per update game %.3f px, filtered %.3f px;"
                " jitter (second difference) game %.3f px, filtered %.3f px (vblank count %u..%u)", (unsigned long long)S.dg_n,

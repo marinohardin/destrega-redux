@@ -157,11 +157,13 @@ typedef struct {
     u64 calls, audited, vtx, vtx_bad, col, col_bad, faces, kept, link_bad, word_bad, bad_model;
     u64 attached, no_frame, cam_diff, frames_bad;
     double proj_err_sum; u64 proj_n; double proj_err_max;  /* float projection of the game's bones vs SXY */
-    u64 resets, snaps;
+    u64 resets, snaps, holds;
     double dg_step[2], dg_jit[2]; u64 dg_n; u32 dg_vb0, dg_vb1;              /* DESTREGA_HLR_BONE_DIAG */
 } HlrCharStats;
 void hlr_char_get_stats(HlrCharStats *st);
 /* the bone filter alone (tests): x = 12 values (3x3 matrix / 4096 units, translation), returns
  * the filtered values in out */
-typedef struct { float s[12], b[12]; int n; } HlrBoneFilter;   /* level, trend (Holt) */
+typedef struct { float s[12], b[12], x[12]; int n; } HlrBoneFilter;   /* level, trend (Holt), last input */
 void hlr_bone_filter(HlrBoneFilter *bf, const float x[12], float out[12]);
+/* the model's input did not change since the last update (pause, hit-stop): output = input, trend 0 */
+void hlr_bone_filter_hold(HlrBoneFilter *bf, const float x[12], float out[12]);
