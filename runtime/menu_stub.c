@@ -14,7 +14,7 @@
 void rt_log(const char *fmt, ...);
 
 void menu_init(void) {}
-void menu_netplay_progress(const char *text) { overlay_menu_progress(text); }
+void menu_netplay_progress(const char *text, bool copy) { (void)copy; overlay_menu_progress(text); }
 
 /* open the folder holding `path` (or `path` itself if it is a folder) in the file manager */
 void menu_reveal(const char *path) {

@@ -19,6 +19,7 @@
  * Coordinates are the renderer's output pixels (the window's pixel size); mouse events arrive in
  * window points and are scaled by the window's pixel density. */
 #include "menu_overlay.h"
+#include "netplay_ui.h"
 #include "menu.h"
 #include "input.h"
 #include "platform.h"
@@ -73,10 +74,12 @@ static const struct { const char *path, *action, *shortcut; } k_items[] = {
     { "View/Controls...", "controls", NULL },
     { "Netplay/Host Game...", "netplay-host-dialog", NULL },
     { "Netplay/Join Game...", "netplay-join-dialog", NULL },
+    { "Netplay/Copy My Address", "netplay-copy-address", NULL },   /* while hosting; title: netplay_ui.c */
     { "Netplay/-", NULL, NULL },
     { "Netplay/Disconnect", "netplay-disconnect", NULL },
     { "Netplay/-", NULL, NULL },
     { "Netplay/Not connected", "netplay-status", NULL },
+    { "Netplay/Copy Out-of-Sync Report Location", "netplay-copy-report", NULL },   /* after a desync */
 };
 
 typedef struct { char title[64], action[40]; const char *shortcut; int parent; bool sep, sub; } Node;
@@ -156,6 +159,7 @@ static void item_state(int i, ItemState *st) {
     } else if (strcmp(name, "quit") && !frontend_menu_action_allowed(name)) {
         st->enabled = false;
     }
+    if (!strcmp(name, "netplay-copy-address")) snprintf(st->title, sizeof st->title, "%s", netplay_ui_copy_title());
     if (!strcmp(name, "fullscreen")) snprintf(st->title, sizeof st->title, "%s", frontend_fullscreen() ? "Exit Full Screen" : "Enter Full Screen");
     if (!strcmp(name, "widescreen")) st->checked = frontend_widescreen();
     frontend_view_checked(n->action, &st->checked);

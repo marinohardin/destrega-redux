@@ -15,11 +15,13 @@
 #include <string.h>
 #include <stdio.h>
 #include "menu.h"
+#include "netplay_ui.h"
 #include "widescreen.h"
 #include "settings.h"
 #include "input.h"
 
 static void netplay_dialog(bool host);
+static NSTextField *s_paste_field;   /* Join Game: the field the Paste button fills */
 
 @interface DestregaMenu : NSObject <NSMenuItemValidation>
 @end
@@ -43,6 +45,23 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
     (void)sender;
     frontend_menu_action("netplay-disconnect", NULL);
 }
+- (void)netplayCopy:(id)sender {
+    (void)sender;
+    frontend_menu_action("netplay-copy-address", NULL);
+}
+/* Join Game's Paste button: the game has no Edit menu, so Cmd+V does not reach the text field.
+ * A pasted address is tidied (spaces, line breaks, quotes) when it parses; else pasted as it is. */
+- (void)netplayPaste:(id)sender {
+    (void)sender;
+    NSString *t = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
+    if (!t || !s_paste_field) return;
+    char host[256], err[300];
+    int port = 0;
+    if (netplay_ui_parse_address(t.UTF8String, 0, host, sizeof host, &port, err, sizeof err))
+        s_paste_field.stringValue = [NSString stringWithFormat:@"%s:%d", host, port];
+    else
+        s_paste_field.stringValue = [t stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
 /* check marks follow the state (requested state, so a click shows at once) */
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     NSString *a = item.representedObject;
@@ -50,6 +69,7 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
         item.title = @(netplay_status_text());
         return NO;
     }
+    if ([a isEqual:@"netplay-copy-address"]) item.title = @(netplay_ui_copy_title());
     if (a) {   /* greyed out while refused (netplay: game image and save games) */
         NSRange r = [a rangeOfString:@"="];
         NSString *name = r.location == NSNotFound ? a : [a substringToIndex:r.location];
@@ -80,13 +100,14 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
  * keeps running offline meanwhile. */
 static NSPanel *s_np_panel;
 static NSTextField *s_np_label;
+static NSButton *s_np_copy;
 
-void menu_netplay_progress(const char *text) {
+void menu_netplay_progress(const char *text, bool copy) {
     if (!s_target) return;   /* no menus (headless) */
     @autoreleasepool {
         if (!text) { [s_np_panel orderOut:nil]; return; }
         if (!s_np_panel) {
-            s_np_panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 420, 170)
+            s_np_panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 460, 220)
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskUtilityWindow
                                                       backing:NSBackingStoreBuffered defer:NO];
             s_np_panel.title = @"Netplay";
@@ -94,14 +115,19 @@ void menu_netplay_progress(const char *text) {
             s_np_panel.hidesOnDeactivate = NO;
             s_np_panel.releasedWhenClosed = NO;
             s_np_label = [NSTextField wrappingLabelWithString:@""];
-            s_np_label.frame = NSMakeRect(16, 52, 388, 106);   /* status + the router's answer (portmap.c) */
+            s_np_label.frame = NSMakeRect(16, 52, 428, 156);   /* status, addresses, the router's answer */
+            s_np_label.selectable = YES;                       /* the address can be selected by hand too */
             [s_np_panel.contentView addSubview:s_np_label];
+            s_np_copy = [NSButton buttonWithTitle:@"Copy Address" target:s_target action:@selector(netplayCopy:)];
+            s_np_copy.frame = NSMakeRect(12, 12, 130, 32);
+            [s_np_panel.contentView addSubview:s_np_copy];
             NSButton *cancel = [NSButton buttonWithTitle:@"Cancel" target:s_target action:@selector(netplayCancel:)];
-            cancel.frame = NSMakeRect(310, 12, 96, 32);
+            cancel.frame = NSMakeRect(350, 12, 96, 32);
             cancel.keyEquivalent = @"\e";
             [s_np_panel.contentView addSubview:cancel];
         }
         s_np_label.stringValue = @(text);
+        s_np_copy.hidden = !copy;
         if (!s_np_panel.visible) [s_np_panel center];   /* updates (the router's answer) leave it where it is */
         [s_np_panel orderFront:nil];
     }
@@ -115,6 +141,15 @@ static NSTextField *field(NSView *v, NSString *label, NSString *value, CGFloat y
     f.frame = NSMakeRect(115, y, w, 24);
     [v addSubview:f];
     return f;
+}
+
+static void dialog_error(NSString *title, const char *err) {
+    NSAlert *e = [NSAlert new];
+    e.alertStyle = NSAlertStyleWarning;
+    e.messageText = title;
+    e.informativeText = @(err);
+    [e addButtonWithTitle:@"OK"];
+    [e runModal];
 }
 
 static void netplay_dialog(bool host) {
@@ -133,55 +168,82 @@ static void netplay_dialog(bool host) {
         NSString *port = (sv = settings_get("netplay", "port")) ? @(sv) : @"7000";
         NSString *addr = (sv = settings_get("netplay", "join_address")) ? @(sv) : @"";
         NSString *delay = (sv = settings_get("netplay", "delay")) ? @(sv) : @"2";
-        NSAlert *a = [NSAlert new];
-        a.messageText = host ? @"Host Game" : @"Join Game";
-        if (host) {
-            char ip[256];
-            net_local_addresses(ip, sizeof ip);
-            a.informativeText = [NSString stringWithFormat:
-                @"Your opponent chooses Join Game and types one of this computer's addresses and the port.\n\n"
-                 "This computer's addresses: %s\n\nOver the internet, the game asks your router to forward UDP port %@ to "
-                 "this computer and shows the address to give your opponent; if the router can't, forward the port by hand. "
-                 "Both games restart from the beginning when your opponent connects.", *ip ? ip : "none found", port];
-        } else {
-            a.informativeText = @"Type the address and port your opponent gave you, for example 192.168.1.20:7000. "
-                                 "Both games restart from the beginning when you connect.";
-        }
-        const CGFloat y0 = host ? 30 : 0;   /* host: room for the router checkbox below the fields */
-        NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 340, 60 + y0)];
-        NSTextField *f1 = host ? field(v, @"Port:", port, 32 + y0, 90) : field(v, @"Address:port:", addr, 32 + y0, 180);
-        NSTextField *f2 = field(v, @"Input delay:", delay, y0, 50);
-        NSButton *pm = nil;
-        if (host) {   /* [netplay] port_mapping (portmap.c) */
-            pm = [NSButton checkboxWithTitle:@"Ask the router to open the port automatically" target:nil action:nil];
-            pm.frame = NSMakeRect(0, 0, 340, 22);
-            pm.state = settings_get_bool("netplay", "port_mapping", true) ? NSControlStateValueOn : NSControlStateValueOff;
-            [v addSubview:pm];
-        }
-        a.accessoryView = v;
-        [a addButtonWithTitle:host ? @"Host" : @"Join"];
-        [a addButtonWithTitle:@"Cancel"];
-        a.window.initialFirstResponder = f1;
-        if ([a runModal] != NSAlertFirstButtonReturn) return;
-        int dl = f2.intValue;
-        if (dl < 1 || dl > 30) dl = 2;
-        settings_set_int("netplay", "delay", dl);
-        char arg[400];
-        if (host) {
-            int p = f1.intValue;
-            if (p <= 0 || p > 65535) p = 7000;
-            settings_set_int("netplay", "port", p);
-            settings_set_bool("netplay", "port_mapping", pm.state == NSControlStateValueOn);
-            settings_save();
-            snprintf(arg, sizeof arg, "%d,%d", p, dl);
-            frontend_menu_action("netplay-host", arg);
-        } else {
-            NSString *s = [f1.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-            if (![s containsString:@":"]) s = [s stringByAppendingFormat:@":%@", port];
-            settings_set("netplay", "join_address", s.UTF8String);
-            settings_save();
-            snprintf(arg, sizeof arg, "%s,%d", s.UTF8String, dl);
-            frontend_menu_action("netplay-join", arg);
+        bool pm_on = settings_get_bool("netplay", "port_mapping", true);
+        /* shown again with what was typed until the values are usable or the player cancels */
+        for (;;) {
+            NSAlert *a = [NSAlert new];
+            a.messageText = host ? @"Host Game" : @"Join Game";
+            if (host) {
+                char ip[256];
+                net_local_addresses(ip, sizeof ip);
+                a.informativeText = [NSString stringWithFormat:
+                    @"Your opponent chooses Join Game and types your address and port.\n\n"
+                     "On your home network: %s\n\nOver the internet, the game asks your router to open the port and then "
+                     "shows your internet address, with a Copy Address button; if the router can't, forward the UDP "
+                     "port to this computer by hand. Both games restart from the beginning when your opponent connects.",
+                    *ip ? ip : "no network address found"];
+            } else {
+                a.informativeText = @"Type or paste the address your opponent gave you, for example 192.168.1.20:7000. "
+                                     "Both games restart from the beginning when you connect.";
+            }
+            const CGFloat y0 = host ? 30 : 0;   /* host: room for the router checkbox below the fields */
+            NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 60 + y0)];
+            NSTextField *f1 = host ? field(v, @"Port:", port, 32 + y0, 90) : field(v, @"Address:port:", addr, 32 + y0, 170);
+            NSTextField *f2 = field(v, @"Input delay:", delay, y0, 50);
+            NSButton *pm = nil;
+            if (host) {   /* [netplay] port_mapping (portmap.c) */
+                pm = [NSButton checkboxWithTitle:@"Ask the router to open the port automatically" target:nil action:nil];
+                pm.frame = NSMakeRect(0, 0, 360, 22);
+                pm.state = pm_on ? NSControlStateValueOn : NSControlStateValueOff;
+                [v addSubview:pm];
+            } else {      /* no Edit menu in the game, so Cmd+V does not work in the field: a button does */
+                NSButton *paste = [NSButton buttonWithTitle:@"Paste" target:s_target action:@selector(netplayPaste:)];
+                paste.frame = NSMakeRect(290, 32 + y0 - 4, 70, 32);
+                [v addSubview:paste];
+                s_paste_field = f1;
+            }
+            a.accessoryView = v;
+            [a addButtonWithTitle:host ? @"Host" : @"Join"];
+            [a addButtonWithTitle:@"Cancel"];
+            a.window.initialFirstResponder = f1;
+            NSModalResponse r = [a runModal];
+            s_paste_field = nil;
+            if (r != NSAlertFirstButtonReturn) return;
+            /* keep what was typed for the next round */
+            if (host) port = f1.stringValue; else addr = f1.stringValue;
+            delay = f2.stringValue;
+            if (pm) pm_on = pm.state == NSControlStateValueOn;
+            char err[400], host_s[256];
+            int dl = 2, p = 7000;
+            if (!netplay_ui_parse_delay(delay.UTF8String, &dl, err, sizeof err)) {
+                dialog_error(a.messageText, err);
+                continue;
+            }
+            if (host) {
+                if (!netplay_ui_parse_port(port.UTF8String, &p, err, sizeof err)) { dialog_error(@"Host Game", err); continue; }
+                settings_set_int("netplay", "delay", dl);
+                settings_set_int("netplay", "port", p);
+                settings_set_bool("netplay", "port_mapping", pm_on);
+                settings_save();
+                char arg[64];
+                snprintf(arg, sizeof arg, "%d,%d", p, dl);
+                frontend_menu_action("netplay-host", arg);
+            } else {
+                int defp = atoi(settings_get("netplay", "port") ? settings_get("netplay", "port") : "7000");
+                if (!netplay_ui_parse_address(addr.UTF8String, defp > 0 && defp <= 65535 ? defp : 7000, host_s,
+                                              sizeof host_s, &p, err, sizeof err)) {
+                    dialog_error(@"Join Game", err);
+                    continue;
+                }
+                char arg[400], hp[300];
+                snprintf(hp, sizeof hp, "%s:%d", host_s, p);
+                settings_set_int("netplay", "delay", dl);
+                settings_set("netplay", "join_address", hp);
+                settings_save();
+                snprintf(arg, sizeof arg, "%s,%d", hp, dl);
+                frontend_menu_action("netplay-join", arg);
+            }
+            return;
         }
     }
 }
@@ -372,10 +434,12 @@ void menu_init(void) {
         NSMenu *np = [[NSMenu alloc] initWithTitle:@"Netplay"];
         add(np, @"Host Game…", @"netplay-host-dialog", nil, 0);
         add(np, @"Join Game…", @"netplay-join-dialog", nil, 0);
+        add(np, @"Copy My Address", @"netplay-copy-address", nil, 0);   /* while hosting; title: netplay_ui.c */
         [np addItem:NSMenuItem.separatorItem];
         add(np, @"Disconnect", @"netplay-disconnect", nil, 0);
         [np addItem:NSMenuItem.separatorItem];
         add(np, @"Not connected", @"netplay-status", nil, 0);
+        add(np, @"Copy Out-of-Sync Report Location", @"netplay-copy-report", nil, 0);   /* after a desync */
         NSMenuItem *npItem = [[NSMenuItem alloc] initWithTitle:@"Netplay" action:nil keyEquivalent:@""];
         npItem.submenu = np;
         NSInteger vi = -1;

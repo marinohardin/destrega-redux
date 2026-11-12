@@ -14,9 +14,10 @@ void menu_reveal(const char *path);
 /* Absolute path of the running executable (for the clean re-exec after loading a game image). */
 bool menu_executable_path(char *out, size_t n);
 
-/* Netplay progress panel ("Waiting for an opponent..." with Cancel); NULL hides it. No-op
- * without menus (headless, other platforms). */
-void menu_netplay_progress(const char *text);
+/* Netplay progress panel ("Waiting for an opponent..." with Cancel); NULL hides it. `copy` adds a
+ * "Copy Address" button (queues netplay-copy-address). No-op without menus (headless, other
+ * platforms). The text comes from netplay_ui.c. */
+void menu_netplay_progress(const char *text, bool copy);
 /* Test hook (--menu-action F:menu-test=CMD, windowed): "dump" logs every menu item with its
  * greyed / checked state; "click=Menu/Submenu/Item" chooses that item as a click would.
  * Windows only (menu_win.c); elsewhere it logs and returns false. */
@@ -28,8 +29,9 @@ bool menu_test(const char *cmd);
  * Returns false where there is nothing to run (no menus, other platforms): sleep instead. */
 bool menu_wait_until(unsigned long long deadline_ns);
 
-/* ---- provided by netplay.c / net.c (Netplay menu) ---- */
+/* ---- provided by netplay.c / netplay_ui.c / net.c (Netplay menu) ---- */
 const char *netplay_status_text(void);
+const char *netplay_ui_copy_title(void);   /* "Copy My Address" / "Copy My Home-Network Address" */
 bool netplay_busy(void);          /* a session or a host / join attempt is running */
 bool netplay_active(void);        /* a session is running */
 int net_local_addresses(char *out, size_t n);

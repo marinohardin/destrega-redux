@@ -61,10 +61,13 @@ def check_dump():
             "View/Texture Filtering/Bilinear", "View/Texture Filtering/Smooth 2D Edges + Bilinear 3D",
             "View/Smooth Colours", "View/Anti-aliasing/Off [checked]", "View/Anti-aliasing/4x",
             "View/Enter Full Screen", "View/Controls...", "Netplay/Host Game...", "Netplay/Join Game...",
-            "Netplay/Disconnect [greyed]", "Netplay/Not connected [greyed]"]
+            "Netplay/Disconnect [greyed]", "Netplay/Not connected [greyed]",
+            "Netplay/Copy Out-of-Sync Report Location [greyed]"]
     for w in want:
         if w not in items:
             fail("dump: missing '%s'" % w)
+    if not any(i.startswith("Netplay/Copy My") and i.endswith("[greyed]") for i in items):
+        fail("dump: no greyed Copy My Address item while not hosting")
     if any("emory card" in i for i in items):
         fail("dump: an item says memory card")
     print("overlay-menu: dump: %d items" % len(items))

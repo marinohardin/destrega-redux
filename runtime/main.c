@@ -14,6 +14,7 @@
 #include "input.h"
 #include "settings.h"
 #include "portmap.h"
+#include "netplay_ui.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1553,7 +1554,8 @@ static void usage(void) {
         "                        tex-filter[=nearest|bilinear|xbr], smooth-colours[=on|off], ssaa[=1..4],\n"
         "                        gpu-precision[=exact|fast], tex-cache[=on|off]\n"
         "                        (View menu; no argument = toggle / next), netplay-host=PORT[,DELAY],\n"
-        "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect (Netplay menu),\n"
+        "                        netplay-join=HOST:PORT[,DELAY], netplay-disconnect, netplay-copy-address,\n"
+        "                        netplay-copy-report (Netplay menu),\n"
         "                        controls, controls-bind=P1:cross=key:Z|pad:east, controls-device=P2:keyboard,\n"
         "                        controls-stick=P1:on|off, controls-deadzone=P1:40, controls-reset=P1|P2|all,\n"
         "                        controls-dump (Controls window)\n"
@@ -1779,6 +1781,13 @@ void frontend_alert(const char *msg) {
     if (!s_headless && !(na && *na == '1')) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Destrega Netplay", msg, s_win);
 }
 void frontend_pump_events(void) { if (!s_headless) SDL_PumpEvents(); }
+/* Netplay > Copy My Address etc. (netplay_ui.c): the system clipboard; headless runs leave it alone
+ * (the caller logs the text). */
+bool frontend_copy_text(const char *text) {
+    if (s_headless) return false;
+    if (!SDL_SetClipboardText(text)) { rt_log("netplay: cannot copy to the clipboard: %s", SDL_GetError()); return false; }
+    return true;
+}
 
 static void action_load(const char *arg) {
     char path[2048];
@@ -1915,11 +1924,9 @@ static void action_card_delete(const char *arg) {
  * Export only reads the card but flushes it first, so it is blocked too (netplay detaches cards). */
 bool netplay_active(void);   /* netplay.c */
 bool netplay_busy(void);
-void netplay_menu_host(int port, int delay);
-void netplay_menu_join(const char *addr, int port, int delay);
-void netplay_menu_disconnect(void);
 bool frontend_menu_action_allowed(const char *name) {
     static const char *const blocked[] = { "load", "save-import", "save-export", "save-delete" };
+    if (!strncmp(name, "netplay-copy-", 13)) return netplay_ui_allowed(name);
     if (!strcmp(name, "netplay-host") || !strcmp(name, "netplay-join")) return !netplay_busy();
     if (!strcmp(name, "netplay-disconnect")) return netplay_busy();
     if (!netplay_active()) return true;
@@ -2012,7 +2019,8 @@ static void resolution_set(const char *arg) {
 static void menu_run(const char *name, const char *arg) {
     rt_log("menu: action %s%s%s", name, *arg ? " " : "", arg);
     if (!frontend_menu_action_allowed(name)) {
-        if (!strncmp(name, "netplay-", 8))
+        if (!strncmp(name, "netplay-copy-", 13)) rt_log("menu: REFUSED %s: %s", name, netplay_ui_refusal(name));
+        else if (!strncmp(name, "netplay-", 8))
             rt_log("menu: REFUSED %s: %s", name, netplay_busy() ? "a netplay session is already running" : "no netplay session");
         else rt_log("menu: REFUSED %s: not available during a netplay session (it would desync the peers)", name);
         return;
@@ -2023,22 +2031,10 @@ static void menu_run(const char *name, const char *arg) {
     else if (!strcmp(name, "save-import")) action_card_import(arg);
     else if (!strcmp(name, "save-export")) action_card_export(arg);
     else if (!strcmp(name, "save-delete")) action_card_delete(arg);
-    else if (!strcmp(name, "netplay-host")) {   /* PORT[,DELAY] */
-        int port = 7000, delay = 2;
-        if (*arg) sscanf(arg, "%d,%d", &port, &delay);
-        netplay_menu_host(port, delay);
-    }
-    else if (!strcmp(name, "netplay-join")) {   /* HOST:PORT[,DELAY] */
-        char host[256] = "";
-        int port = 0, delay = 2;
-        const char *c = strrchr(arg, ':');
-        if (c) {
-            snprintf(host, sizeof host, "%.*s", (int)(c - arg), arg);
-            sscanf(c + 1, "%d,%d", &port, &delay);
-        }
-        netplay_menu_join(host, port, delay);
-    }
+    else if (!strcmp(name, "netplay-host")) netplay_ui_host_action(arg);   /* PORT[,DELAY] (netplay_ui.c) */
+    else if (!strcmp(name, "netplay-join")) netplay_ui_join_action(arg);   /* HOST:PORT[,DELAY] */
     else if (!strcmp(name, "netplay-disconnect")) netplay_menu_disconnect();
+    else if (!strncmp(name, "netplay-copy-", 13)) netplay_ui_copy(name);   /* -address, -report */
     else if (!strcmp(name, "renderer")) {
         /* View > Renderer; arg software | gpu (the platform default) | metal | vulkan | d3d12 |
          * compare (keeps the API in use); none = toggle software <-> GPU */

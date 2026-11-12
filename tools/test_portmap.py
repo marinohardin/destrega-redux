@@ -13,6 +13,11 @@ port-mapping argument at all: nothing), restart (the menu session restart
 keeps the mapping: the new process renews it with the same PCP nonce and deletes it when the
 opponent leaves).
 
+Every basic case also checks Netplay > Copy My Address (menu action netplay-copy-address; headless
+runs only log what they would copy): refused before hosting; while hosting, the router's internet
+address when it gave a public one, else this computer's home-network address, labelled as such with
+the reason (CGNAT, refused, no answer, port opening off).
+
   test_portmap.py [CASE...] [-j N] [--win]     (--win: the host is build/win/destrega.exe under
                                                 Wine, see tools/test_netplay_wine.py for WINE /
                                                 WINE_ARGS / WIN_EXE / PAK)
@@ -58,10 +63,44 @@ def common_checks(problems, rc, log, frames):
     if f'headless: reached {frames} frames' not in log: problems.append('the game did not keep running to the end')
 
 
+# what Copy My Address must copy per case: 'internet' (the router's address) or the reason given
+# with the home-network address
+COPY = {'natpmp': 'internet', 'pcp': 'internet', 'upnp': 'internet', 'upnp_permanent': 'internet',
+        'refused': 'the router did not open the port', 'noanswer': 'the router did not open the port',
+        'cgnat': "your internet provider doesn't allow incoming connections",
+        'off': 'automatic port opening is off', 'no_override': 'automatic port opening is off',
+        'plain': 'automatic port opening is off'}
+
+
+def check_copy(problems, name, log, port):
+    if 'menu: REFUSED netplay-copy-address: not hosting a game' not in log:
+        problems.append('copy address: not refused before hosting')
+    want = COPY.get(name)
+    if not want: return
+    if want == 'internet':
+        if f'netplay: copy address: 203.0.113.45:{port} (your internet address, from the router)' not in log:
+            problems.append('copy address: the router\'s address was not copied')
+        if 'Give your opponent this address: 203.0.113.45' not in log: problems.append('panel: no address for the opponent')
+        return
+    m = re.search(r'netplay: copy address: (\S+) \(your home-network address: (.*)\)', log)
+    if not m:
+        if 'This computer has no network address right now' not in log:
+            problems.append('copy address: no home-network address copied and no explanation')
+        return
+    if not re.fullmatch(rf'\d+\.\d+\.\d+\.\d+:{port}', m.group(1)): problems.append(f'copy address: copied {m.group(1)}')
+    if '100.72.1.9' in m.group(1): problems.append('copy address: copied the unreachable CGNAT address')
+    if want not in m.group(2): problems.append(f'copy address: reason "{want}" missing in "{m.group(2)}"')
+    if 'Players outside your home network need your internet address' not in log:
+        problems.append('panel: does not say that players outside need the internet address')
+
+
 def case_basic(name, port, router_kw, use_gw, use_upnp, expect, disc_at=None, frames=14000, extra=()):
-    """Host from frame 30; cancel at disc_at (None = exit while hosting)."""
+    """Host from frame 30; cancel at disc_at (None = exit while hosting). Copy My Address at frame 10
+    (refused) and shortly before the end of hosting."""
     r = FakeRouter(**router_kw)
-    args = ['--frames', str(frames), '--menu-action', f'30:netplay-host={port},2']
+    copy_at = (disc_at or frames) - 1000
+    args = ['--frames', str(frames), '--menu-action', f'30:netplay-host={port},2',
+            '--menu-action', '10:netplay-copy-address', '--menu-action', f'{copy_at}:netplay-copy-address']
     if use_gw or use_upnp: args += ['--net-portmap-lease', LEASE]   # 'plain': no port-mapping argument at all
     if use_gw: args += ['--net-portmap-gateway', r.gateway]
     if use_upnp: args += ['--net-portmap-upnp', r.upnp_url]
@@ -74,6 +113,7 @@ def case_basic(name, port, router_kw, use_gw, use_upnp, expect, disc_at=None, fr
     problems = []
     common_checks(problems, rc, log, frames)
     expect(problems, r, log, port)
+    check_copy(problems, name, log, port)
     return problems, dt, r.events
 
 
