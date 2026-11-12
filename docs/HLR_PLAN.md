@@ -219,6 +219,13 @@ Acceptance:
   complete (no holes or missing limbs), same pose and position as off, shading matches; the diff
   shows outlines only (edges, a semi-transparent ground quad's rectangle under Milena where the
   native floor below it rasterizes differently).
+- Play-test fixes (user report, Gate, Milena vs Doyle, 4x6 16:9 fast): (1) thin bright seams
+  outlining the floor's pass boundaries around the fighters: every MSAA pass restarted from the
+  resolved target; the MSAA samples are now kept across the passes of a frame (NOTES.md "HLR phase
+  3"). vs_gate frame 3300: 2 seams (345 and 485 px) -> 0; `test_hlr.py seams` (with a negative
+  check). (2) Smooth Character Motion kept moving ~1 s after a pause: a model whose bones did not
+  change is now held at the game's pose (filtered step during the pause 0.011 -> 0.000 px); head
+  flips on the Milena repro 0.52 % mean, 0.95 % max (were 0.55 / 0.98).
 
 **Not done / deviations.** Per-pixel character lighting (the faces use the game's NCCT vertex
 colours, so the dynamic hit light is right but flat-shaded per vertex); the plan's `float` bones mode

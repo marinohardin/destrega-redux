@@ -586,6 +586,30 @@ What drawing the fighters natively (`--hlr on`, parts `chars`; `runtime/hlr/hlr_
   ms/frame. Consequence: such a shadow piece is ordered against the fighter as a whole (before or
   after all of its faces) instead of between two foot faces; nothing visible in the contact sheets
   (likely: only the 12 stage sheets and the character sheets were looked at).
+- **Seams around the fighters came from MSAA passes restarting from the resolve** (verified (dumps,
+  vs_gate frame 3300 at 4x6 16:9, Metal; `tools/check_hlr_seams.py`)). User report: thin bright
+  lines outlining rectangles and trapezoids on the floor around the fighters (Gate, Milena vs Doyle).
+  The shadow pieces above split the stage into passes around each fighter (2-3 per frame). Each pass
+  used to blit the resolved target into every MSAA sample, so on a floor edge shared by polygons of
+  two passes the second pass's edge pixels were averaged with the first pass's *resolved* pixel,
+  which on the far side of that edge held what the PS1 had under the floor (the replaced packets
+  are not drawn, so it is the background), giving a bright 1-2 px line along every pass boundary:
+  2 seams of 345 and 485 px in that frame, in fast and exact precision, with `--hlr-parts stage`
+  too, none with `--hlr-msaa 1` or `--hlr off`. Fix (hlr_gpu.c): the MSAA texture keeps its samples
+  for the whole frame (`RESOLVE_AND_STORE`, LOAD in later passes); a pass blits only the pixels
+  the target changed since the previous resolve (the original-path packets drawn in between), the
+  resolve textures ping-pong. After: 0 seams in fight and pause frames (515 of 762 MSAA passes
+  kept the previous samples in the run). `DESTREGA_HLR_TEST_NOKEEP=1` brings the old behaviour
+  back for the negative check of `test_hlr.py seams`. Known limit: a pixel the original path
+  changed between two passes takes the new value in every sample (its edge coverage is lost there).
+- **The game keeps drawing the fighters with frozen bones while paused** (verified (`hlr-chars:`
+  holds, Milena practice repro with Start at 3800)): `char_mesh_render` runs every update during the
+  pause with each part's matrix and translation unchanged (1092 part updates held in 55 vblanks). The
+  Holt filter's trend made the fighters coast on for ~30 updates after the pause started (3579
+  pixels of difference to the held run at the first paused frame, 24 still at the 28th update;
+  filtered step 0.011 px per update vs 0 for the game's bones). Now a model whose every part's input
+  equals the last one is held (output = input, trend 0): filtered step 0.000. Head flips on the
+  Milena repro unchanged (mean 0.52 %, max 0.95 %; were 0.55 / 0.98).
 
 ### Fog, depth cue and lights per stage (verified (phase 1))
 

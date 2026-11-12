@@ -1811,7 +1811,11 @@ the fighters too, in the same depth buffer (below).
   `hlr_gpu.c` draws each pass as a `HiresBackend.external` on the hi-res device: float camera from the
   GTE state (`hlr_cam.h`; `hlr_cam_clip` gives the clip-space form for any pass rectangle, guard band
   included), reverse-Z depth (D32, else D24) cleared per table, MSAA with resolve
-  (`SDL_GPUTextureSupportsSampleCount`, lowered to what the target format takes), GTE fog and
+  (`SDL_GPUTextureSupportsSampleCount`, lowered to what the target format takes; the MSAA texture
+  keeps its samples across the passes of one frame: `RESOLVE_AND_STORE`, later passes LOAD it and
+  blit only the target pixels that changed since the previous resolve, two resolve textures
+  ping-pong. Restarting every pass from the resolve drew the floor's pass boundaries around the
+  fighters as thin bright seams; `tools/check_hlr_seams.py`, `test_hlr.py seams`), GTE fog and
   lighting per pixel (enhanced) or per vertex (ps1 look), textures from the texture cache's layers
   (`material_texture(key)`, keyed by content fingerprint for a later replacement pack; trilinear +
   anisotropic, point-sampled in the ps1 look), opaque then semi-transparent (blend from the tpage).
@@ -1837,7 +1841,9 @@ the fighters too, in the same depth buffer (below).
   action `hlr-bones[=game|smooth]`, none = toggle; View > 3D Scene > Smooth Character Motion): Holt
   smoothing of every part's matrix and translation (part 0 in world space, the others relative to
   it), snapping on large changes, no added delay; state dropped on `on_restore`, a mode change or a
-  model not drawn for > 3 updates; never feeds back. `DESTREGA_HLR_BONE_DIAG=1|LO-HI` (libetc vblank
+  model not drawn for > 3 updates; never feeds back. A model whose every part has the same input
+  as last update (pause, hit-stop) is held: output = input, trend 0 (`hlr_bone_filter_hold`; it used
+  to coast on for ~1 s after a pause). `DESTREGA_HLR_BONE_DIAG=1|LO-HI` (libetc vblank
   count) prints `hlr-bones-diag:` (per-update step and jitter, game vs filtered).
 - **2b switches**: `--hlr-msaa 1|2|4|8` (default 4), `--hlr-near clip|ps1` (default clip: polygons
   crossing the near plane are clipped by the GPU; ps1 drops what the PS1 dropped as too near),
@@ -1849,13 +1855,16 @@ the fighters too, in the same depth buffer (below).
   (polygons recorded), `hlr-native-draw:` (passes and polygons per frame, culled, near-dropped,
   stale, without texture, suppressed, walks given up, GPU passes / draws / failed).
   `DESTREGA_HLR_DIAG=N` logs the first N native polygons that cover more than a quarter of a pass.
-  `DESTREGA_HLR_TEST_DROP=N` leaves out every Nth packet (tests prove they notice).
+  `DESTREGA_HLR_TEST_DROP=N` leaves out every Nth packet, `DESTREGA_HLR_TEST_NOKEEP=1` restarts
+  every MSAA pass from the resolve (the old seams) (tests prove they notice).
 - **Tests**: CTest `hlr` (no disc; also the float camera against the GTE's RTPS: within 0.75 px
   for z >= 4H, where the GTE's own integer view position moves SX by at most H / z) and `hlr_gpu` /
   `hlr_gpu_vulkan` (`test_hires_gpu external [API]`: empty external passes leave GPU == software, and
   a cube through `hlr_gpu_external`: face colours, depth test, MSAA resolve, 15-bit channel order;
   `external d3d12` passes under CrossOver (vkd3d) with the same cube pixel counts as Metal and MoltenVK);
-  `tools/test_hlr.py [audit chars hash exact rewind]` (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`,
+  `tools/test_hlr.py [audit chars hash exact seams rewind]` (`seams`: vs_gate fight + pause in the
+  user configuration, `tools/check_hlr_seams.py` on --hlr on vs off dumps: no long thin bright line
+  only the HLR draws; plus the NOKEEP negative check) (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`,
   `CHARS`; `chars` = the `practice_<char>` replays with `--hlr audit`, every character's move set;
   `hash` and `rewind` require the native draw line and native character faces); CTest `hlr` also
   audits a synthetic fighter built on the guest GTE (faults must be caught) and the bone filter; `test_netplay.py lan_hlr`; pr_check group `hlr`.
