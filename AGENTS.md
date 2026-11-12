@@ -1773,7 +1773,8 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
 ## Native high-level renderer (`runtime/hlr/`, `--hlr`; docs/HLR_PLAN.md)
 
 Presentation only, in phases (plan and results: `docs/HLR_PLAN.md`; game facts: NOTES.md "Stage
-builders in full", "HLR phase 2a"). Phase 2a: the stage is captured and redrawn exactly.
+builders in full", "HLR phase 2a", "HLR phase 2b"). Phase 2a: the stage is captured and redrawn
+exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below).
 
 - **Hooks** (`runtime/hlr_hook.h`, table `g_hlr` in bus.c; all NULL = off): `stage_pre(mode)` /
   `stage_post()` around the real pass of `stage_render` (`overrides/widescreen.c real_pass`),
@@ -1791,18 +1792,52 @@ builders in full", "HLR phase 2a"). Phase 2a: the stage is captured and redrawn 
   (`gpu_set_node_no_hires`); a changed packet ("stale") goes the normal way. The end of the walk
   consumes the frame; a save-state load or a mode / parts change drops every frame.
 - **Modes**: `off`; `audit` (prediction + checks, draws nothing differently); `exact` (any hi-res
-  backend); `on` (= exact in 2a, needs a GPU API). Default: on in a window, off headless. `--hlr-parts
+  backend; byte-identical to off); `on` (native 3D stage, needs a GPU API with HLR shaders: Metal or
+  Vulkan; Direct3D 12 has no DXIL yet and keeps the exact replay). Default: on in a window, off headless. `--hlr-parts
   stage|chars|shadows|fx|story|all|none` (only stage exists). Settings `[display] hlr` (on|off),
   `hlr_parts`; menu actions `hlr[=on|off]`, `hlr-part=stage:on|off`; View > 3D Scene > Original /
   Native, Stage (Mac, Windows; greyed unless a GPU API renders). `runtime/hlr/` is outside the
   netplay build identity (`source_ident.py`), `hlr_hook.h` and the call sites are inside.
+- **Native 3D stage (`on`, phase 2b)**: the capture also records every stage polygon (model
+  vertices = world coordinates, normals / colours, its packet for UV / CLUT / page) of every object
+  the flag rules let through, also those the PS1 culled; an object the stage renderer's own 4-point
+  test culls at 4:3 only if the same test widened by the guard band passes (widescreen; `hlr_set_guard`
+  from main.c), because that test culls some covering objects on purpose (Throne's VS camera is
+  behind a wall). `hlr_native.c` schedules them into the GPU linked-list walk (header comment:
+  positions, overlap intervals against the non-stage packets' GP0 boxes, fewest passes) and
+  `hlr_gpu.c` draws each pass as a `HiresBackend.external` on the hi-res device: float camera from the
+  GTE state (`hlr_cam.h`; `hlr_cam_clip` gives the clip-space form for any pass rectangle, guard band
+  included), reverse-Z depth (D32, else D24) cleared per table, MSAA with resolve
+  (`SDL_GPUTextureSupportsSampleCount`, lowered to what the target format takes), GTE fog and
+  lighting per pixel (enhanced) or per vertex (ps1 look), textures from the texture cache's layers
+  (`material_texture(key)`, keyed by content fingerprint for a later replacement pack; trilinear +
+  anisotropic, point-sampled in the ps1 look), opaque then semi-transparent (blend from the tpage).
+  The background gradient strips are drawn natively, stretched over the pass. The stage packets go
+  to the 1x GPU only. `stage_render` skips the widescreen shadow pass while the stage is drawn
+  natively (`g_hlr.stage_native`; still counts `g_ws_cull_hits`, so the presentation stays 16:9);
+  software renderer / HLR off keep it. Characters, shadows, effects and the HUD stay on the
+  original path and keep the PS1's order relative to each stage polygon; known limit: a character
+  the PS1 drew between two overlapping stage polygons gets the order of its pass.
+- **2b switches**: `--hlr-msaa 1|2|4|8` (default 4), `--hlr-near clip|ps1` (default clip: polygons
+  crossing the near plane are clipped by the GPU; ps1 drops what the PS1 dropped as too near),
+  `--hlr-look enhanced|ps1` (default enhanced); settings `[display] hlr_msaa`, `hlr_near`, `hlr_look`
+  (flags lock them); menu actions `hlr-msaa=N`, `hlr-near=clip|ps1`, `hlr-look=enhanced|ps1`; View >
+  3D Scene items (Enhanced / PS1 Look, Clip / Drop Near Polygons, Edge Smoothing Off / 2x / 4x / 8x).
 - Exit lines: `hlr-audit:` (+ `-kinds`, `-alt`), `hlr-cost:` (host ms per stage pass), `hlr:` (frames
-  captured / walked / dropped, packets drawn by the HLR, stale, external passes).
+  captured / walked / dropped, packets drawn by the HLR, stale, external passes), `hlr-native:`
+  (polygons recorded), `hlr-native-draw:` (passes and polygons per frame, culled, near-dropped,
+  stale, without texture, suppressed, walks given up, GPU passes / draws / failed).
+  `DESTREGA_HLR_DIAG=N` logs the first N native polygons that cover more than a quarter of a pass.
   `DESTREGA_HLR_TEST_DROP=N` leaves out every Nth packet (tests prove they notice).
-- **Tests**: CTest `hlr` (no disc) and `hlr_gpu` (`test_hires_gpu external`); `tools/test_hlr.py
-  [audit hash exact rewind]` (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`); `test_netplay.py
-  lan_hlr`; pr_check group `hlr`. Must hold: audit 0 everywhere, state hashes on == off, exact
-  dumps byte-identical to off.
+- **Tests**: CTest `hlr` (no disc; also the float camera against the GTE's RTPS: within 0.75 px
+  for z >= 4H, where the GTE's own integer view position moves SX by at most H / z) and `hlr_gpu` /
+  `hlr_gpu_vulkan` (`test_hires_gpu external [API]`: empty external passes leave GPU == software, and
+  a cube through `hlr_gpu_external`: face colours, depth test, MSAA resolve, 15-bit channel order);
+  `tools/test_hlr.py [audit hash exact rewind]` (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`; `hash`
+  and `rewind` require the native draw line); `test_netplay.py lan_hlr`; pr_check group `hlr`.
+  `tools/hlr_diff.py` (not a test): every VS stage key frame off / on at 4x6 16:9, contact sheets
+  and a difference table in `build/hlr2b/diff/`. Must hold: audit 0 everywhere, state hashes on ==
+  off, exact dumps byte-identical to off.
 
 ## Releases (`docs/RELEASES.md`)
 

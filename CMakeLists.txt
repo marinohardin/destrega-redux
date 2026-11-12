@@ -273,6 +273,8 @@ if(DESTREGA_TESTS)
   if(APPLE)   # MoltenVK, when the Vulkan loader is installed (Homebrew vulkan-loader + molten-vk)
     add_test(NAME hires_gpu_vulkan COMMAND test_hires_gpu vulkan WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     set_tests_properties(hires_gpu_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME hlr_gpu_vulkan COMMAND test_hires_gpu external vulkan WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(hlr_gpu_vulkan PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 endif()
 

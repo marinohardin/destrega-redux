@@ -1,6 +1,6 @@
 # Destrega native high-level renderer (HLR): implementation plan
 
-Status: phase 0 done, phase 2a done (see "Phase 2a results"); phase 2b next. Builds on `docs/HIGH_LEVEL_RENDERER.md` (phase 1 done,
+Status: phase 0 done, phase 2a and 2b done (see "Phase 2a results", "Phase 2b results"); phase 3 next. Builds on `docs/HIGH_LEVEL_RENDERER.md` (phase 1 done,
 phase 2 "go") and corrects it where the findings of PRs #34 / #35 and a closer reading of the
 runtime change it. Written against commit bb2d4bf. Facts about the game carry the NOTES.md
 confidence levels (`verified` / `likely` / `guess`); design claims about the runtime are from
@@ -100,6 +100,43 @@ Blocking / open for 2b: the external pass gets the colour target only (no depth 
 needs a depth attachment and its clear per captured table); `on` currently draws like `exact`, so
 "Native" looks identical until 2b; the triangle subdivision builder 800423e0 is modelled but never
 exercised by any scenario; not run on a native Vulkan / D3D12 driver or under Wine.
+
+## Phase 2b results (2026-11-11, `feature/hlr`)
+
+What exists: `--hlr on` draws the stage in real 3D on Metal and Vulkan (AGENTS.md "Native high-level
+renderer"): `runtime/hlr/hlr_native.c` (polygon records, scheduling into the GPU linked-list walk),
+`hlr_gpu.c` (scene pipelines: reverse-Z D32/D24 depth cleared per table, MSAA 1/2/4/8 with resolve,
+15-bit and RGBA8 targets; MSL in the file), `runtime/shaders/hlr.glsl` -> `hlr_spirv.h`, `hlr_cam.h`
+(float camera, `hlr_cam_clip`), fog / lights per pixel or per vertex, the background gradient, textures
+through `material_texture`, `stage_render` without the shadow pass while the stage is native.
+Switches `--hlr-msaa` (4), `--hlr-near clip|ps1` (clip), `--hlr-look enhanced|ps1` (enhanced), settings
+keys, menu actions and View > 3D Scene items.
+
+Acceptance:
+- state hash on == off per frame (`--renderer gpu --no-interp --verify-overrides`): vs_hills, vs_castle1
+  16:9, story; native stage drawn in 306 / 304 / 4230 frames, 0 failed GPU passes; key-frame dumps
+  differ from off (as they must). Rewinds with the HLR on: per-frame hashes equal, 68 loads.
+- `--hlr exact` byte-identical to off (subset: hills castle1 throne shrine, Metal and MoltenVK).
+- `tools/hlr_diff.py`: all 12 VS stages at 4x6 16:9, sheets `build/hlr2b/diff2/<stage>.png` (not
+  committed); 0 failed passes, 0 walks given up; 0.00-2.6 % of pixels > 4 steps (Throne 7.7 %).
+- CTest: float camera vs RTPS within 0.70 px (z >= 4H); `hlr_gpu` cube + MSAA resolve on Metal and
+  `hlr_gpu_vulkan` on MoltenVK.
+
+**Deviations.** No DXIL: Microsoft's DXC is not installed here, so Direct3D 12 keeps the exact replay
+for `on` (generate with `tools/gen_dxil.py --src hlr` when DXC is available). `hlr_diff.py` writes one
+sheet per stage (off | on | diff x 4 at key and key + 20) and a table instead of three files per
+frame. `check_ws_cracks.py` was not run on HLR dumps (its heuristic compares against a PGXP-off frame
+of the original path; the native stage has no shared-edge cracks by construction: one vertex buffer,
+one camera). Ordering: a non-stage packet is ordered against the native stage per pass, not per
+polygon, so a character the PS1 drew between two overlapping stage polygons takes the order of its
+pass (not seen on the 12 key frames). Hidden objects: drawn only through the widened 4-point test
+(NOTES.md "HLR phase 2b"), not by a free frustum, because the game's test culls covering walls on
+purpose.
+
+Open for phase 3: characters still come from the original path; their depth is not in the native
+depth buffer (they are painted after / between passes), so phase 3 has to write character depth
+into the same buffer or keep per-pass ordering; DXIL for both HLR shaders; a native Vulkan / D3D12
+driver; the triangle subdivision builder 800423e0 still unexercised.
 
 ## 1. Executive summary
 

@@ -498,6 +498,36 @@ Facts the pairing relies on (verified by the exact-dump and hash tests on every 
 Cost: 0.37 ms host time per stage pass (one per game update) in the Hills fight, quick_check bench
 configuration (`hlr-cost:` line).
 
+### HLR phase 2b: the stage in native 3D
+
+What the native stage (`--hlr on`, AGENTS.md "Native high-level renderer") learned about the game:
+- **Stage model coordinates are world coordinates** (verified (audit + native draw on all 12
+  stages)): every object is drawn with the world-screen matrix 800ed4c8 (RT + TR) alone, so one
+  float camera per stage pass (`hlr_cam.h`, from the GTE control registers) places every polygon;
+  the native picture lines up with the original one on every stage key frame (`tools/hlr_diff.py`).
+- **The per-object visibility test culls on purpose** (verified (Throne VS key frame, diagnostics
+  `DESTREGA_HLR_DIAG`)): the flags & 4 test projects 4 points that do not bound the object. Throne's
+  VS camera stands behind / inside a wall object (view z 500-1200 in front of the eye) that this
+  test hides; drawn by the native frustum alone it covered the whole screen and the fighters. So an
+  object the test hides at 4:3 is drawn natively only if the same test with x bounds widened by the
+  guard band (-344 / 345) passes, i.e. what the widescreen shadow pass would show. Packets of an
+  object hidden this frame are not written: their UV / CLUT / page words are left from the last
+  frame it was drawn (or never written); a polygon whose command byte is not its own or whose page
+  is in the framebuffer is left out (counted, 0 seen after the widened test).
+- **GTE projection error vs the float camera** (verified (CTest `hlr`)): RTPS truncates the view
+  position to integers (IR1 / IR2) before the division, so SX can be up to H / z px off the exact
+  projection, plus the floor of SX. For z >= 4H (the fight stages' usual depths) the float camera is
+  within 0.70 px of SX + 0.5 over 6867 random on-screen vertices; near the eye (z ~ H) the GTE itself
+  is off by ~1-3 px, which the native stage does not reproduce (it is the source of the PS1 wobble).
+- **Stage key frames, native vs original** (4x6 16:9, Metal, MSAA 4x; `build/hlr2b/diff2/table.txt`,
+  not committed): 1.4 (Hills) to 4 (Canyon) passes per frame, 114-506 polygons per frame drawn, 0
+  walks given up, 0 failed passes. Pixels off by > 4 15-bit steps: 0.00-2.6 % (Throne 7.7 %: its
+  carpet and floor textures differ most under filtering); the differences are texture filtering
+  (trilinear + anisotropic and per-pixel lighting vs the 15-bit affine original), polygon edges
+  (MSAA) and gaps the original leaves in the guard band (Canyon: 6.5 % black pixels off, 3.9 % on,
+  the cliff at the left edge is filled). Characters, shadows and the HUD are byte-identical (black in
+  the difference images).
+
 ### Fog, depth cue and lights per stage (verified (phase 1))
 
 `stage_env_setup` (8003fa44) runs once per stage, before the fight loop, with the stage index
