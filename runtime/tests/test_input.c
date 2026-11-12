@@ -116,13 +116,13 @@ static void test_rebind(void) {
     EQ(p.key[PSB_CIRCLE], 0);
     EQ(keys(&p, SDL_SCANCODE_X, 0), 0x4000);
     EQ(keys(&p, SDL_SCANCODE_Z, 0), 0);
-    static const int reserved[] = { SDL_SCANCODE_ESCAPE, SDL_SCANCODE_TAB, SDL_SCANCODE_F9, SDL_SCANCODE_F11,
-                                    SDL_SCANCODE_F12, SDL_SCANCODE_LGUI, SDL_SCANCODE_RGUI };
+    static const int reserved[] = { SDL_SCANCODE_ESCAPE, SDL_SCANCODE_TAB, SDL_SCANCODE_F9, SDL_SCANCODE_F10,
+                                    SDL_SCANCODE_F11, SDL_SCANCODE_F12, SDL_SCANCODE_LGUI, SDL_SCANCODE_RGUI };
     for (size_t i = 0; i < sizeof reserved / sizeof *reserved; i++) {
         CHECK(!input_bind_key(&p, PSB_START, reserved[i]));
         EQ(p.key[PSB_START], SDL_SCANCODE_RETURN);
     }
-    CHECK(input_bind_key(&p, PSB_START, SDL_SCANCODE_F10));   /* other function keys are fine */
+    CHECK(input_bind_key(&p, PSB_START, SDL_SCANCODE_F8));    /* other function keys are fine */
     CHECK(input_bind_key(&p, PSB_START, 0));                 /* clear */
     EQ(keys(&p, SDL_SCANCODE_RETURN, 0), 0);
     PadBind south = { PADB_BUTTON, SDL_GAMEPAD_BUTTON_SOUTH, 0 };

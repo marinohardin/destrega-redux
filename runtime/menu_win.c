@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "menu.h"
+#include "netplay_ui.h"
 #include "platform.h"
 #include "widescreen.h"
 #include "settings.h"
@@ -105,6 +106,7 @@ static void update_items(void) {
         size_t l = strlen(name);
         if (l > 7 && !strcmp(name + l - 7, "-dialog")) name[l - 7] = 0;
         bool enabled = true, checked = false;
+        if (!strcmp(name, "netplay-copy-address")) set_text(it->id, netplay_ui_copy_title());
         if (!strcmp(name, "netplay-status")) {
             set_text(it->id, netplay_status_text());
             enabled = false;
@@ -209,10 +211,12 @@ void menu_init(void) {
     HMENU np = CreatePopupMenu();
     add(np, "Host Game…", "netplay-host-dialog");
     add(np, "Join Game…", "netplay-join-dialog");
+    add(np, "Copy My Address", "netplay-copy-address");   /* while hosting; title follows netplay_ui.c */
     AppendMenuW(np, MF_SEPARATOR, 0, NULL);
     add(np, "Disconnect", "netplay-disconnect");
     AppendMenuW(np, MF_SEPARATOR, 0, NULL);
     add(np, "Not connected", "netplay-status");
+    add(np, "Copy Out-of-Sync Report Location", "netplay-copy-report");   /* after a desync */
     add_sub(s_bar, "Netplay", np);
 
     /* keep the client area (the game picture) the same size: SDL sizes the window by its client
@@ -284,7 +288,27 @@ static void register_class(const wchar_t *name, WNDPROC proc) {
 
 static int s_form_result;   /* 0 open, 1 OK, -1 cancel */
 
+/* Join Game's Paste button: the clipboard's text into the address field, tidied (spaces, line
+ * breaks, quotes) when it parses as an address; Ctrl+V in the field works as well. */
+static void form_paste(HWND form) {
+    if (!OpenClipboard(form)) return;
+    HANDLE hd = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t *w = hd ? (const wchar_t *)GlobalLock(hd) : NULL;
+    char t[512] = "";
+    if (w) { from_w(w, t, sizeof t); GlobalUnlock(hd); }
+    CloseClipboard();
+    if (!*t) return;
+    char host[256], err[300], out[300];
+    int port = 0;
+    if (netplay_ui_parse_address(t, 0, host, sizeof host, &port, err, sizeof err)) snprintf(out, sizeof out, "%s:%d", host, port);
+    else snprintf(out, sizeof out, "%s", t);
+    wchar_t wo[300];
+    to_w(out, wo, 300);
+    SetWindowTextW(GetDlgItem(form, 101), wo);
+}
+
 static LRESULT CALLBACK form_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_COMMAND && LOWORD(wp) == 104) { form_paste(h); return 0; }
     if (msg == WM_COMMAND && (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL)) {
         s_form_result = LOWORD(wp) == IDOK ? 1 : -1;
         return 0;
@@ -294,9 +318,10 @@ static LRESULT CALLBACK form_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-/* Modal form: title, explanation, two labelled fields (values in/out, UTF-8), an optional check
- * box (check = its label, *checked in/out), OK button text. Returns true on OK. */
-static bool form_run(const char *title, const char *text, const char *l1, char *v1, int w1,
+/* Modal form: title, explanation, two labelled fields (values in/out, UTF-8), an optional Paste
+ * button for the first field, an optional check box (check = its label, *checked in/out), OK button
+ * text. Returns true on OK. */
+static bool form_run(const char *title, const char *text, const char *l1, char *v1, int w1, bool paste,
                      const char *l2, char *v2, const char *check, bool *checked, const char *ok) {
     ui_init();
     register_class(L"DestregaForm", form_proc);
@@ -317,6 +342,7 @@ static bool form_run(const char *title, const char *text, const char *l1, char *
     child(f, L"STATIC", wx, SS_LEFT | SS_NOPREFIX, M, M, W - 2 * M, th, 0);
     child(f, L"STATIC", wl1, SS_LEFT, M, y + 3, 110, 20, 0);
     HWND e1 = child(f, L"EDIT", wv1, WS_TABSTOP | ES_AUTOHSCROLL, M + 115, y, w1, 24, 101);
+    if (paste) child(f, L"BUTTON", L"Paste", WS_TABSTOP | BS_PUSHBUTTON, M + 115 + w1 + 6, y - 1, 70, 26, 104);
     y += 30;
     child(f, L"STATIC", wl2, SS_LEFT, M, y + 3, 110, 20, 0);
     HWND e2 = child(f, L"EDIT", wv2, WS_TABSTOP | ES_NUMBER, M + 115, y, 50, 24, 102);
@@ -382,12 +408,13 @@ static void reg_set(const char *name, const char *value) {
     settings_save();
 }
 
-static void trim(char *s) {
-    char *p = s;
-    while (*p == ' ' || *p == '\t') p++;
-    memmove(s, p, strlen(p) + 1);
-    size_t l = strlen(s);
-    while (l && (s[l - 1] == ' ' || s[l - 1] == '\t')) s[--l] = 0;
+static void form_error(const char *title, const char *err) {
+    rt_log("menu: %s: %s", title, err);
+    if (s_auto_dialogs) return;   /* test hook: no click would come */
+    wchar_t wt[64], we[512];
+    to_w(title, wt, 64);
+    to_w(err, we, 512);
+    MessageBoxW(s_hwnd, we, wt, MB_OK | MB_ICONWARNING);
 }
 
 static void netplay_dialog(bool host) {
@@ -395,44 +422,60 @@ static void netplay_dialog(bool host) {
     reg_get("Port", port, sizeof port, "7000");
     reg_get("JoinAddress", addr, sizeof addr, "");
     reg_get("Delay", delay, sizeof delay, "2");
-    bool ok, portmap = settings_get_bool("netplay", "port_mapping", true);   /* portmap.c */
-    if (host) {
-        char ip[256];
-        plat_local_ipv4(ip, sizeof ip);
-        snprintf(text, sizeof text,
-                 "Your opponent chooses Join Game and types one of this computer's addresses and the port.\n\n"
-                 "This computer's addresses: %s\n\nOver the internet, the game asks your router to forward UDP port %s to "
-                 "this computer and shows the address to give your opponent; if the router can't, forward the port by hand. "
-                 "Both games restart from the beginning when your opponent connects.", *ip ? ip : "none found", port);
-        ok = form_run("Host Game", text, "Port:", port, 90, "Input delay:", delay,
-                      "Ask the router to open the port automatically", &portmap, "Host");
-    } else {
-        snprintf(text, sizeof text, "Type the address and port your opponent gave you, for example 192.168.1.20:7000. "
-                                    "Both games restart from the beginning when you connect.");
-        ok = form_run("Join Game", text, "Address:port:", addr, 200, "Input delay:", delay, NULL, NULL, "Join");
-    }
-    rt_log("menu: %s dialog %s", host ? "Host Game" : "Join Game", ok ? "accepted" : "cancelled");
-    if (!ok) return;
-    int dl = atoi(delay);
-    if (dl < 1 || dl > 30) dl = 2;
-    snprintf(delay, sizeof delay, "%d", dl);
-    reg_set("Delay", delay);
-    char arg[400];
-    if (host) {
-        int p = atoi(port);
-        if (p <= 0 || p > 65535) p = 7000;
-        snprintf(port, sizeof port, "%d", p);
-        reg_set("Port", port);
-        settings_set_bool("netplay", "port_mapping", portmap);
-        settings_save();
-        snprintf(arg, sizeof arg, "%d,%d", p, dl);
-        frontend_menu_action("netplay-host", arg);
-    } else {
-        trim(addr);
-        if (!strchr(addr, ':') && strlen(addr) + strlen(port) + 2 < sizeof addr) { strcat(addr, ":"); strcat(addr, port); }
-        reg_set("JoinAddress", addr);
-        snprintf(arg, sizeof arg, "%s,%d", addr, dl);
-        frontend_menu_action("netplay-join", arg);
+    bool portmap = settings_get_bool("netplay", "port_mapping", true);   /* portmap.c */
+    const char *title = host ? "Host Game" : "Join Game";
+    /* shown again with what was typed until the values are usable or the player cancels */
+    for (;;) {
+        bool ok;
+        if (host) {
+            char ip[256];
+            plat_local_ipv4(ip, sizeof ip);
+            snprintf(text, sizeof text,
+                     "Your opponent chooses Join Game and types your address and port.\n\n"
+                     "On your home network: %s\n\nOver the internet, the game asks your router to open the port and then "
+                     "shows your internet address, with a Copy Address button; if the router can't, forward the UDP "
+                     "port to this computer by hand. Both games restart from the beginning when your opponent connects.",
+                     *ip ? ip : "no network address found");
+            ok = form_run(title, text, "Port:", port, 90, false, "Input delay:", delay,
+                          "Ask the router to open the port automatically", &portmap, "Host");
+        } else {
+            snprintf(text, sizeof text, "Type or paste the address your opponent gave you, for example 192.168.1.20:7000. "
+                                        "Both games restart from the beginning when you connect.");
+            ok = form_run(title, text, "Address:port:", addr, 200, true, "Input delay:", delay, NULL, NULL, "Join");
+        }
+        rt_log("menu: %s dialog %s", title, ok ? "accepted" : "cancelled");
+        if (!ok) return;
+        char err[400];
+        int dl = 2, p = 7000;
+        if (!netplay_ui_parse_delay(delay, &dl, err, sizeof err)) { form_error(title, err); if (s_auto_dialogs) return; continue; }
+        char arg[400];
+        if (host) {
+            if (!netplay_ui_parse_port(port, &p, err, sizeof err)) { form_error(title, err); if (s_auto_dialogs) return; continue; }
+            snprintf(delay, sizeof delay, "%d", dl);
+            reg_set("Delay", delay);
+            snprintf(port, sizeof port, "%d", p);
+            reg_set("Port", port);
+            settings_set_bool("netplay", "port_mapping", portmap);
+            settings_save();
+            snprintf(arg, sizeof arg, "%d,%d", p, dl);
+            frontend_menu_action("netplay-host", arg);
+        } else {
+            char h[200], defp[256];
+            reg_get("Port", defp, sizeof defp, "7000");
+            int dp = atoi(defp);
+            if (!netplay_ui_parse_address(addr, dp > 0 && dp <= 65535 ? dp : 7000, h, sizeof h, &p, err, sizeof err)) {
+                form_error(title, err);
+                if (s_auto_dialogs) return;
+                continue;
+            }
+            snprintf(delay, sizeof delay, "%d", dl);
+            reg_set("Delay", delay);
+            snprintf(addr, sizeof addr, "%s:%d", h, p);
+            reg_set("JoinAddress", addr);
+            snprintf(arg, sizeof arg, "%s,%d", addr, dl);
+            frontend_menu_action("netplay-join", arg);
+        }
+        return;
     }
 }
 
@@ -440,7 +483,10 @@ static void netplay_dialog(bool host) {
 
 static HWND s_panel, s_panel_label;
 
+static HWND s_panel_copy;
+
 static LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_COMMAND && LOWORD(wp) == 201) { frontend_menu_action("netplay-copy-address", NULL); return 0; }
     if ((msg == WM_COMMAND && LOWORD(wp) == IDCANCEL) || msg == WM_CLOSE) {
         frontend_menu_action("netplay-disconnect", NULL);
         return 0;
@@ -448,28 +494,29 @@ static LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-void menu_netplay_progress(const char *text) {
+void menu_netplay_progress(const char *text, bool copy) {
     if (!s_hwnd) return;   /* no menus (headless) */
     if (!text) { if (s_panel) ShowWindow(s_panel, SW_HIDE); return; }
     ui_init();
     if (!s_panel) {
         register_class(L"DestregaPanel", panel_proc);
-        const int W = 420, H = 170;   /* status + the router's answer (portmap.c) */
+        const int W = 460, H = 220;   /* status, addresses, the router's answer (netplay_ui.c) */
         RECT r = { 0, 0, px(W), px(H) };
         DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_TOOLWINDOW;
         AdjustWindowRectEx(&r, style, FALSE, ex);
         s_panel = CreateWindowExW(ex, L"DestregaPanel", L"Netplay", style, CW_USEDEFAULT, CW_USEDEFAULT,
                                   r.right - r.left, r.bottom - r.top, s_hwnd, NULL, GetModuleHandleW(NULL), NULL);
         if (!s_panel) return;
-        s_panel_label = child(s_panel, L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 16, 14, W - 32, 106, 0);
+        s_panel_label = child(s_panel, L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 16, 14, W - 32, H - 72, 0);
+        s_panel_copy = child(s_panel, L"BUTTON", L"Copy Address", WS_TABSTOP | BS_PUSHBUTTON, 16, H - 16 - 28, 120, 28, 201);
         child(s_panel, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, W - 16 - 96, H - 16 - 28, 96, 28, IDCANCEL);
     }
     wchar_t w[1024];
     to_w(text, w, 1024);
     SetWindowTextW(s_panel_label, w);
+    ShowWindow(s_panel_copy, copy ? SW_SHOWNA : SW_HIDE);
     if (!IsWindowVisible(s_panel)) center_on_game(s_panel);   /* updates leave it where it is */
-    ShowWindow(s_panel, SW_SHOWNOACTIVATE);
-    rt_log("menu: netplay panel: %s", text);
+    ShowWindow(s_panel, SW_SHOWNOACTIVATE);   /* the text is logged by netplay_ui.c */
 }
 
 /* ---- Explorer ------------------------------------------------------------------------------ */

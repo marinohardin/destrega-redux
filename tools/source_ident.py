@@ -33,6 +33,7 @@ import sys
 
 EXCLUDE = {
     "runtime/menu_mac.m", "runtime/menu_win.c", "runtime/menu_stub.c", "runtime/menu.h",
+    "runtime/menu_overlay.c", "runtime/menu_overlay.h",
     "runtime/platform.c", "runtime/platform_net.c", "runtime/platform.h",
     "runtime/hires.c", "runtime/hires.h", "runtime/hires_gpu.c", "runtime/hires_gpu.h",
     # host input -> pad bits and the settings file: they decide which key or controller button
@@ -43,6 +44,10 @@ EXCLUDE = {
     # automatic port forwarding for the host (router protocols on a worker thread): it only talks
     # to the router and shows an address, never touches emulated state
     "runtime/portmap.c", "runtime/portmap.h",
+    # Netplay menu / panel text, the copy actions and the parsing of typed addresses: they read
+    # netplay.c's state for display and call the same host / join entry points, never emulated state
+    # or the protocol
+    "runtime/netplay_ui.c", "runtime/netplay_ui.h",
     # smoothness statistics and the render-scale governor: host timing in, a hi-res render scale and
     # a load figure for the status line out; never emulated state (tools/test_governor.py compares
     # every frame's state hash with a plain run)

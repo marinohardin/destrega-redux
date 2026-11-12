@@ -47,7 +47,7 @@ void frontend_set_max_frames(u64 n);       /* main.c */
 void frontend_alert(const char *msg);      /* main.c: native alert (logged; headless: log only) */
 void frontend_pump_events(void);           /* main.c: keep the window responsive while waiting */
 void frontend_restart_with(const char *const *args, int n);   /* main.c: clean re-exec + args */
-void menu_netplay_progress(const char *text);                  /* menu_mac.m / menu_stub.c */
+#include "netplay_ui.h"                    /* status line, panel, copy actions (presentation only) */
 void replay_record_in_memory(void);        /* replay.c: desync reports are replay files */
 bool replay_write(const char *path, u64 last);
 u64 replay_last_frame(void);
@@ -106,7 +106,7 @@ static u64 s_local_through;                 /* our inputs are known up to this f
 static u64 s_first_bad;                     /* earliest mispredicted frame (0 = none) */
 static u16 s_last_remote;                   /* prediction source */
 static bool s_peer_left, s_pred_prev;
-static char s_end_msg[512];                 /* session end requested (peer left, desync, timeout) */
+static char s_end_msg[1400];                 /* session end requested (peer left, desync, timeout) */
 static bool s_end_pending;
 static void end_later(const char *msg) {
     if (s_end_pending) return;
@@ -571,7 +571,7 @@ static void session_end(const char *msg) {
     g_pad_buttons[0] = g_pad_buttons[1] = 0xffff;   /* released; the frontend's own input takes over */
     o.on = false;
     s_started = false;
-    menu_netplay_progress(NULL);
+    netplay_ui_panel_update();   /* hides the panel */
     if (msg && *msg) frontend_alert(msg);
 }
 
@@ -801,8 +801,11 @@ static const char *ping_text(double ms) {
     return t[k];
 }
 
-/* Connection-quality readout, once a second: window title (windowed) and every 10 s on stderr. */
+/* Connection-quality readout, once a second: window title (windowed) and every 10 s on stderr. The
+ * last second's rollbacks and waiting also feed the Netplay menu's status line (netplay_ui.c). */
 void frontend_set_status(const char *s);   /* main.c */
+static double s_q_rb, s_q_wait;
+static bool s_q_known;
 static void status(u64 f) {
     static u64 last_f, last_rb, last_pred, last_stall_ns, last_ns;
     u64 now = ss_now_ns();
@@ -815,10 +818,13 @@ static void status(u64 f) {
              (double)(st.rollbacks - last_rb) / sec,
              f > last_f ? 100.0 * (double)(st.predicted - last_pred) / (double)(f - last_f) : 0.0,
              100.0 * (double)(st.stall_ns - last_stall_ns) / (double)(now - last_ns),
-             s_desyncs ? " | DESYNC" : s_peer_left ? " | peer left" :
+             s_desyncs ? " | DESYNC" : s_peer_left ? " | opponent left" :
              s_peer_load >= 95 ? " | Opponent's computer is running slowly" :
              smooth_load() >= 0.95 ? " | This computer is running slowly" : "");
     frontend_set_status(b);
+    s_q_rb = (double)(st.rollbacks - last_rb) / sec;
+    s_q_wait = 100.0 * (double)(st.stall_ns - last_stall_ns) / (double)(now - last_ns);
+    s_q_known = true;
     static int n;
     if (++n % 10 == 0) fprintf(stderr, "%s | frame-to-frame ping %s\n", b, ping_text(s_rtt_frame));
     last_ns = now; last_f = f; last_rb = st.rollbacks; last_pred = st.predicted; last_stall_ns = st.stall_ns;
@@ -833,6 +839,7 @@ static void status(u64 f) {
  *   desync-FRAME-host.dtr   both pads for frames 1..FRAME + this peer's per-frame field hashes
  * `destrega --headless --replay desync-FRAME-host.dtr` re-runs the inputs offline: on the peer
  * that went wrong it reports the first frame where its own timeline differs from a clean run. */
+static char s_report_path[1024];   /* the last report written ("" = none) */
 static void desync_report(u64 frame) {
     /* the hash check can run before this vblank's replay_vblank_begin recorded `frame` (depends on when
      * the peer's packet arrived): wait one vblank so the report's replay file includes it */
@@ -853,6 +860,7 @@ static void desync_report(u64 frame) {
     bool rec = replay_write(dtr, frame);
     FILE *f = fopen(txt, "w");
     if (!f) { fprintf(stderr, "netplay: cannot write %s\n", txt); return; }
+    snprintf(s_report_path, sizeof s_report_path, "%s", txt);   /* Netplay > Copy Out-of-Sync Report Location */
     fprintf(f, "Destrega netplay desync report (%s, player %d)\n\n", who, s_local_idx + 1);
     fprintf(f, "first differing final frame: %llu (state at the start of the frame; every input before it was\n"
                "confirmed on both peers)\n", (unsigned long long)frame);
@@ -885,9 +893,10 @@ static void desync_report(u64 frame) {
     fprintf(stderr, "netplay: desync report written to %s%s%s\n", txt, rec ? " and " : "", rec ? dtr : "");
     if (o.desync_stop) { fprintf(stderr, "netplay: stopping (--net-desync-stop)\n"); frontend_set_max_frames(s_applied + 1); }
     if (o.from_menu) {
-        char m[512];
+        char m[1400];
         snprintf(m, sizeof m, "Netplay stopped: the two games went out of sync at frame %llu. Continuing offline. "
-                 "A report was saved as %s.", (unsigned long long)frame, txt);
+                 "A report was saved as %s (Netplay > Copy Out-of-Sync Report Location copies where it is).",
+                 (unsigned long long)frame, txt);
         end_later(m);
     }
 }
@@ -919,7 +928,7 @@ static void lobby_stop(void) {
     if (s_lsock) net_close(s_lsock);
     s_lsock = NULL;
     s_lobby = LOBBY_OFF;
-    menu_netplay_progress(NULL);
+    netplay_ui_panel_update();   /* hides the panel */
 }
 
 static void lobby_restart(bool host, int delay) {
@@ -955,15 +964,9 @@ void netplay_menu_host(int port, int delay) {
     lobby_portmap_changed();
 }
 
-/* Host's waiting panel: the home-network address, and what the router said (portmap.c). */
+/* Host's waiting panel: the addresses to give the opponent and what the router said (netplay_ui.c). */
 static void lobby_portmap_changed(void) {
-    if (s_lobby != LOBBY_HOSTING) return;
-    char ip[256], m[800];
-    net_local_addresses(ip, sizeof ip);
-    const char *pm = portmap_text();
-    snprintf(m, sizeof m, "Waiting for an opponent on port %d...\nOn your home network, your opponent joins with: %s:%d%s%s",
-             s_lport, *ip ? ip : "(your IP address)", s_lport, *pm ? "\n" : "", pm);
-    menu_netplay_progress(m);
+    if (s_lobby == LOBBY_HOSTING) netplay_ui_panel_update();
 }
 
 void netplay_menu_join(const char *addr, int port, int delay) {
@@ -979,10 +982,8 @@ void netplay_menu_join(const char *addr, int port, int delay) {
     }
     s_lobby = LOBBY_JOINING; s_lport = port; s_ldelay = delay; s_lt0 = ss_now_ns(); s_llast = 0;
     snprintf(s_laddr, sizeof s_laddr, "%s", addr);
-    char m[400];
-    snprintf(m, sizeof m, "Connecting to %s:%d...", addr, port);
     fprintf(stderr, "netplay: joining %s:%d\n", addr, port);
-    menu_netplay_progress(m);
+    netplay_ui_panel_update();
 }
 
 void netplay_menu_disconnect(void) {
@@ -1061,19 +1062,24 @@ static void lobby_poll(void) {
     }
 }
 
-/* One line for the Netplay menu's status item. */
-const char *netplay_status_text(void) {
-    static char t[512];
-    if (s_lobby == LOBBY_HOSTING) {
-        const char *pm = portmap_status_short();
-        snprintf(t, sizeof t, "Waiting for an opponent on port %d%s%s%s", s_lport, *pm ? " (" : "", pm, *pm ? ")" : "");
-    }
-    else if (s_lobby == LOBBY_JOINING) snprintf(t, sizeof t, "Connecting to %s:%d", s_laddr, s_lport);
-    else if (o.on && s_first_desync) snprintf(t, sizeof t, "Desync at frame %llu", (unsigned long long)s_first_desync);
-    else if (o.on && s_started && s_sock) snprintf(t, sizeof t, "Connected to %s, ping %s", net_peer_name(s_sock), ping_text(s_rtt));
-    else if (o.on) snprintf(t, sizeof t, "Connecting...");
-    else snprintf(t, sizeof t, "Not connected");
-    return t;
+/* What the Netplay menu, its status line and the waiting panel show (netplay_ui.c). */
+void netplay_ui_info(NetplayUiInfo *i) {
+    memset(i, 0, sizeof *i);
+    i->lobby = s_lobby == LOBBY_HOSTING ? NPUI_LOBBY_HOSTING : s_lobby == LOBBY_JOINING ? NPUI_LOBBY_JOINING : NPUI_LOBBY_OFF;
+    i->port = s_lport;
+    i->join_addr = s_laddr;
+    i->session = o.on;
+    i->host = o.host;
+    i->connected = o.on && s_started && s_sock;
+    i->peer = i->connected ? net_peer_name(s_sock) : NULL;
+    i->ping_ms = s_rtt;
+    i->quality_known = i->connected && s_q_known && s_rtt_n > 0;
+    i->rollbacks_per_s = s_q_rb;
+    i->waiting_pct = s_q_wait;
+    i->peer_load = s_peer_load;
+    i->peer_left = s_peer_left;
+    i->desync_frame = o.on ? s_first_desync : 0;
+    i->desync_report = s_report_path;
 }
 
 /* ---- options / report ---------------------------------------------------------------------- */
