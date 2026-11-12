@@ -1,9 +1,9 @@
-/* Vulkan (SPIR-V) shaders of the native high-level renderer's 3D stage (runtime/hlr/hlr_gpu.c):
+/* Vulkan (SPIR-V) and Direct3D 12 (DXIL) shaders of the native high-level renderer's 3D stage (runtime/hlr/hlr_gpu.c):
  * the same logic as vs_hlr / fs_hlr / vs_hblit / fs_hblit in the MSL source of hlr_gpu.c (keep
  * the two in step). Float camera, reverse-Z depth, per-pixel GTE fog and lighting
  * (runtime/hlr/hlr_cam.h has the formulas), textures from the texture cache's arrays.
- * Compiled by tools/gen_spirv.py into runtime/shaders/hlr_spirv.h. (Direct3D 12 would take
- * tools/gen_dxil.py --src hlr with Microsoft's DXC: not generated yet, see docs/HLR_PLAN.md.)
+ * Compiled by tools/gen_spirv.py into runtime/shaders/hlr_spirv.h (Vulkan) and by tools/gen_dxil.py
+ * (-DPORTABLE_MUL, SPIRV-Cross HLSL, DXC) into runtime/shaders/hlr_dxil.h (Direct3D 12).
  * Entry points:
  *   VS_HLR / FS_HLR        stage polygons and background strips
  *   VS_HBLIT / FS_HBLIT    the target rectangle into every sample of the MSAA colour texture

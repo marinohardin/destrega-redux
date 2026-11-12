@@ -13,10 +13,9 @@
  *      given (depth tested, not written; the four PS1 blend modes as fixed-function blends);
  *   4. MSAA resolves into the single-sample texture; the rectangle is copied back into the target.
  *
- * Shaders: MSL below (Metal), shaders/hlr.glsl -> shaders/hlr_spirv.h (Vulkan; tools/gen_spirv.py).
- * Direct3D 12 needs shaders/hlr_dxil.h from tools/gen_dxil.py, which needs Microsoft's DXC: not
- * generated yet, so on D3D12 the HLR is unavailable (hlr_gpu_available false: the "on" mode
- * replays the captured packets like exact; docs/HLR_PLAN.md). */
+ * Shaders: MSL below (Metal), shaders/hlr.glsl -> shaders/hlr_spirv.h (Vulkan; tools/gen_spirv.py)
+ * and -> shaders/hlr_dxil.h (Direct3D 12; tools/gen_dxil.py: GLSL -> SPIR-V -> HLSL -> signed
+ * DXIL, registers in SDL's set = space convention). */
 #include "hlr_gpu.h"
 #include "hlr.h"
 #include "../hires_gpu.h"
@@ -24,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../shaders/hlr_spirv.h"
+#include "../shaders/hlr_dxil.h"
 
 static const char s_msl[] =
 "#include <metal_stdlib>\n"
@@ -133,13 +133,20 @@ static SDL_GPUShader *shader(const char *entry, SDL_GPUShaderStage stage, u32 sa
     SDL_GPUShaderCreateInfo si = { .code = (const Uint8 *)s_msl, .code_size = sizeof s_msl - 1, .entrypoint = entry,
                                    .format = SDL_GPU_SHADERFORMAT_MSL, .stage = stage, .num_samplers = samplers,
                                    .num_uniform_buffers = ubufs };
-    if (fmt == SDL_GPU_SHADERFORMAT_SPIRV) {
-        static const struct { const char *name; const unsigned char *spv; size_t n; } mods[] = {
-            { "vs_hlr", s_spv_vs_hlr, sizeof s_spv_vs_hlr }, { "fs_hlr", s_spv_fs_hlr, sizeof s_spv_fs_hlr },
-            { "vs_hblit", s_spv_vs_hblit, sizeof s_spv_vs_hblit }, { "fs_hblit", s_spv_fs_hblit, sizeof s_spv_fs_hblit },
+    if (fmt == SDL_GPU_SHADERFORMAT_SPIRV || fmt == SDL_GPU_SHADERFORMAT_DXIL) {
+        /* one module per entry point (from shaders/hlr.glsl), each with entry "main" */
+        static const struct { const char *name; const unsigned char *spv, *dxil; size_t spv_n, dxil_n; } mods[] = {
+            { "vs_hlr", s_spv_vs_hlr, s_dxil_vs_hlr, sizeof s_spv_vs_hlr, sizeof s_dxil_vs_hlr },
+            { "fs_hlr", s_spv_fs_hlr, s_dxil_fs_hlr, sizeof s_spv_fs_hlr, sizeof s_dxil_fs_hlr },
+            { "vs_hblit", s_spv_vs_hblit, s_dxil_vs_hblit, sizeof s_spv_vs_hblit, sizeof s_dxil_vs_hblit },
+            { "fs_hblit", s_spv_fs_hblit, s_dxil_fs_hblit, sizeof s_spv_fs_hblit, sizeof s_dxil_fs_hblit },
         };
+        const bool dx = fmt == SDL_GPU_SHADERFORMAT_DXIL;
         for (size_t i = 0; i < sizeof mods / sizeof mods[0]; i++)
-            if (!strcmp(mods[i].name, entry)) { si.code = mods[i].spv; si.code_size = mods[i].n; }
+            if (!strcmp(mods[i].name, entry)) {
+                si.code = dx ? mods[i].dxil : mods[i].spv;
+                si.code_size = dx ? mods[i].dxil_n : mods[i].spv_n;
+            }
         si.entrypoint = "main";
         si.format = fmt;
     }
@@ -156,8 +163,9 @@ static bool ensure_device(void)
         release_all();
         s_dev = gi.dev;
         hires_gpu_on_shutdown(on_shutdown);
-        if (gi.shader_format != SDL_GPU_SHADERFORMAT_MSL && gi.shader_format != SDL_GPU_SHADERFORMAT_SPIRV) {
-            s_why = "no native renderer shaders for Direct3D 12 yet (shaders/hlr_dxil.h needs DXC)";
+        if (gi.shader_format != SDL_GPU_SHADERFORMAT_MSL && gi.shader_format != SDL_GPU_SHADERFORMAT_SPIRV &&
+            gi.shader_format != SDL_GPU_SHADERFORMAT_DXIL) {
+            s_why = "no native renderer shaders for this graphics API";
             s_failed = true;
             rt_log("hlr-gpu: %s; the stage is replayed instead", s_why);
             return false;
@@ -187,7 +195,7 @@ static bool ensure_device(void)
             return false;
         }
         rt_log("hlr-gpu: native stage renderer ready (%s shaders, depth %s)",
-               f == SDL_GPU_SHADERFORMAT_MSL ? "MSL" : "SPIR-V", s_dfmt == SDL_GPU_TEXTUREFORMAT_D32_FLOAT ? "D32" : "D24");
+               f == SDL_GPU_SHADERFORMAT_MSL ? "MSL" : f == SDL_GPU_SHADERFORMAT_DXIL ? "DXIL" : "SPIR-V", s_dfmt == SDL_GPU_TEXTUREFORMAT_D32_FLOAT ? "D32" : "D24");
     }
     return !s_failed;
 }

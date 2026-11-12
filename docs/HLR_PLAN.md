@@ -131,8 +131,12 @@ Acceptance:
   widescreen shadow pass) are replaced by ~164 hardware-rasterized polygons in 3 passes per frame;
   MSAA 4x costs ~0.4 ms.
 
-**Deviations.** No DXIL: Microsoft's DXC is not installed here, so Direct3D 12 keeps the exact replay
-for `on` (generate with `tools/gen_dxil.py --src hlr` when DXC is available). `hlr_diff.py` writes one
+**Deviations.** DXIL came after the rest of 2b (2026-11-12): `tools/gen_dxil.py --src hlr` (DXC under
+CrossOver) writes `hlr_dxil.h`, and `hlr_gpu.c` takes it on Direct3D 12 instead of refusing that API
+(before, D3D12 kept the exact replay for `on`). Under CrossOver (vkd3d): `test_hires_gpu external
+d3d12` 57 passed (cube counts equal to Metal / MoltenVK); vs_hills 4x6 16:9 off / on / exact state
+hashes equal to each other and to Metal, exact dumps byte-identical to off, on vs Metal on 0.107 % of
+pixels off by 1 step, none by more. `hlr_diff.py` writes one
 sheet per stage (off | on | diff x 4 at key and key + 20) and a table instead of three files per
 frame. `check_ws_cracks.py` was not run on HLR dumps (its heuristic compares against a PGXP-off frame
 of the original path; the native stage has no shared-edge cracks by construction: one vertex buffer,
@@ -144,8 +148,8 @@ purpose.
 
 Open for phase 3: characters still come from the original path; their depth is not in the native
 depth buffer (they are painted after / between passes), so phase 3 has to write character depth
-into the same buffer or keep per-pass ordering; DXIL for both HLR shaders; a native Vulkan / D3D12
-driver; the triangle subdivision builder 800423e0 still unexercised.
+into the same buffer or keep per-pass ordering; a native Vulkan / D3D12 driver (D3D12 only under
+CrossOver so far); the triangle subdivision builder 800423e0 still unexercised.
 
 ## 1. Executive summary
 

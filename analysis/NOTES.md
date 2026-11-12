@@ -527,6 +527,9 @@ What the native stage (`--hlr on`, AGENTS.md "Native high-level renderer") learn
   (MSAA) and gaps the original leaves in the guard band (Canyon: 6.5 % black pixels off, 3.9 % on,
   the cliff at the left edge is filled). Characters, shadows and the HUD are byte-identical (black in
   the difference images).
+  Direct3D 12 (DXIL, under CrossOver, Hills): the same 114 polygons in 1.40 passes per frame as
+  Metal; its key frames differ from Metal's in 0.107 % of the pixels by 1 15-bit step at most
+  (verified (runtime): `--hlr on`, both state hashes equal to `off`).
 
 ### Fog, depth cue and lights per stage (verified (phase 1))
 

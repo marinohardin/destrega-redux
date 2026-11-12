@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile runtime/shaders/hires.glsl to DXIL (Direct3D 12) and write runtime/shaders/hires_dxil.h
-(and hires_fast.glsl, the fast precision's shaders, to hires_fast_dxil.h).
+(hires_fast.glsl, the fast precision's shaders, to hires_fast_dxil.h; hlr.glsl, the native 3D
+stage of runtime/hlr/hlr_gpu.c, to hlr_dxil.h).
 
 The SDL_GPU hi-res backend (runtime/hires_gpu.c) embeds DXIL for Direct3D 12 next to the MSL
 (Metal) and SPIR-V (Vulkan, tools/gen_spirv.py) versions. One shader source for Vulkan and
@@ -12,7 +13,7 @@ needs no shader compiler.
     python3 tools/gen_dxil.py               # regenerate the header
     python3 tools/gen_dxil.py --check       # compile + validate only; exit 1 on errors
     python3 tools/gen_dxil.py --check-fresh # no tools: the headers were made from these sources
-    python3 tools/gen_dxil.py --src hires_fast   # only that source
+    python3 tools/gen_dxil.py --src hires_fast   # only that source (hires, hires_fast, hlr)
 
 Tools: glslangValidator, spirv-cross (Homebrew: glslang, spirv-cross) and DXC. DXC is taken from
 $DXC (a command line, e.g. a Windows dxc.exe run through Wine:
@@ -21,7 +22,8 @@ PATH (the Linux release of microsoft/DirectXShaderCompiler validates and signs b
 
 Resource registers follow SDL_GPU's D3D12 convention, which is the SPIR-V one with set = space:
 vertex uniforms b0 space1; fragment textures t0..t2 + samplers s0..s2 space2, the primitive
-storage buffer t3 space2 (hires_fast.glsl too: VRAM t0 / s0, texture cache arrays t1, t2), fragment
+storage buffer t3 space2 (hires_fast.glsl too: VRAM t0 / s0, texture cache arrays t1, t2; hlr.glsl:
+texture cache colour / STP arrays t0 / t1 + s0 / s1, or the blit's target t0 / s0), fragment
 uniforms b0 space3. Vertex inputs are TEXCOORD<location>.
 """
 import hashlib
@@ -46,6 +48,12 @@ SOURCES = {
     'hires_fast': ('hires_fast_dxil.h', [
         ('s_dxil_vs_fast', 'VS_FAST', 'vert', 'vs_6_0'),
         ('s_dxil_fs_fast', 'FS_FAST', 'frag', 'ps_6_0'),
+    ]),
+    'hlr': ('hlr_dxil.h', [
+        ('s_dxil_vs_hlr', 'VS_HLR', 'vert', 'vs_6_0'),
+        ('s_dxil_fs_hlr', 'FS_HLR', 'frag', 'ps_6_0'),
+        ('s_dxil_vs_hblit', 'VS_HBLIT', 'vert', 'vs_6_0'),
+        ('s_dxil_fs_hblit', 'FS_HBLIT', 'frag', 'ps_6_0'),
     ]),
 }
 # -Gis: IEEE strictness (no fast-math flags: the float estimates are corrected exactly, but the

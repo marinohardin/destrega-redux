@@ -30,7 +30,7 @@ unsigned hlr_get_parts(void);
  * in 2a it draws like exact */
 bool hlr_draws(void);
 /* on draws the stage natively (phase 2b): mode on, a backend with external passes, and the native
- * renderer available on its device (hlr_gpu.c; not on Direct3D 12 yet). Otherwise on replays the
+ * renderer available on its device (hlr_gpu.c: MSL, SPIR-V or DXIL shaders). Otherwise on replays the
  * captured packets like exact. */
 bool hlr_native(void);
 /* the widescreen shadow pass of stage_render is not needed (hlr_hook.h stage_native) */

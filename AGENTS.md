@@ -1515,7 +1515,7 @@ replay 4500 frames, 4x6 widescreen xbr full colour).
 - **Where**: `runtime/hires_gpu.c` (header comment "Fast precision"; `fast_tri`, the `s_fast`
   branches of `be_tri` / `be_rect`; MSL `vs_fast` / `fs_fast`) and `runtime/shaders/hires_fast.glsl`
   (Vulkan + D3D12; `python3 tools/gen_spirv.py` and `tools/gen_dxil.py` now build both GLSL files,
-  `--src hires_fast` one of them; `gen_dxil.py --check-fresh` checks both headers).
+  `--src hires_fast` one of them; `gen_dxil.py --check-fresh` checks every header, `hlr_dxil.h` included).
 - **What is approximate**: coverage (the GPU's fill rule and sub-pixel snapping on float vertices:
   polygon edges, shared-edge ties), u/v (float interpolation: texel choice at exact ties; vertex
   u/v are shifted to hires.c's sample point and the perspective case uses clip w = 1 / q there, so
@@ -1792,8 +1792,8 @@ exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below)
   (`gpu_set_node_no_hires`); a changed packet ("stale") goes the normal way. The end of the walk
   consumes the frame; a save-state load or a mode / parts change drops every frame.
 - **Modes**: `off`; `audit` (prediction + checks, draws nothing differently); `exact` (any hi-res
-  backend; byte-identical to off); `on` (native 3D stage, needs a GPU API with HLR shaders: Metal or
-  Vulkan; Direct3D 12 has no DXIL yet and keeps the exact replay). Default: on in a window, off headless. `--hlr-parts
+  backend; byte-identical to off); `on` (native 3D stage, needs the GPU renderer: Metal (MSL),
+  Vulkan (SPIR-V) or Direct3D 12 (DXIL, `hlr_dxil.h` from `gen_dxil.py --src hlr`)). Default: on in a window, off headless. `--hlr-parts
   stage|chars|shadows|fx|story|all|none` (only stage exists). Settings `[display] hlr` (on|off),
   `hlr_parts`; menu actions `hlr[=on|off]`, `hlr-part=stage:on|off`; View > 3D Scene > Original /
   Native, Stage (Mac, Windows; greyed unless a GPU API renders). `runtime/hlr/` is outside the
@@ -1832,12 +1832,19 @@ exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below)
 - **Tests**: CTest `hlr` (no disc; also the float camera against the GTE's RTPS: within 0.75 px
   for z >= 4H, where the GTE's own integer view position moves SX by at most H / z) and `hlr_gpu` /
   `hlr_gpu_vulkan` (`test_hires_gpu external [API]`: empty external passes leave GPU == software, and
-  a cube through `hlr_gpu_external`: face colours, depth test, MSAA resolve, 15-bit channel order);
+  a cube through `hlr_gpu_external`: face colours, depth test, MSAA resolve, 15-bit channel order;
+  `external d3d12` passes under CrossOver (vkd3d) with the same cube pixel counts as Metal and MoltenVK);
   `tools/test_hlr.py [audit hash exact rewind]` (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`; `hash`
   and `rewind` require the native draw line); `test_netplay.py lan_hlr`; pr_check group `hlr`.
   `tools/hlr_diff.py` (not a test): every VS stage key frame off / on at 4x6 16:9, contact sheets
   and a difference table in `build/hlr2b/diff/`. Must hold: audit 0 everywhere, state hashes on ==
   off, exact dumps byte-identical to off.
+- **Direct3D 12** (checked under CrossOver 26, vkd3d over MoltenVK; Windows build, vs_hills 4x6 16:9,
+  `--no-interp --verify-overrides`): `off` / `on` / `exact` per-frame state hashes equal to each other
+  and to Metal on the Mac; `exact` and `off` dumps byte-identical to each other and to Metal `off`;
+  `on` vs Metal `on`: 0.107 % of the pixels differ, by at most 1 15-bit step (8 of 255), none by
+  more; same polygon / pass counts (114 polygons, 1.40 passes per frame, 0 failed). Not run on a
+  native D3D12 driver or WARP.
 
 ## Releases (`docs/RELEASES.md`)
 
