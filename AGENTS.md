@@ -910,7 +910,7 @@ the left stick is mapped to the D-pad, never reported as analog.
   7/8 L1/R1, 9/0 L2/R2, P Start, Backslash Select. Controller: positional (south = Cross, east = Circle,
   west = Square, north = Triangle), shoulders L1/R1, triggers L2/R2, Start, Back/Share = Select, D-pad,
   left stick on with a 50 % radial deadzone and 8 sectors of 45 degrees.
-- **Reserved** (never bindable, never reach a pad): Escape, Tab, F9, F11, F12, the Cmd/Win keys and
+- **Reserved** (never bindable, never reach a pad): Escape, Tab, F9, F10 (in-window menu), F11, F12, the Cmd/Win keys and
   anything pressed with them, and the Alt+Enter / Ctrl+Cmd+F combinations handled before input.c.
   Bindings are **scancodes** (layout-independent positions), names from `SDL_GetScancodeName` with a
   few aliases (Comma, Period, Backslash...) and `#N` for nameless ones; controller inputs are SDL
