@@ -21,7 +21,7 @@
 #             CASES="s4x6 verify1 c4x6", test_render_quality.sh CASES="call169 cxbr43 glive"
 #             (each plus its reference run)
 #   menus     runtime/menu*, settings*, input*, controls_*, main.c, their test tools:
-#             test_menu.sh, test_input.py, test_governor.py (if present)
+#             test_menu.sh, test_input.py, test_overlay_menu.py, test_governor.py (if present)
 #   core      every other runtime/*.c|h, runtime/overrides/, recomp/, analysis/overrides.txt,
 #             extra_seeds.txt, idle_loops.txt, rea_*.json, overlays/, CMakeLists.txt, scenarios / replays tools:
 #             4 scenarios (stage fight, story, options, practice), 3 replays, test_savestate.sh
@@ -66,7 +66,7 @@ classify() { # path -> group (or nothing)
     tools/test_hires_determinism.sh|tools/test_render_quality.sh|tools/test_widescreen.sh|tools/check_ws_*.py) echo renderer ;;
     tools/gen_spirv.py|tools/gen_dxil.py) echo renderer ;;
     runtime/menu*|runtime/settings*|runtime/input*|runtime/controls_*|runtime/main.c) echo menus ;;
-    tools/test_menu.sh|tools/test_input.py|tools/test_governor.py) echo menus ;;
+    tools/test_menu.sh|tools/test_input.py|tools/test_overlay_menu.py|tools/test_governor.py) echo menus ;;
     runtime/tests/*|runtime/win/*) ;;
     runtime/*.c|runtime/*.h|runtime/overrides/*|recomp/*) echo core ;;
     analysis/overrides.txt|analysis/extra_seeds.txt|analysis/idle_loops.txt|analysis/rea_*.json|analysis/overlays/*|CMakeLists.txt) echo core ;;
@@ -144,6 +144,7 @@ for g in $sel; do
   menus)
     if tl_step menus:menu tools/test_menu.sh; then rm -rf build/menu; fi   # disc image + packs: ~1 GB
     tl_step menus:input python3 tools/test_input.py
+    tl_step menus:overlay python3 tools/test_overlay_menu.py
     if [ -f tools/test_governor.py ]; then tl_step menus:governor python3 tools/test_governor.py
     else tl_note menus:governor "not present (tools/test_governor.py)"; fi
     ;;
