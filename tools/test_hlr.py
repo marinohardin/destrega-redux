@@ -236,7 +236,7 @@ def case_exact(pool):
 
 
 # ---- seams ------------------------------------------------------------------------------------------
-SEAM_FRAMES = list(range(3300, 3461, 40))     # fight from 3300, Start pressed at 3350: paused from ~3356
+SEAM_FRAMES = list(range(3320, 3441, 40))     # dumps fall on multiples of 40; Start at 3350: paused from ~3356
 
 
 def seams_run(item):
