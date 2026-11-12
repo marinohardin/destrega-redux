@@ -1,6 +1,6 @@
 # Destrega Redux: an enhanced online native port
 
-The PlayStation fighting game *Destrega* (Koei, 1998), with frame-for-frame identical gameplay, better graphics, widescreen, and online rollback netplay.
+The PlayStation fighting game *Destrega* (Koei, 1998), with frame-for-frame identical gameplay, better graphics, widescreen, and online rollback netplay, for Windows/Mac/Linux.
 
 - **Better graphics**: high-resolution rendering (up to 4x6 the original resolution, with
   automatic scaling to what your computer can keep up with), a GPU renderer on Metal, Vulkan and
@@ -12,6 +12,8 @@ The PlayStation fighting game *Destrega* (Koei, 1998), with frame-for-frame iden
 - **A desktop app**: native menus, full screen, rebindable keyboard and controller controls,
   save-game import / export, settings that persist.
 
+Built from Rogers de Cristo's [Destrega Recomp](https://github.com/rogerscristo/destrega-recomp).
+
 | | |
 |---|---|
 | ![A close-range fight on the canyon stage](docs/screenshots/fight-canyon.jpg) | ![Magic projectiles on the canyon stage](docs/screenshots/magic-canyon.jpg) |
@@ -20,7 +22,6 @@ The PlayStation fighting game *Destrega* (Koei, 1998), with frame-for-frame iden
 *Captured from this port: GPU renderer at 4x6 the original resolution, 16:9 widescreen,
 smoothed textures and full-precision colour.*
 
-Analysis is done with [REA](https://github.com/morluto/rea) (Ghidra provider).
 
 You need your own copy of the game: the North American release (SLUS-00732)
 as a MODE2/2352 `.cue`/`.bin`. Nothing from the game is in this repository.
