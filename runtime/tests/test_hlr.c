@@ -463,6 +463,265 @@ static void test_float_camera(void)
            " clip space vs float %.4f px\n", checked, far, worst, offscreen, skipped, worst_clip);
 }
 
+
+/* ---- characters (phase 3): a synthetic fighter model through hlr_char.c's audit --------------- */
+#define CMB       0x80110000u                 /* model block */
+#define CPARTS    0x80110100u
+#define CCOORD    0x80110400u                 /* coordinate structs, 0x100 apart */
+#define CVERT     0x80111000u
+#define CNORM     0x80111400u
+#define CCHAIN    0x80111800u
+#define CGRP      0x80112000u
+#define CHTRI     0x80112100u
+#define CHQUAD    0x80113000u
+#define CVB       0x800c9d38u
+#define CCB       0x800cb7c8u
+#define CNV       8                           /* vertices (and normals) per part */
+#define CNTRI     8
+#define CNQUAD    5
+
+static int s_cv[CNTRI + CNQUAD][4];
+
+static void build_char(int rot)
+{
+    memset(g_ram, 0, RAM_SIZE);
+    memset(g_scratch, 0, sizeof g_scratch);
+    *(u32 *)(g_scratch + 0x0c) = 1000;
+    *(u32 *)(g_scratch + 0x10) = 4000;
+    *(u32 *)(g_scratch + 0x08) = 16000;
+    for (u32 i = 0; i < 2048; i++) wr(OT + 4 * i, 0x00ffffffu);
+    /* world-screen matrix: identity rotation, the model 1500 units in front */
+    const u32 ws[8] = { 0x1000, 0, 0x1000, 0, 0x1000, 0, 0, 1500 };
+    for (int i = 0; i < 8; i++) wr(0x800ed4c8u + 4 * (u32)i, ws[i]);
+    wr(0x800bfe28u, 0x3c808080u);                 /* RGBC (GT4 code) */
+    wr(CMB + 8, 2); wr(CMB + 12, CPARTS); wr(CMB + 16, CGRP); wr(CMB + 20, CCHAIN);
+    const double ang[2] = { 0.3 + 0.01 * rot, 0.9 - 0.02 * rot };
+    const int tr[2][3] = { { 0, 0, 0 }, { 50, -30, 20 + rot } };
+    for (int p = 0; p < 2; p++) {
+        const u32 part = CPARTS + 0x70u * (u32)p, coord = CCOORD + 0x100u * (u32)p;
+        wr(part, coord);
+        /* workm: rotation about Y */
+        const int c = (int)lround(4096 * cos(ang[p])), sn = (int)lround(4096 * sin(ang[p]));
+        const int m[9] = { c, 0, sn, 0, 4096, 0, -sn, 0, c };
+        for (int k = 0; k < 9; k++) wr16(coord + 36 + 2 * (u32)k, (u32)m[k]);
+        for (int k = 0; k < 3; k++) wr(coord + 56 + 4 * (u32)k, (u32)tr[p][k]);
+        /* light matrix (one light, from the front) and light colours */
+        /* LLM row 1 = (0, 0, -4096): L13 is the low half of word 1 */
+        wr(part + 36, 0); wr(part + 40, 0xf000u); wr(part + 44, 0); wr(part + 48, 0); wr(part + 52, 0);
+        const u32 lcm[5] = { 0x1000, 0, 0x1000, 0, 0x1000 };
+        for (int k = 0; k < 5; k++) wr(part + 68 + 4 * (u32)k, lcm[k]);
+        const u32 vp = CVERT + 0x100u * (u32)p, np = CNORM + 0x100u * (u32)p;
+        wr(part + 0x64, vp); wr(part + 0x68, np);
+        wr16(part + 0x6c, CNV); wr16(part + 0x6e, CNV);
+        for (int k = 0; k < CNV; k++) {
+            const int x = k & 1 ? 60 : -60, y = k & 2 ? 70 : -70, z = k & 4 ? 40 : -40;
+            wr16(vp + 8 * (u32)k, (u32)x); wr16(vp + 8 * (u32)k + 2, (u32)y); wr16(vp + 8 * (u32)k + 4, (u32)z);
+            const double l = sqrt((double)(x * x + y * y + z * z));
+            wr16(np + 8 * (u32)k, (u32)(int)(4096 * x / l)); wr16(np + 8 * (u32)k + 2, (u32)(int)(4096 * y / l));
+            wr16(np + 8 * (u32)k + 4, (u32)(int)(4096 * z / l));
+        }
+    }
+    /* one chain on part 1: anchored at its vertex 3, two world points */
+    wr(CCHAIN, 1); wr(CCHAIN + 4, 1);
+    wr(CCHAIN + 8, 3u << 16 | 2);
+    const int pts[2][3] = { { 90, 40, 10 }, { 110, 80, 30 } };
+    for (int k = 0; k < 2; k++) {
+        const u32 a = CCHAIN + 12 + 8 * (u32)k;
+        wr16(a, (u32)pts[k][0]); wr16(a + 2, (u32)pts[k][1]); wr16(a + 4, (u32)pts[k][2]); wr16(a + 6, 40);
+    }
+    /* faces: one group, a GT3 list and a GT4 list */
+    wr(CGRP, 1); wr(CGRP + 4, 2); wr(CGRP + 8, CHTRI); wr(CGRP + 12, CHQUAD);
+    wr(CHTRI, 0x1au << 16 | CNTRI); wr(CHQUAD, 0x1bu << 16 | CNQUAD);
+    s_rng = 777;
+    for (int f = 0; f < CNTRI + CNQUAD; f++) {
+        const bool quad = f >= CNTRI;
+        for (int j = 0; j < 4; j++) s_cv[f][j] = rnd(0, 2 * CNV + 1);   /* chain vertices 16, 17 too */
+        if (quad) {
+            const u32 rec = CHQUAD + 4 + 0x78u * (u32)(f - CNTRI);
+            wr(rec + 0x68, (u32)s_cv[f][0] | (u32)s_cv[f][1] << 16); wr(rec + 0x6c, (u32)s_cv[f][2] | (u32)s_cv[f][3] << 16);
+            const int c0 = s_cv[f][0] % (2 * CNV), c1 = s_cv[f][1] % (2 * CNV), c2 = s_cv[f][2] % (2 * CNV), c3 = s_cv[f][3] % (2 * CNV);
+            wr(rec + 0x70, (u32)c0 | (u32)c1 << 16); wr(rec + 0x74, (u32)c2 | (u32)c3 << 16);
+            for (int j = 0; j < 4; j++) wr(rec + 12 + 12 * (u32)j, 0x00401020u + (u32)j);    /* uv / clut / tpage */
+        } else {
+            const u32 rec = CHTRI + 4 + 0x5cu * (u32)f;
+            /* packet order A, C, B: w50 = A | C, w54 = B | colour A, w58 = colours C | B */
+            const int c0 = s_cv[f][0] % (2 * CNV), c1 = s_cv[f][1] % (2 * CNV), c2 = s_cv[f][2] % (2 * CNV);
+            wr(rec + 0x50, (u32)s_cv[f][0] | (u32)s_cv[f][1] << 16);
+            wr(rec + 0x54, (u32)s_cv[f][2] | (u32)c0 << 16);
+            wr(rec + 0x58, (u32)c1 | (u32)c2 << 16);
+            for (int j = 0; j < 3; j++) wr(rec + 12 + 12 * (u32)j, 0x00401020u + (u32)j);
+        }
+    }
+}
+
+/* the game's char_mesh_render (80036b0c, chains 800367d8, face builders 80036138 / 800363c8),
+ * written plainly on the guest GTE */
+static void game_char(int fault)
+{
+    u32 ws[8];
+    for (int i = 0; i < 8; i++) ws[i] = rd(0x800ed4c8u + 4 * (u32)i);
+    int nv = 0, nc = 0;
+    for (int p = 0; p < 2; p++) {
+        const u32 part = CPARTS + 0x70u * (u32)p, coord = rd(part);
+        s16 sm[3][3];
+        for (int i = 0; i < 5; i++) gte_write_ctrl(i, ws[i]);
+        for (int col = 0; col < 3; col++) {
+            for (int r = 0; r < 3; r++) gte_write_data(9 + r, *(u16 *)(g_ram + ((coord + 36 + 6 * (u32)r + 2 * (u32)col) & 0x1fffff)));
+            gte_command(0x4a49e012);
+            for (int r = 0; r < 3; r++) sm[r][col] = (s16)gte_read_data(9 + r);
+        }
+        for (int i = 5; i < 8; i++) gte_write_ctrl(i, ws[i]);
+        gte_write_data(0, (rd(coord + 56) & 0xffff) | rd(coord + 60) << 16);
+        gte_write_data(1, rd(coord + 64));
+        gte_command(0x4a480012);
+        const u32 t[3] = { gte_read_data(25), gte_read_data(26), gte_read_data(27) };
+        gte_write_ctrl(0, (u16)sm[0][0] | (u32)(u16)sm[0][1] << 16); gte_write_ctrl(1, (u16)sm[0][2] | (u32)(u16)sm[1][0] << 16);
+        gte_write_ctrl(2, (u16)sm[1][1] | (u32)(u16)sm[1][2] << 16); gte_write_ctrl(3, (u16)sm[2][0] | (u32)(u16)sm[2][1] << 16);
+        gte_write_ctrl(4, (u16)sm[2][2]);
+        for (int k = 0; k < 3; k++) gte_write_ctrl(5 + k, t[k]);
+        const u32 vp = rd(part + 0x64), np = rd(part + 0x68);
+        for (int k = 0; k < CNV; k++) {           /* RTPS each (the game uses RTPT in threes: same results) */
+            gte_write_data(0, rd(vp + 8 * (u32)k)); gte_write_data(1, rd(vp + 8 * (u32)k + 4));
+            gte_command(0x4a180001);
+            wr(CVB + 8 * (u32)(nv + k), gte_read_data(14)); wr(CVB + 8 * (u32)(nv + k) + 4, gte_read_data(19));
+        }
+        for (int k = 0; k < 5; k++) { gte_write_ctrl(8 + k, rd(part + 36 + 4 * (u32)k)); gte_write_ctrl(16 + k, rd(part + 68 + 4 * (u32)k)); }
+        gte_write_data(6, rd(0x800bfe28u));
+        for (int k = 0; k < CNV; k++) {
+            gte_write_data(0, rd(np + 8 * (u32)k)); gte_write_data(1, rd(np + 8 * (u32)k + 4));
+            gte_command(0x4b08041b);
+            wr(CCB + 4 * (u32)(nc + k), gte_read_data(22));
+        }
+        nv += CNV; nc += CNV;
+    }
+    /* chain points: world coordinates projected with WS alone */
+    for (int i = 0; i < 8; i++) gte_write_ctrl(i, ws[i]);
+    for (int k = 0; k < 2; k++) {
+        const u32 a = CCHAIN + 12 + 8 * (u32)k;
+        gte_write_data(0, rd(a)); gte_write_data(1, rd(a + 4));
+        gte_command(0x4a180001);
+        wr(CVB + 8 * (u32)nv, gte_read_data(14)); wr(CVB + 8 * (u32)nv + 4, gte_read_data(19));
+        nv++;
+    }
+    if (fault == 1) wr(CCB + 4 * 5, rd(CCB + 4 * 5) ^ 0x10);          /* a colour the lights do not give */
+    if (fault == 3) wr(CVB + 8 * 4, rd(CVB + 8 * 4) + 1);             /* a vertex one pixel off */
+    int linked = 0;
+    for (int f = 0; f < CNTRI + CNQUAD; f++) {
+        const bool quad = f >= CNTRI;
+        const int n = quad ? 4 : 3;
+        u32 xy[4], z[4], col[4];
+        for (int j = 0; j < n; j++) {
+            xy[j] = rd(CVB + 8 * (u32)s_cv[f][j]); z[j] = rd(CVB + 8 * (u32)s_cv[f][j] + 4);
+            col[j] = rd(CCB + 4 * (u32)(s_cv[f][j] % (2 * CNV)));
+        }
+        gte_write_data(12, xy[0]); gte_write_data(13, xy[1]); gte_write_data(14, xy[2]);
+        gte_command(0x4b400006);                                        /* NCLIP */
+        s32 a = (s32)gte_read_data(24);
+        bool kept = a > 0;
+        u32 sz;
+        if (quad) {
+            gte_write_data(12, xy[3]); gte_write_data(13, xy[1]); gte_write_data(14, xy[2]);
+            gte_command(0x4b400006);
+            kept = kept || (s32)gte_read_data(24) < 0;
+            sz = z[0];
+            for (int j = 1; j < 4; j++) if ((s32)z[j] < (s32)sz) sz = z[j];
+        } else sz = (z[0] + z[1] + z[2]) / 3;
+        if (!kept) continue;
+        if (fault == 2 && linked++ == 1) continue;                      /* a face the rule keeps, not linked */
+        const u32 pk = quad ? CHQUAD + 4 + 0x78u * (u32)(f - CNTRI) : CHTRI + 4 + 0x5cu * (u32)f;
+        for (int j = 0; j < n; j++) {
+            wr(pk + 4 + 12 * (u32)j, j ? col[j] : quad ? col[0] : (col[0] & 0xffffff) | 0x34000000u);
+            wr(pk + 8 + 12 * (u32)j, xy[j]);
+        }
+        const int slot = slot_of(sz) < 0 ? (int)(sz * 0x155u / 1001) : slot_of(sz);
+        const u32 head = OT + 4 * (u32)slot;
+        wr(pk, (rd(head) & 0xffffff) | (quad ? 12u : 9u) << 24);
+        wr(head, pk & 0xffffff);
+    }
+}
+
+static void char_frame(int fault, int rot)
+{
+    build_char(rot);
+    gte_camera();
+    if (g_hlr.char_pre) g_hlr.char_pre(CMB, OT);
+    game_char(fault);
+    if (g_hlr.char_post) g_hlr.char_post();
+}
+
+static void test_char_audit(void)
+{
+    hlr_set_mode(HLR_AUDIT);
+    HlrCharStats a, b;
+    hlr_char_get_stats(&a);
+    char_frame(0, 0);
+    hlr_char_get_stats(&b);
+    CHECK(b.audited == a.audited + 1, "model audited (%llu)", (unsigned long long)(b.audited - a.audited));
+    CHECK(b.vtx - a.vtx == 2 * CNV + 2 && b.col - a.col == 2 * CNV, "%llu vertices, %llu colours",
+          (unsigned long long)(b.vtx - a.vtx), (unsigned long long)(b.col - a.col));
+    CHECK(b.faces - a.faces == CNTRI + CNQUAD, "%llu faces", (unsigned long long)(b.faces - a.faces));
+    CHECK(b.kept > a.kept && b.kept - a.kept < CNTRI + CNQUAD, "%llu of %d faces kept (some must face away)",
+          (unsigned long long)(b.kept - a.kept), CNTRI + CNQUAD);
+    CHECK(b.vtx_bad == a.vtx_bad && b.col_bad == a.col_bad && b.link_bad == a.link_bad && b.word_bad == a.word_bad &&
+          b.bad_model == a.bad_model && b.frames_bad == a.frames_bad,
+          "clean model: vtx %llu col %llu link %llu words %llu bad %llu rejected %llu",
+          (unsigned long long)(b.vtx_bad - a.vtx_bad), (unsigned long long)(b.col_bad - a.col_bad),
+          (unsigned long long)(b.link_bad - a.link_bad), (unsigned long long)(b.word_bad - a.word_bad),
+          (unsigned long long)(b.bad_model - a.bad_model), (unsigned long long)(b.frames_bad - a.frames_bad));
+    CHECK(b.proj_n > a.proj_n && b.proj_err_max < 1.5, "float projection of the bones within 1.5 px (max %.3f)", b.proj_err_max);
+    a = b; char_frame(1, 0); hlr_char_get_stats(&b);
+    CHECK(b.col_bad > a.col_bad && b.frames_bad == a.frames_bad + 1, "a wrong colour is found (%llu) and rejects the model",
+          (unsigned long long)(b.col_bad - a.col_bad));
+    a = b; char_frame(2, 0); hlr_char_get_stats(&b);
+    CHECK(b.link_bad == a.link_bad + 1 && b.frames_bad == a.frames_bad + 1, "an unlinked kept face is found (%llu)",
+          (unsigned long long)(b.link_bad - a.link_bad));
+    a = b; char_frame(3, 0); hlr_char_get_stats(&b);
+    CHECK(b.vtx_bad == a.vtx_bad + 1 && b.frames_bad == a.frames_bad + 1, "a wrong vertex is found (%llu)",
+          (unsigned long long)(b.vtx_bad - a.vtx_bad));
+    for (int r = 1; r < 6; r++) {
+        a = b; char_frame(0, r); hlr_char_get_stats(&b);
+        CHECK(b.frames_bad == a.frames_bad && b.audited == a.audited + 1, "pose %d clean", r);
+    }
+    hlr_set_mode(HLR_OFF);
+}
+
+/* the bone filter: smooths jitter, gives way to real motion at once, starts from the input */
+static void test_bone_filter(void)
+{
+    HlrBoneFilter bf;
+    memset(&bf, 0, sizeof bf);
+    float x[12], o[12];
+    for (int i = 0; i < 12; i++) x[i] = i < 9 ? (i % 4 == 0 ? 1.0f : 0.0f) : 100.0f;
+    hlr_bone_filter(&bf, x, o);
+    CHECK(!memcmp(x, o, sizeof o), "first update passes through");
+    /* jitter: +-0.006 on the matrix, +-1.5 units on the translation, alternating */
+    double ein = 0, eout = 0;
+    for (int u = 0; u < 200; u++) {
+        const float s = (u & 1) ? 1.0f : -1.0f, j = (float)((rnd(0, 1000) - 500) / 500.0) * 0.5f + 0.5f;
+        float y[12];
+        for (int i = 0; i < 12; i++) y[i] = x[i] + (i < 9 ? 0.006f : 1.5f) * s * j;
+        hlr_bone_filter(&bf, y, o);
+        if (u >= 20) for (int i = 0; i < 12; i++) { ein += fabs(y[i] - x[i]); eout += fabs(o[i] - x[i]); }
+    }
+    printf("  jitter: output error %.3f vs input %.3f\n", eout, ein);
+    CHECK(eout < 0.6 * ein, "jitter reduced: output error %.3f vs input %.3f", eout, ein);
+    /* a real move: a 0.5 rotation change and 80 units of translation are followed in one update */
+    float y[12];
+    memcpy(y, x, sizeof y);
+    y[0] = 0.5f; y[9] = 180.0f;
+    hlr_bone_filter(&bf, y, o);
+    CHECK(fabsf(o[0] - 0.5f) < 1e-4f && fabsf(o[9] - 180.0f) < 1e-3f, "a large change snaps (%.4f, %.3f)", o[0], o[9]);
+    /* a steady slow motion is tracked without lag once the prediction is in */
+    float lag = 0;
+    for (int u = 0; u < 60; u++) {
+        y[10] = 100.0f + 2.0f * (float)u;
+        hlr_bone_filter(&bf, y, o);
+        if (u >= 40) lag = fmaxf(lag, fabsf(o[10] - y[10]));
+    }
+    printf("  slow motion lag %.3f units\n", lag);
+    CHECK(lag < 1.0f, "slow motion followed (lag %.3f units)", lag);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -473,6 +732,8 @@ int main(int argc, char **argv)
     printf("capture and pairing\n"); test_capture_and_pairing();
     printf("suppression\n"); test_suppression();
     printf("float camera\n"); test_float_camera();
+    printf("characters\n"); test_char_audit();
+    printf("bone filter\n"); test_bone_filter();
     printf("test_hlr: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

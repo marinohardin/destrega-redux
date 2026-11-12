@@ -27,13 +27,16 @@
  * the packet's texture words. hlr_native.c draws them with the stage, in its depth buffer.
  *
  * Bone filter (--hlr-bones smooth, the default; presentation only): the jitter of a fighter's face
- * comes from the animation's own local matrices (NOTES.md "Character depth and face shimmer"), so
- * every part's workm and translation (relative to part 0, so walking / jumping is never smoothed)
- * go through an exponential moving average (alpha 0.3) plus a one-update linear prediction of the
- * smoothed track, which removes the lag the average adds (measured with tools/hlr_probe.py: head
- * step 0.224 -> 0.136 px per update, no lag). A large change (a fast attack, a new animation)
- * raises alpha towards 1 and drops the prediction, so real motion is never delayed or overshot.
- * The filter state is dropped on a save-state load, a mode change and when a model was not drawn
+ * comes from the animation itself (NOTES.md "Floor tile seams and face shimmer"), so
+ * every part's workm and translation (part 0's in the world, the others relative to part 0: the
+ * root's bob is most of the jitter) go through Holt's linear smoothing (level gain 0.3, trend gain 0.15): the level follows a
+ * steady motion with no lag (a plain moving average trails by (1 - a) / a updates; test_hlr checks
+ * < 0.01 unit on a ramp) while jitter around it is cut to about a quarter (test_hlr). A large
+ * change (a fast attack, a new animation: matrix elements moving > 0.03..0.20 or the relative
+ * translation > 6..40 units in one update) raises both gains towards 1, so real motion is never
+ * delayed or overshot. Milena repro (frames 3880-3950, every vertex of a fighter):
+ * second difference of the projected positions 0.193 px per update with the game's bones, 0.045
+ * filtered (DESTREGA_HLR_BONE_DIAG=3880-3950 prints it). The filter state is dropped on a save-state load, a mode change and when a model was not drawn
  * for a few updates; it never feeds back into emulated state. */
 #include "psx.h"
 #include "hlr.h"
@@ -70,6 +73,8 @@ static u32 s_mb, s_ot;
 static bool s_run, s_draw;
 static int s_model_in_update;
 static u64 s_last_seq;
+static bool s_diag;
+static u32 s_diag_lo, s_diag_hi = ~0u;
 
 void hlr_set_bones(int m) { s_bones = m == HLR_BONES_GAME ? HLR_BONES_GAME : HLR_BONES_SMOOTH; hlr_char_reset(); }
 int hlr_get_bones(void) { return s_bones; }
@@ -78,16 +83,17 @@ void hlr_char_get_stats(HlrCharStats *st) { *st = S; }
 /* ---- bone filter ------------------------------------------------------------------------ */
 static float ramp(float d, float lo, float hi) { return d <= lo ? 0.0f : d >= hi ? 1.0f : (d - lo) / (hi - lo); }
 
-#define ALPHA 0.3f
+#define ALPHA     0.3f         /* level gain */
+#define BETA      0.15f        /* trend gain */
 #define SNAP_M_LO 0.03f     /* matrix elements (1.0 = 4096): change per update where smoothing gives way */
 #define SNAP_M_HI 0.20f
-#define SNAP_T_LO 6.0f      /* relative translation, world units per update */
+#define SNAP_T_LO 6.0f      /* translation (part 0: world; others: relative to part 0), units per update */
 #define SNAP_T_HI 40.0f
 
 void hlr_bone_filter(HlrBoneFilter *bf, const float x[12], float out[12])
 {
     if (!bf->n) {
-        memcpy(bf->s, x, sizeof bf->s); memcpy(bf->prev, x, sizeof bf->prev);
+        memcpy(bf->s, x, sizeof bf->s); memset(bf->b, 0, sizeof bf->b);
         memcpy(out, x, 12 * sizeof *out);
         bf->n = 1;
         return;
@@ -98,11 +104,16 @@ void hlr_bone_filter(HlrBoneFilter *bf, const float x[12], float out[12])
     dt = sqrtf(dt);
     const float rm = ramp(dm, SNAP_M_LO, SNAP_M_HI), rt = ramp(dt, SNAP_T_LO, SNAP_T_HI), r = rm > rt ? rm : rt;
     if (r >= 1.0f) S.snaps++;
-    const float a = ALPHA + (1.0f - ALPHA) * r;
+    /* Holt's linear smoothing: level s and trend b (bf->b holds the trend). The level of a
+     * steady motion has no lag (a plain average would trail it by (1 - a) / a updates); a large
+     * change raises both gains to 1, so the output is the input and the trend restarts from it. */
+    const float a = ALPHA + (1.0f - ALPHA) * r, be = BETA + (1.0f - BETA) * r;
     for (int i = 0; i < 12; i++) {
-        bf->prev[i] = bf->s[i];
-        bf->s[i] += a * (x[i] - bf->s[i]);
-        out[i] = bf->s[i] + (bf->s[i] - bf->prev[i]) * (1.0f - r);
+        const float s0 = bf->s[i];
+        bf->s[i] = a * x[i] + (1.0f - a) * (s0 + bf->b[i]);
+        bf->b[i] = be * (bf->s[i] - s0) + (1.0f - be) * bf->b[i];
+        if (r >= 1.0f) bf->b[i] = 0.0f;
+        out[i] = bf->s[i];
     }
     bf->n++;
 }
@@ -180,6 +191,9 @@ void hlr_char_pre(u32 mb, u32 ot)
     s_run = false;
     if (hlr_get_mode() == HLR_OFF) return;
     s_draw = hlr_chars_native();
+    const char *dg = getenv("DESTREGA_HLR_BONE_DIAG");    /* "1" or "LO-HI" (libetc vblank count) */
+    s_diag = dg != NULL;
+    if (dg && strchr(dg, '-')) { s_diag_lo = (u32)strtoul(dg, NULL, 10); s_diag_hi = (u32)strtoul(strchr(dg, '-') + 1, NULL, 10); }
     gte_save(&G0);
     s_mb = mb; s_ot = ot & 0x1ffffc;
     s_run = true;
@@ -214,7 +228,7 @@ void hlr_char_post(void)
     /* 1. parts: matrices, vertices, colours */
     Model *mdl = f && s_bones == HLR_BONES_SMOOTH ? model_for(mb, nparts, f->seq) : NULL;
     const bool step = mdl && mdl->seq != f->seq;
-    float t0[3] = { 0, 0, 0 };
+    float t0[3] = { 0, 0, 0 }, t0f[3] = { 0, 0, 0 };   /* part 0's translation: raw, filtered */
     int nv = 0, nc = 0;
     const u32 rgbc = r32(CHAR_RGBC);
     for (int p = 0; p < nparts && !bad; p++) {
@@ -277,7 +291,8 @@ void hlr_char_post(void)
         if (mdl) {
             if (step) { hlr_bone_filter(&mdl->f[p], x, o); memcpy(mdl->out[p], o, sizeof o); }
             else memcpy(o, mdl->out[p], sizeof o);
-            for (int c = 0; c < 3; c++) o[9 + c] += p ? t0[c] : 0.0f;
+            if (p == 0) memcpy(t0f, o + 9, sizeof t0f);
+            else for (int c = 0; c < 3; c++) o[9 + c] += t0f[c];
         } else {
             memcpy(o, x, sizeof o);
             for (int c = 0; c < 3; c++) o[9 + c] = t[c];
@@ -339,6 +354,33 @@ void hlr_char_post(void)
         }
     }
     S.audited++;
+    const u32 vbc = r32(0x800bf2b4u);   /* libetc's vblank count: only to pick the diagnostic's range */
+    if (s_diag && mdl && step && s_model_in_update == 0 && vbc >= s_diag_lo && vbc <= s_diag_hi) {
+        /* DESTREGA_HLR_BONE_DIAG: the first model of each update, every vertex projected with the
+         * game's bones and with the filtered ones: step per update and second difference (jitter) */
+        static float hist[2][3][VBUF_MAX][2];
+        static int hn, hnv;
+        if (nv != hnv) { hn = 0; hnv = nv; }
+        for (int w = 0; w < 2; w++) {
+            memmove(hist[w][0], hist[w][1], sizeof hist[w][0] * 2);
+            for (int i = 0; i < nv; i++) {
+                float o[3], sx = 0, sy = 0;
+                hlr_cam_view(&cam, w ? s_wp[i] : s_wg[i], o);
+                hlr_cam_project(&cam, o, &sx, &sy);
+                hist[w][2][i][0] = sx; hist[w][2][i][1] = sy;
+            }
+        }
+        if (!S.dg_vb0) S.dg_vb0 = vbc;
+        S.dg_vb1 = vbc;
+        if (++hn >= 3)
+            for (int w = 0; w < 2; w++)
+                for (int i = 0; i < nv; i++) {
+                    const float *a = hist[w][0][i], *b = hist[w][1][i], *c = hist[w][2][i];
+                    S.dg_step[w] += hypot(c[0] - b[0], c[1] - b[1]);
+                    S.dg_jit[w] += hypot(b[0] - 0.5 * (a[0] + c[0]), b[1] - 0.5 * (a[1] + c[1]));
+                    if (!w) S.dg_n++;
+                }
+    }
 
     /* 4. faces: kept by the integer rule <=> linked at the predicted slot, with the predicted words */
     const u32 grp = r32(mb + 16);
@@ -462,4 +504,9 @@ void hlr_char_report(void)
                " bones %s (%llu filter snaps, %llu resets)",
                (unsigned long long)S.attached, (unsigned long long)S.no_frame, (unsigned long long)S.cam_diff,
                s_bones == HLR_BONES_GAME ? "game" : "smooth", (unsigned long long)S.snaps, (unsigned long long)S.resets);
+    if (S.dg_n)
+        rt_log("hlr-bones-diag: %llu vertex updates; step per update game %.3f px, filtered %.3f px;"
+               " jitter (second difference) game %.3f px, filtered %.3f px (vblank count %u..%u)", (unsigned long long)S.dg_n,
+               S.dg_step[0] / (double)S.dg_n, S.dg_step[1] / (double)S.dg_n, S.dg_jit[0] / (double)S.dg_n,
+               S.dg_jit[1] / (double)S.dg_n, S.dg_vb0, S.dg_vb1);
 }
