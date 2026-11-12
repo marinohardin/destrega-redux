@@ -62,8 +62,15 @@ the launcher builds on first launch from the player's own disc and loads at star
   `Contents/Helpers` or `MacOS`). The hardened runtime needs `tools/launcher.entitlements`
   (`com.apple.security.cs.disable-library-validation`), since the game module is signed only by
   the player's linker. Not tried with a real Developer ID.
-- Windows: run the launcher on a real Windows machine (only cross-compiled so far), Authenticode
-  signing; the zip with Zig is large (~100 MB download, Zig's Windows release alone).
+- Windows: run the launcher on a real Windows machine, Authenticode signing. The package
+  (`package_release.sh launcher win`, Zig 0.17.1 x86_64-windows, 106 MB zip, no game code) was run
+  under CrossOver 26 (`--bottle destrega-test`): the launcher starts, finds the bundled Zig, checks
+  it and recompiles (1 s), but every `zig cc` fails with `checking cache failed: manifest_create
+  Unexpected`, also for a one-line file on the bottle's own C: drive. Wine trace: Zig locks its
+  cache manifest with `NtLockFile`, which Wine logs as `fixme:file:NtLockFile Unimplemented yet
+  parameter` and fails. A Wine limitation (real Windows implements it), so the Windows first-launch
+  build cannot be tested under Wine; the launcher reports the failure cleanly (exit 1, no crash).
+  Needs a real Windows machine (or a Windows CI job that runs the bundled `zig cc`); the zip with Zig is large (~100 MB download, Zig's Windows release alone).
 - Linux: build and run the AppImage on Linux (not done: no Linux machine with the game here).
 - Size: Zig's `lib/` holds libc headers and sources for every target (~400 MB unpacked on macOS);
   pruning it to the host target would roughly halve the download.

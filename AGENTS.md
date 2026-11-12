@@ -1753,7 +1753,9 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
   39-46 s, link 0.3 s; bundled Zig (first use, load ~60): compile 93 s, link 16 s (Zig builds its
   compiler-rt into the cache once); cached launch: key check 0.04 s. `--recompile` output is
   identical to `gen/`. A Windows DLL cross-builds with `zig cc -target x86_64-windows-gnu`
-  (exports only the entry point; not run).
+  (exports only the entry point; not run). Under Wine / CrossOver the bundled Windows Zig cannot
+  compile at all (`manifest_create Unexpected`: Wine's `NtLockFile` is incomplete; docs/RELEASES.md),
+  so the Windows first launch is untested until a real Windows machine runs it.
 
 ## Releases (`docs/RELEASES.md`)
 
