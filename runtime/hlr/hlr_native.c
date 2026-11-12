@@ -54,9 +54,10 @@
 enum { W_SLOT, W_STAGE, W_STRIP, W_OTHER, W_NONE, W_CHAR };
 typedef struct { u32 node; u8 kind; s32 nat; } WNode;
 typedef struct { int x0, y0, x1, y1; } IBox;      /* 1x VRAM pixels, inclusive */
-typedef struct { int pos; IBox b; int chr; } Other;   /* chr: a character packet (-1 = none) */
+typedef struct { int pos; IBox b; int chr; bool semi; } Other;   /* chr: a character packet (-1 = none); semi: a semi-transparent primitive */
 typedef struct {
     int pos, lo, hi, t;
+    int ilo, ihi;                   /* character face: its model's first / last linked face (walk positions) */
     IBox b;
     s32 nat;                        /* native polygon, -1 = a strip or a character face */
     int strip;                      /* W node index of the strip, -1 = none */
@@ -209,7 +210,7 @@ static void grid_build(int x0, int y0, int x1, int y1)
                 if (b->x0 > b->x1 || b->y0 > b->y1) continue;     /* outside the pass (not counted above) */
                 const int tx0 = (b->x0 - x0) / TILE, tx1 = (b->x1 - x0) / TILE, ty0 = (b->y0 - y0) / TILE, ty1 = (b->y1 - y0) / TILE;
                 for (int ty = ty0; ty <= ty1; ty++)
-                    for (int tx = tx0; tx <= tx1; tx++) s_tlist[fill[ty * s_gnx + tx]++] = s_o[i].pos;
+                    for (int tx = tx0; tx <= tx1; tx++) s_tlist[fill[ty * s_gnx + tx]++] = i;   /* others in walk order */
             }
             return;
         }
@@ -237,6 +238,34 @@ static void bracket(const int *l, int n, int pos, int *lo, int *hi)
     if (a < n && l[a] < *hi) *hi = l[a];
 }
 
+/* the same against a tile's list of others (indices into s_o, in walk order), counting only the
+ * others whose box really overlaps b (grown by OVL_MARGIN 1x pixels: PGXP moves an other's hi-res
+ * coverage by up to ~1.5 px from its integer GP0 box). The tile alone over-constrains: a shadow's
+ * 5x2-pixel pieces between a fighter's faces in the OT split every face of their 32x32 tile into
+ * passes of its own (Hills fight: 19.6 passes per frame instead of ~4). */
+#define OVL_MARGIN 2
+static bool ovl(const IBox *a, const IBox *b)
+{
+    return a->x0 <= b->x1 + OVL_MARGIN && b->x0 <= a->x1 + OVL_MARGIN && a->y0 <= b->y1 + OVL_MARGIN && b->y0 <= a->y1 + OVL_MARGIN;
+}
+/* skip: a semi-transparent other strictly inside (ilo, ihi), i.e. one the PS1 sorted in between
+ * the faces of the same fighter: its shadow (fighter_shadow_render's GT3 pieces sit in the OT among
+ * the feet). It does not constrain the faces: the depth-tested fighter decides, so the shadow may
+ * end up under the feet where the PS1 painted a piece over them (a few pixels at the contact).
+ * Effects the PS1 drew over the whole fighter (sparks, trails: after its last face) still count. */
+static inline bool skip(const Other *o, const Item *it) { return o->semi && o->pos > it->ilo && o->pos < it->ihi; }
+static void bracket_box(const int *l, int n, const Item *it, int *lo, int *hi)
+{
+    const int pos = it->pos;
+    int a = 0, e = n;
+    while (a < e) { const int m = (a + e) / 2; if (s_o[l[m]].pos < pos) a = m + 1; else e = m; }
+    for (int i = a - 1; i >= 0 && s_o[l[i]].pos > *lo; i--)
+        if (ovl(&s_o[l[i]].b, &it->b) && !skip(&s_o[l[i]], it)) { *lo = s_o[l[i]].pos; break; }
+    while (a < n && s_o[l[a]].pos <= pos) a++;
+    for (int i = a; i < n && s_o[l[i]].pos < *hi; i++)
+        if (ovl(&s_o[l[i]].b, &it->b) && !skip(&s_o[l[i]], it)) { *hi = s_o[l[i]].pos; break; }
+}
+
 static void interval(Item *it)
 {
     it->lo = -1; it->hi = INF_POS;
@@ -251,7 +280,7 @@ static void interval(Item *it)
     for (int ty = (b.y0 - s_gy0) / TILE; ty <= (b.y1 - s_gy0) / TILE; ty++)
         for (int tx = (b.x0 - s_gx0) / TILE; tx <= (b.x1 - s_gx0) / TILE; tx++) {
             const int t = ty * s_gnx + tx;
-            bracket(s_tlist + s_tstart[t], s_tstart[t + 1] - s_tstart[t], it->pos, &it->lo, &it->hi);
+            bracket_box(s_tlist + s_tstart[t], s_tstart[t + 1] - s_tstart[t], it, &it->lo, &it->hi);
         }
 }
 
@@ -435,13 +464,14 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
             if (r != BB_NONE) {
                 w->kind = W_OTHER;
                 if (r == BB_FULL) { GROW(s_full, s_fcap, s_nfull + 1, 256); s_full[s_nfull++] = s_nw; }
-                else { GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = -1; s_no++; }
+                else { GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = -1;
+                       const u32 op0 = rw(a + 4) >> 24; s_o[s_no].semi = op0 >= 0x20 && op0 < 0x80 && (op0 & 2); s_no++; }
             }
         } else if (w->kind == W_CHAR) {
             /* an other unless the face is drawn natively (decided below, before the grid is built) */
             IBox b;
             if (gp0_bbox(a, (int)n, &e, &b) == BB_BOX) {
-                GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = w->nat; s_no++;
+                GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = w->nat; s_o[s_no].semi = false; s_no++;
             }
         }
         if (w->kind == W_STRIP && !se_set) { se = e; se_set = true; }
@@ -469,6 +499,14 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     /* 3a. character faces (phase 3): float backface test per triangle, the frustum, the texture. A
      * face handled here is drawn natively (or found invisible) and its packet, if the game linked it,
      * is suppressed and no longer an "other"; the rest keep their packets and stay others. */
+    int mlo[256], mhi[256];          /* per model: walk positions of its first / last linked face */
+    for (int m = 0; m < 256; m++) { mlo[m] = INF_POS; mhi[m] = -1; }
+    for (int i = 0; i < f->nc; i++)
+        if (s_chrpos[i] >= 0) {
+            const int m = f->chr[i].model;
+            if (s_chrpos[i] < mlo[m]) mlo[m] = s_chrpos[i];
+            if (s_chrpos[i] > mhi[m]) mhi[m] = s_chrpos[i];
+        }
     for (int i = 0; i < f->nc; i++) {
         const HlrChr *c = &f->chr[i];
         int pos = s_chrpos[i];
@@ -513,6 +551,7 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         Item *it = &s_it[s_ni++];
         memset(it, 0, sizeof *it);
         it->pos = pos; it->b = b; it->nat = -1; it->strip = -1; it->chr = i; it->tris = tris; it->info = info;
+        it->ilo = mlo[c->model]; it->ihi = mhi[c->model];
         it->blend = -1;
         if (c->code & 2) { it->blend = (int)((tp >> 5) & 3); it->tex_semi = true; }
         s_chrdone[i] = true;
@@ -634,6 +673,28 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     int u = 0;
     for (int i = 0; i < np; i++) if (!u || pts[i] != pts[u - 1]) pts[u++] = pts[i];
     np = u;
+
+    {   /* DESTREGA_HLR_PASS_DIAG=N: the walk nodes at the pass points of the first N frames with > 6 passes */
+        static int pd = -1;
+        if (pd < 0) { const char *d = getenv("DESTREGA_HLR_PASS_DIAG"); pd = d ? atoi(d) : 0; }
+        if (pd > 0 && np > 6) {
+            pd--;
+            int nchr = 0; for (int i = 0; i < s_ni; i++) nchr += s_it[i].chr >= 0;
+            rt_log("hlr-pass-diag: %d passes, %d items (%d character faces), %d others, %d full", np, s_ni, nchr, s_no, s_nfull);
+            for (int i = 0; i < np; i++) {
+                const int q = pts[i];
+                int nc = 0, ns = 0; for (int j = 0; j < s_ni; j++) if (s_it[j].t == q) { if (s_it[j].chr >= 0) nc++; else ns++; }
+                int oi = -1; for (int j = 0; j < s_no; j++) if (s_o[j].pos == q) { oi = j; break; }
+                bool full = false; for (int j = 0; j < s_nfull; j++) full |= s_full[j] == q;
+                const u32 nd = q < s_nw ? s_w[q].node : 0;
+                const u32 hdr = nd ? *(u32 *)(g_ram + (nd & 0x1ffffc)) : 0, w0 = nd ? *(u32 *)(g_ram + ((nd + 4) & 0x1ffffc)) : 0;
+                rt_log("hlr-pass-diag:   pt %d kind %d node %06x n %u op %02x%s box %d,%d-%d,%d chr %d; items %d chr + %d stage", q,
+                       q < s_nw ? s_w[q].kind : -1, nd, hdr >> 24, w0 >> 24, full ? " FULL" : "",
+                       oi >= 0 ? s_o[oi].b.x0 : 0, oi >= 0 ? s_o[oi].b.y0 : 0, oi >= 0 ? s_o[oi].b.x1 : 0, oi >= 0 ? s_o[oi].b.y1 : 0,
+                       oi >= 0 ? s_o[oi].chr : -9, nc, ns);
+            }
+        }
+    }
 
     /* 5. one HlrGpuFrame for the whole walk, one pass per point */
     HlrGpuFrame *gf = hlr_gpu_frame_new();
