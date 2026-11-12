@@ -1652,9 +1652,10 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
   units, link), Cancel / Esc / closing the window; errors in an SDL message box with Copy Details.
   Headless prints progress every 10%.
 - **Other options**: `--recompile OUTDIR` (C recompiler only, then exit).
-- **Determinism** (verified): a module build (CMake/clang dev module) gives per-frame
-  `--state-hash` identical to the static build on vs_hills, `vs_tieme_rohzen_villa` and
-  `1p_reyus_cpu` with `--no-interp --verify-overrides`. Netplay identity is unchanged by the
+- **Determinism** (verified): a module build gives per-frame `--state-hash` identical to the
+  static build on vs_hills, `vs_tieme_rohzen_villa` and `1p_reyus_cpu` with `--no-interp
+  --verify-overrides`, both for the CMake/clang dev module and for a module the packaged app built
+  with its bundled Zig 0.17.1. `test_netplay.py lan` with a static host and a module joiner: ok. Netplay identity is unchanged by the
   layout: `replay_build_id` hashes the table only, and `source_ident.py` covers
   `runtime/launcher/recompiler.[ch]` but not the rest of `runtime/launcher/`.
 - **Tests**: `tools/test_launcher.sh [--cc CMD] [--jobs N]` (scratch data dir under
@@ -1664,8 +1665,11 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
 - **Packaging**: `tools/package_release.sh launcher mac|win|linux --zig DIR`, `tools/make_appimage.sh`,
   `tools/check_no_game_code.py PATH...` (also run by CI on the Linux launcher build); see
   "Releases".
-- Measured (M1 Pro, loaded machine, system clang, 4 jobs): recompile 0.3 s, compile 50 units
-  ~46 s, link 0.3 s; cached launch: key check 0.04 s.
+- Measured (M1 Pro, shared machine, 4 jobs): system clang: recompile 0.3 s, compile 50 units
+  39-46 s, link 0.3 s; bundled Zig (first use, load ~60): compile 93 s, link 16 s (Zig builds its
+  compiler-rt into the cache once); cached launch: key check 0.04 s. `--recompile` output is
+  identical to `gen/`. A Windows DLL cross-builds with `zig cc -target x86_64-windows-gnu`
+  (exports only the entry point; not run).
 
 ## Releases (`docs/RELEASES.md`)
 
