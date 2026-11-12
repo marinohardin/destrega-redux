@@ -263,8 +263,15 @@ jobs:
           mkdir -p $st/gen
           cp tools/ci/stub_gen/stub.c tools/ci/stub_gen/gen_protos.h $st/gen/
           printf 'set(GEN_SOURCES\n  ${GEN_DIR}/stub.c\n)\n' > $st/gen/files.cmake
-          LD_LIBRARY_PATH=$HOME/sdl3/lib ./build/launcher/destrega --headless --data-dir $st/data --game-cc ${{ matrix.cc }} --game-selftest $st/gen 2>&1 | tee st.txt
-          grep -q "self-test passed" st.txt
+          set +e
+          LD_LIBRARY_PATH=$HOME/sdl3/lib ./build/launcher/destrega --headless --data-dir $st/data --game-cc ${{ matrix.cc }} --game-selftest $st/gen > st.txt 2>&1
+          rc=$?
+          set -e
+          cat st.txt; echo "exit $rc"
+          if [ $rc != 0 ] && command -v gdb >/dev/null; then
+            LD_LIBRARY_PATH=$HOME/sdl3/lib gdb -batch -ex run -ex bt --args ./build/launcher/destrega --headless --data-dir $st/data2 --game-cc ${{ matrix.cc }} --game-selftest $st/gen 2>&1 | tail -40
+          fi
+          test $rc = 0 && grep -q "self-test passed" st.txt
 
   macos:
     name: macOS (stub app bundle)
