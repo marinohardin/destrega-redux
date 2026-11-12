@@ -1,7 +1,7 @@
 /* Netplay presentation (runtime/netplay_ui.c): the Netplay menu's status line, the waiting panel's
  * text, "Copy My Address" / "Copy Out-of-Sync Report Location", and the tolerant parsing of what a
  * player types or pastes into Host Game / Join Game. Shared by the macOS and Windows menus and the
- * --menu-action hooks (Linux has no menus; the actions work there).
+ * in-window menu (menu_overlay.c, Linux) and the --menu-action hooks.
  *
  * Presentation only: it reads netplay.c's state through netplay_ui_info() and the router's answer
  * through portmap.c, writes the clipboard and the panel, and calls the same netplay_menu_* entry

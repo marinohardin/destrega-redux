@@ -4,6 +4,7 @@
 #include "mdec.h"
 #include "memcard.h"
 #include "menu.h"
+#include "menu_overlay.h"
 #include "hires.h"
 #include "widescreen.h"
 #include "hires_gpu.h"
@@ -308,6 +309,14 @@ static void dump_vram(const char *path) {
 
 static int s_gpu1x;          /* --gpu-1x: 0 auto, 1 copy, 2 skip (display copy of the 1x picture), 3 draw (no skip rule) */
 static bool s_host_input;   /* headless: --input-event given, so host input feeds the pads */
+#if defined(__APPLE__) || defined(_WIN32)
+static int s_overlay_menu = 0;   /* --overlay-menu: the in-window menu bar (native menus here) */
+#else
+static int s_overlay_menu = 1;   /* the in-window menu bar is Linux's menus */
+#endif
+static u64 s_paused_ns;          /* time the game waited in an open in-window menu */
+static void overlay_pause(void);
+static void overlay_shot(const char *path);
 static void window_settings_event(const SDL_Event *e);
 
 /* --press / --press2 masks for the current frame (taps held 6 frames). */
@@ -331,20 +340,23 @@ static void cursor_idle_update(void) {
     else SDL_ShowCursor();
 }
 
-static void poll_events(void) {
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
+/* One host event: press-to-bind first, then the in-window menu (menu_overlay.c), then the
+ * window's own keys and the pads. Also the route of the overlay's synthetic test events. */
+static void handle_event(SDL_Event *ev) {
+    SDL_Event e = *ev;
+    {
         if (e.type == SDL_EVENT_QUIT) exit(0);
         if (e.type == SDL_EVENT_MOUSE_MOTION || e.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
             e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
             s_mouse_moved_ns = SDL_GetTicksNS();
-        if (input_capture_event(&e)) continue;   /* press-to-bind (Controls window) */
+        if (input_capture_event(&e)) return;   /* press-to-bind (Controls window) */
+        if (overlay_menu_event(&e)) return;    /* the in-window menu bar (paused while open) */
         if (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) {
             bool down = e.type == SDL_EVENT_KEY_DOWN;
             if (e.key.key == SDLK_ESCAPE && down) {   /* full screen: leave it (macOS habit); windowed: quit */
                 if (!frontend_fullscreen()) exit(0);
                 if (!e.key.repeat) frontend_menu_action("fullscreen", "off");
-                continue;
+                return;
             }
             if (e.key.key == SDLK_TAB) s_fast = down;
             if (e.key.key == SDLK_F9 && down && !e.key.repeat)   /* = View > Widescreen (16:9) */
@@ -357,7 +369,7 @@ static void poll_events(void) {
                           (e.key.key == SDLK_F && (mod & SDL_KMOD_GUI) && (mod & SDL_KMOD_CTRL));
             if (fs_key) {
                 if (down && !e.key.repeat) frontend_menu_action("fullscreen", NULL);
-                continue;
+                return;
             }
             if (e.key.key == SDLK_F12 && down) {
                 char p[64]; snprintf(p, sizeof p, "shot_%06llu.png", (unsigned long long)s_frame);
@@ -373,6 +385,11 @@ static void poll_events(void) {
         window_settings_event(&e);
         input_handle_event(&e);
     }
+}
+
+static void poll_events(void) {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) handle_event(&e);
     cursor_idle_update();
 }
 
@@ -957,6 +974,7 @@ void frontend_vblank(void) {
     }
     static s16 audio[2048 * 2];
     menu_script_and_poll();
+    overlay_pause();                       /* the in-window menu is open: the game waits */
     settings_autosave(SDL_GetTicksNS());
     ws_apply();                            /* a View-menu switch takes effect this vblank */
     for (int i = 0; i < s_resize_n; i++)
@@ -1098,6 +1116,8 @@ void frontend_vblank(void) {
         return;
     }
     static u64 t_emu, t_present, t_sleep, t_prev_end;
+    if (t_prev_end) t_prev_end += s_paused_ns;   /* a menu pause is not host work (scale governor) */
+    s_paused_ns = 0;
     u64 t_start = SDL_GetTicksNS();
     if (t_prev_end) t_emu += t_start - t_prev_end;
     poll_input();
@@ -1252,7 +1272,80 @@ static void present_frame(void) {
         SDL_FRect src = {0, 0, (float)w, (float)h};
         SDL_RenderTexture(s_ren, s_tex, &src, &dst);
     }
+    if (overlay_menu_enabled()) overlay_menu_draw(s_ren, pw, ph);
     SDL_RenderPresent(s_ren);
+}
+
+/* ---- the in-window menu (menu_overlay.c): pause, screenshots ------------------------------- */
+
+/* While a menu or form is open the game waits here, between frames (like the Mac's menu
+ * tracking): the last picture is presented with the overlay, every input event goes to the
+ * overlay, audio is paused. Headless runs never wait: a menu still open after a test step is
+ * closed. */
+static void overlay_pause(void) {
+    if (!overlay_menu_modal()) return;
+    if (s_headless || !s_win) {
+        rt_log("menu: overlay still open after the test step: closed (headless runs never pause)");
+        overlay_menu_close();
+        return;
+    }
+    const u64 t0 = SDL_GetTicksNS();
+    if (s_audio) SDL_PauseAudioStreamDevice(s_audio);
+    while (overlay_menu_modal()) {
+        poll_events();
+        if (overlay_menu_hold_expired() || !overlay_menu_modal()) break;
+        present_frame();
+        SDL_DelayNS(15000000);
+    }
+    if (s_audio) SDL_ResumeAudioStreamDevice(s_audio);
+    s_paused_ns += SDL_GetTicksNS() - t0;
+    s_next_tick_ns = 0;   /* pacing starts over */
+    rt_log("menu: game resumed after %.1f s", (double)(SDL_GetTicksNS() - t0) / 1e9);
+}
+
+/* menu-test shot=PATH: the current picture letterboxed into the window (headless: --window) with
+ * the overlay drawn on top by a software renderer. Presentation only. */
+static void overlay_shot(const char *path) {
+    GpuDisplay d;
+    HiresView hv;
+    gpu_get_display(&d);
+    int extra = ws_present_extra(&d), w = 0, h = 0;
+    u32 *px = NULL;
+    bool own = false;
+    if (hires_read_view_wide(&d, extra, &hv) && (px = malloc((size_t)view_w(&hv) * view_h(&hv) * 4))) {
+        w = view_w(&hv); h = view_h(&hv);
+        convert_view(&hv, px, (size_t)w);
+        own = true;
+    } else {
+        convert_display(&w, &h);
+        px = s_rgba;
+        extra = 0;
+    }
+    int cw = s_pres_w > 0 ? s_pres_w : s_win_w, ch = s_pres_h > 0 ? s_pres_h : s_win_h;
+    SDL_Surface *sf = SDL_CreateSurface(cw, ch, SDL_PIXELFORMAT_ABGR8888);
+    SDL_Renderer *r = sf ? SDL_CreateSoftwareRenderer(sf) : NULL;
+    SDL_Texture *t = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h) : NULL;
+    if (t) {
+        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
+        SDL_UpdateTexture(t, NULL, px, w * 4);
+        SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
+        SDL_RenderClear(r);
+        SDL_FRect dst = letterbox_ar(cw, ch, extra ? 4.0 / 3.0 * (d.w + 2 * extra) / d.w : 4.0 / 3.0);
+        SDL_RenderTexture(r, t, NULL, &dst);
+        overlay_menu_draw(r, cw, ch);
+        SDL_FlushRenderer(r);
+        u32 *out = malloc((size_t)cw * ch * 4);
+        if (out) {
+            for (int y = 0; y < ch; y++) memcpy(out + (size_t)y * cw, (u8 *)sf->pixels + (size_t)y * sf->pitch, (size_t)cw * 4);
+            for (size_t i = 0; i < (size_t)cw * ch; i++) out[i] |= 0xFF000000u;
+            write_png(path, out, cw, ch);
+            free(out);
+        }
+    } else rt_log("menu: test: shot %s failed: %s", path, SDL_GetError());
+    if (t) SDL_DestroyTexture(t);
+    if (r) SDL_DestroyRenderer(r);
+    if (sf) SDL_DestroySurface(sf);
+    if (own) free(px);
 }
 
 /* ---- saved settings (settings.c; keys documented in AGENTS.md "Settings file") ---------------
@@ -1452,6 +1545,8 @@ static void usage(void) {
         "                        default on in a window, off headless;\n"
         "                        View > Widescreen (16:9) or F9 switches at runtime)\n"
         "  --widescreen-at F:0|1,...  headless: switch widescreen off/on at the given frames\n"
+        "  --overlay-menu on|off  the in-window menu bar (F10, Alt, right-click; default on Linux,\n"
+        "                        off on macOS / Windows, which have native menus)\n"
         "  --menu-action F:NAME[=ARG]  (testing) run a menu action on frame F: load=IMAGE, reveal-game,\n"
         "                        reveal-saves, save-import=FILE, save-export=FILE, save-delete,\n"
         "                        widescreen[=on|off], renderer[=software|gpu|compare],\n"
@@ -1991,10 +2086,14 @@ static void menu_run(const char *name, const char *arg) {
         if (n < 1 || n > HIRES_MAX_SSAA) rt_log("menu: ssaa: 1 (off) to %d", HIRES_MAX_SSAA);
         else { hires_set_ssaa(n); hires_set_ssaa_cap(ssaa_cap()); s_ssaa_chosen = true; view_changed(); }
     }
-    else if (!strcmp(name, "menu-test"))    /* Windows menu bar test hook (menu.h): dump | click=PATH */
-        menu_test(arg);
+    else if (!strcmp(name, "menu-test")) {  /* menu test hook: the in-window menu's (menu_overlay.c),
+                                              * headless on every platform; else the native one */
+        if (overlay_menu_enabled() || s_headless) overlay_menu_test(arg);
+        else menu_test(arg);
+    }
     else if (!strcmp(name, "controls") || !strcmp(name, "settings")) {   /* Settings… / View > Controls… */
         if (s_headless) rt_log("menu: controls: no window in headless mode");
+        else if (overlay_menu_enabled()) overlay_menu_controls();
         else controls_open();
     }
     else if (!strncmp(name, "controls-", 9)) input_menu_action(name, arg);   /* input.c */
@@ -2143,6 +2242,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-widescreen")) { s_widescreen = false; s_ws_given = true; }
         else if (!strcmp(argv[i], "--settings") && i + 1 < argc) s_settings_arg = argv[++i];
         else if (!strcmp(argv[i], "--no-settings")) s_no_settings = true;
+        else if (!strcmp(argv[i], "--overlay-menu") && i + 1 < argc) s_overlay_menu = strcmp(argv[++i], "off") ? 1 : 0;
         else if (!strcmp(argv[i], "--input-event") && i + 1 < argc) {
             if (!input_parse_events(argv[++i])) return 1;
         }
@@ -2399,8 +2499,10 @@ int main(int argc, char **argv) {
         s_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
         if (s_audio) SDL_ResumeAudioStreamDevice(s_audio);
         menu_init();   /* File menu; windowed only. Headless runs have no menus. */
+        if (s_overlay_menu) overlay_menu_init(s_win, &(OverlayHooks){ handle_event, overlay_shot, false, 0, 0 });
         /* display.fullscreen = on: entered from menu_script_and_poll once the window has focus */
-    }
+    } else   /* headless: the in-window menu's test hooks only (menu-test=...), never drawn */
+        overlay_menu_init(NULL, &(OverlayHooks){ handle_event, overlay_shot, true, s_win_w, s_win_h });
 
     memset(&g_cpu.r, 0, sizeof g_cpu.r);
     g_cpu.r[29] = 0x801fff00;   /* SYSTEM.CNF STACK */

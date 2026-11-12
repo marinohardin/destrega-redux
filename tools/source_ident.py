@@ -28,6 +28,7 @@ import sys
 
 EXCLUDE = {
     "runtime/menu_mac.m", "runtime/menu_win.c", "runtime/menu_stub.c", "runtime/menu.h",
+    "runtime/menu_overlay.c", "runtime/menu_overlay.h",
     "runtime/platform.c", "runtime/platform_net.c", "runtime/platform.h",
     "runtime/hires.c", "runtime/hires.h", "runtime/hires_gpu.c", "runtime/hires_gpu.h",
     # host input -> pad bits and the settings file: they decide which key or controller button

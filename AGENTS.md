@@ -82,8 +82,9 @@ SDL **3.4+** (`SDL_CreateGPURenderer(device, window)`), zlib, Python 3 and the d
   link platform.c need no socket libraries). Sockets stay in `net.c` (BSD sockets / Winsock; on
   Windows created with `WSA_FLAG_NO_HANDLE_INHERIT`: `SetHandleInformation` on a bound socket
   made it receive nothing under Wine). `\` is a path separator on Windows (cue -> bin, folders).
-  Native menus on macOS (`menu_mac.m`) and Windows (`menu_win.c`, see "Application menus"); Linux
-  has none (`menu_stub.c`). Alt+Enter/F11 full screen and F9 widescreen work everywhere.
+  Native menus on macOS (`menu_mac.m`) and Windows (`menu_win.c`); Linux gets the in-window menu
+  bar (`menu_overlay.c`, glue in `menu_stub.c`; see "Application menus"). Alt+Enter/F11 full
+  screen and F9 widescreen work everywhere.
 - GPU renderer: Windows tries **Direct3D 12** (DXIL) first, then Vulkan (SPIR-V), then software;
   Linux Vulkan, then software (see "GPU renderer", "Graphics APIs"). `--renderer` works everywhere;
   View > Renderer on macOS and Windows.
@@ -752,16 +753,15 @@ GGPO-style rollback on top of save states, two peers, UDP. Started from the **Ne
   code has been sent to real hardware), the Host dialog check box and the panel's router line by hand
   (compiled on both platforms), the Linux gateway lookup (compiled in CI only), IPv6 (PCP can map
   IPv6, the host listens on IPv4 only); NAT traversal or a server-assisted lobby (direct UDP only: the
-  host's port is forwarded, automatically or by hand), spectators, Linux menus (the actions work there), a real
+  host's port is forwarded, automatically or by hand), spectators, the Linux menus by hand (only driven through `menu-test`), a real
   Windows machine (only Wine), the Mac dialogs, panel and greyed-out items by hand (compiled; two
   windowed processes were driven through the same actions with `--menu-action`),
   windowed-vs-windowed play by two people.
 
-## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_win.c`, `menu_stub.c`, `main.c`)
+## Application menus (`runtime/menu.h`, `menu_mac.m`, `menu_win.c`, `menu_overlay.[ch]`, `menu_stub.c`, `main.c`)
 
 macOS gets a native **File** menu inserted after the app menu (SDL3 keeps building the standard
-app/Window menus; Quit still works). `menu_mac.m` (Cocoa, ARC, Apple only; `menu_stub.c` no-ops
-elsewhere) only builds items; each item calls `frontend_menu_action(NAME, ARG)` which **queues**. `main.c`
+app/Window menus; Quit still works). `menu_mac.m` (Cocoa, ARC, Apple only) only builds items; each item calls `frontend_menu_action(NAME, ARG)` which **queues**. `main.c`
 runs the queue at the top of each VBlank (`menu_script_and_poll`), i.e. between frames on the main
 thread, so menus cannot disturb emulation. Headless runs never create menus.
 
@@ -805,7 +805,7 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   texture cache, see "Texture cache".
 - **Netplay** menu (after View): Host Game…, Join Game…, Copy My Address, Disconnect, status line, Copy
   Out-of-Sync Report Location; see "Rollback netplay".
-- **View > Controls…** (both platforms) and app menu **Settings… (Cmd+,)** on macOS: the Controls
+- **View > Controls…** (Mac, Windows; Linux: the in-window menu's Controls form) and app menu **Settings… (Cmd+,)** on macOS: the Controls
   window, see "Input, controls and settings". View toggles are saved in `settings.ini`.
 - **Full screen** on every platform from the SDL event loop in `main.c` (so not a Cocoa-only
   feature): **Alt+Enter** and **F11**, plus **Ctrl+Cmd+F** on macOS, queue the action
@@ -872,9 +872,58 @@ thread, so menus cannot disturb emulation. Headless runs never create menus.
   CrossOver (windowed): the dump before / during hosting / after Disconnect (Host and Join greyed
   and Disconnect enabled while waiting, status "Waiting for an opponent on port N"), widescreen
   check mark, full screen in and out (title follows), Exit, both forms (screenshots), the panel.
-  On macOS and Linux `menu-test` logs that it is not available.
-- Not done: saves other than the game's own file, Linux menus, the Windows menus clicked by a
+  Headless (every platform) `menu-test` drives the in-window menu below instead.
+- Not done: saves other than the game's own file, the Windows menus clicked by a
   person (only driven through `menu-test` under Wine), a real Windows machine.
+
+### In-window menu bar (Linux; `--overlay-menu on` elsewhere)
+
+`runtime/menu_overlay.[ch]`; `menu_stub.c` (non-Apple, non-Windows) routes `menu_reveal` (SDL_OpenURL
+`file://`), `controls_open`, `menu_netplay_progress` and `menu_test` to it. **Why drawn by the frontend**:
+SDL3 has no menu API on Linux, a GTK menu bar inside an SDL window is fragile across X11 / Wayland and
+absent in full screen or on a bare compositor (Steam Deck style); an overlay works the same in every
+case and needs nothing beyond SDL (SDL_Renderer rectangles / lines and SDL's built-in 8x8 debug font
+scaled by whole pixels; no fonts or toolkits from elsewhere). File pickers and alerts stay SDL's dialogs
+(portal / zenity on Linux).
+- **What the player sees**: a hint "Menu: F10, Alt, right-click or the mouse at the top" for 6 s at
+  start; the bar (File, View, Netplay) slides in while the mouse is near the top. Opens with F10, Alt
+  pressed and released alone (not when a player has Alt bound), a right-click (popup at the pointer) or
+  a controller's Guide button. Arrows / Return / Escape, mouse hover and click (outside = close),
+  controller D-pad or left stick, South = choose, East / Back = back, Start / Guide = close.
+- **Same items as the native menus** from one table (`k_items`: path, action, shortcut label): File (Load
+  Game Image, Show Game Files, Save Games submenu, Quit), View (Widescreen, Renderer with this platform's
+  APIs + Software + Exact / Fast, Resolution, Texture Filtering, Smooth Colours, Anti-aliasing, Enter /
+  Exit Full Screen, Controls), Netplay (Host Game, Join Game, Disconnect, status line). Greying, check
+  marks and titles follow `frontend_menu_action_allowed` and the `frontend_*` getters as in
+  `menu_win.c`. Every item queues `frontend_menu_action`; Host Game / Join Game are overlay forms (same
+  text, `[netplay]` defaults, validation and resulting action as `menu_win.c`), Controls an overlay form
+  (device, key / controller column per button, press-to-bind through `input_capture_begin`, stick,
+  deadzone, Reset with SDL's confirm). The netplay waiting panel (non-modal, Cancel) shows at the bottom.
+- **The game waits while a menu or form is open** (`overlay_pause` in `frontend_vblank`, right after
+  the queued actions: presents the last picture with the overlay, every input event goes to the overlay,
+  audio paused, pacing restarts; the pause does not count as host work for the scale governor). Keys
+  held when it opens are released; controllers reach no pad after it closes until all their inputs are
+  released (`input_hold_pads`). F10 is a reserved key. During netplay a long pause stalls the opponent
+  (as the Mac's menu tracking does).
+- `--overlay-menu on|off`: default on in a Linux window, off on macOS / Windows (native menus there).
+  Headless never draws it. Not in the netplay build identity (`tools/source_ident.py`).
+- **Test hook** (`--menu-action F:menu-test=CMD;CMD...`, headless on every platform, windowed when the
+  overlay is on): `dump` (`menu: item PATH [greyed] [checked]`), `click=PATH`, `open=PATH`,
+  `context=X,Y`, `bar`, `key=NAME` / `key-down=` / `key-up=` (scancode names), `pad=BUTTON`,
+  `mouse=X,Y`, `mclick=X,Y`, `rclick=X,Y`, `type=TEXT`, `controls`, `panel=TEXT`, `state`, `close`,
+  `shot=PATH` (the picture letterboxed into the window / `--window` size with the overlay, drawn by an
+  SDL software renderer), `hold=MS` (windowed: stay paused MS ms). Synthetic events go through
+  main.c's own event handler (`handle_event`: press-to-bind, overlay, window keys, pads). Headless a
+  menu still open after the step is closed (headless runs never pause).
+- Tests: `tools/test_overlay_menu.py` (menus group of `pr_check.sh`, `run_tests.sh`; ~15 s, two
+  processes): the dump; clicks, greyed refusals, the Join form sending `netplay-join ADDR,DELAY`; a key
+  pressed while a menu is open never reaches pad 1 (`--input-log`), the same key without the menu or
+  after it closed does; a 2400-frame run that opens every menu, form and the context menu, navigates
+  with keys / mouse / controller, chooses presentation-only items and takes 8 screenshots has the
+  same per-frame `--state-hash` as a plain run.
+- Not done: run on Linux (built and tested headless on macOS only; Docker was unavailable), a person
+  using it, IME / non-ASCII text (the font is ASCII; forms take ASCII), live pressed-button marks in
+  Controls (the game is paused, nothing polls).
 
 ## Input, controls and settings (`runtime/input.[ch]`, `settings.[ch]`, `controls_mac.m`, `controls_win.c`)
 
@@ -896,7 +945,7 @@ the left stick is mapped to the D-pad, never reported as analog.
   7/8 L1/R1, 9/0 L2/R2, P Start, Backslash Select. Controller: positional (south = Cross, east = Circle,
   west = Square, north = Triangle), shoulders L1/R1, triggers L2/R2, Start, Back/Share = Select, D-pad,
   left stick on with a 50 % radial deadzone and 8 sectors of 45 degrees.
-- **Reserved** (never bindable, never reach a pad): Escape, Tab, F9, F11, F12, the Cmd/Win keys and
+- **Reserved** (never bindable, never reach a pad): Escape, Tab, F9, F10 (in-window menu), F11, F12, the Cmd/Win keys and
   anything pressed with them, and the Alt+Enter / Ctrl+Cmd+F combinations handled before input.c.
   Bindings are **scancodes** (layout-independent positions), names from `SDL_GetScancodeName` with a
   few aliases (Comma, Period, Backslash...) and `#N` for nameless ones; controller inputs are SDL

@@ -111,6 +111,7 @@ bool input_capture_event(const SDL_Event *e);
 void input_frame(uint16_t out[2]);
 /* Release everything held (focus lost). */
 void input_release_all(void);
+void input_hold_pads(void);   /* controllers reach no pad until all their inputs are released (menu closed) */
 
 /* live configuration for the Controls window / menu actions; call input_changed after edits
  * (re-assigns controllers, stores to settings and saves) */
