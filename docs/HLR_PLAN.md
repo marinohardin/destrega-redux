@@ -119,8 +119,17 @@ Acceptance:
 - `--hlr exact` byte-identical to off (subset: hills castle1 throne shrine, Metal and MoltenVK).
 - `tools/hlr_diff.py`: all 12 VS stages at 4x6 16:9, sheets `build/hlr2b/diff2/<stage>.png` (not
   committed); 0 failed passes, 0 walks given up; 0.00-2.6 % of pixels > 4 steps (Throne 7.7 %).
+- `test_netplay.py lan_hlr` ok (5846 final frames equal on both peers and offline, native stage in 1599
+  frames); `PR_JOBS=2 tools/pr_check.sh` PASS (all groups, 798 s).
 - CTest: float camera vs RTPS within 0.70 px (z >= 4H); `hlr_gpu` cube + MSAA resolve on Metal and
   `hlr_gpu_vulkan` on MoltenVK.
+- Timing (quick_check bench configuration: Hills replay, 3834x2328 -> 4x6, widescreen, xbr, full colour,
+  PGXP on; fight segment 3700-4000, ms/frame emulation + hi-res, two rounds, load 12 rising to ~100 from
+  other agents' work): Metal off 4.44 / 4.45, exact 4.39 / 4.39, on (MSAA 1) 2.28 / 2.26, on (MSAA 4)
+  2.66 / 2.65; MoltenVK off 8.51 / 8.59, exact 8.54 / 8.59, on 6.81 / 6.84, on MSAA 4 7.23 / 7.27. The
+  native stage is faster than the original: the stage's exact-plane-equation triangles (and the
+  widescreen shadow pass) are replaced by ~164 hardware-rasterized polygons in 3 passes per frame;
+  MSAA 4x costs ~0.4 ms.
 
 **Deviations.** No DXIL: Microsoft's DXC is not installed here, so Direct3D 12 keeps the exact replay
 for `on` (generate with `tools/gen_dxil.py --src hlr` when DXC is available). `hlr_diff.py` writes one
