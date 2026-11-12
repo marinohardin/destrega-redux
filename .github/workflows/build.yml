@@ -216,6 +216,14 @@ jobs:
           set -e
           cat out.txt
           test $rc = 1 && grep -q "no data pack" out.txt
+      # The launcher layout (docs/RELEASES.md option A) needs no gen/ at all: the executable holds
+      # no game code by construction. Built and checked here, never packaged or uploaded.
+      - name: Launcher build (no game code)
+        run: |
+          cmake -S . -B build/launcher -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_PREFIX_PATH=$HOME/sdl3 -DDESTREGA_GAME_MODULE=ON -DDESTREGA_DEV_GAME_MODULE=OFF
+          cmake --build build/launcher
+          python3 tools/check_no_game_code.py build/launcher/destrega
+          LD_LIBRARY_PATH=$HOME/sdl3/lib ./build/launcher/destrega --help | grep -q -- --game-cc
 
   macos:
     name: macOS (stub app bundle)

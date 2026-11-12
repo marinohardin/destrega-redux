@@ -108,6 +108,7 @@ target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE} ${CMAKE_CURRE
 file(GLOB _ident_deps CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/runtime/*.c ${CMAKE_SOURCE_DIR}/runtime/*.h
   ${CMAKE_SOURCE_DIR}/runtime/overrides/*.c ${CMAKE_SOURCE_DIR}/runtime/overrides/*.h
+  ${CMAKE_SOURCE_DIR}/runtime/launcher/recompiler.c ${CMAKE_SOURCE_DIR}/runtime/launcher/recompiler.h
   ${CMAKE_SOURCE_DIR}/recomp/*.py ${CMAKE_SOURCE_DIR}/analysis/*.txt ${CMAKE_SOURCE_DIR}/analysis/*.json
   ${CMAKE_SOURCE_DIR}/analysis/overlays/*)
 add_custom_command(

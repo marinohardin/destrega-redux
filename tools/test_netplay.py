@@ -25,6 +25,9 @@ sys.path.insert(0, os.path.join(ROOT, 'tools'))
 import replays as R  # noqa: E402
 
 BIN = os.environ.get('DESTREGA_BIN', os.path.join(ROOT, 'build/cmake/destrega'))
+# the joiner of the two-peer cases (lan, wan, ...) may be another build, e.g. a launcher build
+# with a game module against a static one: DESTREGA_BIN_JOIN=build/launcher/destrega
+BIN_JOIN = os.environ.get('DESTREGA_BIN_JOIN', BIN)
 OUT = os.path.join(ROOT, 'build', 'netplay')
 
 # name: (replay, delay, sim host->join, sim join->host, extra args for both, expectations)
@@ -108,7 +111,7 @@ def run_case(name, port, pace):
               '--net-pace', str(pace), '--net-desync-dir', d, '--net-full-boot'] + extra + os.environ.get('NETPLAY_EXTRA', '').split()
     host = common + ['--press', R.fmt(rp.p1), '--host', str(port), '--net-sim', sim_h,
                      '--net-hash-log', os.path.join(d, 'host.hash')]
-    join = common + ['--press', R.fmt(rp.p2), '--join', f'127.0.0.1:{port}', '--net-sim', sim_j,
+    join = [BIN_JOIN] + common[1:] + ['--press', R.fmt(rp.p2), '--join', f'127.0.0.1:{port}', '--net-sim', sim_j,
                      '--net-hash-log', os.path.join(d, 'join.hash')]
     if expect.get('desync'):
         join += ['--net-inject-desync', str(rp.frames // 2)]

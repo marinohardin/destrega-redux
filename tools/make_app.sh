@@ -7,6 +7,7 @@
 #
 #   tools/make_app.sh [--bin PATH] [--out PATH.app] [--icon PNG|ICNS]
 #                     [--version X.Y] [--sign IDENTITY] [--dmg PATH.dmg]
+#                     [--zig DIR] [--entitlements FILE]
 #
 #   --bin      built executable           (default: build/cmake/destrega)
 #   --out      bundle to create           (default: next to --bin, Destrega.app)
@@ -17,6 +18,12 @@
 #   --sign     codesign identity          (default: "-" = ad-hoc, runs on this Mac;
 #              use a "Developer ID Application: ..." identity to distribute)
 #   --dmg      also write a compressed disk image
+#   --zig      launcher builds (DESTREGA_GAME_MODULE): copy this unpacked Zig release into
+#              Contents/Resources/zig (the launcher's bundled C compiler, `zig cc`)
+#   --entitlements  codesign entitlements for the app (with a Developer ID identity the bundle
+#              is signed with the hardened runtime; a launcher build then needs
+#              tools/launcher.entitlements: the game module it builds and loads is signed by
+#              nobody but the player's own linker, so library validation must be off)
 #
 # Every non-system dylib the binary links (e.g. Homebrew's libSDL3) is copied
 # into Contents/Frameworks and relinked through @rpath, build-machine rpaths are
@@ -32,6 +39,8 @@ ICON="$ROOT/assets/icon/destrega.png"
 VERSION=""
 SIGN="-"
 DMG=""
+ZIGDIR=""
+ENTITLEMENTS=""
 BUNDLE_ID="io.github.destrega-recomp"
 
 while [ $# -gt 0 ]; do
@@ -42,7 +51,9 @@ while [ $# -gt 0 ]; do
         --version) VERSION="$2"; shift 2 ;;
         --sign)    SIGN="$2"; shift 2 ;;
         --dmg)     DMG="$2"; shift 2 ;;
-        -h|--help) sed -n 2,26p "$0"; exit 0 ;;
+        --zig)     ZIGDIR="$2"; shift 2 ;;
+        --entitlements) ENTITLEMENTS="$2"; shift 2 ;;
+        -h|--help) sed -n 2,32p "$0"; exit 0 ;;
         *) echo "make_app: unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -107,6 +118,10 @@ EOF
 plutil -lint -s "$TMPAPP/Contents/Info.plist"
 
 cp "$ROOT/THIRD_PARTY_LICENSES.txt" "$TMPAPP/Contents/Resources/"
+if [ -n "$ZIGDIR" ]; then
+    [ -x "$ZIGDIR/zig" ] || { echo "make_app: no zig executable in $ZIGDIR" >&2; exit 1; }
+    ditto "$ZIGDIR" "$TMPAPP/Contents/Resources/zig"
+fi
 
 # 2. Copy every non-system dylib (recursively) into Frameworks; relink via @rpath.
 is_external() { case "$1" in /usr/lib/*|/System/*|@*) return 1 ;; *) return 0 ;; esac; }
@@ -145,7 +160,13 @@ if [ -n "$leftover" ]; then echo "make_app: unbundled dependencies remain:" >&2;
 for lib in "$TMPAPP"/Contents/Frameworks/*; do
     [ -f "$lib" ] && codesign --force --timestamp=none -s "$SIGN" "$lib" 2>/dev/null
 done
-codesign --force --timestamp=none -s "$SIGN" "$TMPAPP" 2>/dev/null
+# Zig's compiler is a nested executable: signed on its own before the bundle seals it.
+[ -f "$TMPAPP/Contents/Resources/zig/zig" ] &&
+    codesign --force --timestamp=none -s "$SIGN" "$TMPAPP/Contents/Resources/zig/zig" 2>/dev/null
+SIGNOPTS=()
+if [ "$SIGN" != "-" ]; then SIGNOPTS+=(--options runtime); fi
+if [ -n "$ENTITLEMENTS" ]; then SIGNOPTS+=(--entitlements "$ENTITLEMENTS"); fi
+codesign --force --timestamp=none ${SIGNOPTS[@]+"${SIGNOPTS[@]}"} -s "$SIGN" "$TMPAPP" 2>/dev/null
 codesign --verify --strict "$TMPAPP"
 
 rm -rf "$APP"

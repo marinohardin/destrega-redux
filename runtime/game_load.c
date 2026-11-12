@@ -2,10 +2,7 @@
  * recompiled game code built on this machine by the launcher (runtime/launcher/) or by CMake
  * (destrega_game, development). Only compiled into module builds. */
 #ifdef DESTREGA_GAME_MODULE
-#include "game_load.h"
-#include "game_abi.h"
-#include "game_sdk.h"
-
+/* system headers first: recomp.h's register macros (R8 ...) would rename winnt.h's fields */
 #include <stdio.h>
 #include <string.h>
 #ifdef _WIN32
@@ -14,6 +11,10 @@
 #else
 #include <dlfcn.h>
 #endif
+
+#include "game_load.h"
+#include "game_abi.h"
+#include "game_sdk.h"
 
 const RecompEntry *g_recomp_table;
 u32 g_recomp_count;

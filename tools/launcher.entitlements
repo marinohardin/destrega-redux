@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Launcher builds (DESTREGA_GAME_MODULE) signed with the hardened runtime (Developer ID,
+     notarization): the game module is compiled and linked on the player's Mac, so it carries
+     only the linker's ad-hoc signature, not the app's team ID. Without this entitlement dlopen
+     refuses it ("not valid for use in process: mapping process and mapped file have different
+     Team IDs"). Not needed for ad-hoc signed builds (no hardened runtime). -->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict>
+</plist>
