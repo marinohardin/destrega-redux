@@ -62,6 +62,7 @@ static void push_int_slot(u8 type, const u8 *resp, int len, u64 delay, int slot)
 
 u32 g_cd_int1_pushed, g_cd_int1_delivered;
 u32 cdrom_int1_dropped(void) { return s_int1_dropped; }
+u32 cdrom_stream_lba(void) { return s_reading ? s_curloc : 0; }
 static void cd_deliver(void) {
     if (s_qn == 0) return;
     if (s_int_flag) return;   /* wait for ack */

@@ -153,3 +153,5 @@ Developed and tested on macOS (Apple Silicon); the Windows build is tested under
 the Linux build in CI (without the game). Work in progress: a native 3D renderer with a depth buffer
 and smooth 60 Hz motion (`docs/HLR_PLAN.md` on the `feature/hlr` branch). See `AGENTS.md` for
 internals and `tools/pr_check.sh` / `tools/run_tests.sh` for the tests.
+
+<sub>Licensed under the GPL-3.0 (`LICENSE`). Game data and code stay with their owners and are never part of this repository.</sub>

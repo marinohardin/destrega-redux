@@ -149,6 +149,12 @@ then `rt_call(0x800a44e8)` (Psy-Q crt0 → `main` at `0x8002b80c`). Everything
 else is driven from the game's own loop; the frontend runs inside the VBlank
 scheduler event (`frontend_vblank`: present, input, audio, 60 Hz pacing).
 
+**Splash caption** (`runtime/splash.[ch]`, presentation only, not in the netplay identity): while
+the KOEI logo movie streams (CD position LBA 152757..155253, `cdrom_stream_lba`), the frontend
+draws "DESTREGA REDUX / MARINO'S BUILD" under "KOEI PRESENTS", fading with the logo; the movie
+itself is untouched. Text art: `runtime/splash_text.h` from `tools/make_splash_text.py` (macOS
+font, original art). `--no-splash` turns it off; test screenshots (`menu-test shot=`) include it.
+
 ## Code model
 
 - One C function per MIPS function: `f_<addr>` (main), `f_<addr>_<OVL>` (overlays).

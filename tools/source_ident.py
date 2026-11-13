@@ -52,6 +52,9 @@ EXCLUDE = {
     # a load figure for the status line out; never emulated state (tools/test_governor.py compares
     # every frame's state hash with a plain run)
     "runtime/smooth.c", "runtime/smooth.h",
+    # the caption over the KOEI logo movie: drawn by the frontend over the presented picture, reads
+    # only the CD stream position
+    "runtime/splash.c", "runtime/splash.h", "runtime/splash_text.h",
 }
 # EXCLUDE runtime/hlr/ (the native high-level renderer, docs/HLR_PLAN.md): presentation only. It is
 # left out by not scanning the directory (files() lists runtime/ and runtime/overrides/ only). The

@@ -7,6 +7,7 @@
 #include "memcard.h"
 #include "menu.h"
 #include "menu_overlay.h"
+#include "splash.h"
 #include "hires.h"
 #include "widescreen.h"
 #include "hires_gpu.h"
@@ -605,6 +606,7 @@ static void window_textures_make(void) {
 /* Destroy the window's renderer, the GPU backend's resources and the renderer's device. */
 static void window_renderer_drop(void) {
     window_textures_drop();
+    splash_release();
     hires_gpu_shutdown();
     if (s_ren) SDL_DestroyRenderer(s_ren);
     s_ren = NULL;
@@ -1290,6 +1292,8 @@ static void present_frame(void) {
         SDL_FRect src = {0, 0, (float)w, (float)h};
         SDL_RenderTexture(s_ren, s_tex, &src, &dst);
     }
+    SDL_FRect pic43 = letterbox_ar(pw, ph, 4.0 / 3.0);
+    splash_draw(s_ren, &pic43, true);
     if (overlay_menu_enabled()) overlay_menu_draw(s_ren, pw, ph);
     SDL_RenderPresent(s_ren);
 }
@@ -1350,6 +1354,8 @@ static void overlay_shot(const char *path) {
         SDL_RenderClear(r);
         SDL_FRect dst = letterbox_ar(cw, ch, extra ? 4.0 / 3.0 * (d.w + 2 * extra) / d.w : 4.0 / 3.0);
         SDL_RenderTexture(r, t, NULL, &dst);
+        SDL_FRect pic43 = letterbox_ar(cw, ch, 4.0 / 3.0);
+        splash_draw(r, &pic43, false);
         overlay_menu_draw(r, cw, ch);
         SDL_FlushRenderer(r);
         u32 *out = malloc((size_t)cw * ch * 4);
@@ -1580,6 +1586,7 @@ static void usage(void) {
         "  --memcard2 PATH       memory card image for slot 2 (default: empty slot)\n"
         "  --no-memcard          no memory cards at all (the game cannot save)\n"
         "                        (default: <data dir>/memcard1.mcd; headless runs: no card unless given)\n"
+        "  --no-splash           no caption over the KOEI logo movie\n"
         "  --state-hash FILE     write a per-frame hash of all emulated state (determinism testing)\n"
         "  --gameplay-trace FILE per frame: fighters' health/gauge/position, round time, wins, RNG seed\n"
         "  --ram-snap DIR        write raw guest RAM + scratchpad to DIR every --ram-snap-every N frames (100)\n"
@@ -2510,6 +2517,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--memcard1") && i + 1 < argc) s_memcard_path[0] = argv[++i];
         else if (!strcmp(argv[i], "--memcard2") && i + 1 < argc) s_memcard_path[1] = argv[++i];
         else if (!strcmp(argv[i], "--no-memcard")) s_no_memcard = true;
+        else if (!strcmp(argv[i], "--no-splash")) splash_set_enabled(false);
         else if (!strcmp(argv[i], "--menu-action") && i + 1 < argc) {
             if (s_menu_script_n >= (int)(sizeof s_menu_script / sizeof s_menu_script[0])) { fprintf(stderr, "--menu-action: at most %d\n", (int)(sizeof s_menu_script / sizeof s_menu_script[0])); return 1; }
             char *s = argv[++i];

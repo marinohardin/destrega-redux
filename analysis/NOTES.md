@@ -1125,6 +1125,11 @@ floors; Milena's forehead and eye polygons jumping between shapes during her idl
   motors through `4D`, so there is no rumble to emulate; guess: the values are a default
   actuator table, not game intent). Port 1 was only probed in menus.
 - CD: libcd at register level; XA audio and the 5 STR movies live in `XADATA.BNS`.
+- First movie = KOEI logo + "Produced by Omega Force" (verified: `--trace` CD log and dumps every 30
+  frames from power-on, no input): Setloc MSF 33:58:57 (LBA 152757) + ReadS at ~frame 171, ~2.2
+  sectors per vblank (132 per 60), 320x240 24-bit; "KOEI PRESENTS" complete ~frame 570, logo faded
+  out ~810, Omega Force ~870-1110; the intro movie follows at MSF 34:32:03 (LBA 155253, frame
+  ~1138). Used by `runtime/splash.c` (caption timed by sectors read into the movie).
 
 ### CD: GetlocL and the BGM loop (the "stuck BGM" report, fixed in cdrom.c)
 

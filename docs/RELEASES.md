@@ -55,7 +55,7 @@ the launcher builds on first launch from the player's own disc and loads at star
 
 ### What remains before a launcher release
 
-- A licence for the repository (none yet) and a licence review of the bundled Zig (MIT; it
+- A licence review of the bundled Zig (MIT; it
   contains LLVM and C library headers/sources under their own terms, `THIRD_PARTY_LICENSES.txt`).
 - macOS: Developer ID signing and notarization of the app **including** the bundled Zig
   (`make_app.sh` signs `Resources/zig/zig` separately; notarization may want it under
@@ -93,8 +93,7 @@ the launcher builds on first launch from the player's own disc and loads at star
   and inside `Destrega.app/Contents/Resources`.
 - Versions come from `VERSION` plus git (`tools/version.py`): Info.plist (short version = base,
   `CFBundleVersion` = commit count, `DestregaBuild` = full string) and the Windows version resource.
-- The repository has **no licence file yet**. The owner has to pick one before anything is
-  published as a release.
+- The repository is licensed under the GPL-3.0 (`LICENSE`, owner decision 2026-11-12).
 
 ## macOS signing and notarization (needs an Apple Developer account; not done here)
 
