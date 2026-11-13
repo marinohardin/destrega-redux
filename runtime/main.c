@@ -163,6 +163,10 @@ static bool s_hlr_msaa_given, s_hlr_near_given, s_hlr_look_given;
 /* --hlr-bones game|smooth (settings display.hlr_bones): characters' bone matrices as the game made
  * them or smoothed + predicted (hlr_char.c); presentation only */
 static bool s_hlr_bones_given;
+/* --hlr-motion on|off (settings display.hlr_motion, View > 3D Scene > 60 Hz Motion): fights update at
+ * 30 Hz; with --hlr on, the second presentation of each update shows the native scene halfway to the
+ * next one (hires_gpu.c "Motion", hlr_gpu.c); presentation only. Default on in a window */
+static bool s_hlr_motion_given;
 #define HLR_WINDOW_DEFAULT HLR_ON    /* windowed default: draws only with a GPU API (HiresBackend.external) */
 
 static void wav_header(FILE *f, u32 bytes) {
@@ -1012,6 +1016,7 @@ void frontend_vblank(void) {
             GpuDisplay d;
             HiresView hv;
             gpu_get_display(&d);
+            hires_gpu_motion_vblank(d.x, d.y, d.w, d.h);   /* 60 Hz motion: replay before the first view */
             bool used = hires_get_view(&d, &hv);
             int f = s_frame >= s_fight_from;
             (used ? s_hr_used : s_hr_fallback)[0]++;
@@ -1142,6 +1147,13 @@ void frontend_vblank(void) {
     if (t_prev_end) t_emu += t_start - t_prev_end;
     poll_input();
     present_frame();
+    /* windowed --dump: the picture just presented (60 Hz motion's in-between ones included; reads the
+     * target back, so the frame takes longer) */
+    if (s_dump_dir && s_dump_every && s_frame >= s_dump_from && s_frame % s_dump_every == 0) {
+        char p[512];
+        snprintf(p, sizeof p, "%s/frame_%06llu.png", s_dump_dir, (unsigned long long)s_frame);
+        frontend_screenshot(p);
+    }
     u64 t_after_present = SDL_GetTicksNS();
     t_present += t_after_present - t_start;
     smooth_present(t_after_present, t_prev_end ? t_after_present - t_prev_end : 0, s_frame);
@@ -1411,6 +1423,7 @@ static void settings_apply(const char *dir) {
     if (s_hlr_near_given) settings_lock("display", "hlr_near");
     if (s_hlr_look_given) settings_lock("display", "hlr_look");
     if (s_hlr_bones_given) settings_lock("display", "hlr_bones");
+    if (s_hlr_motion_given) settings_lock("display", "hlr_motion");
     if (s_win_set) settings_lock("display", "window");
     if (s_opt_filter >= 0) settings_lock("display", "tex_filter");
     if (s_opt_full >= 0) settings_lock("display", "smooth_colours");
@@ -1480,6 +1493,14 @@ static void settings_apply(const char *dir) {
         if (!strcmp(v, "game") || !strcmp(v, "smooth")) hlr_set_bones(!strcmp(v, "game") ? HLR_BONES_GAME : HLR_BONES_SMOOTH);
         else rt_log("settings: display.hlr_bones: game or smooth");
     }
+    if (!s_hlr_motion_given) {   /* headless stays off (tests' dumps); windowed default on */
+        bool m = !s_headless;
+        if ((v = settings_get("display", "hlr_motion"))) {
+            if (!strcmp(v, "on") || !strcmp(v, "off")) m = !strcmp(v, "on");
+            else rt_log("settings: display.hlr_motion: on or off");
+        }
+        hlr_set_motion(m);
+    }
     if (!s_win_set && (v = settings_get("display", "window"))) {
         if (parse_wxh(v, &a, &b, 320, 16384)) { s_win_w = a; s_win_h = b; s_win_set = true; }
     }
@@ -1518,6 +1539,7 @@ static void settings_note_view(const char *name) {
     else if (!strcmp(name, "hlr-near")) settings_set("display", "hlr_near", hlr_get_near() == HLR_NEAR_PS1 ? "ps1" : "clip");
     else if (!strcmp(name, "hlr-look")) settings_set("display", "hlr_look", hlr_get_look() == HLR_LOOK_PS1 ? "ps1" : "enhanced");
     else if (!strcmp(name, "hlr-bones")) settings_set("display", "hlr_bones", hlr_get_bones() == HLR_BONES_GAME ? "game" : "smooth");
+    else if (!strcmp(name, "hlr-motion")) settings_set("display", "hlr_motion", hlr_get_motion() ? "on" : "off");
     else if (!strcmp(name, "tex-filter")) settings_set("display", "tex_filter", hires_tex_filter_name(hires_get_tex_filter()));
     else if (!strcmp(name, "smooth-colours")) settings_set_bool("display", "smooth_colours", hires_get_colour());
     else if (!strcmp(name, "ssaa") && s_ssaa_chosen) {
@@ -2064,6 +2086,10 @@ bool frontend_view_checked(const char *action, bool *checked) {
         *checked = *arg ? !strcmp(arg, "game") == (hlr_get_bones() == HLR_BONES_GAME) : hlr_get_bones() == HLR_BONES_SMOOTH;
         return true;
     }
+    if (n == 10 && !strncmp(action, "hlr-motion", n)) {   /* none: View > 3D Scene > 60 Hz Motion */
+        *checked = *arg ? !strcmp(arg, "on") == hlr_get_motion() : hlr_get_motion();
+        return true;
+    }
     if (n == 8 && !strncmp(action, "hlr-part", n) && *arg) {   /* hlr-part=stage[:on] */
         char part[16];
         snprintf(part, sizeof part, "%.*s", (int)strcspn(arg, ":"), arg);
@@ -2180,6 +2206,11 @@ static void menu_run(const char *name, const char *arg) {
                       : hlr_get_bones() == HLR_BONES_GAME ? HLR_BONES_SMOOTH : HLR_BONES_GAME;
         hlr_set_bones(m);
         rt_log("hlr: bones %s at frame %llu", m == HLR_BONES_GAME ? "game" : "smooth", (unsigned long long)s_frame);
+    }
+    else if (!strcmp(name, "hlr-motion")) {   /* 60 Hz motion: on | off; none = toggle */
+        const bool m = !strcmp(arg, "on") ? true : !strcmp(arg, "off") ? false : !hlr_get_motion();
+        hlr_set_motion(m);
+        rt_log("hlr: motion %s at frame %llu", m ? "on" : "off", (unsigned long long)s_frame);
     }
     else if (!strcmp(name, "hlr-part")) {   /* View > 3D Scene > Stage: PART:on|off, none = toggle */
         char part[16];
@@ -2326,6 +2357,12 @@ int main(int argc, char **argv) {
             if (strcmp(m, "game") && strcmp(m, "smooth")) { fprintf(stderr, "--hlr-bones: game or smooth\n"); return 2; }
             hlr_set_bones(!strcmp(m, "game") ? HLR_BONES_GAME : HLR_BONES_SMOOTH);
             s_hlr_bones_given = true;
+        }
+        else if (!strcmp(argv[i], "--hlr-motion") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (strcmp(m, "on") && strcmp(m, "off")) { fprintf(stderr, "--hlr-motion: on or off\n"); return 2; }
+            hlr_set_motion(!strcmp(m, "on"));
+            s_hlr_motion_given = true;
         }
         else if (!strcmp(argv[i], "--hlr-look") && i + 1 < argc) {
             const char *m = argv[++i];

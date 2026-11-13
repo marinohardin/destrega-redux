@@ -66,6 +66,9 @@ typedef struct {
                          * the PS1's walk order among the other effects; untextured: tpage holds the
                          * draw-mode (e1) word the builder linked before it (its semi mode) */
     s16 slot;           /* ordering-table slot (the game's rule; also for faces it dropped) */
+    u64 key[4];         /* each vertex's identity across updates, for motion (phase 6): characters
+                         * 1 << 62 | model block << 16 | mesh vertex, shadows 2 << 62 | fighter << 16 |
+                         * shadow vertex, effects 3 << 62 | effect object << 16 | builder << 8 | corner */
 } HlrChr;
 
 /* A stage polygon for native 3D drawing (phase 2b), read from the stage model by the capture: the
@@ -155,6 +158,10 @@ void hlr_stage_get_stats(HlrAuditStats *st);
 enum { HLR_BONES_GAME, HLR_BONES_SMOOTH };      /* --hlr-bones: the game's matrices / smoothed + predicted */
 void hlr_set_bones(int m);
 int hlr_get_bones(void);
+/* --hlr-motion on|off (phase 6): the second presentation of each fight update shows the native scene
+ * half way to the next update (hires_gpu.c "Motion", hlr_gpu.c); only with --hlr on and a GPU API */
+void hlr_set_motion(bool on);
+bool hlr_get_motion(void);
 void hlr_char_pre(u32 mb, u32 ot);              /* char_mesh_render (80036b0c) entry: model block, scene OT */
 void hlr_char_post(void);                       /* after it: audit, and the capture when drawing natively */
 bool hlr_chars_native(void);                    /* characters are drawn natively (char_mesh.c skips its extras) */

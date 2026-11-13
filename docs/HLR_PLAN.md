@@ -345,6 +345,64 @@ other than story's first scenes; per-effect depth from the game's own objects (t
 rule of the polygon's size).
 
 
+## Phase 6 results (2026-11-12, `claude/hlr-phase6`)
+
+What exists: `--hlr-motion on|off` (default on in a window, off headless; settings `[display]
+hlr_motion`, menu action `hlr-motion[=on|off]`, View > 3D Scene > 60 Hz Motion on Mac and Windows),
+active with `--hlr on` on the GPU renderer. In fights every second presented frame is an in-between
+picture of the native scene: camera, fighters, shadows and effects halfway to the next update.
+
+**Design: record and replay instead of the over-layer of 4.8.** `hires_gpu.c` records every command
+of a vblank. At the second presentation of an update it copies the target and redraws that update's
+commands into the copy. Each HLR pass is replaced by an in-between frame from the provider in
+`hlr_gpu.c` (camera uniforms and keyed vertices lerped to t = 0.5). The copy is presented. Why not the
+over-layer:
+- Nothing is composed, so no PS1 blend chain loses its per-op clamp. With t = 0 the redraw is
+  byte-identical to the original frame. That is stronger than the plan's "< 0.01 % of pixels
+  off by > 1 step".
+- No latency choice: the game draws update k + 1 into the other buffer during the second vblank
+  that shows k (NOTES.md "HLR phase 6"), so the in-between frame is k -> k + 1 at 0.5 with no
+  added latency, and `interp` / `extrap` are not needed.
+- No new shaders: the copy is a texture copy, and the redraw goes through the existing pipelines.
+
+What stays at the shown update in the in-between frame: everything the HLR does not draw (HUD,
+2D, background strips, anything drawn the original way). Items that cannot be matched keep their
+position: no key, ambiguous, a step > 600 units (`DESTREGA_HLR_MOTION_SNAP`), or a camera cut
+(`DESTREGA_HLR_MOTION_CUT`). The replay is refused, and the picture shown as it was, when the
+recordings are not one update apart or the newer one drew into the shown buffer, a recording has
+more than 65536 commands, or an external pass has no token. `DESTREGA_HLR_MOTION_T` (default 0.5)
+and `DESTREGA_HLR_MOTION_DIAG=1|2` are for tests. Exit lines `hlr-motion:` and `hlr-motion-frames:`.
+
+Acceptance (Metal, M1 Pro, load 40-70 from other work):
+- `--state-hash` equal on / off: vs_hills 2x3, vs_castle1 4x6 16:9 in the exact precision, and
+  `practice_milena` (every effect builder that character uses) with `--verify-overrides` (3686
+  in-between frames). vs_gate with `--savestate-rewind 37:23` and motion on: 96 rewinds, 0
+  mismatches, per-frame state hashes equal to a plain run (766 in-between frames).
+  `test_netplay.py lan_hlr` now runs the host with motion on: hashes equal on both peers and offline,
+  1594 in-between pictures.
+- A windowed capture of 120 presented frames (vs_hills fight, `--dump` now works windowed) has 120
+  distinct pictures with motion on and 61 with it off. The 60 frames that show a new update are
+  byte-identical to the off run.
+- Per-pixel: with `DESTREGA_HLR_MOTION_T=0` every dumped frame is byte-identical to off (vs_hills 2x3
+  4:3 fast precision; vs_castle1 4x6 16:9 exact precision with the guard band): 0 pixels differ.
+  At t = 0.5 the in-between frame is between its neighbours: about 2-4K pixels differ from update k
+  and 7-8K from k + 1 (2x3). It is closer to k because the HUD stays at k.
+- Mac <-> Mac loopback smoothness (`netplay_smooth.py mm_lan`, `--hlr on`), back to back:
+  - first pair: off then on. Host p50 16.6 / 16.7 ms, p95 22.4 / 20.2, held 1.39 / 1.18 %. The on
+    run had a 1.1 s stall while the load went from 37 to 53;
+  - second pair, reversed: on then off. p50 16.7 / 16.4, p95 21.0 / 21.3, held 0.93 / 0.18 %, no
+    stalls, no rollbacks;
+  - so it is unchanged within the machine's noise. Present costs ~0.3 ms per frame more (0.5-0.6 ->
+    0.8-0.9 ms).
+
+- `tools/test_hlr.py motion` (new; in pr_check's hlr group) checks the hash, t = 0 and in-between
+  frame facts on vs_hills. `tools/pr_check.sh` (`PR_JOBS=2`): PASS, 862 s, every step ok (groups net,
+  renderer, menus, hlr, core; Wine skipped).
+
+Not done: a person looking at it in a window (the windowed runs were scripted); Vulkan / D3D12
+(nothing API-specific: copy, render target switch, existing pipelines); the HUD and the
+original-path parts at 60 Hz; more than 60 Hz.
+
 ## 1. Executive summary
 
 - **Keep the capture-not-replacement architecture of the existing plan.** Every guest render

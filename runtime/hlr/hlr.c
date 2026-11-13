@@ -17,12 +17,14 @@
 #include "hlr_gpu.h"
 #include "../hlr_hook.h"
 #include "../hires.h"
+#include "../hires_gpu.h"
 #include "../pgxp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int s_mode = HLR_OFF;
+static void motion_apply(void);
 static unsigned s_parts = HLR_PARTS_IMPLEMENTED;
 static HlrFrame s_fr[2];
 static HlrFrame *s_active;          /* the frame whose table the walk is in */
@@ -122,6 +124,7 @@ void hlr_set_mode(int mode)
     if (mode == s_mode) return;
     hlr_frames_drop();
     s_mode = mode;
+    motion_apply();
     if (mode == HLR_OFF) { memset(&g_hlr, 0, sizeof g_hlr); return; }
     g_hlr.stage_pre = hlr_stage_pre;
     g_hlr.stage_post = hlr_stage_post;
@@ -138,6 +141,11 @@ void hlr_set_mode(int mode)
 }
 
 int hlr_get_mode(void) { return s_mode; }
+
+static bool s_motion;
+static void motion_apply(void) { hires_gpu_set_motion(s_motion && s_mode == HLR_ON ? hlr_gpu_motion_provider() : NULL); }
+void hlr_set_motion(bool on) { s_motion = on; motion_apply(); }
+bool hlr_get_motion(void) { return s_motion; }
 void hlr_set_parts(unsigned parts) { if (parts != s_parts) hlr_frames_drop(); s_parts = parts & HLR_PARTS_ALL; }
 unsigned hlr_get_parts(void) { return s_parts; }
 
@@ -374,5 +382,21 @@ void hlr_report(void)
                (unsigned long long)N.desync, (unsigned long long)G.passes, (unsigned long long)G.msaa_passes,
                (unsigned long long)G.msaa_kept,
                (unsigned long long)G.draws, (unsigned long long)G.tris, (unsigned long long)G.failed);
+    }
+    HgpuMotionStats M;
+    hires_gpu_motion_stats(&M);
+    if (M.vblanks) {
+        HlrMotionStats I;
+        hlr_gpu_motion_stats(&I);
+        rt_log("hlr-motion: %llu vblanks, %llu with a new picture, %llu in-between pictures (%llu commands redrawn);"
+               " not replayed: %llu without a pair, %llu not shown, %llu without native passes, %llu too many commands, %llu failed",
+               (unsigned long long)M.vblanks, (unsigned long long)M.recorded, (unsigned long long)M.replays,
+               (unsigned long long)M.ops_replayed, (unsigned long long)M.no_pair, (unsigned long long)M.not_shown,
+               (unsigned long long)M.no_token, (unsigned long long)M.overflow, (unsigned long long)M.failed);
+        rt_log("hlr-motion-frames: %llu in-between frames (%llu without a next frame, %llu other pass area, %llu camera cuts);"
+               " vertices %llu, keyed %llu, moved %llu (largest step %.0f), snapped %llu, ambiguous %llu",
+               (unsigned long long)I.frames, (unsigned long long)I.unpaired, (unsigned long long)I.refused,
+               (unsigned long long)I.cuts, (unsigned long long)I.verts, (unsigned long long)I.keyed,
+               (unsigned long long)I.matched, I.max_step, (unsigned long long)I.snapped, (unsigned long long)I.ambiguous);
     }
 }

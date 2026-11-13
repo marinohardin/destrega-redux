@@ -146,6 +146,7 @@ void hlr_shadow_post(void)
             hc->v[j][0] = (float)r16s(w); hc->v[j][1] = (float)r16s(w + 2); hc->v[j][2] = (float)r16s(w + 4);
             hc->col[j] = g3;
             hc->uv[j] = (u16)words[2 + 3 * j];
+            hc->key[j] = 2ull << 62 | (u64)(s_fighter & 0x1fffff) << 16 | (u64)vi[j];
         }
         hc->col[0] |= words[0] & 0xff000000u;
         hc->clut = (u16)(words[2] >> 16);

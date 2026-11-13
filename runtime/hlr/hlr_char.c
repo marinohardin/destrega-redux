@@ -481,6 +481,7 @@ void hlr_char_post(void)
                 HlrChr *hc = hlr_frame_add_chr(f);
                 for (int j = 0; j < nvx; j++) {
                     memcpy(hc->v[j], s_wp[vi[j]], sizeof hc->v[j]);
+                    hc->key[j] = 1ull << 62 | (u64)(mb & 0x1fffff) << 16 | (u64)(u16)vi[j];
                     hc->col[j] = col[j] & 0xffffff;
                     hc->uv[j] = (u16)r32(pkt + 12 + 12 * (u32)j);
                 }

@@ -844,6 +844,35 @@ How to read the table:
   ray towards the camera by the polygon's longest diagonal (`DESTREGA_HLR_FX_LIFT`, default 1):
   the projection is unchanged and only geometry nearer than the effect's own size can still hide it.
 
+### HLR phase 6: 60 Hz motion (what the frames look like to the presenter)
+
+Facts the in-between frames rely on (verified: `DESTREGA_HLR_MOTION_DIAG=1` logs every decision with
+the y ranges each vblank drew, vs_hills, vs_castle1, practice_milena, vs_gate):
+- In a fight every update draws exactly once, into one buffer: y 0..239 and y 240..479 alternate. The
+  vblank after it draws nothing. The display shows the buffer of the update drawn two vblanks
+  earlier, so when an update is presented for the second time, the next update is already complete
+  in the other buffer. An in-between picture at t = 0.5 therefore adds no latency (the plan's
+  `interp` / `extrap` choice in HLR_PLAN 4.8 does not arise).
+- Each update, in both buffers, also issues one VRAM copy of 2x1 pixels from (0,0) onto itself.
+  It changes nothing. It is probably the 0x80 packet counted in OT A at the phase 1 probe (likely);
+  the writer was not looked up. The motion recorder ignores self-copies for the "which buffer did
+  this update draw" test, because this copy made every update look as if it touched the shown buffer.
+- Outside fights (menus, character select, story text) the game draws every vblank: there is no
+  pair of recordings two vblanks apart, so nothing is interpolated (`hlr-motion: ... without a pair`).
+
+How it works (presentation only; header comment "Motion" in `hires_gpu.c`, provider in `hlr_gpu.c`):
+`hires_gpu.c` records every command of a vblank (tri / rect / line / fill / copy / put and the HLR's
+external passes, which the provider keeps alive with a reference). At a vblank that draws nothing,
+if the older recording drew into the shown buffer and the newer one outside it, the target is copied,
+the older recording is redrawn into the copy with every external pass replaced by an in-between
+frame (`interp_frame`), and the copy is presented. The in-between frame lerps the camera
+uniforms and every keyed vertex (`HlrChr.key`: fighter vertex by model + index, shadow vertex by
+fighter + index, effect vertex by object + builder slot) towards the same key in the next update.
+Stage polygons move with the camera only. Keys present twice in the next update are ambiguous (none
+seen), steps above 600 world units snap, a camera jump is a cut (no lerp). Everything not drawn by
+the HLR (HUD, 2D, background strips) keeps the shown update's picture: at t = 0 the replay is
+byte-identical to the original frame (tested, see HLR_PLAN "Phase 6 results").
+
 ### Packet attribution: which function wrote each drawn packet (verified (phase 1))
 
 For every node of the GPU linked-list DMA, the probe recorded which guest function last wrote

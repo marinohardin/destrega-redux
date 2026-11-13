@@ -1121,7 +1121,8 @@ hashing all emulated state per frame).
   = intro, title, character select, stage intro, then fight), `--hires-min-fight PCT` (exit 4 unless that % of frames >= F could be shown from the hi-res
   target; the run prints `hires-frames: ...` with hi-res vs 1x-fallback counts). `--press`,
   `--frames` and these work windowed too; a windowed `--frames` run prints the host
-  emu/present time over the fight frames. `--dump` writes frames at the render scale;
+  emu/present time over the fight frames. `--dump` writes frames at the render scale (windowed too:
+  the presented picture, read back after the present);
   `tools/contact_sheet.py --cell WxH --cols N` tiles them; `tools/fight_script.py` prints a
   boot->fight `--press` script.
 - Tests: `runtime/tests/test_hires.c` (rasterizer vs hand-checked counts at several
@@ -1779,10 +1780,11 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
 ## Native high-level renderer (`runtime/hlr/`, `--hlr`; docs/HLR_PLAN.md)
 
 Presentation only, in phases (plan and results: `docs/HLR_PLAN.md`; game facts: NOTES.md "Stage
-builders in full", "HLR phase 2a", "HLR phase 2b", "HLR phase 3", "Shadows", "Effect builders in full"). Phase 2a: the stage is captured
+builders in full", "HLR phase 2a", "HLR phase 2b", "HLR phase 3", "Shadows", "Effect builders in full", "HLR phase 6"). Phase 2a: the stage is captured
 and redrawn exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below). Phase 3:
 the fighters too, in the same depth buffer (below). Phase 4: their shadows, as decals on the floor (below).
-Phase 5: the effects (projectiles, magic, sparks), depth tested in the same scene (below).
+Phase 5: the effects (projectiles, magic, sparks), depth tested in the same scene (below). Phase 6:
+in fights every second presented frame shows the native scene halfway to the next update (below).
 
 - **Hooks** (`runtime/hlr_hook.h`, table `g_hlr` in bus.c; all NULL = off): `stage_pre(mode)` /
   `stage_post()` around the real pass of `stage_render` (`overrides/widescreen.c real_pass`),
@@ -1881,6 +1883,32 @@ read-only wrappers; in `analysis/overrides.txt`, game ABI version 4). Hooks only
   camera by the polygon's longest diagonal (`DESTREGA_HLR_FX_LIFT`, default 1; projection unchanged):
   without it the floor cut them along straight lines. `DESTREGA_HLR_FX_FRAMES=1` logs `hlr-fx-frame:`
   per vblank with effects. `--hlr exact` / `audit` never attach them.
+- **60 Hz motion (phase 6; header comment "Motion" in `hires_gpu.c`, provider in `hlr_gpu.c`)**:
+  `--hlr-motion on|off`. Default on in a window, off headless. Settings `[display] hlr_motion`, menu
+  action `hlr-motion[=on|off]` (none = toggle), View > 3D Scene > 60 Hz Motion. It only acts with
+  `--hlr on` on the GPU renderer (`hires_gpu_set_motion` from `hlr.c motion_apply`). Mechanism:
+  - With a provider set, `hires_gpu.c` records every command between `hires_gpu_motion_vblank` calls
+    (main.c, once per vblank before the first view). External passes are kept through the
+    provider's tokens.
+  - At a vblank that draws nothing, it checks for: an older recording 2 vblanks back that drew inside
+    the shown buffer, a newer one from the last vblank that drew outside it (copies onto themselves do
+    not count: the game's 2x1 copy at (0,0)), no overflow (65536 commands), and every external with a
+    token. If all hold, it copies the target (`ST_ALTCOPY`), redraws the older recording into the copy
+    (`ST_RT`) with each external replaced by `subst(token, next update's token, t)`, and view, present
+    and readback use the copy for that vblank. The redraw skips VRAM dirty bits and texture-cache
+    stamps (`s_mreplay`).
+  - The provider's in-between frame (`interp_frame`, cached per pair) lerps the camera uniforms (not
+    `misc`) and every keyed vertex (`HlrChr.key`, written into `HlrGpuFrame.k` by `put_chr`) towards
+    the same key in the next update. Keys: chars `1<<62 | model << 16 | vertex`, shadows `2<<62 |
+    fighter << 16 | vertex`, effects `3<<62 | object << 16 | builder slot`; stage polygons and strips
+    0 (camera only). Unmatched, ambiguous or > `DESTREGA_HLR_MOTION_SNAP` (600) keep their position.
+    A camera cut (`DESTREGA_HLR_MOTION_CUT` "ROT,TRANS", default 0.25 / 4000) keeps the whole frame.
+    Pass rectangles may differ in position (two buffers), not in size or samples.
+  - `DESTREGA_HLR_MOTION_T` (default 0.5; 0 must give the original frame byte for byte) and
+    `DESTREGA_HLR_MOTION_DIAG=1|2` (each refused / each vblank). Exit lines `hlr-motion:` and
+    `hlr-motion-frames:`.
+  - Presentation only: state hashes are equal on and off, also with rewinds and in netplay
+    (`test_netplay.py lan_hlr` runs the host with it).
 - **2b switches**: `--hlr-msaa 1|2|4|8` (default 4), `--hlr-near clip|ps1` (default clip: polygons
   crossing the near plane are clipped by the GPU; ps1 drops what the PS1 dropped as too near),
   `--hlr-look enhanced|ps1` (default enhanced); settings `[display] hlr_msaa`, `hlr_near`, `hlr_look`

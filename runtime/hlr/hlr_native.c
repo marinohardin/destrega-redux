@@ -361,10 +361,12 @@ static void put_chr(HlrGpuFrame *gf, const HlrFrame *f, const Item *it, int sel)
     }
     const u32 uvr = umin | umax << 8 | vmin << 16 | vmax << 24;
     const u32 info = it->info | (u32)sel << HV_SEL_SH;
+    u64 *key = gf->k + (v - gf->v);
     for (int t = 0; t < 2; t++) {
         if (!(it->tris >> t & 1)) continue;
         for (int k = 0; k < 3; k++, v++) {
             const int i = tri[t][k];
+            *key++ = c->key[i];
             v->pos[0] = c->v[i][0]; v->pos[1] = c->v[i][1]; v->pos[2] = c->v[i][2];
             v->nrm[0] = v->nrm[1] = v->nrm[2] = 0.0f;
             const u32 col = c->col[i];

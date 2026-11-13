@@ -223,6 +223,7 @@ void hlr_fx_post(void)
         }
         const double q[3] = { o[j][0] * sc - f->cam.tr[0], o[j][1] * sc - f->cam.tr[1], o[j][2] * sc - f->cam.tr[2] };
         for (int r = 0; r < 3; r++) hc->v[j][r] = (float)(inv[r][0] * q[0] + inv[r][1] * q[1] + inv[r][2] * q[2]);
+        hc->key[j] = 3ull << 62 | (u64)(s_obj & 0x1fffff) << 16 | (u64)bi << 8 | (u64)j;
     }
     /* colours (0x00BBGGRR), UV, CLUT, page by packet layout (word index - 1 into words[]) */
     switch (b->kind) {
