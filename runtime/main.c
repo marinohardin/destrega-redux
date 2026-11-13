@@ -1236,6 +1236,7 @@ static void present_frame(void) {
     gpu_get_display(&d);
     int extra = ws_present_extra(&d);
     SDL_FRect dst = letterbox_ar(pw, ph, 4.0 / 3.0);
+    SDL_SetRenderDrawColor(s_ren, 0, 0, 0, 255);   /* bars black, whatever drew last (import bar) */
     SDL_RenderClear(s_ren);
     bool have = hires_get_view_wide(&d, extra, &hv);
     if (have && extra) dst = letterbox_ar(pw, ph, 4.0 / 3.0 * (d.w + 2 * extra) / d.w);
@@ -1672,6 +1673,7 @@ static void draw_progress(void *ud, float frac) {
     SDL_RenderRect(s_ren, &(SDL_FRect){120, 228, 400, 24});
     SDL_SetRenderDrawColor(s_ren, 200, 40, 40, 255);
     SDL_RenderFillRect(s_ren, &(SDL_FRect){122, 230, 396 * frac, 20});
+    SDL_SetRenderDrawColor(s_ren, 0, 0, 0, 255);
     SDL_RenderPresent(s_ren);
 }
 
