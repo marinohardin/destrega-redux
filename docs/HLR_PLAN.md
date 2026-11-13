@@ -230,9 +230,54 @@ Acceptance:
 **Not done / deviations.** Per-pixel character lighting (the faces use the game's NCCT vertex
 colours, so the dynamic hit light is right but flat-shaded per vertex); the plan's `float` bones mode
 (phase 0 C showed it removes only 17 % of the step; `game` and `smooth` exist); shadows and effects
-are still the original packets (phase 4 / 5), so a shadow piece the PS1 painted over a foot can now
-be under it; no native Vulkan / D3D12 driver; the triangle subdivision builder 800423e0 still
+were still the original packets (phase 4 / 5; shadows are native since phase 4), so a shadow piece the PS1 painted over a foot could be under it; no native Vulkan / D3D12 driver; the triangle subdivision builder 800423e0 still
 unexercised.
+
+## Phase 4 results (2026-11-12, `claude/hlr-phase4-*`)
+
+What exists: `--hlr on` draws the fighters' shadows natively (AGENTS.md "Native high-level renderer",
+NOTES.md "Shadows"): `runtime/hlr/hlr_shadow.c` (read-only model of `fighter_shadow_render` 8007ec5c:
+audit and capture), hooks `shadow_pre` / `shadow_post` around a new read-only wrapper in
+`overrides/char_mesh.c` (8007ec5c in `analysis/overrides.txt`, game ABI 3, CI stubs), decal items in
+`hlr_native.c`, a sixth pipeline in `hlr_gpu.c` (opaque, depth tested, no depth write) and a depth bias
+for decal vertices in both shader sources (MSL; `hlr.glsl`, SPIR-V and DXIL regenerated). `--hlr-parts`
+gains `shadows` (on by default; needs `stage`), View > 3D Scene > Shadows (Mac, Windows).
+
+**Facts (verified at runtime):** the shadow is 64 triangles of command 0x36 on texture page 0059 =
+semi mode 2 (B - F), 4-bit, CLUT 7d11, on every stage; the game links all of them (no backface test),
+each at the slot of its first vertex's SZ.
+
+**Design.** The triangles are decals on the native floor in the scene's depth buffer:
+- texels without STP go through pipeline 5 (opaque, depth tested, depth not written), STP texels
+  through the tpage's blend (reverse subtract);
+- vertex depth is pulled 40 world units towards the camera (`HV_DECAL`, `misc.w`,
+  `DESTREGA_HLR_SHADOW_BIAS`). The mesh is draped only at its vertices, so across a ridge it dips
+  into the floor: with 8 units the Canyon floor cut a shadow along a straight line, 40 removes it;
+- order inside a pass: stage polygons, then shadows, then fighter faces. A shadow goes in the latest
+  pass its interval allows, but never after the first pass that holds fighter faces. So the feet are
+  drawn over the shadow, as the PS1's OT order has it, and the large bias never covers a foot.
+
+Acceptance:
+- Audit 0 on the whole replay library: all 30 replays, `--hlr audit`. 146290 shadows, 6583050
+  vertices and 9362560 triangles, 0 wrong (vertex, word, grey, link, index, matrix), 0 rejected;
+  the stage audit is still 0 everywhere.
+- `test_hlr.py` (audit on the 12 VS stages, practice, story; chars = the 12 `practice_<char>` replays,
+  both checking the shadow line too; hash; exact; rewind; seams): TEST_HLR_RESULT
+- State hash on == off: vs_anjie_laon_canyon (5825 frames) and the Hills match up to frame 5000,
+  4x6 16:9, `--no-interp --verify-overrides`. 116-118 shadow triangles per frame drawn in 3D (the rest
+  are off screen); 0 failed GPU passes.
+- `--hlr exact` stays byte-identical to off: exact/audit never attach decals (test_hlr `exact`).
+- Metal vs MoltenVK: Canyon frame 4100, 4x6 16:9, 0 pixels differ by more than one 15-bit step.
+  Direct3D 12: DXIL regenerated (DXC under CrossOver), not run.
+- CTest `hlr`: a synthetic shadow built on the guest GTE audits clean. A wrong screen vertex, a wrong
+  grey, an unlinked triangle and another world-screen matrix in RAM are each caught.
+- Visual (contact sheets kept out of the repo, `build/p4/` in the worktree): Canyon and Hills, off /
+  phase 3 / phase 4. The shadows match the original's shape and darkness on flat ground and slopes.
+
+**Not done / seen.** An effect (fire) drawn over a fighter that the PS1 drew behind it: it also happens
+with shadows off, so it is phase 3's (effects stay in painter's order around the passes; phase 5).
+The bias is a constant in world units; a very thin stage object closer than 40 units in front of a
+shadow would not hide it.
 
 ## 1. Executive summary
 

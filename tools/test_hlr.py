@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b and 3. Needs the disc.
+"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b, 3 and 4. Needs the disc.
 
   tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact seams rewind (default: all)
   CASES="hash exact" STAGES="castle1" ...    environment selection (tools/pr_check.sh group hlr)
@@ -21,6 +21,9 @@
           the whole command battery): the character audit reproduces every vertex, colour and face
           the game builds (hlr-chars: 0 mismatched, 0 linked differently, 0 other words, 0 bad, 0
           rejected). CHARS="milena reyus" picks the characters. (audit also checks hlr-chars.)
+          Both audit and chars also check the fighter shadows (phase 4, hlr-shadows: every vertex's
+          RTPS, triangle word, grey and OT slot as the game builds them; 0 mismatched, 0 rejected),
+          and hash requires them drawn natively (hlr-native-shadows) on every run.
   seams   vs_gate (Milena vs Doyle) in the user configuration (GPU fast precision, 4x6 16:9, xbr, full
           colour, PGXP on, the HLR's default 4x MSAA) with a pause (Start) in the fight: --hlr on vs
           off, tools/check_hlr_seams.py on the fight and pause frames finds no thin bright line that
@@ -87,6 +90,29 @@ def chars_audit(log):
                 f'float bones vs SXY {m.group(13)} px')
 
 
+SHADOWS_RE = re.compile(r'hlr-shadows: (\d+) shadows drawn by the game, (\d+) audited; vertices (\d+), (\d+) mismatched; '
+                        r'triangles (\d+), (\d+) with other words, (\d+) with another grey, (\d+) linked elsewhere, '
+                        r'(\d+) bad indices; (\d+) with another camera matrix, (\d+) rejected')
+
+
+def shadows_audit(log):
+    """(ok, text) of the hlr-shadows audit line (phase 4); ok None when the run drew no shadow"""
+    m = SHADOWS_RE.search(log)
+    if not m:
+        return None, 'no shadow audit'
+    calls, aud, v, vb, t, wb, gb, lb, ib, ws, rej = map(int, m.groups())
+    ok = calls > 0 and aud == calls and vb == wb == gb == lb == ib == ws == rej == 0
+    return ok, (f'shadows: {aud}/{calls} audited, {v} vertices ({vb} wrong), {t} triangles ({wb} other words, '
+                f'{gb} other grey, {lb} linked elsewhere, {ib} bad indices), {ws} other matrix, {rej} rejected')
+
+
+def shadows_native(log):
+    """(triangles per frame drawn in 3D, attached, without a frame, other camera) or None"""
+    m = re.search(r'hlr-native-shadows: (\d+) shadow triangles per frame drawn in 3D', log)
+    a = re.search(r'hlr-shadows: (\d+) attached to a native frame, (\d+) without a frame, (\d+) with another camera', log)
+    return (int(m.group(1)), int(a.group(1)), int(a.group(2)), int(a.group(3))) if m and a else None
+
+
 def chars_native(log):
     """(faces per frame drawn in 3D, models attached, without a frame, other camera) or None"""
     m = re.search(r'hlr-native-chars: (\d+) character faces per frame drawn in 3D', log)
@@ -109,9 +135,10 @@ def audit_one(scn):
         return False, f'{scn}: exit {rc}, no audit line' if not m else f'{scn}: exit {rc}'
     pk, mis, un, fr, miss, heads, bad = map(int, m.groups())
     cok, ctext = chars_audit(log)
-    ok = fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0 and cok is not False
+    sok, stext = shadows_audit(log)
+    ok = fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0 and cok is not False and sok is not False
     return ok, (f'{scn}: {fr} frames, {pk} packets, {mis} mismatched, {un} unexplained, {miss} missing, '
-                f'{heads} heads, {bad} bad walks; {alt.group(1) if alt else "?"}; {ctext}')
+                f'{heads} heads, {bad} bad walks; {alt.group(1) if alt else "?"}; {ctext}; {stext}')
 
 
 def chars_one(char):
@@ -123,7 +150,8 @@ def chars_one(char):
         rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=ROOT)
     log = open(log_path, errors='replace').read()
     cok, ctext = chars_audit(log)
-    return bool(cok) and rc == 0, f'practice_{char}: exit {rc}; {ctext}'
+    sok, stext = shadows_audit(log)
+    return bool(cok) and bool(sok) and rc == 0, f'practice_{char}: exit {rc}; {ctext}; {stext}'
 
 
 def case_chars(pool):
@@ -160,12 +188,16 @@ def hash_pair(item):
     dumps = sorted(f for f in os.listdir(d0) if f.startswith('frame_0'))
     ndiff = sum(not same_files(os.path.join(d0, f), os.path.join(d1, f)) for f in dumps)
     cn = chars_native(log1)
-    ok = same and nl and nl[0] > 0 and nl[2] == 0 and dumps and cn and cn[0] > 0 and cn[1] > 0 and cn[3] == 0
+    sn = shadows_native(log1)
+    ok = (same and nl and nl[0] > 0 and nl[2] == 0 and dumps and cn and cn[0] > 0 and cn[1] > 0 and cn[3] == 0
+          and sn and sn[0] > 0 and sn[1] > 0 and sn[3] == 0)
     return ok, (f'{scn}: state hash {"identical" if same else "DIFFERS"}; native 3D stage in '
                 f'{nl[1] if nl else "?"} frames, {nl[0] if nl else "?"} polygons per frame, '
                 f'{nl[2] if nl else "?"} failed GPU passes; characters: {cn[0] if cn else "?"} faces per frame in 3D, '
                 f'{cn[1] if cn else "?"} models attached, {cn[2] if cn else "?"} without a frame, '
-                f'{cn[3] if cn else "?"} with another camera; {ndiff} of {len(dumps)} key frames differ from off')
+                f'{cn[3] if cn else "?"} with another camera; shadows: {sn[0] if sn else "?"} triangles per frame in 3D, '
+                f'{sn[1] if sn else "?"} attached, {sn[3] if sn else "?"} with another camera; '
+                f'{ndiff} of {len(dumps)} key frames differ from off')
 
 
 def case_hash(pool):

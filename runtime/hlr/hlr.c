@@ -104,6 +104,12 @@ bool hlr_chars_native(void)
     return (s_parts & HLR_PART_CHARS) && (s_parts & HLR_PART_STAGE) && hlr_native();
 }
 
+/* shadows are decals on the native floor: the stage must be drawn natively too */
+bool hlr_shadows_native(void)
+{
+    return (s_parts & HLR_PART_SHADOWS) && (s_parts & HLR_PART_STAGE) && hlr_native();
+}
+
 void hlr_set_mode(int mode)
 {
     if (mode < HLR_OFF || mode > HLR_AUDIT) mode = HLR_OFF;
@@ -119,6 +125,8 @@ void hlr_set_mode(int mode)
     g_hlr.char_pre = hlr_char_pre;
     g_hlr.char_post = hlr_char_post;
     g_hlr.chars_native = mode == HLR_ON ? hlr_chars_native : NULL;
+    g_hlr.shadow_pre = hlr_shadow_pre;
+    g_hlr.shadow_post = hlr_shadow_post;
 }
 
 int hlr_get_mode(void) { return s_mode; }
@@ -318,6 +326,7 @@ void hlr_report(void)
     if (s_mode == HLR_OFF && !S.captured) return;
     hlr_stage_report();
     hlr_char_report();
+    hlr_shadow_report();
     if (s_mode == HLR_AUDIT) return;
     u64 left = 0;
     for (int i = 0; i < 2; i++) if (s_fr[i].valid) left++;
@@ -338,6 +347,9 @@ void hlr_report(void)
         if (N.chr_items || N.chr_back)
             rt_log("hlr-native-chars: %.0f character faces per frame drawn in 3D, %.0f per frame facing away (float test)",
                    (double)N.chr_items / (double)N.frames, (double)N.chr_back / (double)N.frames);
+        if (N.shadow_items)
+            rt_log("hlr-native-shadows: %.0f shadow triangles per frame drawn in 3D (depth-biased decals)",
+                   (double)N.shadow_items / (double)N.frames);
         rt_log("hlr-native-draw: %llu frames, %.2f passes per frame, %.0f polygons per frame drawn in 3D"
                " (near %s, look %s, MSAA %dx); %llu culled by the camera, %llu dropped as too near, %llu stale,"
                " %llu without texture, %llu of skipped objects without packet words; %llu packets suppressed; %llu walks given up; GPU %llu passes"

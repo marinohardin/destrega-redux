@@ -47,7 +47,8 @@ void main()
     vec3 p = in_pos;
     float vx = dot(u.rt0.xyz, p) + u.tr.x, vy = dot(u.rt1.xyz, p) + u.tr.y, vz = dot(u.rt2.xyz, p) + u.tr.z;
     if ((in_info & 0x1000u) != 0u) { gl_Position = vec4(p.xy, 0.0, 1.0); vz = 1.0; }
-    else gl_Position = vec4(u.proj.x * vx + u.proj.y * vz, u.proj.z * vy + u.proj.w * vz, u.misc.x, vz);
+    else gl_Position = vec4(u.proj.x * vx + u.proj.y * vz, u.proj.z * vy + u.proj.w * vz,
+                            (in_info & 0x8000u) != 0u ? u.misc.x * vz / max(vz - u.misc.w, 0.5 * u.misc.x) : u.misc.x, vz);
     uint shade = (in_info >> 10) & 3u;
     v_nrm = in_nrm; v_raw = in_col.rgb; v_vz = vz; v_uv = in_uv; v_uvr = in_uvr; v_info = in_info;
     vec3 c = shade == 1u ? H_LIGHT(u, in_nrm) : in_col.rgb;
