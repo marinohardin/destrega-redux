@@ -25,6 +25,16 @@ void f_80036b0c_orig(void) { no_game(__func__); }
 void f_80044210_orig(void) { no_game(__func__); }
 void f_800465a4_orig(void) { no_game(__func__); }
 void f_8007ec5c_orig(void) { no_game(__func__); }
+void f_80055820_orig(void) { no_game(__func__); }
+void f_800559b0_orig(void) { no_game(__func__); }
+void f_80055b70_orig(void) { no_game(__func__); }
+void f_80055d48_orig(void) { no_game(__func__); }
+void f_80055f54_orig(void) { no_game(__func__); }
+void f_80056348_orig(void) { no_game(__func__); }
+void f_8005650c_orig(void) { no_game(__func__); }
+void f_80056704_orig(void) { no_game(__func__); }
+void f_80056908_orig(void) { no_game(__func__); }
+void f_80056b40_orig(void) { no_game(__func__); }
 void f_80044918(void) { no_game(__func__); }
 void f_80045414(void) { no_game(__func__); }
 void f_80095188(void) { no_game(__func__); }

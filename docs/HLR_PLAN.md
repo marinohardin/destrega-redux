@@ -285,6 +285,66 @@ with shadows off, so it is phase 3's (effects stay in painter's order around the
 The bias is a constant in world units; a very thin stage object closer than 40 units in front of a
 shadow would not hide it.
 
+## Phase 5 results (2026-11-12, `claude/hlr-phase5-effects`)
+
+What exists: `--hlr on` draws the effects natively (AGENTS.md "Native high-level renderer", NOTES.md
+"Effect builders in full"): `runtime/hlr/hlr_fx.c` (read-only model of the ten builders 80055820..
+80056b40: audit and capture), hooks `fx_pre` / `fx_post` around ten read-only wrappers in
+`runtime/overrides/effects.c` (`analysis/overrides.txt`, game ABI 4, CI stubs), effect items in
+`hlr_native.c`. No shader change: effects use the existing pipelines (5 = opaque without depth write,
+and the four blends). `--hlr-parts fx` (on by default; needs `stage`), View > 3D Scene > Effects
+(Mac, Windows).
+
+**Facts (verified: generated C read in full, audit at runtime):** every builder is (a0 = object,
+a1 = scene OT); packet, points, facing-test normal and draw-mode prim sit at fixed offsets in the
+object (NOTES.md table). The plan's "e1 word that precedes each packet in its slot" is the builders'
+own mode prim for the five untextured ones (G3, G4, F3); the textured ones carry their semi mode in
+the packet's tpage. Five builders have a facing test (MVMVA, MAC3 > 0); none culls by screen
+position, near plane or size.
+
+**Design.**
+- An effect polygon is an item of the stage's frame: depth tested against stage and fighters, depth
+  never written, drawn in the semi-transparent part of each pass in walk order (opaque texels or an
+  opaque polygon through pipeline 5, STP texels or a semi polygon with the tpage / e1 blend).
+- Order: the PS1's order among effects is kept exactly (each effect takes the earliest pass point
+  that is not before the previous effect's and still inside its interval; a point is added only when
+  none exists: 0.00 per frame in the practice runs). The "sorted by OT slot" of the plan falls out of
+  that: the walk order is the OT order.
+- **Lift instead of "depth test off"**: billboards are screen aligned and about a fighter's height,
+  so drawn at their true depth the floor cut most of them along straight lines (Milena's ice crystals
+  lost their lower-left corners; screenshots in `build/p5/` of the worktree). Every vertex slides
+  along its own view ray towards the camera by the polygon's longest diagonal: the screen position is
+  exact, only geometry nearer than the effect's own size can still hide it (a wall between it and the
+  camera does), and a glow at a fighter's hand is drawn over the arm as on the PS1.
+  `DESTREGA_HLR_FX_LIFT` scales it (0 = true depth).
+
+Acceptance:
+- Audit 0 on every replay with effects (29 of the 30 library replays: all 12 `practice_<char>`, every
+  VS fight, the 1P, story, option and timeout replays; `timeout_draw` has none): 591544 effect polygons
+  built, 539869 audited and 51675 facing away (not drawn by the game), 2094126 vertices, 0 wrong
+  vertex, word, link or e1 word, 0 rejected. All ten builders run in the practice battery. The stage,
+  character and shadow audits stay 0.
+- CTest `hlr`: a synthetic FT4 (80055b70) and G4 with draw mode and facing test (80056908) built on
+  the guest GTE audit clean; a wrong XY, another tag length, another OT slot and a missing e1 word are
+  each caught, a polygon facing away is counted as not drawn.
+- State hash on == off: `test_hlr.py hash` (vs_hills, vs_castle1, story: 2017 effect polygons attached
+  in story, 0 without a frame or with another camera) and `practice_milena` (every effect builder that
+  character uses); `rewind` identical per frame with 68 loads.
+- `--hlr exact` byte-identical to off: all 12 stages at 4:3 / 16:9, 2x3 / 4x6, Metal and Vulkan (effects
+  are never attached in exact or audit).
+- Signature attacks of all 12 characters (two effect-heavy frames each, from the `practice_<char>`
+  replays, off / on at 2x3 16:9): contact sheets `build/p5/sig/sheet0.png`, `sheet1.png` in the worktree
+  (not in the repo). Effects keep their shape, colour and blend; the PS1's order among them holds.
+- Widescreen edge: the builders never cull by screen position, so the effects of the extra 16:9 columns
+  were already in the scene OT; in the guard band (`practice_milena`, checked by eye and by difference image) on and off differ only in
+  the stage, no effect appears or vanishes at the old 4:3 edge.
+- `tools/pr_check.sh` (`PR_JOBS=2`): see the PR.
+
+Not done: native effects seen only on Metal (not on Vulkan, D3D12 or a native driver); effects outside fights
+other than story's first scenes; per-effect depth from the game's own objects (the lift is a fixed
+rule of the polygon's size).
+
+
 ## 1. Executive summary
 
 - **Keep the capture-not-replacement architecture of the existing plan.** Every guest render

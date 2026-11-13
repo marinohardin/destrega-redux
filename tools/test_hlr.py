@@ -120,6 +120,29 @@ def chars_native(log):
     return (int(m.group(1)), int(a.group(1)), int(a.group(2)), int(a.group(3))) if m and a else None
 
 
+FX_RE = re.compile(r'hlr-fx: (\d+) effect polygons built by the game, (\d+) audited, (\d+) facing away \(not drawn\); '
+                   r'vertices (\d+), (\d+) mismatched; (\d+) with other words, (\d+) linked elsewhere, '
+                   r'(\d+) without a draw-mode word, (\d+) rejected')
+
+
+def fx_audit(log):
+    """(ok, text) of the hlr-fx audit line (phase 5); ok None when the run built no effect"""
+    m = FX_RE.search(log)
+    if not m:
+        return None, 'no effect audit'
+    calls, aud, away, v, vb, wb, lb, mb, rej = map(int, m.groups())
+    ok = calls > 0 and aud + away == calls and vb == wb == lb == mb == rej == 0
+    return ok, (f'effects: {aud}/{calls} audited ({away} facing away), {v} vertices ({vb} wrong), {wb} other words, '
+                f'{lb} linked elsewhere, {mb} without a draw mode, {rej} rejected')
+
+
+def fx_native(log):
+    """(effect polygons per frame drawn in 3D, attached, without a frame, other camera) or None"""
+    m = re.search(r'hlr-native-fx: ([\d.]+) effect polygons per frame drawn in 3D', log)
+    a = re.search(r'hlr-fx: (\d+) attached to a native frame, (\d+) without a frame, (\d+) with another camera', log)
+    return (float(m.group(1)), int(a.group(1)), int(a.group(2)), int(a.group(3))) if m and a else None
+
+
 def same_files(a, b):
     return os.path.exists(a) and os.path.exists(b) and filecmp.cmp(a, b, shallow=False)
 
@@ -136,9 +159,11 @@ def audit_one(scn):
     pk, mis, un, fr, miss, heads, bad = map(int, m.groups())
     cok, ctext = chars_audit(log)
     sok, stext = shadows_audit(log)
-    ok = fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0 and cok is not False and sok is not False
+    fok, ftext = fx_audit(log)
+    ok = (fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0 and cok is not False and sok is not False
+          and fok is not False)
     return ok, (f'{scn}: {fr} frames, {pk} packets, {mis} mismatched, {un} unexplained, {miss} missing, '
-                f'{heads} heads, {bad} bad walks; {alt.group(1) if alt else "?"}; {ctext}; {stext}')
+                f'{heads} heads, {bad} bad walks; {alt.group(1) if alt else "?"}; {ctext}; {stext}; {ftext}')
 
 
 def chars_one(char):
@@ -151,7 +176,8 @@ def chars_one(char):
     log = open(log_path, errors='replace').read()
     cok, ctext = chars_audit(log)
     sok, stext = shadows_audit(log)
-    return bool(cok) and bool(sok) and rc == 0, f'practice_{char}: exit {rc}; {ctext}; {stext}'
+    fok, ftext = fx_audit(log)
+    return bool(cok) and bool(sok) and bool(fok) and rc == 0, f'practice_{char}: exit {rc}; {ctext}; {stext}; {ftext}'
 
 
 def case_chars(pool):
@@ -189,14 +215,16 @@ def hash_pair(item):
     ndiff = sum(not same_files(os.path.join(d0, f), os.path.join(d1, f)) for f in dumps)
     cn = chars_native(log1)
     sn = shadows_native(log1)
+    fn = fx_native(log1)
     ok = (same and nl and nl[0] > 0 and nl[2] == 0 and dumps and cn and cn[0] > 0 and cn[1] > 0 and cn[3] == 0
-          and sn and sn[0] > 0 and sn[1] > 0 and sn[3] == 0)
+          and sn and sn[0] > 0 and sn[1] > 0 and sn[3] == 0 and (fn is None or (fn[2] == 0 and fn[3] == 0)))
     return ok, (f'{scn}: state hash {"identical" if same else "DIFFERS"}; native 3D stage in '
                 f'{nl[1] if nl else "?"} frames, {nl[0] if nl else "?"} polygons per frame, '
                 f'{nl[2] if nl else "?"} failed GPU passes; characters: {cn[0] if cn else "?"} faces per frame in 3D, '
                 f'{cn[1] if cn else "?"} models attached, {cn[2] if cn else "?"} without a frame, '
                 f'{cn[3] if cn else "?"} with another camera; shadows: {sn[0] if sn else "?"} triangles per frame in 3D, '
                 f'{sn[1] if sn else "?"} attached, {sn[3] if sn else "?"} with another camera; '
+                f'effects: {f"{fn[0]} polygons per frame in 3D, {fn[1]} attached, {fn[2]} without a frame, {fn[3]} with another camera" if fn else "none drawn"}; '
                 f'{ndiff} of {len(dumps)} key frames differ from off')
 
 

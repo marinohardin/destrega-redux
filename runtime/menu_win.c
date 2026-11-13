@@ -210,6 +210,7 @@ void menu_init(void) {
     add(scene, "Stage", "hlr-part=stage");
     add(scene, "Characters", "hlr-part=chars");
     add(scene, "Shadows", "hlr-part=shadows");
+    add(scene, "Effects", "hlr-part=fx");
     add(scene, "Smooth Character Motion", "hlr-bones");
     AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
     add(scene, "Enhanced Look", "hlr-look=enhanced");

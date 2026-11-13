@@ -408,6 +408,7 @@ void menu_init(void) {
         add(scene, @"Stage", @"hlr-part=stage", nil, 0);
         add(scene, @"Characters", @"hlr-part=chars", nil, 0);
         add(scene, @"Shadows", @"hlr-part=shadows", nil, 0);
+        add(scene, @"Effects", @"hlr-part=fx", nil, 0);
         add(scene, @"Smooth Character Motion", @"hlr-bones", nil, 0);   /* bone filter (hlr_char.c) */
         [scene addItem:[NSMenuItem separatorItem]];
         add(scene, @"Enhanced Look", @"hlr-look=enhanced", nil, 0);   /* per-pixel lighting, filtered textures */
