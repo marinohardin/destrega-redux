@@ -753,12 +753,29 @@ How to read the table:
   its first vertex's SZ; all triangles are linked (no backface test). The texture page is 0059:
   **semi mode 2 (B - F, subtractive)**, 4-bit, CLUT 7d11 (the same on every stage seen).
 - **Native drawing (phase 4):** the 64 triangles become depth-tested decals on the native floor
-  (pipeline 5 of `hlr_gpu.c`: no depth write; vertex depth pulled 40 world units towards the camera,
-  `DESTREGA_HLR_SHADOW_BIAS`). The mesh is draped only at its vertices (spacing ~100), so across a
+  (pipeline 5 of `hlr_gpu.c`: no depth write; vertex depth pulled towards the camera,
+  `DESTREGA_HLR_SHADOW_BIAS`, 40 world units at first, 400 since the first test build, see below). The mesh is draped only at its vertices (spacing ~100), so across a
   ridge of the floor it lies inside the floor: with 8 units the Canyon floor cut a shadow along a
   straight line; 40 removes it. Drawn after the stage polygons and before the fighters of their pass
   (and never in a pass after the first one with fighter faces), so the feet cover the shadow as on
   the PS1, where the shadow's OT slot is behind the fighter's.
+- **Bias 40 was too small (verified, first test build 2026-11-13).** On sloped and stepped floors
+  (Relics, Castle 1, Shrine) the floor still cut pieces out of shadows, and the pieces changed as the
+  fighters moved: the flicker a player reported. Relics, one frame, shadow pixels lost: 15899 at 40,
+  1407 at 100, 826 at 200, none visible at 400; Castle 1 and Shrine shadows are whole at 400.
+  400 is safe because the shadows are drawn before the fighters and never write depth, and on the
+  PS1 the shadow is drawn over the floor by OT order anyway.
+- **Fallen fighters sink into sloped floors (verified, `story_continue_yes` frame 16700, 2x3 PGXP
+  widescreen).** A knocked-down fighter is laid flat at the floor height under its centre; on a slope
+  its limbs go up to ~200 world units below the native floor, the depth test hides them and the
+  shadow (drawn on that floor) shows where the legs should be. The PS1 draws the whole fighter over
+  the floor by OT order. `hlr_native.c` now lifts every fighter vertex that lies within 8 units
+  (`DESTREGA_HLR_FLOOR_MARGIN`, 0 = off) of the floor surface or below it, where the floor is the
+  highest shadow triangle under the vertex, along its view ray towards the eye: the screen position
+  is unchanged, only the depth moves, so the fighter's outline is exactly the PS1's. Keyed vertices
+  for the 60 Hz in-between frames are lifted the same way. Only where a shadow exists, i.e. under
+  fighters. ~38.5 vertices per frame lifted at that frame (`hlr-native-shadows:` exit line); legs and
+  hands visible as on the PS1.
 
 ### Effects
 

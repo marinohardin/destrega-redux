@@ -250,7 +250,7 @@ each at the slot of its first vertex's SZ.
 **Design.** The triangles are decals on the native floor in the scene's depth buffer:
 - texels without STP go through pipeline 5 (opaque, depth tested, depth not written), STP texels
   through the tpage's blend (reverse subtract);
-- vertex depth is pulled 40 world units towards the camera (`HV_DECAL`, `misc.w`,
+- vertex depth is pulled 40 world units (400 since the first test build) towards the camera (`HV_DECAL`, `misc.w`,
   `DESTREGA_HLR_SHADOW_BIAS`). The mesh is draped only at its vertices, so across a ridge it dips
   into the floor: with 8 units the Canyon floor cut a shadow along a straight line, 40 removes it;
 - order inside a pass: stage polygons, then shadows, then fighter faces. A shadow goes in the latest
@@ -282,8 +282,8 @@ Acceptance:
 
 **Not done / seen.** An effect (fire) drawn over a fighter that the PS1 drew behind it: it also happens
 with shadows off, so it is phase 3's (effects stay in painter's order around the passes; phase 5).
-The bias is a constant in world units; a very thin stage object closer than 40 units in front of a
-shadow would not hide it.
+The bias is a constant in world units; a stage object closer than the bias (400 units) in front of a
+shadow would not hide it (none seen).
 
 ## Phase 5 results (2026-11-12, `claude/hlr-phase5-effects`)
 
@@ -411,6 +411,12 @@ original-path parts at 60 Hz; more than 60 Hz.
 - An effect lifted in front of a fighter the PS1 draws over it (phase 5): such effects are now drawn
   like shadows, before the fighters (NOTES.md). `vs_laon_gradd_gate` 3768-3786: the dust cloud under
   the knocked-down fighter is behind him again, as large as in the original.
+- Shadows over a fallen fighter on a sloped floor (second test build report): the fighter's limbs lay
+  below the native floor. Fighter vertices at or below the shadow mesh are now moved along their view
+  ray to just above it (same pixel, nearer depth). `story_continue_yes` 16700: legs visible as on the
+  PS1 (NOTES.md "Fallen fighters sink into sloped floors").
+- Shadow flicker on sloped / stepped floors: the decal bias (40) let the floor cut pieces out of the
+  shadows. Now 400 (Relics: 15899 lost pixels at 40, none visible at 400; Castle 1, Shrine whole).
 
 ## Phase 7 results (2026-11-12)
 
