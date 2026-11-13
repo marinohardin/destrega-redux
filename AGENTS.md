@@ -1914,7 +1914,12 @@ notarization steps) is in `docs/RELEASES.md`.
   `Contents/Resources/zig`; win: exe + DLLs + `zig/`; linux: `make_appimage.sh`, needs
   `appimagetool` on PATH, never downloaded by the script). Refused unless the binary is a launcher
   build and `check_no_game_code.py` passes. Zig is never committed; the dev copy lives in
-  `build/zig/`.
+  `build/zig/`. **mac is a `.dmg`** (the app, an Applications shortcut, README, licences):
+  `--sign "Developer ID Application: ..."` signs app and image (secure timestamp, hardened runtime
+  on every nested executable), `--notarize PROFILE` (a `notarytool store-credentials` keychain
+  profile, made by the owner) notarizes and staples the app, then the image, and checks the image
+  with `spctl`. The Linux release package is the CI artifact `LAUNCHER-linux-x86_64` (tar.gz,
+  SDL3 in `lib/`, the player's gcc / clang), not the AppImage.
 
 ## Pitfalls
 

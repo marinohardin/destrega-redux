@@ -45,7 +45,8 @@ the launcher builds on first launch from the player's own disc and loads at star
 - The module interface is explicit and versioned (`runtime/game_abi.h`): a module built for
   other headers, another ABI version or another target is refused with a plain message.
 - Packages: `tools/package_release.sh launcher mac|win|linux --zig DIR` ->
-  `Destrega-<version>-<os>-<arch>.zip` (Linux: an AppImage, `tools/make_appimage.sh`, needs
+  `Destrega-<version>-<os>-<arch>.zip` (macOS: a signed, notarized `.dmg` with an Applications
+  shortcut, `--sign IDENTITY --notarize PROFILE`; Linux: an AppImage, `tools/make_appimage.sh`, needs
   `appimagetool` installed by hand). Every package is checked by `tools/check_no_game_code.py`
   (no generated-code files, no recompiled-function names beyond the interface, no bytes of the
   game executable) and refused if anything is found.

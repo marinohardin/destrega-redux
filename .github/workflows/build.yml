@@ -16,6 +16,9 @@
 #                                         from it, and it still compiles to signed DXIL with
 #                                         Microsoft's DXC (Linux release, downloaded)
 #
+# The Linux clang job also packages the launcher build (no game code by construction, checked by
+# tools/check_no_game_code.py) as LAUNCHER-linux-x86_64 for releases.
+#
 # Each OS job also packages the STUB build with tools/package_release.sh (proves packaging works:
 # app bundle / DLL collection, licence files, version resources) and uploads it as
 # STUB-NOT-PLAYABLE-<os>: no game code, cannot run the game, kept 3 days. Real (playable)
@@ -251,10 +254,11 @@ jobs:
           cat out.txt
           test $rc = 1 && grep -q "no data pack" out.txt
       # The launcher layout (docs/RELEASES.md option A) needs no gen/ at all: the executable holds
-      # no game code by construction. Built and checked here, never packaged or uploaded.
+      # no game code by construction. Built and checked here; the clang job also packages it
+      # (below) for releases.
       - name: Launcher build (no game code)
         run: |
-          cmake -S . -B build/launcher -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_PREFIX_PATH=$HOME/sdl3 -DDESTREGA_GAME_MODULE=ON -DDESTREGA_DEV_GAME_MODULE=OFF
+          cmake -S . -B build/launcher -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_PREFIX_PATH=$HOME/sdl3 -DDESTREGA_GAME_MODULE=ON -DDESTREGA_DEV_GAME_MODULE=OFF
           cmake --build build/launcher
           python3 tools/check_no_game_code.py build/launcher/destrega
           LD_LIBRARY_PATH=$HOME/sdl3/lib ./build/launcher/destrega --help 2>&1 | grep -q -- --game-cc
@@ -272,6 +276,31 @@ jobs:
             LD_LIBRARY_PATH=$HOME/sdl3/lib gdb -batch -ex run -ex bt --args ./build/launcher/destrega --headless --data-dir $st/data2 --game-cc ${{ matrix.cc }} --game-selftest $st/gen 2>&1 | tail -40
           fi
           test $rc = 0 && grep -q "self-test passed" st.txt
+      # Linux launcher package (no game code; the player's own gcc / clang builds the game module
+      # on first launch, no bundled Zig): the executable, SDL3 next to it (RUNPATH $ORIGIN/lib),
+      # licences. Checked with check_no_game_code.py; a release attaches this artifact.
+      - name: Package the Linux launcher
+        if: matrix.cc == 'clang'
+        run: |
+          sudo apt-get install -y patchelf
+          ver=$(python3 tools/version.py describe | tr + -)
+          d=$RUNNER_TEMP/pkg/Destrega-$ver-linux-x86_64
+          mkdir -p $d/lib
+          cp build/launcher/destrega $d/
+          cp -L $HOME/sdl3/lib/libSDL3.so.0 $d/lib/
+          patchelf --set-rpath '$ORIGIN/lib' $d/destrega
+          cp LICENSE THIRD_PARTY_LICENSES.txt $d/
+          cp docs/README-LINUX.txt $d/README.txt
+          python3 tools/check_no_game_code.py $d
+          ldd $d/destrega | grep -q "$d/lib/libSDL3.so.0"
+          tar -C $RUNNER_TEMP/pkg -czf Destrega-$ver-linux-x86_64.tar.gz Destrega-$ver-linux-x86_64
+          echo "PKG=Destrega-$ver-linux-x86_64.tar.gz" >> $GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        if: matrix.cc == 'clang'
+        with:
+          name: LAUNCHER-linux-x86_64
+          path: ${{ env.PKG }}
+          retention-days: 7
 
   macos:
     name: macOS (stub app bundle)

@@ -60,7 +60,9 @@ done
 
 [ "$(uname -s)" = Darwin ] || { echo "make_app: macOS only" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "make_app: no executable at $BIN (build first: cmake --build build/cmake)" >&2; exit 1; }
-[ -n "$VERSION" ] || VERSION="$(python3 "$ROOT/tools/version.py" short)"
+# CFBundleShortVersionString must be numeric: a pre-release tag (v0.1.0-alpha) gives 0.1.0 there;
+# the full string is in DestregaBuild.
+[ -n "$VERSION" ] || VERSION="$(python3 "$ROOT/tools/version.py" short | sed 's/-.*//')"
 BUILD_NUM="$(python3 "$ROOT/tools/version.py" build)"
 BUILD_DESC="$(python3 "$ROOT/tools/version.py" describe)"
 YEAR="$(date +%Y)"
@@ -156,17 +158,20 @@ leftover="$(for o in "$EXE" "$TMPAPP"/Contents/Frameworks/*; do [ -f "$o" ] && d
             | grep -vE '^(/usr/lib/|/System/|@rpath/|@executable_path/|@loader_path/)' || true)"
 if [ -n "$leftover" ]; then echo "make_app: unbundled dependencies remain:" >&2; echo "$leftover" >&2; exit 1; fi
 
-# 4. Sign (relinking invalidated the original signatures): libraries, then the bundle.
+# 4. Sign (relinking invalidated the original signatures): libraries, then the bundle. A real
+#    identity (Developer ID) gets what notarization requires: a secure timestamp and the hardened
+#    runtime on every executable; ad-hoc signing stays offline (no timestamp server).
+TS=(--timestamp=none); RT=()
+if [ "$SIGN" != "-" ]; then TS=(--timestamp); RT=(--options runtime); fi
 for lib in "$TMPAPP"/Contents/Frameworks/*; do
-    [ -f "$lib" ] && codesign --force --timestamp=none -s "$SIGN" "$lib" 2>/dev/null
+    [ -f "$lib" ] && codesign --force "${TS[@]}" -s "$SIGN" "$lib"
 done
 # Zig's compiler is a nested executable: signed on its own before the bundle seals it.
 [ -f "$TMPAPP/Contents/Resources/zig/zig" ] &&
-    codesign --force --timestamp=none -s "$SIGN" "$TMPAPP/Contents/Resources/zig/zig" 2>/dev/null
-SIGNOPTS=()
-if [ "$SIGN" != "-" ]; then SIGNOPTS+=(--options runtime); fi
+    codesign --force "${TS[@]}" ${RT[@]+"${RT[@]}"} -s "$SIGN" "$TMPAPP/Contents/Resources/zig/zig"
+SIGNOPTS=(${RT[@]+"${RT[@]}"})
 if [ -n "$ENTITLEMENTS" ]; then SIGNOPTS+=(--entitlements "$ENTITLEMENTS"); fi
-codesign --force --timestamp=none ${SIGNOPTS[@]+"${SIGNOPTS[@]}"} -s "$SIGN" "$TMPAPP" 2>/dev/null
+codesign --force "${TS[@]}" ${SIGNOPTS[@]+"${SIGNOPTS[@]}"} -s "$SIGN" "$TMPAPP"
 codesign --verify --strict "$TMPAPP"
 
 rm -rf "$APP"
