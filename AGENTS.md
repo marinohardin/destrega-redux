@@ -1121,7 +1121,8 @@ hashing all emulated state per frame).
   = intro, title, character select, stage intro, then fight), `--hires-min-fight PCT` (exit 4 unless that % of frames >= F could be shown from the hi-res
   target; the run prints `hires-frames: ...` with hi-res vs 1x-fallback counts). `--press`,
   `--frames` and these work windowed too; a windowed `--frames` run prints the host
-  emu/present time over the fight frames. `--dump` writes frames at the render scale;
+  emu/present time over the fight frames. `--dump` writes frames at the render scale (windowed too:
+  the presented picture, read back after the present);
   `tools/contact_sheet.py --cell WxH --cols N` tiles them; `tools/fight_script.py` prints a
   boot->fight `--press` script.
 - Tests: `runtime/tests/test_hires.c` (rasterizer vs hand-checked counts at several
@@ -1779,16 +1780,22 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
 ## Native high-level renderer (`runtime/hlr/`, `--hlr`; docs/HLR_PLAN.md)
 
 Presentation only, in phases (plan and results: `docs/HLR_PLAN.md`; game facts: NOTES.md "Stage
-builders in full", "HLR phase 2a", "HLR phase 2b", "HLR phase 3"). Phase 2a: the stage is captured
+builders in full", "HLR phase 2a", "HLR phase 2b", "HLR phase 3", "Shadows", "Effect builders in full", "HLR phase 6"). Phase 2a: the stage is captured
 and redrawn exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below). Phase 3:
-the fighters too, in the same depth buffer (below).
+the fighters too, in the same depth buffer (below). Phase 4: their shadows, as decals on the floor (below).
+Phase 5: the effects (projectiles, magic, sparks), depth tested in the same scene (below). Phase 6:
+in fights every second presented frame shows the native scene halfway to the next update (below).
 
 - **Hooks** (`runtime/hlr_hook.h`, table `g_hlr` in bus.c; all NULL = off): `stage_pre(mode)` /
   `stage_post()` around the real pass of `stage_render` (`overrides/widescreen.c real_pass`),
   `ll_filter(node)` per node of the GPU linked-list DMA (`bus.c`; `0xffffffff` = end of the walk),
   `on_restore()` from `ss_restore`, `char_pre(model, ot)` / `char_post()` around every call of
   `char_mesh_render` 80036b0c (`overrides/char_mesh.c`, a read-only wrapper), `chars_native()` (true
-  while the faces are drawn natively: char_mesh.c then adds no PGXP extras). Hooks only read guest RAM / scratchpad; GTE work runs on a copy
+  while the faces are drawn natively: char_mesh.c then adds no PGXP extras), `shadow_pre(fighter, ot,
+  buf)` / `shadow_post()` around every call of `fighter_shadow_render` 8007ec5c (`overrides/char_mesh.c`,
+  read-only wrapper; listed in `analysis/overrides.txt` and the game ABI), `fx_pre(builder, obj, ot)` /
+`fx_post()` around every call of the ten effect builders 80055820..80056b40 (`overrides/effects.c`,
+read-only wrappers; in `analysis/overrides.txt`, game ABI version 4). Hooks only read guest RAM / scratchpad; GTE work runs on a copy
   (`gte_exec_on`); they never call guest code or touch cycles, the scheduler, RAM or GPU state.
 - **Capture** (`hlr_stage.c`): predicts every stage packet (all builders incl. the 0x2000
   subdivision ones), audits the prediction against RAM and the scene OT, and a clean frame becomes
@@ -1803,9 +1810,9 @@ the fighters too, in the same depth buffer (below).
 - **Modes**: `off`; `audit` (prediction + checks, draws nothing differently); `exact` (any hi-res
   backend; byte-identical to off); `on` (native 3D stage, needs the GPU renderer: Metal (MSL),
   Vulkan (SPIR-V) or Direct3D 12 (DXIL, `hlr_dxil.h` from `gen_dxil.py --src hlr`)). Default: on in a window, off headless. `--hlr-parts
-  stage|chars|shadows|fx|story|all|none` (stage and chars exist). Settings `[display] hlr` (on|off),
-  `hlr_parts`; menu actions `hlr[=on|off]`, `hlr-part=stage|chars[:on|off]`; View > 3D Scene > Original /
-  Native, Stage, Characters, Smooth Character Motion (Mac, Windows; greyed unless a GPU API renders). `runtime/hlr/` is outside the
+  stage|chars|shadows|fx|story|all|none` (stage, chars, shadows and fx exist; shadows and fx need the stage). Settings `[display] hlr` (on|off),
+  `hlr_parts`; menu actions `hlr[=on|off]`, `hlr-part=stage|chars|shadows|fx[:on|off]`; View > 3D Scene > Original /
+  Native, Stage, Characters, Shadows, Effects, Smooth Character Motion (Mac, Windows; greyed unless a GPU API renders). `runtime/hlr/` is outside the
   netplay build identity (`source_ident.py`), `hlr_hook.h` and the call sites are inside.
 - **Native 3D stage (`on`, phase 2b)**: the capture also records every stage polygon (model
   vertices = world coordinates, normals / colours, its packet for UV / CLUT / page) of every object
@@ -1838,7 +1845,7 @@ the fighters too, in the same depth buffer (below).
   PS1 lit it), textures through `material_texture`; `hlr_native.c` draws them opaque in the stage's
   passes with depth written, float backface test per triangle (faces the integer NCLIP dropped
   but that face the camera are drawn); their packets go to the 1x GPU only. A changed packet
-  (stale) or a model whose audit fails is drawn the original way. Shadows, effects, HUD: original.
+  (stale) or a model whose audit fails is drawn the original way. Effects, HUD: original.
   Scheduling: an other constrains an item only when their boxes overlap (2 px margin), and a
   semi-transparent other sorted in between a fighter's own faces (its shadow's pieces) does not
   constrain that fighter (without these a Hills fight needed 19.6 passes per frame);
@@ -1851,6 +1858,57 @@ the fighters too, in the same depth buffer (below).
   as last update (pause, hit-stop) is held: output = input, trend 0 (`hlr_bone_filter_hold`; it used
   to coast on for ~1 s after a pause). `DESTREGA_HLR_BONE_DIAG=1|LO-HI` (libetc vblank
   count) prints `hlr-bones-diag:` (per-update step and jitter, game vs filtered).
+- **Native shadows (`on`, phase 4; `hlr_shadow.c`, header comment)**: after each `fighter_shadow_render`
+  call the audit re-projects the 45 world vertices (800e70f0) with a host RTPS and compares them with
+  800e6f80, then checks each of the 64 triangles' words, grey and OT slot (`hlr-shadows:` exit lines,
+  must be 0 mismatched / rejected; a second line gives the packets' command, page and semi mode: 36,
+  0059, mode 2 = B - F). A clean shadow's triangles join the stage's frame as decals (`HlrChr.decal`):
+  pipeline 5 of `hlr_gpu.c` (no depth write) for texels without STP, the tpage's blend for STP ones,
+  vertex depth pulled towards the camera by 40 world units (`HV_DECAL`, `misc.w`;
+  `DESTREGA_HLR_SHADOW_BIAS`), drawn after the pass's stage polygons and before its fighter faces, in
+  the latest pass their interval allows but not after the first pass with fighter faces. Exit line
+  `hlr-native-shadows:`. `--hlr exact` / `audit` never attach them (exact stays byte-identical).
+- **Native effects (`on`, phase 5; `hlr_fx.c`, header comment)**: after each builder call the audit
+  repeats the facing test (MVMVA on the object's normal), a host RTPT / RTPS of the object's points vs
+  the packet's XY words, the tag length and polygon type, the OT slot (minimum SZ, 3-segment map) and,
+  for the untextured builders, the draw-mode prim with its e1 word (`hlr-fx:` exit lines, must be 0
+  mismatched / other words / linked elsewhere / without a draw-mode word / rejected; a per-builder line
+  with the command bytes). A clean polygon joins the stage's frame (`HlrChr.fx`; world vertices from
+  the effect's own GTE camera and the frame camera's inverse; colours, UV, CLUT, page by layout; the
+  e1 word as the page of the untextured ones) and is drawn in the pass loop's semi-transparent part in
+  walk order: depth tested, depth never written, opaque texels / an opaque polygon through pipeline 5,
+  STP texels / a semi polygon with the page's blend. Placement keeps the PS1's order among effects
+  (earliest pass point in (lo, hi] not before the previous effect's; `hlr-native-fx:` counts points
+  added). Billboards reach into the floor, so every vertex slides along its view ray towards the
+  camera by the polygon's longest diagonal (`DESTREGA_HLR_FX_LIFT`, default 1; projection unchanged):
+  without it the floor cut them along straight lines. `DESTREGA_HLR_FX_FRAMES=1` logs `hlr-fx-frame:`
+  per vblank with effects. `--hlr exact` / `audit` never attach them.
+- **60 Hz motion (phase 6; header comment "Motion" in `hires_gpu.c`, provider in `hlr_gpu.c`)**:
+  `--hlr-motion on|off`. Default on in a window, off headless. Settings `[display] hlr_motion`, menu
+  action `hlr-motion[=on|off]` (none = toggle), View > 3D Scene > 60 Hz Motion. It only acts with
+  `--hlr on` on the GPU renderer (`hires_gpu_set_motion` from `hlr.c motion_apply`). Mechanism:
+  - With a provider set, `hires_gpu.c` records every command between `hires_gpu_motion_vblank` calls
+    (main.c, once per vblank before the first view). External passes are kept through the
+    provider's tokens.
+  - At a vblank that draws nothing, it checks for: an older recording 2 vblanks back that drew inside
+    the shown buffer, a newer one from the last vblank that drew outside it (copies onto themselves do
+    not count: the game's 2x1 copy at (0,0)), no overflow (65536 commands), and every external with a
+    token. If all hold, it copies the target (`ST_ALTCOPY`), redraws the older recording into the copy
+    (`ST_RT`) with each external replaced by `subst(token, next update's token, t)`, and view, present
+    and readback use the copy for that vblank. The redraw skips VRAM dirty bits and texture-cache
+    stamps (`s_mreplay`).
+  - The provider's in-between frame (`interp_frame`, cached per pair) lerps the camera uniforms (not
+    `misc`) and every keyed vertex (`HlrChr.key`, written into `HlrGpuFrame.k` by `put_chr`) towards
+    the same key in the next update. Keys: chars `1<<62 | model << 16 | vertex`, shadows `2<<62 |
+    fighter << 16 | vertex`, effects `3<<62 | object << 16 | builder slot`; stage polygons and strips
+    0 (camera only). Unmatched, ambiguous or > `DESTREGA_HLR_MOTION_SNAP` (600) keep their position.
+    A camera cut (`DESTREGA_HLR_MOTION_CUT` "ROT,TRANS", default 0.25 / 4000) keeps the whole frame.
+    Pass rectangles may differ in position (two buffers), not in size or samples.
+  - `DESTREGA_HLR_MOTION_T` (default 0.5; 0 must give the original frame byte for byte) and
+    `DESTREGA_HLR_MOTION_DIAG=1|2` (each refused / each vblank). Exit lines `hlr-motion:` and
+    `hlr-motion-frames:`.
+  - Presentation only: state hashes are equal on and off, also with rewinds and in netplay
+    (`test_netplay.py lan_hlr` runs the host with it).
 - **2b switches**: `--hlr-msaa 1|2|4|8` (default 4), `--hlr-near clip|ps1` (default clip: polygons
   crossing the near plane are clipped by the GPU; ps1 drops what the PS1 dropped as too near),
   `--hlr-look enhanced|ps1` (default enhanced); settings `[display] hlr_msaa`, `hlr_near`, `hlr_look`
@@ -1868,12 +1926,13 @@ the fighters too, in the same depth buffer (below).
   `hlr_gpu_vulkan` (`test_hires_gpu external [API]`: empty external passes leave GPU == software, and
   a cube through `hlr_gpu_external`: face colours, depth test, MSAA resolve, 15-bit channel order;
   `external d3d12` passes under CrossOver (vkd3d) with the same cube pixel counts as Metal and MoltenVK);
-  `tools/test_hlr.py [audit chars hash exact seams rewind]` (`seams`: vs_gate fight + pause in the
+  `tools/test_hlr.py [audit chars hash exact seams rewind]` (audit / chars also check the `hlr-fx:` line;
+  chars requires effects in every `practice_<char>`) (`seams`: vs_gate fight + pause in the
   user configuration, `tools/check_hlr_seams.py` on --hlr on vs off dumps: no long thin bright line
-  only the HLR draws; plus the NOKEEP negative check) (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`,
+  only the HLR draws; plus the NOKEEP negative check, run with `--hlr-parts stage,chars` since native shadows remove the pass splits it needs) (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`,
   `CHARS`; `chars` = the `practice_<char>` replays with `--hlr audit`, every character's move set;
   `hash` and `rewind` require the native draw line and native character faces); CTest `hlr` also
-  audits a synthetic fighter built on the guest GTE (faults must be caught) and the bone filter; `test_netplay.py lan_hlr`; pr_check group `hlr`.
+  audits a synthetic effect (FT4; G4 with draw mode and facing test: five faults caught) and a synthetic fighter built on the guest GTE (faults must be caught) and the bone filter; `test_netplay.py lan_hlr`; pr_check group `hlr`.
   `tools/hlr_diff.py` (not a test): every VS stage key frame off / on at 4x6 16:9, contact sheets
   and a difference table in `build/hlr2b/diff/`; `--chars "milena laon ..."` does the same for
   practice replays (fighters close up). Must hold: audit 0 everywhere, state hashes on ==

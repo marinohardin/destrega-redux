@@ -15,7 +15,7 @@
 
 enum { HLR_OFF, HLR_ON, HLR_EXACT, HLR_AUDIT };
 enum { HLR_PART_STAGE = 1, HLR_PART_CHARS = 2, HLR_PART_SHADOWS = 4, HLR_PART_FX = 8, HLR_PART_STORY = 16,
-       HLR_PARTS_ALL = 31, HLR_PARTS_IMPLEMENTED = HLR_PART_STAGE | HLR_PART_CHARS };
+       HLR_PARTS_ALL = 31, HLR_PARTS_IMPLEMENTED = HLR_PART_STAGE | HLR_PART_CHARS | HLR_PART_SHADOWS | HLR_PART_FX };
 
 /* ---- switches (hlr.c) ---------------------------------------------------------------- */
 int hlr_parse_mode(const char *s);              /* -1 if invalid */
@@ -59,8 +59,16 @@ typedef struct {
     u16 clut, tpage;
     u32 pkt;            /* RAM offset of its packet (this frame's half of the face record) */
     u8 nv, code, linked;    /* linked: the game put it into the table this frame */
-    u8 model;           /* which char_mesh_render call of the update (0, 1, ...) */
+    u8 model;           /* which char_mesh_render call of the update (0, 1, ...); shadows 128 + n */
+    u8 decal;           /* a fighter shadow triangle (phase 4, hlr_shadow.c): drawn on the floor with a
+                         * depth bias, never writing depth, after the floor under it */
+    u8 fx;              /* an effect polygon (phase 5, hlr_fx.c): depth tested, never writing depth, in
+                         * the PS1's walk order among the other effects; untextured: tpage holds the
+                         * draw-mode (e1) word the builder linked before it (its semi mode) */
     s16 slot;           /* ordering-table slot (the game's rule; also for faces it dropped) */
+    u64 key[4];         /* each vertex's identity across updates, for motion (phase 6): characters
+                         * 1 << 62 | model block << 16 | mesh vertex, shadows 2 << 62 | fighter << 16 |
+                         * shadow vertex, effects 3 << 62 | effect object << 16 | builder << 8 | corner */
 } HlrChr;
 
 /* A stage polygon for native 3D drawing (phase 2b), read from the stage model by the capture: the
@@ -134,6 +142,8 @@ typedef struct {
     u64 frames, passes, items, culled, near_dropped, stale, no_texture, suppressed, desync, lookups;
     u64 hidden_bad;     /* polygons of objects the PS1 skipped whose packet words were never written */
     u64 chr_items, chr_back;    /* character faces drawn natively, faces found facing away (float) */
+    u64 shadow_items;           /* shadow (decal) triangles drawn natively */
+    u64 fx_items, fx_points;    /* effect polygons drawn natively, pass points added for them */
 } HlrNativeStats;
 void hlr_native_get_stats(HlrNativeStats *st);
 
@@ -148,6 +158,10 @@ void hlr_stage_get_stats(HlrAuditStats *st);
 enum { HLR_BONES_GAME, HLR_BONES_SMOOTH };      /* --hlr-bones: the game's matrices / smoothed + predicted */
 void hlr_set_bones(int m);
 int hlr_get_bones(void);
+/* --hlr-motion on|off (phase 6): the second presentation of each fight update shows the native scene
+ * half way to the next update (hires_gpu.c "Motion", hlr_gpu.c); only with --hlr on and a GPU API */
+void hlr_set_motion(bool on);
+bool hlr_get_motion(void);
 void hlr_char_pre(u32 mb, u32 ot);              /* char_mesh_render (80036b0c) entry: model block, scene OT */
 void hlr_char_post(void);                       /* after it: audit, and the capture when drawing natively */
 bool hlr_chars_native(void);                    /* characters are drawn natively (char_mesh.c skips its extras) */
@@ -167,3 +181,27 @@ typedef struct { float s[12], b[12], x[12]; int n; } HlrBoneFilter;   /* level, 
 void hlr_bone_filter(HlrBoneFilter *bf, const float x[12], float out[12]);
 /* the model's input did not change since the last update (pause, hit-stop): output = input, trend 0 */
 void hlr_bone_filter_hold(HlrBoneFilter *bf, const float x[12], float out[12]);
+
+/* ---- shadows (hlr_shadow.c, phase 4) -------------------------------------------------- */
+void hlr_shadow_pre(u32 fighter, u32 ot, u32 buf);  /* fighter_shadow_render (8007ec5c) entry */
+void hlr_shadow_post(void);                     /* after it: audit, and the capture when drawing natively */
+bool hlr_shadows_native(void);                  /* shadows are drawn natively (needs the stage drawn natively) */
+void hlr_shadow_report(void);                   /* "hlr-shadows: ..." */
+typedef struct {
+    u64 calls, audited, vtx, vtx_bad, faces, word_bad, link_bad, grey_bad, idx_bad, ws_bad, frames_bad;
+    u64 attached, no_frame, cam_diff;
+} HlrShadowStats;
+void hlr_shadow_get_stats(HlrShadowStats *st);
+
+/* ---- effects (hlr_fx.c, phase 5) ------------------------------------------------------ */
+void hlr_fx_pre(u32 builder, u32 obj, u32 ot);  /* an effect builder (80055820 .. 80056b40) entry */
+void hlr_fx_post(void);                         /* after it: audit, and the capture when drawing natively */
+bool hlr_fx_native(void);                       /* effects are drawn natively (needs the stage drawn natively) */
+void hlr_fx_report(void);                       /* "hlr-fx: ..." */
+#define HLR_FX_BUILDERS 10
+typedef struct {
+    u64 calls[HLR_FX_BUILDERS], drawn[HLR_FX_BUILDERS], skipped[HLR_FX_BUILDERS];
+    u64 audited, test_bad, vtx, vtx_bad, word_bad, link_bad, mode_bad, frames_bad;
+    u64 attached, no_frame, cam_diff, lifted;   /* lifted: vertices moved towards the camera */
+} HlrFxStats;
+void hlr_fx_get_stats(HlrFxStats *st);

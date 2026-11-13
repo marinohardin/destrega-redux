@@ -230,9 +230,178 @@ Acceptance:
 **Not done / deviations.** Per-pixel character lighting (the faces use the game's NCCT vertex
 colours, so the dynamic hit light is right but flat-shaded per vertex); the plan's `float` bones mode
 (phase 0 C showed it removes only 17 % of the step; `game` and `smooth` exist); shadows and effects
-are still the original packets (phase 4 / 5), so a shadow piece the PS1 painted over a foot can now
-be under it; no native Vulkan / D3D12 driver; the triangle subdivision builder 800423e0 still
+were still the original packets (phase 4 / 5; shadows are native since phase 4), so a shadow piece the PS1 painted over a foot could be under it; no native Vulkan / D3D12 driver; the triangle subdivision builder 800423e0 still
 unexercised.
+
+## Phase 4 results (2026-11-12, `claude/hlr-phase4-*`)
+
+What exists: `--hlr on` draws the fighters' shadows natively (AGENTS.md "Native high-level renderer",
+NOTES.md "Shadows"): `runtime/hlr/hlr_shadow.c` (read-only model of `fighter_shadow_render` 8007ec5c:
+audit and capture), hooks `shadow_pre` / `shadow_post` around a new read-only wrapper in
+`overrides/char_mesh.c` (8007ec5c in `analysis/overrides.txt`, game ABI 3, CI stubs), decal items in
+`hlr_native.c`, a sixth pipeline in `hlr_gpu.c` (opaque, depth tested, no depth write) and a depth bias
+for decal vertices in both shader sources (MSL; `hlr.glsl`, SPIR-V and DXIL regenerated). `--hlr-parts`
+gains `shadows` (on by default; needs `stage`), View > 3D Scene > Shadows (Mac, Windows).
+
+**Facts (verified at runtime):** the shadow is 64 triangles of command 0x36 on texture page 0059 =
+semi mode 2 (B - F), 4-bit, CLUT 7d11, on every stage; the game links all of them (no backface test),
+each at the slot of its first vertex's SZ.
+
+**Design.** The triangles are decals on the native floor in the scene's depth buffer:
+- texels without STP go through pipeline 5 (opaque, depth tested, depth not written), STP texels
+  through the tpage's blend (reverse subtract);
+- vertex depth is pulled 40 world units towards the camera (`HV_DECAL`, `misc.w`,
+  `DESTREGA_HLR_SHADOW_BIAS`). The mesh is draped only at its vertices, so across a ridge it dips
+  into the floor: with 8 units the Canyon floor cut a shadow along a straight line, 40 removes it;
+- order inside a pass: stage polygons, then shadows, then fighter faces. A shadow goes in the latest
+  pass its interval allows, but never after the first pass that holds fighter faces. So the feet are
+  drawn over the shadow, as the PS1's OT order has it, and the large bias never covers a foot.
+
+Acceptance:
+- Audit 0 on the whole replay library: all 30 replays, `--hlr audit`. 146290 shadows, 6583050
+  vertices and 9362560 triangles, 0 wrong (vertex, word, grey, link, index, matrix), 0 rejected;
+  the stage audit is still 0 everywhere.
+- `test_hlr.py` (audit on the 12 VS stages, practice, story; chars = the 12 `practice_<char>` replays,
+  both checking the shadow line too; hash; exact; rewind; seams): all PASS: audit 0 on all 14 runs
+  (shadow audit 0 wrong), chars 12/12, hash on == off on vs_hills / vs_castle1 / story with native shadows
+  (128 / 120 / 14 shadow triangles per frame), exact byte-identical on all 12 stages (Metal and Vulkan) and
+  the dropped-packet check noticed, rewind (68 loads), seams 0. The seams negative check now keeps the
+  shadows on the original path (`--hlr-parts stage,chars`): native shadows no longer split the passes
+  around the fighters, so with them the old pass restart left no seam to find (0 0 0 0 before the change,
+  2 2 2 2 with it)
+- State hash on == off: vs_anjie_laon_canyon (5825 frames) and the Hills match up to frame 5000,
+  4x6 16:9, `--no-interp --verify-overrides`. 116-118 shadow triangles per frame drawn in 3D (the rest
+  are off screen); 0 failed GPU passes.
+- `--hlr exact` stays byte-identical to off: exact/audit never attach decals (test_hlr `exact`).
+- Metal vs MoltenVK: Canyon frame 4100, 4x6 16:9, 0 pixels differ by more than one 15-bit step.
+  Direct3D 12: DXIL regenerated (DXC under CrossOver), not run.
+- CTest `hlr`: a synthetic shadow built on the guest GTE audits clean. A wrong screen vertex, a wrong
+  grey, an unlinked triangle and another world-screen matrix in RAM are each caught.
+- Visual (contact sheets kept out of the repo, `build/p4/` in the worktree): Canyon and Hills, off /
+  phase 3 / phase 4. The shadows match the original's shape and darkness on flat ground and slopes.
+
+**Not done / seen.** An effect (fire) drawn over a fighter that the PS1 drew behind it: it also happens
+with shadows off, so it is phase 3's (effects stay in painter's order around the passes; phase 5).
+The bias is a constant in world units; a very thin stage object closer than 40 units in front of a
+shadow would not hide it.
+
+## Phase 5 results (2026-11-12, `claude/hlr-phase5-effects`)
+
+What exists: `--hlr on` draws the effects natively (AGENTS.md "Native high-level renderer", NOTES.md
+"Effect builders in full"): `runtime/hlr/hlr_fx.c` (read-only model of the ten builders 80055820..
+80056b40: audit and capture), hooks `fx_pre` / `fx_post` around ten read-only wrappers in
+`runtime/overrides/effects.c` (`analysis/overrides.txt`, game ABI 4, CI stubs), effect items in
+`hlr_native.c`. No shader change: effects use the existing pipelines (5 = opaque without depth write,
+and the four blends). `--hlr-parts fx` (on by default; needs `stage`), View > 3D Scene > Effects
+(Mac, Windows).
+
+**Facts (verified: generated C read in full, audit at runtime):** every builder is (a0 = object,
+a1 = scene OT); packet, points, facing-test normal and draw-mode prim sit at fixed offsets in the
+object (NOTES.md table). The plan's "e1 word that precedes each packet in its slot" is the builders'
+own mode prim for the five untextured ones (G3, G4, F3); the textured ones carry their semi mode in
+the packet's tpage. Five builders have a facing test (MVMVA, MAC3 > 0); none culls by screen
+position, near plane or size.
+
+**Design.**
+- An effect polygon is an item of the stage's frame: depth tested against stage and fighters, depth
+  never written, drawn in the semi-transparent part of each pass in walk order (opaque texels or an
+  opaque polygon through pipeline 5, STP texels or a semi polygon with the tpage / e1 blend).
+- Order: the PS1's order among effects is kept exactly (each effect takes the earliest pass point
+  that is not before the previous effect's and still inside its interval; a point is added only when
+  none exists: 0.00 per frame in the practice runs). The "sorted by OT slot" of the plan falls out of
+  that: the walk order is the OT order.
+- **Lift instead of "depth test off"**: billboards are screen aligned and about a fighter's height,
+  so drawn at their true depth the floor cut most of them along straight lines (Milena's ice crystals
+  lost their lower-left corners; screenshots in `build/p5/` of the worktree). Every vertex slides
+  along its own view ray towards the camera by the polygon's longest diagonal: the screen position is
+  exact, only geometry nearer than the effect's own size can still hide it (a wall between it and the
+  camera does), and a glow at a fighter's hand is drawn over the arm as on the PS1.
+  `DESTREGA_HLR_FX_LIFT` scales it (0 = true depth).
+
+Acceptance:
+- Audit 0 on every replay with effects (29 of the 30 library replays: all 12 `practice_<char>`, every
+  VS fight, the 1P, story, option and timeout replays; `timeout_draw` has none): 591544 effect polygons
+  built, 539869 audited and 51675 facing away (not drawn by the game), 2094126 vertices, 0 wrong
+  vertex, word, link or e1 word, 0 rejected. All ten builders run in the practice battery. The stage,
+  character and shadow audits stay 0.
+- CTest `hlr`: a synthetic FT4 (80055b70) and G4 with draw mode and facing test (80056908) built on
+  the guest GTE audit clean; a wrong XY, another tag length, another OT slot and a missing e1 word are
+  each caught, a polygon facing away is counted as not drawn.
+- State hash on == off: `test_hlr.py hash` (vs_hills, vs_castle1, story: 2017 effect polygons attached
+  in story, 0 without a frame or with another camera) and `practice_milena` (every effect builder that
+  character uses); `rewind` identical per frame with 68 loads.
+- `--hlr exact` byte-identical to off: all 12 stages at 4:3 / 16:9, 2x3 / 4x6, Metal and Vulkan (effects
+  are never attached in exact or audit).
+- Signature attacks of all 12 characters (two effect-heavy frames each, from the `practice_<char>`
+  replays, off / on at 2x3 16:9): contact sheets `build/p5/sig/sheet0.png`, `sheet1.png` in the worktree
+  (not in the repo). Effects keep their shape, colour and blend; the PS1's order among them holds.
+- Widescreen edge: the builders never cull by screen position, so the effects of the extra 16:9 columns
+  were already in the scene OT; in the guard band (`practice_milena`, checked by eye and by difference image) on and off differ only in
+  the stage, no effect appears or vanishes at the old 4:3 edge.
+- `tools/pr_check.sh` (`PR_JOBS=2`): PASS, 605 s, every step ok (groups renderer, menus, hlr, core).
+
+Not done: native effects seen only on Metal (not on Vulkan, D3D12 or a native driver); effects outside fights
+other than story's first scenes; per-effect depth from the game's own objects (the lift is a fixed
+rule of the polygon's size).
+
+
+## Phase 6 results (2026-11-12, `claude/hlr-phase6`)
+
+What exists: `--hlr-motion on|off` (default on in a window, off headless; settings `[display]
+hlr_motion`, menu action `hlr-motion[=on|off]`, View > 3D Scene > 60 Hz Motion on Mac and Windows),
+active with `--hlr on` on the GPU renderer. In fights every second presented frame is an in-between
+picture of the native scene: camera, fighters, shadows and effects halfway to the next update.
+
+**Design: record and replay instead of the over-layer of 4.8.** `hires_gpu.c` records every command
+of a vblank. At the second presentation of an update it copies the target and redraws that update's
+commands into the copy. Each HLR pass is replaced by an in-between frame from the provider in
+`hlr_gpu.c` (camera uniforms and keyed vertices lerped to t = 0.5). The copy is presented. Why not the
+over-layer:
+- Nothing is composed, so no PS1 blend chain loses its per-op clamp. With t = 0 the redraw is
+  byte-identical to the original frame. That is stronger than the plan's "< 0.01 % of pixels
+  off by > 1 step".
+- No latency choice: the game draws update k + 1 into the other buffer during the second vblank
+  that shows k (NOTES.md "HLR phase 6"), so the in-between frame is k -> k + 1 at 0.5 with no
+  added latency, and `interp` / `extrap` are not needed.
+- No new shaders: the copy is a texture copy, and the redraw goes through the existing pipelines.
+
+What stays at the shown update in the in-between frame: everything the HLR does not draw (HUD,
+2D, background strips, anything drawn the original way). Items that cannot be matched keep their
+position: no key, ambiguous, a step > 600 units (`DESTREGA_HLR_MOTION_SNAP`), or a camera cut
+(`DESTREGA_HLR_MOTION_CUT`). The replay is refused, and the picture shown as it was, when the
+recordings are not one update apart or the newer one drew into the shown buffer, a recording has
+more than 65536 commands, or an external pass has no token. `DESTREGA_HLR_MOTION_T` (default 0.5)
+and `DESTREGA_HLR_MOTION_DIAG=1|2` are for tests. Exit lines `hlr-motion:` and `hlr-motion-frames:`.
+
+Acceptance (Metal, M1 Pro, load 40-70 from other work):
+- `--state-hash` equal on / off: vs_hills 2x3, vs_castle1 4x6 16:9 in the exact precision, and
+  `practice_milena` (every effect builder that character uses) with `--verify-overrides` (3686
+  in-between frames). vs_gate with `--savestate-rewind 37:23` and motion on: 96 rewinds, 0
+  mismatches, per-frame state hashes equal to a plain run (766 in-between frames).
+  `test_netplay.py lan_hlr` now runs the host with motion on: hashes equal on both peers and offline,
+  1594 in-between pictures.
+- A windowed capture of 120 presented frames (vs_hills fight, `--dump` now works windowed) has 120
+  distinct pictures with motion on and 61 with it off. The 60 frames that show a new update are
+  byte-identical to the off run.
+- Per-pixel: with `DESTREGA_HLR_MOTION_T=0` every dumped frame is byte-identical to off (vs_hills 2x3
+  4:3 fast precision; vs_castle1 4x6 16:9 exact precision with the guard band): 0 pixels differ.
+  At t = 0.5 the in-between frame is between its neighbours: about 2-4K pixels differ from update k
+  and 7-8K from k + 1 (2x3). It is closer to k because the HUD stays at k.
+- Mac <-> Mac loopback smoothness (`netplay_smooth.py mm_lan`, `--hlr on`), back to back:
+  - first pair: off then on. Host p50 16.6 / 16.7 ms, p95 22.4 / 20.2, held 1.39 / 1.18 %. The on
+    run had a 1.1 s stall while the load went from 37 to 53;
+  - second pair, reversed: on then off. p50 16.7 / 16.4, p95 21.0 / 21.3, held 0.93 / 0.18 %, no
+    stalls, no rollbacks;
+  - so it is unchanged within the machine's noise. Present costs ~0.3 ms per frame more (0.5-0.6 ->
+    0.8-0.9 ms).
+
+- `tools/test_hlr.py motion` (new; in pr_check's hlr group) checks the hash, t = 0 and in-between
+  frame facts on vs_hills. `tools/pr_check.sh` (`PR_JOBS=2`): PASS, 862 s, every step ok (groups net,
+  renderer, menus, hlr, core; Wine skipped).
+
+Not done: a person looking at it in a window (the windowed runs were scripted); Vulkan / D3D12
+(nothing API-specific: copy, render target switch, existing pipelines); the HUD and the
+original-path parts at 60 Hz; more than 60 Hz.
 
 ## 1. Executive summary
 

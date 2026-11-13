@@ -36,7 +36,7 @@ CASES = {
     # one peer draws the stage through the native high-level renderer (presentation only, so the
     # peers must stay in sync); its log must show packets drawn by the HLR and captures dropped on rollbacks
     'lan_hlr':    ('vs_tieme_rohzen_villa', 2, '2:1:0:0:21', '2:1:0:0:22', [],
-                   {'host_extra': ['--renderer', 'gpu', '--scale', '2x3', '--hlr', 'on'], 'hlr': True}),
+                   {'host_extra': ['--renderer', 'gpu', '--scale', '2x3', '--hlr', 'on', '--hlr-motion', 'on'], 'hlr': True}),
     'wan':        ('vs_milena_cougar_fortress', 2, '20:8:1:2:3', '20:8:1:2:4', [], {}),
     'lossy':      ('vs_zauber_doyle_throne', 2, '15:15:10:10:5', '15:15:10:10:6', [], {}),
     'asym':       ('vs_anjie_laon_canyon', 1, '35:5:2:0:7', '5:2:2:0:8', [], {}),
@@ -197,12 +197,16 @@ def run_case(name, port, pace):
         elif int(nd.group(2)) == 0: problems.append('host: the native stage drew no polygon')
         elif int(nd.group(3)): problems.append(f'host: {nd.group(3)} native GPU passes failed')
         if 'hlr:' in jlog: problems.append('join: HLR summary in the plain peer')
+        mo = re.search(r'hlr-motion: \d+ vblanks, \d+ with a new picture, (\d+) in-between pictures', hlog)
+        if not mo or not int(mo.group(1)): problems.append('host: no 60 Hz motion in-between picture (--hlr-motion on)')
     full = sum(1 for f in both if len(H[f]) > 1)
     dt = time.time() - t0
     msg = f'{len(both)} final frames equal on both peers and offline ({full} full-state hashes)'
     if expect.get('hlr') and m and nd:
         msg += (f'; host drew the stage natively in {nd.group(1)} frames ({nd.group(2)} polygons per frame), '
                 f'{m.group(2)} rollback loads dropped {m.group(1)} captures')
+        mo = re.search(r'hlr-motion: \d+ vblanks, \d+ with a new picture, (\d+) in-between pictures', hlog)
+        if mo: msg += f', {mo.group(1)} in-between pictures (60 Hz motion)'
     if sh and sj:
         msg += (f'; rollbacks {int(sh["rollbacks"])}/{int(sj["rollbacks"])} (max depth {int(max(sh["max_depth"], sj["max_depth"]))}), '
                 f're-sim {max(sh["resim_ms_per_frame"], sj["resim_ms_per_frame"]):.3f} ms/vblank, '

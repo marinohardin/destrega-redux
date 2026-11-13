@@ -99,10 +99,10 @@ add_executable(destrega
   runtime/main.c runtime/rt.c runtime/bus.c runtime/bios.c runtime/interp.c
   runtime/cdrom.c runtime/disc.c runtime/sio.c runtime/memcard.c runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/gte.c runtime/pgxp.c runtime/spu.c runtime/xa.c runtime/mdec.c
   runtime/overrides/override.c runtime/overrides/collision.c runtime/menu_stub.c
-  runtime/overrides/widescreen.c runtime/overrides/char_mesh.c runtime/platform.c runtime/platform_net.c
+  runtime/overrides/widescreen.c runtime/overrides/char_mesh.c runtime/overrides/effects.c runtime/platform.c runtime/platform_net.c
   runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c runtime/smooth.c runtime/portmap.c
   runtime/netplay_ui.c runtime/input.c runtime/settings.c
-  runtime/menu_overlay.c runtime/splash.c runtime/hlr/hlr.c runtime/hlr/hlr_stage.c runtime/hlr/hlr_char.c runtime/hlr/hlr_native.c runtime/hlr/hlr_gpu.c)
+  runtime/menu_overlay.c runtime/splash.c runtime/hlr/hlr.c runtime/hlr/hlr_stage.c runtime/hlr/hlr_char.c runtime/hlr/hlr_shadow.c runtime/hlr/hlr_fx.c runtime/hlr/hlr_native.c runtime/hlr/hlr_gpu.c)
 target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE} ${CMAKE_CURRENT_BINARY_DIR})
 # Emulation source identity for the netplay handshake (rule in tools/source_ident.py): the same
 # on every platform for the same sources.
@@ -257,7 +257,7 @@ if(DESTREGA_TESTS)
   set_tests_properties(hlr_gpu PROPERTIES SKIP_RETURN_CODE 77)
   # HLR phase 2a without the disc: switches, a synthetic stage through the capture and audit,
   # frame pairing in the linked-list filter, save-state drop, gpu.c suppression
-  add_executable(test_hlr runtime/hlr/hlr.c runtime/hlr/hlr_stage.c runtime/hlr/hlr_char.c runtime/hlr/hlr_native.c runtime/hlr/hlr_gpu.c
+  add_executable(test_hlr runtime/hlr/hlr.c runtime/hlr/hlr_stage.c runtime/hlr/hlr_char.c runtime/hlr/hlr_shadow.c runtime/hlr/hlr_fx.c runtime/hlr/hlr_native.c runtime/hlr/hlr_gpu.c
                  runtime/gte.c runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c runtime/platform.c
                  runtime/tests/test_hlr.c)
   target_include_directories(test_hlr PRIVATE runtime)

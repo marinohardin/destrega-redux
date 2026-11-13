@@ -69,6 +69,10 @@ typedef struct {
     u32 info;                       /* layer / TEX / RAW / shade */
     int blend;                      /* -1 opaque, 0..3 semi mode */
     bool tex_semi;                  /* textured + semi: opaque texels and STP texels separately */
+    bool decal;                     /* a shadow triangle: in the latest pass its interval allows, after the
+                                     * opaque draw, depth biased and never writing depth */
+    bool fx;                        /* an effect polygon: drawn with the semi-transparent ones in walk order,
+                                     * depth tested, never writing depth (opaque ones too) */
 } Item;
 
 static int s_near = HLR_NEAR_CLIP, s_look = HLR_LOOK_ENHANCED;
@@ -89,6 +93,10 @@ static HlrGpuPass **s_pp; static int s_ppcap;
 static int s_pos, s_next;                                    /* walk position, next pass index */
 static bool s_on;                                            /* a native walk is in progress */
 static HlrNativeStats S;
+/* depth bias of the shadow decals, world units towards the camera (DESTREGA_HLR_SHADOW_BIAS): the
+ * shadow mesh is draped over the floor at its vertices only, so between them it lies up to a few
+ * units under or over the native floor's triangles */
+static float s_decal_bias = -1.0f;
 
 void hlr_set_near(int m) { s_near = m == HLR_NEAR_PS1 ? HLR_NEAR_PS1 : HLR_NEAR_CLIP; }
 int hlr_get_near(void) { return s_near; }
@@ -353,10 +361,12 @@ static void put_chr(HlrGpuFrame *gf, const HlrFrame *f, const Item *it, int sel)
     }
     const u32 uvr = umin | umax << 8 | vmin << 16 | vmax << 24;
     const u32 info = it->info | (u32)sel << HV_SEL_SH;
+    u64 *key = gf->k + (v - gf->v);
     for (int t = 0; t < 2; t++) {
         if (!(it->tris >> t & 1)) continue;
         for (int k = 0; k < 3; k++, v++) {
             const int i = tri[t][k];
+            *key++ = c->key[i];
             v->pos[0] = c->v[i][0]; v->pos[1] = c->v[i][1]; v->pos[2] = c->v[i][2];
             v->nrm[0] = v->nrm[1] = v->nrm[2] = 0.0f;
             const u32 col = c->col[i];
@@ -536,9 +546,34 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         }
         if (behind) { S.near_dropped++; continue; }         /* too near: the PS1's packet (if any) */
         if (out_l == c->nv || out_r == c->nv || out_t == c->nv || out_b == c->nv) { S.culled++; s_chrdone[i] = true; continue; }
+        if (c->fx) {                     /* an effect: no backface test (the game has none), maybe untextured */
+            const bool tex = (c->code & 4) != 0;
+            u32 info = (u32)HLR_SH_FLAT << HV_SHADE_SH;
+            if (tex) {
+                const u32 tp = c->tpage, clut = c->clut;
+                MatKey key = { (int)((tp >> 7) & 3), (tp & 0xf) * 64u, ((tp >> 4) & 1) * 256u, (clut & 0x3f) * 16u, (clut >> 6) & 0x1ff, (u32)de.tw };
+                if (key.depth == 3) key.depth = 2;
+                const int layer = material_texture(&key);
+                if (layer < 0 || layer > 0xff) { S.no_texture++; continue; }
+                info |= (u32)layer | HV_TEX | ((c->code & 1) ? HV_RAW : 0);
+            }
+            GROW(s_it, s_icap, s_ni + 1, 4096);
+            Item *it = &s_it[s_ni++];
+            memset(it, 0, sizeof *it);
+            it->pos = pos; it->b = b; it->nat = -1; it->strip = -1; it->chr = i; it->info = info;
+            it->tris = c->nv == 4 ? 3 : 1;
+            it->ilo = it->ihi = -1;
+            it->blend = (c->code & 2) ? (int)((c->tpage >> 5) & 3) : -1;
+            it->tex_semi = tex && (c->code & 2);
+            it->fx = true;
+            s_chrdone[i] = true;
+            S.fx_items++;
+            continue;
+        }
         static const int tri[2][3] = { { 0, 1, 2 }, { 1, 3, 2 } };
         u8 tris = 0;
-        for (int t = 0; t < (c->nv == 4 ? 2 : 1); t++) {
+        if (c->decal) tris = 1;          /* a shadow: the game links every triangle (no backface test) */
+        else for (int t = 0; t < (c->nv == 4 ? 2 : 1); t++) {
             const int p0 = tri[t][0], p1 = tri[t][1], p2 = tri[t][2];
             const float area = sx[p0] * sy[p1] + sx[p1] * sy[p2] + sx[p2] * sy[p0] - sx[p0] * sy[p2] - sx[p1] * sy[p0] - sx[p2] * sy[p1];
             if (area > 0.0f) tris |= (u8)(1 << t);
@@ -549,7 +584,7 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         if (key.depth == 3) key.depth = 2;
         const int layer = material_texture(&key);
         if (layer < 0 || layer > 0xff) { S.no_texture++; continue; }
-        u32 info = (u32)HLR_SH_FLAT << HV_SHADE_SH | (u32)layer | HV_TEX | ((c->code & 1) ? HV_RAW : 0);
+        u32 info = (u32)HLR_SH_FLAT << HV_SHADE_SH | (u32)layer | HV_TEX | ((c->code & 1) ? HV_RAW : 0) | (c->decal ? HV_DECAL : 0);
         GROW(s_it, s_icap, s_ni + 1, 4096);
         Item *it = &s_it[s_ni++];
         memset(it, 0, sizeof *it);
@@ -557,8 +592,9 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         it->ilo = mlo[c->model]; it->ihi = mhi[c->model];
         it->blend = -1;
         if (c->code & 2) { it->blend = (int)((tp >> 5) & 3); it->tex_semi = true; }
+        it->decal = c->decal;
         s_chrdone[i] = true;
-        S.chr_items++;
+        if (c->decal) S.shadow_items++; else S.chr_items++;
     }
     for (int i = 0; i < s_no; i++)
         if (s_o[i].chr >= 0 && s_chrdone[s_o[i].chr]) { s_o[i].b.x0 = 1; s_o[i].b.x1 = 0; }
@@ -661,6 +697,7 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     for (int i = 0; i < s_ni; i++) {
         Item *it = &s_it[i];
         interval(it);
+        if (it->decal || it->fx) continue;   /* placed after the others (below) */
         if (it->lo < 0) { it->t = 0; zero = true; }
         else ord[nr++] = it;
     }
@@ -676,6 +713,71 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     int u = 0;
     for (int i = 0; i < np; i++) if (!u || pts[i] != pts[u - 1]) pts[u++] = pts[i];
     np = u;
+    /* decals (shadows): a pass point in (lo, hi] as late as possible (the floor under a shadow is
+     * drawn before it: an earlier pass, or the same pass's stage draw) but not after the first pass
+     * holding fighter faces, so the fighters are drawn after their shadows (their feet over the
+     * depth-biased decal, as the PS1's order has it); a new point at hi if none */
+    {
+        int added = 0, minct = INT32_MAX;
+        for (int i = 0; i < s_ni; i++)
+            if (s_it[i].chr >= 0 && !s_it[i].decal && !s_it[i].fx && s_it[i].t < minct) minct = s_it[i].t;
+        for (int i = 0; i < s_ni; i++) {
+            Item *it = &s_it[i];
+            if (!it->decal) continue;
+            int t = -1;
+            for (int pass = 0; pass < 2 && t < 0; pass++) {
+                const int top = pass == 0 ? (it->hi < minct ? it->hi : minct) : it->hi;
+                int a = 0, b = np;      /* the last point <= top */
+                while (a < b) { const int m = (a + b) / 2; if (pts[m] <= top) a = m + 1; else b = m; }
+                if (a > 0 && pts[a - 1] > it->lo) t = pts[a - 1];
+            }
+            if (t >= 0) it->t = t;
+            else { it->t = it->hi; GROW(pts, ptcap, np + added + 1, 4096); pts[np + added++] = it->hi; }
+        }
+        if (added) {
+            np += added;
+            qsort(pts, (size_t)np, sizeof *pts, cmp_int);
+            u = 0;
+            for (int i = 0; i < np; i++) if (!u || pts[i] != pts[u - 1]) pts[u++] = pts[i];
+            np = u;
+        }
+    }
+
+    /* effects: a pass point in (lo, hi] that keeps them in the PS1's order among each other (their
+     * packets are no longer others, so nothing else does): in walk order, each takes the earliest
+     * point >= the previous effect's and <= the smallest hi of itself and every later effect, else a
+     * new point at that bound. The range is never empty: lo < pos < every later hi. */
+    {
+        static Item **fx; static int fxcap;
+        static int *bnd; static int bcap;
+        int nfx = 0;
+        GROW(fx, fxcap, s_ni + 1, 1024);
+        for (int i = 0; i < s_ni; i++) if (s_it[i].fx) fx[nfx++] = &s_it[i];
+        if (nfx) {
+            qsort(fx, (size_t)nfx, sizeof *fx, cmp_pos);
+            GROW(bnd, bcap, nfx + 1, 1024);
+            bnd[nfx] = INF_POS;
+            for (int i = nfx - 1; i >= 0; i--) bnd[i] = fx[i]->hi < bnd[i + 1] ? fx[i]->hi : bnd[i + 1];
+            GROW(pts, ptcap, np + nfx + 1, 4096);
+            int prev = 0;
+            for (int i = 0; i < nfx; i++) {
+                Item *it = fx[i];
+                const int lo = it->lo + 1 > prev ? it->lo + 1 : prev, hi = bnd[i];
+                int a = 0, e = np;      /* the first point >= lo */
+                while (a < e) { const int m = (a + e) / 2; if (pts[m] < lo) a = m + 1; else e = m; }
+                if (a < np && pts[a] <= hi) it->t = pts[a];
+                else {
+                    it->t = hi;
+                    int q = 0;
+                    while (q < np && pts[q] < hi) q++;
+                    memmove(pts + q + 1, pts + q, (size_t)(np - q) * sizeof *pts);
+                    pts[q] = hi; np++;
+                    S.fx_points++;
+                }
+                prev = it->t;
+            }
+        }
+    }
 
     {   /* DESTREGA_HLR_PASS_DIAG=N: the walk nodes at the pass points of the first N frames with > 6 passes */
         static int pd = -1;
@@ -711,6 +813,8 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         U->misc[0] = near;
         U->misc[1] = s_look == HLR_LOOK_ENHANCED ? 1.0f : 0.0f;
         U->misc[2] = gi.full_colour ? 0.0f : 1.0f;
+        if (s_decal_bias < 0) { const char *e = getenv("DESTREGA_HLR_SHADOW_BIAS"); s_decal_bias = e ? (float)atof(e) : 40.0f; }
+        U->misc[3] = s_decal_bias;
         U->fog[0] = k->h * 65536.0f; U->fog[1] = k->dqa; U->fog[2] = k->dqb; U->fog[3] = 1.0f;
         gf->px0 = rect[0]; gf->py0 = rect[1]; gf->pw = rect[2]; gf->ph = rect[3];
         gf->samples = hlr_gpu_msaa_for(gi.target_format);
@@ -725,22 +829,67 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         qsort(lst, (size_t)nl, sizeof *lst, cmp_pos);
         HlrGpuPass *ps = calloc(1, sizeof *ps);
         if (!ps) rt_fatal("hlr-native: out of memory");
-        ps->d = calloc((size_t)nl + 2, sizeof *ps->d);
+        ps->d = calloc(3 * (size_t)nl + 3, sizeof *ps->d);   /* a decal or an effect can take two draws */
         if (!ps->d) rt_fatal("hlr-native: out of memory");
         ps->f = gf; gf->refs++;
-        /* opaque: strips, opaque polygons and the opaque texels of textured semi ones */
+        /* opaque: strips, opaque polygons and the opaque texels of textured semi ones; the stage
+         * first, then the shadows on it, then the fighters */
         HlrDraw *d = &ps->d[ps->nd++];
         d->first = gf->nv; d->blend = -1;
         for (int i = 0; i < nl; i++) {
             const Item *it = lst[i];
+            if (it->decal || it->chr >= 0) continue;
             if (it->blend < 0) put_item(gf, f, &se, rect, it, 0);
             else if (it->tex_semi) put_item(gf, f, &se, rect, it, 1);
         }
         d->count = gf->nv - d->first;
-        /* semi-transparent, in walk order, one draw per run of the same mode */
         for (int i = 0; i < nl; i++) {
             const Item *it = lst[i];
-            if (it->strip >= 0 || it->blend < 0) continue;
+            if (!it->decal) continue;
+            /* its texels without STP opaque (depth tested, not written), then the STP ones blended */
+            for (int part = it->decal && (it->tex_semi || it->blend < 0) ? 0 : 1; part < 2; part++) {
+                const int bl = part == 0 ? HLR_DRAW_OPAQUE_NOZ : it->blend;
+                if (part == 1 && it->blend < 0) break;
+                const int sel = part == 0 ? (it->tex_semi ? 1 : 0) : (it->tex_semi ? 2 : 0);
+                d = &ps->d[ps->nd - 1];
+                if (d->blend != bl || d->first + d->count != gf->nv) {
+                    d = &ps->d[ps->nd++];
+                    d->first = gf->nv; d->count = 0; d->blend = bl;
+                }
+                put_item(gf, f, &se, rect, it, sel);
+                d->count = gf->nv - d->first;
+            }
+        }
+        d = &ps->d[ps->nd++];
+        d->first = gf->nv; d->count = 0; d->blend = -1;
+        for (int i = 0; i < nl; i++) {
+            const Item *it = lst[i];
+            if (it->decal || it->fx || it->chr < 0) continue;
+            if (it->blend < 0) put_item(gf, f, &se, rect, it, 0);
+            else if (it->tex_semi) put_item(gf, f, &se, rect, it, 1);
+        }
+        d->count = gf->nv - d->first;
+        if (!d->count) ps->nd--;
+        /* semi-transparent and effects, in walk order, one draw per run of the same mode; an effect:
+         * opaque texels / an opaque polygon without writing depth, the STP texels blended */
+        for (int i = 0; i < nl; i++) {
+            const Item *it = lst[i];
+            if (it->fx) {
+                for (int part = it->tex_semi || it->blend < 0 ? 0 : 1; part < 2; part++) {
+                    const int bl = part == 0 ? HLR_DRAW_OPAQUE_NOZ : it->blend;
+                    if (part == 1 && it->blend < 0) break;
+                    const int sel = it->tex_semi ? (part == 0 ? 1 : 2) : 0;
+                    d = &ps->d[ps->nd - 1];
+                    if (d->blend != bl || d->first + d->count != gf->nv) {
+                        d = &ps->d[ps->nd++];
+                        d->first = gf->nv; d->count = 0; d->blend = bl;
+                    }
+                    put_item(gf, f, &se, rect, it, sel);
+                    d->count = gf->nv - d->first;
+                }
+                continue;
+            }
+            if (it->strip >= 0 || it->blend < 0 || it->decal) continue;
             d = &ps->d[ps->nd - 1];
             if (d->blend != it->blend || d->first + d->count != gf->nv) {
                 d = &ps->d[ps->nd++];

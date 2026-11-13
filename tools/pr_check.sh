@@ -25,7 +25,7 @@
 #   hlr       runtime/hlr/, hlr_hook.h, tools/test_hlr.py: CTest hlr + hlr_gpu, test_hlr.py audit
 #             (castle1 remains gate, practice), chars (practice_milena, practice_laon replays),
 #             exact (the same stages, Metal), hash (vs_castle1), seams (vs_gate, check_hlr_seams.py),
-#             rewind, and test_netplay.py lan_hlr
+#             rewind, motion (vs_hills: 60 Hz motion on / t=0 / off), and test_netplay.py lan_hlr (host with motion)
 #   core      every other runtime/*.c|h, runtime/overrides/, recomp/, analysis/overrides.txt,
 #             extra_seeds.txt, idle_loops.txt, rea_*.json, overlays/, CMakeLists.txt, scenarios / replays tools:
 #             4 scenarios (stage fight, story, options, practice), 3 replays, test_savestate.sh,
@@ -157,7 +157,7 @@ for g in $sel; do
     ;;
   hlr)
     tl_step hlr:unit ctest --test-dir build/cmake -j "$PR_JOBS" -R '^hlr' --output-on-failure
-    tl_step hlr:test_hlr env CASES="audit chars exact hash seams rewind" STAGES="castle1 remains gate" AUDIT_MODES=practice \
+    tl_step hlr:test_hlr env CASES="audit chars exact hash seams rewind motion" STAGES="castle1 remains gate" AUDIT_MODES=practice \
       CHARS="milena laon" API=metal HASH=vs_castle1 python3 tools/test_hlr.py
     tl_step hlr:netplay python3 tools/test_netplay.py -j 1 lan_hlr
     ;;

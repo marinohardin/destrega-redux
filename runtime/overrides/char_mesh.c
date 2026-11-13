@@ -256,3 +256,14 @@ void char_mesh_report(void)
                (unsigned long long)s_extras, s_kept + s_extras ? 100.0 * (double)s_extras / (double)(s_kept + s_extras) : 0.0,
                (unsigned long long)s_drawn, (unsigned long long)s_stale);
 }
+
+/* fighter_shadow_render (8007ec5c): the original unchanged; the HLR's shadow capture reads what it
+ * wrote (runtime/hlr/hlr_shadow.c). a0 = fighter, a1 = scene ordering table, a2 = packet records. */
+void f_8007ec5c(void)
+{
+    if (!g_hlr.shadow_pre) { f_8007ec5c_orig(); return; }
+    g_hlr.shadow_pre(g_cpu.r[4], g_cpu.r[5], g_cpu.r[6]);
+    f_8007ec5c_orig();
+    if (g_hlr.shadow_post) g_hlr.shadow_post();
+}
+

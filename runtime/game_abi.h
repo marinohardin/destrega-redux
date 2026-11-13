@@ -21,7 +21,7 @@
 
 #include "recomp.h"
 
-#define GAME_ABI_VERSION 2
+#define GAME_ABI_VERSION 4
 
 /* Runtime globals the generated code reads or writes (recomp.h / psx.h / pgxp.h inlines). */
 #define GAME_ABI_VARS(X)                                                                       \
@@ -59,13 +59,26 @@
     X(f_80036b0c, (void), ())                                                                  \
     X(f_800363c8, (void), ())                                                                  \
     X(f_80044210, (void), ())                                                                  \
-    X(f_800465a4, (void), ())
+    X(f_800465a4, (void), ())                                                                  \
+    X(f_8007ec5c, (void), ()) \
+    X(f_80055820, (void), ()) \
+    X(f_800559b0, (void), ()) \
+    X(f_80055b70, (void), ()) \
+    X(f_80055d48, (void), ()) \
+    X(f_80055f54, (void), ()) \
+    X(f_80056348, (void), ()) \
+    X(f_8005650c, (void), ()) \
+    X(f_80056704, (void), ()) \
+    X(f_80056908, (void), ()) \
+    X(f_80056b40, (void), ())
 
 /* Generated functions the runtime calls (the overrides' originals and their guest helpers;
  * the same list as tools/ci/stub_gen/stub.c). */
 #define GAME_ABI_GEN(X)                                                                        \
     X(f_80036138_orig) X(f_800363c8_orig) X(f_80036b0c_orig) X(f_80044210_orig)                 \
-    X(f_800465a4_orig) X(f_80044918) X(f_80045414) X(f_80095188)
+    X(f_800465a4_orig) X(f_8007ec5c_orig) X(f_80044918) X(f_80045414) X(f_80095188) \
+    X(f_80055820_orig) X(f_800559b0_orig) X(f_80055b70_orig) X(f_80055d48_orig) X(f_80055f54_orig) \
+    X(f_80056348_orig) X(f_8005650c_orig) X(f_80056704_orig) X(f_80056908_orig) X(f_80056b40_orig)
 
 /* declared here too: a signature that differs from the runtime's own declaration is a compile
  * error on both sides (and declares the overrides for game_load.c) */

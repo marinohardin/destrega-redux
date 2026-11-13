@@ -17,12 +17,14 @@
 #include "hlr_gpu.h"
 #include "../hlr_hook.h"
 #include "../hires.h"
+#include "../hires_gpu.h"
 #include "../pgxp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int s_mode = HLR_OFF;
+static void motion_apply(void);
 static unsigned s_parts = HLR_PARTS_IMPLEMENTED;
 static HlrFrame s_fr[2];
 static HlrFrame *s_active;          /* the frame whose table the walk is in */
@@ -104,12 +106,25 @@ bool hlr_chars_native(void)
     return (s_parts & HLR_PART_CHARS) && (s_parts & HLR_PART_STAGE) && hlr_native();
 }
 
+/* shadows are decals on the native floor: the stage must be drawn natively too */
+bool hlr_shadows_native(void)
+{
+    return (s_parts & HLR_PART_SHADOWS) && (s_parts & HLR_PART_STAGE) && hlr_native();
+}
+
+/* effects join the stage's frame too (drawn in its passes, depth tested against it) */
+bool hlr_fx_native(void)
+{
+    return (s_parts & HLR_PART_FX) && (s_parts & HLR_PART_STAGE) && hlr_native();
+}
+
 void hlr_set_mode(int mode)
 {
     if (mode < HLR_OFF || mode > HLR_AUDIT) mode = HLR_OFF;
     if (mode == s_mode) return;
     hlr_frames_drop();
     s_mode = mode;
+    motion_apply();
     if (mode == HLR_OFF) { memset(&g_hlr, 0, sizeof g_hlr); return; }
     g_hlr.stage_pre = hlr_stage_pre;
     g_hlr.stage_post = hlr_stage_post;
@@ -119,9 +134,18 @@ void hlr_set_mode(int mode)
     g_hlr.char_pre = hlr_char_pre;
     g_hlr.char_post = hlr_char_post;
     g_hlr.chars_native = mode == HLR_ON ? hlr_chars_native : NULL;
+    g_hlr.shadow_pre = hlr_shadow_pre;
+    g_hlr.shadow_post = hlr_shadow_post;
+    g_hlr.fx_pre = hlr_fx_pre;
+    g_hlr.fx_post = hlr_fx_post;
 }
 
 int hlr_get_mode(void) { return s_mode; }
+
+static bool s_motion;
+static void motion_apply(void) { hires_gpu_set_motion(s_motion && s_mode == HLR_ON ? hlr_gpu_motion_provider() : NULL); }
+void hlr_set_motion(bool on) { s_motion = on; motion_apply(); }
+bool hlr_get_motion(void) { return s_motion; }
 void hlr_set_parts(unsigned parts) { if (parts != s_parts) hlr_frames_drop(); s_parts = parts & HLR_PARTS_ALL; }
 unsigned hlr_get_parts(void) { return s_parts; }
 
@@ -318,6 +342,8 @@ void hlr_report(void)
     if (s_mode == HLR_OFF && !S.captured) return;
     hlr_stage_report();
     hlr_char_report();
+    hlr_shadow_report();
+    hlr_fx_report();
     if (s_mode == HLR_AUDIT) return;
     u64 left = 0;
     for (int i = 0; i < 2; i++) if (s_fr[i].valid) left++;
@@ -338,6 +364,12 @@ void hlr_report(void)
         if (N.chr_items || N.chr_back)
             rt_log("hlr-native-chars: %.0f character faces per frame drawn in 3D, %.0f per frame facing away (float test)",
                    (double)N.chr_items / (double)N.frames, (double)N.chr_back / (double)N.frames);
+        if (N.shadow_items)
+            rt_log("hlr-native-shadows: %.0f shadow triangles per frame drawn in 3D (depth-biased decals)",
+                   (double)N.shadow_items / (double)N.frames);
+        if (N.fx_items)
+            rt_log("hlr-native-fx: %.1f effect polygons per frame drawn in 3D (depth tested, PS1 order among effects), %.2f pass points per frame added for them",
+                   (double)N.fx_items / (double)N.frames, (double)N.fx_points / (double)N.frames);
         rt_log("hlr-native-draw: %llu frames, %.2f passes per frame, %.0f polygons per frame drawn in 3D"
                " (near %s, look %s, MSAA %dx); %llu culled by the camera, %llu dropped as too near, %llu stale,"
                " %llu without texture, %llu of skipped objects without packet words; %llu packets suppressed; %llu walks given up; GPU %llu passes"
@@ -350,5 +382,21 @@ void hlr_report(void)
                (unsigned long long)N.desync, (unsigned long long)G.passes, (unsigned long long)G.msaa_passes,
                (unsigned long long)G.msaa_kept,
                (unsigned long long)G.draws, (unsigned long long)G.tris, (unsigned long long)G.failed);
+    }
+    HgpuMotionStats M;
+    hires_gpu_motion_stats(&M);
+    if (M.vblanks) {
+        HlrMotionStats I;
+        hlr_gpu_motion_stats(&I);
+        rt_log("hlr-motion: %llu vblanks, %llu with a new picture, %llu in-between pictures (%llu commands redrawn);"
+               " not replayed: %llu without a pair, %llu not shown, %llu without native passes, %llu too many commands, %llu failed",
+               (unsigned long long)M.vblanks, (unsigned long long)M.recorded, (unsigned long long)M.replays,
+               (unsigned long long)M.ops_replayed, (unsigned long long)M.no_pair, (unsigned long long)M.not_shown,
+               (unsigned long long)M.no_token, (unsigned long long)M.overflow, (unsigned long long)M.failed);
+        rt_log("hlr-motion-frames: %llu in-between frames (%llu without a next frame, %llu other pass area, %llu camera cuts);"
+               " vertices %llu, keyed %llu, moved %llu (largest step %.0f), snapped %llu, ambiguous %llu",
+               (unsigned long long)I.frames, (unsigned long long)I.unpaired, (unsigned long long)I.refused,
+               (unsigned long long)I.cuts, (unsigned long long)I.verts, (unsigned long long)I.keyed,
+               (unsigned long long)I.matched, I.max_step, (unsigned long long)I.snapped, (unsigned long long)I.ambiguous);
     }
 }

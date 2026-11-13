@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b and 3. Needs the disc.
+"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b, 3, 4, 5 and 6. Needs the disc.
 
-  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact seams rewind (default: all)
+  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact seams rewind motion (default: all)
   CASES="hash exact" STAGES="castle1" ...    environment selection (tools/pr_check.sh group hlr)
 
   audit   --hlr audit on all 12 VS stages, practice and story: every stage packet the game links is
@@ -21,6 +21,9 @@
           the whole command battery): the character audit reproduces every vertex, colour and face
           the game builds (hlr-chars: 0 mismatched, 0 linked differently, 0 other words, 0 bad, 0
           rejected). CHARS="milena reyus" picks the characters. (audit also checks hlr-chars.)
+          Both audit and chars also check the fighter shadows (phase 4, hlr-shadows: every vertex's
+          RTPS, triangle word, grey and OT slot as the game builds them; 0 mismatched, 0 rejected),
+          and hash requires them drawn natively (hlr-native-shadows) on every run.
   seams   vs_gate (Milena vs Doyle) in the user configuration (GPU fast precision, 4x6 16:9, xbr, full
           colour, PGXP on, the HLR's default 4x MSAA) with a pause (Start) in the fight: --hlr on vs
           off, tools/check_hlr_seams.py on the fight and pause frames finds no thin bright line that
@@ -30,6 +33,10 @@
   rewind  --savestate-rewind 37:23 with --hlr on (GPU, 2x3) vs a plain run with the HLR off: equal
           per-frame complete-state hashes, the HLR dropped its captures on every load and drew the
           stage natively.
+  motion  60 Hz motion (phase 6), vs_hills fight at 2x3: --hlr-motion off, on with
+          DESTREGA_HLR_MOTION_T=0 and on: equal state hashes, t=0 dumps byte-identical to off, t=0.5
+          differs exactly in the frames where off repeats an update, in-between pictures made with
+          keyed vertices moved and none failed.
 
 Runs under nice, at most JOBS (default 2) game processes. Output in build/hlr_test/.
 """
@@ -87,11 +94,57 @@ def chars_audit(log):
                 f'float bones vs SXY {m.group(13)} px')
 
 
+SHADOWS_RE = re.compile(r'hlr-shadows: (\d+) shadows drawn by the game, (\d+) audited; vertices (\d+), (\d+) mismatched; '
+                        r'triangles (\d+), (\d+) with other words, (\d+) with another grey, (\d+) linked elsewhere, '
+                        r'(\d+) bad indices; (\d+) with another camera matrix, (\d+) rejected')
+
+
+def shadows_audit(log):
+    """(ok, text) of the hlr-shadows audit line (phase 4); ok None when the run drew no shadow"""
+    m = SHADOWS_RE.search(log)
+    if not m:
+        return None, 'no shadow audit'
+    calls, aud, v, vb, t, wb, gb, lb, ib, ws, rej = map(int, m.groups())
+    ok = calls > 0 and aud == calls and vb == wb == gb == lb == ib == ws == rej == 0
+    return ok, (f'shadows: {aud}/{calls} audited, {v} vertices ({vb} wrong), {t} triangles ({wb} other words, '
+                f'{gb} other grey, {lb} linked elsewhere, {ib} bad indices), {ws} other matrix, {rej} rejected')
+
+
+def shadows_native(log):
+    """(triangles per frame drawn in 3D, attached, without a frame, other camera) or None"""
+    m = re.search(r'hlr-native-shadows: (\d+) shadow triangles per frame drawn in 3D', log)
+    a = re.search(r'hlr-shadows: (\d+) attached to a native frame, (\d+) without a frame, (\d+) with another camera', log)
+    return (int(m.group(1)), int(a.group(1)), int(a.group(2)), int(a.group(3))) if m and a else None
+
+
 def chars_native(log):
     """(faces per frame drawn in 3D, models attached, without a frame, other camera) or None"""
     m = re.search(r'hlr-native-chars: (\d+) character faces per frame drawn in 3D', log)
     a = re.search(r'hlr-chars: (\d+) models attached to a native frame, (\d+) without a frame, (\d+) with another camera', log)
     return (int(m.group(1)), int(a.group(1)), int(a.group(2)), int(a.group(3))) if m and a else None
+
+
+FX_RE = re.compile(r'hlr-fx: (\d+) effect polygons built by the game, (\d+) audited, (\d+) facing away \(not drawn\); '
+                   r'vertices (\d+), (\d+) mismatched; (\d+) with other words, (\d+) linked elsewhere, '
+                   r'(\d+) without a draw-mode word, (\d+) rejected')
+
+
+def fx_audit(log):
+    """(ok, text) of the hlr-fx audit line (phase 5); ok None when the run built no effect"""
+    m = FX_RE.search(log)
+    if not m:
+        return None, 'no effect audit'
+    calls, aud, away, v, vb, wb, lb, mb, rej = map(int, m.groups())
+    ok = calls > 0 and aud + away == calls and vb == wb == lb == mb == rej == 0
+    return ok, (f'effects: {aud}/{calls} audited ({away} facing away), {v} vertices ({vb} wrong), {wb} other words, '
+                f'{lb} linked elsewhere, {mb} without a draw mode, {rej} rejected')
+
+
+def fx_native(log):
+    """(effect polygons per frame drawn in 3D, attached, without a frame, other camera) or None"""
+    m = re.search(r'hlr-native-fx: ([\d.]+) effect polygons per frame drawn in 3D', log)
+    a = re.search(r'hlr-fx: (\d+) attached to a native frame, (\d+) without a frame, (\d+) with another camera', log)
+    return (float(m.group(1)), int(a.group(1)), int(a.group(2)), int(a.group(3))) if m and a else None
 
 
 def same_files(a, b):
@@ -109,9 +162,12 @@ def audit_one(scn):
         return False, f'{scn}: exit {rc}, no audit line' if not m else f'{scn}: exit {rc}'
     pk, mis, un, fr, miss, heads, bad = map(int, m.groups())
     cok, ctext = chars_audit(log)
-    ok = fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0 and cok is not False
+    sok, stext = shadows_audit(log)
+    fok, ftext = fx_audit(log)
+    ok = (fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0 and cok is not False and sok is not False
+          and fok is not False)
     return ok, (f'{scn}: {fr} frames, {pk} packets, {mis} mismatched, {un} unexplained, {miss} missing, '
-                f'{heads} heads, {bad} bad walks; {alt.group(1) if alt else "?"}; {ctext}')
+                f'{heads} heads, {bad} bad walks; {alt.group(1) if alt else "?"}; {ctext}; {stext}; {ftext}')
 
 
 def chars_one(char):
@@ -123,7 +179,9 @@ def chars_one(char):
         rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=ROOT)
     log = open(log_path, errors='replace').read()
     cok, ctext = chars_audit(log)
-    return bool(cok) and rc == 0, f'practice_{char}: exit {rc}; {ctext}'
+    sok, stext = shadows_audit(log)
+    fok, ftext = fx_audit(log)
+    return bool(cok) and bool(sok) and bool(fok) and rc == 0, f'practice_{char}: exit {rc}; {ctext}; {stext}; {ftext}'
 
 
 def case_chars(pool):
@@ -160,12 +218,18 @@ def hash_pair(item):
     dumps = sorted(f for f in os.listdir(d0) if f.startswith('frame_0'))
     ndiff = sum(not same_files(os.path.join(d0, f), os.path.join(d1, f)) for f in dumps)
     cn = chars_native(log1)
-    ok = same and nl and nl[0] > 0 and nl[2] == 0 and dumps and cn and cn[0] > 0 and cn[1] > 0 and cn[3] == 0
+    sn = shadows_native(log1)
+    fn = fx_native(log1)
+    ok = (same and nl and nl[0] > 0 and nl[2] == 0 and dumps and cn and cn[0] > 0 and cn[1] > 0 and cn[3] == 0
+          and sn and sn[0] > 0 and sn[1] > 0 and sn[3] == 0 and (fn is None or (fn[2] == 0 and fn[3] == 0)))
     return ok, (f'{scn}: state hash {"identical" if same else "DIFFERS"}; native 3D stage in '
                 f'{nl[1] if nl else "?"} frames, {nl[0] if nl else "?"} polygons per frame, '
                 f'{nl[2] if nl else "?"} failed GPU passes; characters: {cn[0] if cn else "?"} faces per frame in 3D, '
                 f'{cn[1] if cn else "?"} models attached, {cn[2] if cn else "?"} without a frame, '
-                f'{cn[3] if cn else "?"} with another camera; {ndiff} of {len(dumps)} key frames differ from off')
+                f'{cn[3] if cn else "?"} with another camera; shadows: {sn[0] if sn else "?"} triangles per frame in 3D, '
+                f'{sn[1] if sn else "?"} attached, {sn[3] if sn else "?"} with another camera; '
+                f'effects: {f"{fn[0]} polygons per frame in 3D, {fn[1]} attached, {fn[2]} without a frame, {fn[3]} with another camera" if fn else "none drawn"}; '
+                f'{ndiff} of {len(dumps)} key frames differ from off')
 
 
 def case_hash(pool):
@@ -242,6 +306,9 @@ SEAM_FRAMES = list(range(3320, 3441, 40))     # dumps fall on multiples of 40; S
 def seams_run(item):
     mode, nokeep = item
     tag = f'seams_{mode}' + ('_nokeep' if nokeep else '')
+    # the negative check keeps the shadows on the original path: native shadows (phase 4) no longer
+    # split the passes around the fighters, so without them the old restart has few seams left to show
+    parts = ['--hlr-parts', 'stage,chars'] if nokeep else []
     d = os.path.join(OUT, tag)
     os.makedirs(d, exist_ok=True)
     for f in os.listdir(d):
@@ -250,7 +317,7 @@ def seams_run(item):
     args = ['--renderer', 'gpu', '--gpu-precision', 'fast', '--scale', '4x6',
             '--widescreen', '--window', '1280x720', '--tex-filter', 'xbr', '--hires-colour', 'full',
             '--pgxp', 'on', '--hlr', mode, '--dump', d, '--dump-from', str(SEAM_FRAMES[0]),
-            '--dump-every', '40']
+            '--dump-every', '40'] + parts
     rc, log = run(tag, 'vs_gate', SEAM_FRAMES[-1] + 1, args,
                   env={'DESTREGA_HLR_TEST_NOKEEP': '1'} if nokeep else None, press=s.press() + ',3350:8')
     return rc, log, d
@@ -276,7 +343,7 @@ def case_seams(pool):
                             f'{nl[1] if nl else "?"} frames'))
         else:
             ok = all(counts)
-            out.append((ok, f'seams: with every MSAA pass restarted from the resolve (old behaviour): '
+            out.append((ok, f'seams: with every MSAA pass restarted from the resolve (old behaviour, shadows original): '
                             f'{" ".join(map(str, counts))} seams per frame '
                             f'({"noticed" if ok else "NOT NOTICED in every frame"})'))
     return out
@@ -305,7 +372,43 @@ def case_rewind(pool):
                  f'native stage in {nl[1] if nl else "?"} frames ({nl[0] if nl else "?"} polygons per frame)')]
 
 
-CASES = {'audit': case_audit, 'chars': case_chars, 'hash': case_hash, 'exact': case_exact, 'seams': case_seams, 'rewind': case_rewind}
+# ---- motion -----------------------------------------------------------------------------------------
+def case_motion(pool):
+    """60 Hz motion (phase 6): off, on at t = 0 and on at t = 0.5 over 40 fight frames of vs_hills."""
+    scn, k, frames = 'vs_hills', 3040, 3080
+    base = ['--renderer', 'gpu', '--scale', '2x3', '--no-interp', '--hlr', 'on', '--dump-from', str(k), '--dump-every', '1']
+    jobs = {'off': (['--hlr-motion', 'off'], None), 't0': (['--hlr-motion', 'on'], {'DESTREGA_HLR_MOTION_T': '0'}),
+            'on': (['--hlr-motion', 'on'], None)}
+    def one(kv):
+        name, (extra, env) = kv
+        d = os.path.join(OUT, 'motion_' + name)
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(d):
+            os.remove(os.path.join(d, f))
+        return run('motion_' + name, scn, frames, base + extra + ['--dump', d, '--state-hash', d + '.hash'], env=env)
+    res = dict(zip(jobs, pool.map(one, jobs.items())))
+    if any(rc for rc, _ in res.values()):
+        return [(False, 'motion: exit ' + ' / '.join(str(rc) for rc, _ in res.values()))]
+    d = {n: os.path.join(OUT, 'motion_' + n) for n in jobs}
+    hashes = same_files(d['off'] + '.hash', d['t0'] + '.hash') and same_files(d['off'] + '.hash', d['on'] + '.hash')
+    names = sorted(f for f in os.listdir(d['off']) if f.startswith('frame_0'))
+    t0_diff = [f for f in names if not same_files(os.path.join(d['off'], f), os.path.join(d['t0'], f))]
+    on_diff = [f for f in names if not same_files(os.path.join(d['off'], f), os.path.join(d['on'], f))]
+    # off shows each update twice; on: those second presentations differ, the first ones do not
+    rep = [f for i, f in enumerate(names) if i and same_files(os.path.join(d['off'], names[i - 1]), os.path.join(d['off'], f))]
+    m = re.search(r'hlr-motion: \d+ vblanks, \d+ with a new picture, (\d+) in-between pictures.*?(\d+) failed', res['on'][1])
+    mf = re.search(r'hlr-motion-frames: .*?moved (\d+)', res['on'][1])
+    ok = (hashes and not t0_diff and len(names) >= 40 and rep and set(on_diff) == set(rep) and m and int(m.group(1)) > 0
+          and int(m.group(2)) == 0 and mf and int(mf.group(1)) > 0)
+    return [(ok, f'motion: state hashes {"equal" if hashes else "DIFFER"} (off, t=0, t=0.5); t=0 frames identical to off: '
+                 f'{len(names) - len(t0_diff)}/{len(names)}; t=0.5 differs in {len(on_diff)} frames, off repeats an update in '
+                 f'{len(rep)} ({"the same" if set(on_diff) == set(rep) else "NOT the same"}); '
+                 f'{m.group(1) if m else "?"} in-between pictures, {m.group(2) if m else "?"} failed, '
+                 f'{mf.group(1) if mf else "?"} vertices moved')]
+
+
+CASES = {'audit': case_audit, 'chars': case_chars, 'hash': case_hash, 'exact': case_exact, 'seams': case_seams, 'rewind': case_rewind,
+         'motion': case_motion}
 
 
 def main():
@@ -315,7 +418,7 @@ def main():
         i = args.index('-j')
         jobs = int(args[i + 1])
         del args[i:i + 2]
-    names = args or os.environ.get('CASES', 'audit chars hash exact seams rewind').split()
+    names = args or os.environ.get('CASES', 'audit chars hash exact seams rewind motion').split()
     for n in names:
         if n not in CASES:
             sys.exit(f'test_hlr: unknown case {n} ({" ".join(CASES)})')
