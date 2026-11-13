@@ -1855,6 +1855,12 @@ the fighters too, in the same depth buffer (below).
   (polygons recorded), `hlr-native-draw:` (passes and polygons per frame, culled, near-dropped,
   stale, without texture, suppressed, walks given up, GPU passes / draws / failed).
   `DESTREGA_HLR_DIAG=N` logs the first N native polygons that cover more than a quarter of a pass.
+  `DESTREGA_HLR_WALK_DIAG=LO-HI[:BUCKET]` (libetc vblank count; `on` / `exact` only) classes every
+  packet of the linked-list walks as captured stage / character / other (by GP0 code and RAM page).
+  **Story scenes** (phase 7) need nothing extra: EVENTOVL draws its actors with char_mesh_render
+  and sets the camera with GsSetRefView2 (NOTES.md "HLR phase 7"); `tools/test_hlr.py story` (heavy,
+  not default) audits `story_continue_yes` and `story_win_first_fight`, checks the hash on == off and
+  `exact` == off on story key frames.
   `DESTREGA_HLR_TEST_DROP=N` leaves out every Nth packet, `DESTREGA_HLR_TEST_NOKEEP=1` restarts
   every MSAA pass from the resolve (the old seams) (tests prove they notice).
 - **Tests**: CTest `hlr` (no disc; also the float camera against the GTE's RTPS: within 0.75 px

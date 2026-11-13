@@ -1,6 +1,6 @@
 # Destrega native high-level renderer (HLR): implementation plan
 
-Status: phase 0 done, phase 2a and 2b done (see "Phase 2a results", "Phase 2b results"); phase 3 next. Builds on `docs/HIGH_LEVEL_RENDERER.md` (phase 1 done,
+Status: phase 0 done, phase 2a and 2b done (see "Phase 2a results", "Phase 2b results"); phase 3 done; phase 7 done (story scenes: "Phase 7 results"). Builds on `docs/HIGH_LEVEL_RENDERER.md` (phase 1 done,
 phase 2 "go") and corrects it where the findings of PRs #34 / #35 and a closer reading of the
 runtime change it. Written against commit bb2d4bf. Facts about the game carry the NOTES.md
 confidence levels (`verified` / `likely` / `guess`); design claims about the runtime are from
@@ -233,6 +233,35 @@ colours, so the dynamic hit light is right but flat-shaded per vertex); the plan
 are still the original packets (phase 4 / 5), so a shadow piece the PS1 painted over a foot can now
 be under it; no native Vulkan / D3D12 driver; the triangle subdivision builder 800423e0 still
 unexercised.
+
+## Phase 7 results (2026-11-12)
+
+**Finding: story scenes need no new renderer.** EVENTOVL's scene loop `event_scene_loop` 8001c4dc
+draws its actors with the main exe's `char_mesh_render` 80036b0c (through `actor_render_culled`
+80037360 and `fighter_render` 80037144), the stage through `stage_render`, and sets the camera with
+GsSetRefView2 (WS matrix 800ed4c8, the one the HLR camera reads). NOTES.md "HLR phase 7" has the
+call sequence and the evidence. So phases 2b and 3 already draw story scenes natively; this phase
+only verified it and added a test and a diagnostic. No change to the shared pipeline or shaders.
+
+**Results** (`--no-interp --verify-overrides`):
+
+| check | run | result |
+|---|---|---|
+| audit (`--hlr audit`) | `story` 15600 frames | hlr-audit 450964 packets, 4231 frames, all 0; hlr-chars 6464 models, 0 mismatched |
+| audit | `story_continue_yes` | hlr-audit 569780 packets, 5249 frames, all 0; hlr-chars 8501 models, 0 mismatched |
+| audit + on | `story_win_first_fight` replay 26050 frames | hlr-audit 724897 packets, 8859 frames, all 0; hlr-chars 14326 models, 0 mismatched |
+| state hash on == off | `story_win_first_fight`, GPU 2x3 | per-frame `--state-hash` identical (26050 frames), replay ok |
+| native coverage | same | 14326 models attached, 0 without a frame, 0 other camera; 461 character faces / frame in 3D; 1.26 passes / frame; 0 failed GPU passes |
+| exact == off | `story` key frames 7200..12000 every 1200, GPU 2x3 | 5 dumps byte-identical, state hash identical; HLR drew 308763 packets, 0 stale |
+
+`tools/test_hlr.py story` runs all four (heavy, not in the default case list or `pr_check.sh`).
+A contact sheet of eight story frames on vs off was checked by eye (kept outside the repo): the
+characters and stage match the original with the expected smoothing; no missing faces.
+
+**Stays on packets** (measured with the new `DESTREGA_HLR_WALK_DIAG`): 1-2 FT4 effect billboards
+per event frame from EVENT_SP's effect functions (phase 5), a fixed 0x80 / 0x00 packet pair (also in
+fights), 2D fade / letterbox rects (phase 6). Open: the float projection of the bones reached 474 px
+from SXY on one close-up after the first fight (mean 1.98 px; not an audit mismatch, not traced).
 
 ## 1. Executive summary
 
@@ -892,7 +921,7 @@ own PR with the same determinism table.
 | Depth-buffered look differs from the painter's look where the game relied on it (billboards cutting walls / floor, decals, near walls) | design | acceptance by eye | per-effect depth-test flag; `--hlr-near ps1`; contact sheets per stage / character in each PR |
 | Over-layer loses per-op clamping of chained 2D blends (phase 6) | design | 60 Hz fidelity on HUD | measure on fight frames; keep the layer only at N + 1 if visible |
 | Audit needs bit-exact host GTE (gte.c refactor touches a covered, hot file) | runtime | audit precision | `gte_exec_on` swaps state around the unchanged implementation (no change to the hot path); unit test of equality |
-| Story / EVENTOVL characters have their own renderer | unknown | phase 7 scope | packet attribution on the story scenarios |
+| Story / EVENTOVL characters have their own renderer | retired (phase 7): they use char_mesh_render | - | done: packet attribution + audit on the story runs |
 | Performance of the capture (host time per update) | low | 60 fps on slow hosts | budget 0.3 ms per update; measure with `--segments`; the governor already handles the GPU side |
 
 ---
@@ -961,8 +990,8 @@ own PR with the same determinism table.
    page / CLUT coordinates?
 6. **Widescreen shadow pass**: once the stage capture is on by default, keep maintaining the
    sandboxed shadow pass for the Software renderer, or declare 16:9 stages a GPU-renderer feature?
-7. **Scope of "story scenes"**: is phase 7 worth its RE time (overlay character / camera code),
-   or is "stage in 3D, characters from packets" enough there?
+7. **Scope of "story scenes"**: answered by phase 7: the overlay uses the main-exe character
+   renderer and camera, so story scenes are native with no extra code.
 8. **Priority of phases 3 vs 5**: characters first (the shimmer complaint) or effects first
    (completes the scene for depth correctness)? Proposal: characters.
 
