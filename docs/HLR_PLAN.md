@@ -262,7 +262,13 @@ Acceptance:
   vertices and 9362560 triangles, 0 wrong (vertex, word, grey, link, index, matrix), 0 rejected;
   the stage audit is still 0 everywhere.
 - `test_hlr.py` (audit on the 12 VS stages, practice, story; chars = the 12 `practice_<char>` replays,
-  both checking the shadow line too; hash; exact; rewind; seams): TEST_HLR_RESULT
+  both checking the shadow line too; hash; exact; rewind; seams): all PASS: audit 0 on all 14 runs
+  (shadow audit 0 wrong), chars 12/12, hash on == off on vs_hills / vs_castle1 / story with native shadows
+  (128 / 120 / 14 shadow triangles per frame), exact byte-identical on all 12 stages (Metal and Vulkan) and
+  the dropped-packet check noticed, rewind (68 loads), seams 0. The seams negative check now keeps the
+  shadows on the original path (`--hlr-parts stage,chars`): native shadows no longer split the passes
+  around the fighters, so with them the old pass restart left no seam to find (0 0 0 0 before the change,
+  2 2 2 2 with it)
 - State hash on == off: vs_anjie_laon_canyon (5825 frames) and the Hills match up to frame 5000,
   4x6 16:9, `--no-interp --verify-overrides`. 116-118 shadow triangles per frame drawn in 3D (the rest
   are off screen); 0 failed GPU passes.

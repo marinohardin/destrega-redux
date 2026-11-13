@@ -274,6 +274,9 @@ SEAM_FRAMES = list(range(3320, 3441, 40))     # dumps fall on multiples of 40; S
 def seams_run(item):
     mode, nokeep = item
     tag = f'seams_{mode}' + ('_nokeep' if nokeep else '')
+    # the negative check keeps the shadows on the original path: native shadows (phase 4) no longer
+    # split the passes around the fighters, so without them the old restart has few seams left to show
+    parts = ['--hlr-parts', 'stage,chars'] if nokeep else []
     d = os.path.join(OUT, tag)
     os.makedirs(d, exist_ok=True)
     for f in os.listdir(d):
@@ -282,7 +285,7 @@ def seams_run(item):
     args = ['--renderer', 'gpu', '--gpu-precision', 'fast', '--scale', '4x6',
             '--widescreen', '--window', '1280x720', '--tex-filter', 'xbr', '--hires-colour', 'full',
             '--pgxp', 'on', '--hlr', mode, '--dump', d, '--dump-from', str(SEAM_FRAMES[0]),
-            '--dump-every', '40']
+            '--dump-every', '40'] + parts
     rc, log = run(tag, 'vs_gate', SEAM_FRAMES[-1] + 1, args,
                   env={'DESTREGA_HLR_TEST_NOKEEP': '1'} if nokeep else None, press=s.press() + ',3350:8')
     return rc, log, d
@@ -308,7 +311,7 @@ def case_seams(pool):
                             f'{nl[1] if nl else "?"} frames'))
         else:
             ok = all(counts)
-            out.append((ok, f'seams: with every MSAA pass restarted from the resolve (old behaviour): '
+            out.append((ok, f'seams: with every MSAA pass restarted from the resolve (old behaviour, shadows original): '
                             f'{" ".join(map(str, counts))} seams per frame '
                             f'({"noticed" if ok else "NOT NOTICED in every frame"})'))
     return out

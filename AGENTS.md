@@ -1882,7 +1882,7 @@ the fighters too, in the same depth buffer (below). Phase 4: their shadows, as d
   `external d3d12` passes under CrossOver (vkd3d) with the same cube pixel counts as Metal and MoltenVK);
   `tools/test_hlr.py [audit chars hash exact seams rewind]` (`seams`: vs_gate fight + pause in the
   user configuration, `tools/check_hlr_seams.py` on --hlr on vs off dumps: no long thin bright line
-  only the HLR draws; plus the NOKEEP negative check) (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`,
+  only the HLR draws; plus the NOKEEP negative check, run with `--hlr-parts stage,chars` since native shadows remove the pass splits it needs) (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`,
   `CHARS`; `chars` = the `practice_<char>` replays with `--hlr audit`, every character's move set;
   `hash` and `rewind` require the native draw line and native character faces); CTest `hlr` also
   audits a synthetic fighter built on the guest GTE (faults must be caught) and the bone filter; `test_netplay.py lan_hlr`; pr_check group `hlr`.
