@@ -518,6 +518,10 @@ void hlr_char_post(void)
         hlr_frame_reindex(f);
         S.attached++;
         s_model_in_update++;
+        /* motion: every vertex of the model, also those no face of this update uses (a face that turns
+         * towards the camera in the next update needs its vertices' positions here; HlrChr.key) */
+        if (hlr_get_motion())
+            for (int i = 0; i < nv; i++) hlr_frame_add_kpos(f, 1ull << 62 | (u64)(mb & 0x1fffff) << 16 | (u64)(u16)i, s_wp[i]);
     }
 }
 

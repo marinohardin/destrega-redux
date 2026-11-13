@@ -873,6 +873,25 @@ seen), steps above 600 world units snap, a camera jump is a cut (no lerp). Every
 the HLR (HUD, 2D, background strips) keeps the shown update's picture: at t = 0 the replay is
 byte-identical to the original frame (tested, see HLR_PLAN "Phase 6 results").
 
+**Fighter faces come and go between updates (verified, `practice_reyus` frames 4135-4165).** The
+character renderer only sends the faces that face the camera, so a vertex no face of the next update
+uses has no partner there. At first the in-between frame matched only the vertices of drawn faces:
+14801 vertices of 33 in-between frames had none during a hit and a knockdown, kept the shown update's
+position while their neighbours moved, and stretched the faces between them (an arm as a dark stick
+behind the body, legs split at the hip; a fallen fighter looked as if it lay in a wrong shadow).
+Each update now also records the world position of every vertex of each model, drawn or not
+(`HlrFrame.kp`, `hlr_frame_add_kpos`, only with motion on): 0 fighter vertices unmatched since. The
+1620 still unmatched are effects and shadows that appear or vanish between the two updates.
+
+**Effects the PS1 draws a fighter over (verified, `vs_laon_gradd_gate` frames 3768-3786).** A dust
+cloud the size of a fighter, under a fighter knocked to the ground, sits in a farther OT slot than the
+fighter's faces, so the PS1 draws the fighter over it. Phase 5 moved every effect towards the camera by
+its own size (so the floor does not cut it), which put this one in front of the fighter's legs. Now
+`hlr_fx_lift` (run before the native walk, when the update's fighters are known) marks an effect
+`under` when a fighter face in a nearer slot overlaps it on screen; the walk draws it like a shadow
+(before the fighters, no depth write), so the fighter covers it as on the PS1, and the floor still
+does not cut it. 1205 of 4461 effect polygons in that replay's first 3800 frames.
+
 ### Packet attribution: which function wrote each drawn packet (verified (phase 1))
 
 For every node of the GPU linked-list DMA, the probe recorded which guest function last wrote

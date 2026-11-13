@@ -39,12 +39,18 @@ enum { HLR_DRAW_OPAQUE_NOZ = 4 };
 typedef struct { u32 first, count; int blend; } HlrDraw;   /* blend -1 = opaque (depth write), 0..3 semi,
                                                              * HLR_DRAW_OPAQUE_NOZ opaque without depth write */
 
+#ifndef HLR_KPOS_DEFINED      /* also in hlr.h */
+#define HLR_KPOS_DEFINED
+typedef struct { u64 key; float p[3]; } HlrKpos;
+#endif
+
 /* a frame's geometry, shared by its passes (reference counted: freed after the last pass ran) */
 typedef struct HlrGpuFrame {
     int refs;
     HlrVtx *v; u32 nv, vcap;
     u64 *k;                 /* per vertex: what it is across updates (HlrChr.key; 0 = static world /
                              * screen: moves with the camera only), for motion (phase 6) */
+    HlrKpos *kp; u32 nkp;   /* keyed positions of vertices this frame does not draw (HlrFrame.kp) */
     HlrUniforms u;
     int px0, py0, pw, ph;   /* the passes' rectangle in target pixels */
     int samples;            /* MSAA sample count in effect */

@@ -66,6 +66,9 @@ typedef struct {
                          * the PS1's walk order among the other effects; untextured: tpage holds the
                          * draw-mode (e1) word the builder linked before it (its semi mode) */
     s16 slot;           /* ordering-table slot (the game's rule; also for faces it dropped) */
+    float lift;         /* effects: how far towards the camera hlr_fx_lift may move it (view units) */
+    u8 under;           /* effects: the PS1 draws a fighter over it (hlr_fx_lift): drawn like a shadow,
+                         * before the fighters and without writing depth, so they cover it */
     u64 key[4];         /* each vertex's identity across updates, for motion (phase 6): characters
                          * 1 << 62 | model block << 16 | mesh vertex, shadows 2 << 62 | fighter << 16 |
                          * shadow vertex, effects 3 << 62 | effect object << 16 | builder << 8 | corner */
@@ -93,6 +96,13 @@ typedef struct {
     u16 zmax;           /* largest SZ of its vertices (clamped as the GTE does) */
 } HlrNat;
 
+/* a keyed vertex's world position, whether or not a face of this update uses it: a face hidden in one
+ * update and shown in the next still finds its vertices' partners (phase 6 motion) */
+#ifndef HLR_KPOS_DEFINED
+#define HLR_KPOS_DEFINED
+typedef struct { u64 key; float p[3]; } HlrKpos;
+#endif
+
 typedef struct HlrFrame {
     bool valid;
     u32 ot;             /* RAM offset of the scene ordering table it was built into */
@@ -102,6 +112,7 @@ typedef struct HlrFrame {
     int *hash; int hcap;
     HlrNat *nat; int nn, ncap;      /* native polygons (mode on) */
     HlrChr *chr; int nc, chcap;     /* character faces (mode on, phase 3) */
+    HlrKpos *kp; int nkp, kpcap;    /* every keyed vertex's position, drawn or not (motion, phase 6) */
     HlrCam cam;         /* the float camera of the pass (hlr_cam.h) */
 } HlrFrame;
 
@@ -110,6 +121,7 @@ HlrFrame *hlr_frame_begin(u32 ot);              /* empty frame for this table (r
 HlrPkt *hlr_frame_add(HlrFrame *f, u32 addr, int kind, const u32 *words, int n);
 HlrNat *hlr_frame_add_nat(HlrFrame *f);      /* a zeroed native polygon */
 HlrChr *hlr_frame_add_chr(HlrFrame *f);      /* a zeroed character face */
+void hlr_frame_add_kpos(HlrFrame *f, u64 key, const float p[3]);
 HlrFrame *hlr_frame_for_ot(u32 ot);             /* the committed, not yet walked frame of that table */
 void hlr_frame_reindex(HlrFrame *f);            /* after packets were added to a committed frame */
 void hlr_frame_commit(HlrFrame *f);
@@ -196,6 +208,7 @@ void hlr_shadow_get_stats(HlrShadowStats *st);
 /* ---- effects (hlr_fx.c, phase 5) ------------------------------------------------------ */
 void hlr_fx_pre(u32 builder, u32 obj, u32 ot);  /* an effect builder (80055820 .. 80056b40) entry */
 void hlr_fx_post(void);                         /* after it: audit, and the capture when drawing natively */
+void hlr_fx_lift(HlrFrame *f);                  /* before the native walk: lift the frame's effects (hlr_fx.c) */
 bool hlr_fx_native(void);                       /* effects are drawn natively (needs the stage drawn natively) */
 void hlr_fx_report(void);                       /* "hlr-fx: ..." */
 #define HLR_FX_BUILDERS 10
@@ -203,5 +216,6 @@ typedef struct {
     u64 calls[HLR_FX_BUILDERS], drawn[HLR_FX_BUILDERS], skipped[HLR_FX_BUILDERS];
     u64 audited, test_bad, vtx, vtx_bad, word_bad, link_bad, mode_bad, frames_bad;
     u64 attached, no_frame, cam_diff, lifted;   /* lifted: vertices moved towards the camera */
+    u64 held;           /* effect polygons drawn under a fighter the PS1 draws over them (HlrChr.under) */
 } HlrFxStats;
 void hlr_fx_get_stats(HlrFxStats *st);
