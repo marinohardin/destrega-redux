@@ -21,7 +21,7 @@
 
 #include "recomp.h"
 
-#define GAME_ABI_VERSION 1
+#define GAME_ABI_VERSION 2
 
 /* Runtime globals the generated code reads or writes (recomp.h / psx.h / pgxp.h inlines). */
 #define GAME_ABI_VARS(X)                                                                       \
@@ -56,6 +56,7 @@
     X(rt_unreached, (u32 pc), (pc))                                                            \
     /* hand-written overrides (analysis/overrides.txt): the generated code calls them */       \
     X(f_80036138, (void), ())                                                                  \
+    X(f_80036b0c, (void), ())                                                                  \
     X(f_800363c8, (void), ())                                                                  \
     X(f_80044210, (void), ())                                                                  \
     X(f_800465a4, (void), ())
@@ -63,8 +64,8 @@
 /* Generated functions the runtime calls (the overrides' originals and their guest helpers;
  * the same list as tools/ci/stub_gen/stub.c). */
 #define GAME_ABI_GEN(X)                                                                        \
-    X(f_80036138_orig) X(f_800363c8_orig) X(f_80044210_orig) X(f_800465a4_orig)                 \
-    X(f_80044918) X(f_80045414) X(f_80095188)
+    X(f_80036138_orig) X(f_800363c8_orig) X(f_80036b0c_orig) X(f_80044210_orig)                 \
+    X(f_800465a4_orig) X(f_80044918) X(f_80045414) X(f_80095188)
 
 /* declared here too: a signature that differs from the runtime's own declaration is a compile
  * error on both sides (and declares the overrides for game_load.c) */

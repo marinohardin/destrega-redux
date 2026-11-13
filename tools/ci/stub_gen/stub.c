@@ -21,6 +21,7 @@ static void no_game(const char *f)
 }
 void f_80036138_orig(void) { no_game(__func__); }
 void f_800363c8_orig(void) { no_game(__func__); }
+void f_80036b0c_orig(void) { no_game(__func__); }
 void f_80044210_orig(void) { no_game(__func__); }
 void f_800465a4_orig(void) { no_game(__func__); }
 void f_80044918(void) { no_game(__func__); }
