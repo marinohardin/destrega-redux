@@ -9,10 +9,14 @@
 # LAUNCHER PACKAGES (docs/RELEASES.md option A) hold no game code at all: an executable built with
 #   -DDESTREGA_GAME_MODULE=ON -DDESTREGA_DEV_GAME_MODULE=OFF plus an unpacked Zig release (the C
 #   compiler the launcher uses to build the game module from the player's disc on first launch).
-#   Named Destrega-<version>-<os>-<arch>.zip (Linux: .AppImage via tools/make_appimage.sh). The
+#   Named Destrega-<version>-<os>-<arch>.zip (macOS: .dmg; Linux: .AppImage via tools/make_appimage.sh). The
 #   package is refused unless the executable is a launcher build (it has the module entry point
 #   name) and tools/check_no_game_code.py finds nothing in the staged files.
-#     mac    --bin build/launcher/destrega (default); the app is made by tools/make_app.sh --zig
+#     mac    --bin build/launcher/destrega (default); the app is made by tools/make_app.sh --zig.
+#            A disk image: Destrega.app, an Applications shortcut to drag it onto, README, licences.
+#            --sign IDENTITY (Developer ID Application: ...) signs the app and the image;
+#            --notarize PROFILE (an `xcrun notarytool store-credentials` keychain profile) then
+#            notarizes and staples both (the app first, so a copy dragged out works offline too).
 #     win    --bin build/win-launcher/destrega.exe (default) + DLLs as for `win`, zig/ next to it
 #     linux  --bin build/launcher/destrega; needs appimagetool on PATH
 #   --zig DIR is required (the folder that holds the zig executable and its lib/).
@@ -50,7 +54,7 @@ if [ "$KIND" = launcher ]; then
     [ $# -ge 1 ] || { echo "package_release: launcher needs mac, win or linux" >&2; exit 1; }
     LKIND="$1"; shift
 fi
-OUT="$ROOT/dist"; APP=""; EXE=""; PERSONAL=0; DLLDIRS=(); LBIN=""; ZIGDIR=""; SIGNID="-"
+OUT="$ROOT/dist"; APP=""; EXE=""; PERSONAL=0; DLLDIRS=(); LBIN=""; ZIGDIR=""; SIGNID="-"; NOTARY=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --app) APP="$2"; shift 2 ;;
@@ -58,6 +62,7 @@ while [ $# -gt 0 ]; do
         --bin) LBIN="$2"; shift 2 ;;
         --zig) ZIGDIR="$2"; shift 2 ;;
         --sign) SIGNID="$2"; shift 2 ;;
+        --notarize) NOTARY="$2"; shift 2 ;;
         --dll-dir) DLLDIRS+=("$2"); shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --personal) PERSONAL=1; shift ;;
@@ -140,8 +145,8 @@ Report problems at https://github.com/marinohardin/destrega-redux/issues
 
 No game is included. On first launch Destrega asks for your own disc image of the game (the
 North American release, SLUS-00732: .cue/.bin), imports it, and then prepares the game for this
-computer: it translates the game program on your disc and compiles it with the build tools in
-the "zig" folder. That takes a minute or two, once; later launches start straight away.
+computer: it translates the game program on your disc and compiles it with the build tools that
+come with it (Zig). That takes a minute or two, once; later launches start straight away.
 
 Destrega is free software under the GPL-3.0 (LICENSE). Third-party licences:
 THIRD_PARTY_LICENSES.txt (Zig: zig/LICENSE)
@@ -153,9 +158,30 @@ EOF
             --entitlements "$ROOT/tools/launcher.entitlements" >/dev/null
         codesign --verify --strict "$PKG/Destrega.app" || die "app bundle signature is invalid"
         python3 "$ROOT/tools/check_no_game_code.py" "$PKG" || die "the package holds game code"
-        ZIP="$OUT/$NAME.zip"
-        [ -e "$ZIP" ] && rm "$OUT/$NAME.zip"
-        ditto -c -k --norsrc --noextattr --noqtn --keepParent "$PKG" "$ZIP" ;;
+        notarize() {    # $1 = file to submit (zip or dmg)
+            xcrun notarytool submit "$1" --keychain-profile "$NOTARY" --wait --timeout 60m \
+                > "$STAGE/notary.log" 2>&1 || { cat "$STAGE/notary.log" >&2; die "notarization failed"; }
+            cat "$STAGE/notary.log"
+            grep -q "status: Accepted" "$STAGE/notary.log" || die "notarization was not accepted"
+        }
+        if [ -n "$NOTARY" ]; then
+            [ "$SIGNID" != "-" ] || die "--notarize needs --sign with a Developer ID identity"
+            ditto -c -k --keepParent "$PKG/Destrega.app" "$STAGE/app.zip"
+            notarize "$STAGE/app.zip"
+            xcrun stapler staple "$PKG/Destrega.app" || die "stapling the app failed"
+        fi
+        ln -s /Applications "$PKG/Applications"
+        ZIP="$OUT/$NAME.dmg"; rm -f "$ZIP"
+        hdiutil create -volname "Destrega $VER" -srcfolder "$PKG" -fs HFS+ -format UDZO \
+            -imagekey zlib-level=9 -ov "$ZIP" >/dev/null || die "hdiutil create failed"
+        if [ "$SIGNID" != "-" ]; then
+            codesign --force --timestamp -s "$SIGNID" "$ZIP" || die "signing the disk image failed"
+        fi
+        if [ -n "$NOTARY" ]; then
+            notarize "$ZIP"
+            xcrun stapler staple "$ZIP" || die "stapling the disk image failed"
+            spctl -a -t open --context context:primary-signature -v "$ZIP" || die "Gatekeeper rejects the image"
+        fi ;;
     win)
         cp "$LBIN" "$PKG/destrega.exe"
         copy_dlls "$LBIN" "$PKG"

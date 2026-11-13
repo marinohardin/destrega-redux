@@ -15,7 +15,7 @@ clang).
 
 | File | For |
 |---|---|
-| `Destrega-0.1.0-alpha-macos-arm64.zip` | macOS 13+ on Apple Silicon (signed and notarized) |
+| `Destrega-0.1.0-alpha-macos-arm64.dmg` | macOS 13+ on Apple Silicon (signed and notarized): open it and drag Destrega to Applications |
 | `Destrega-0.1.0-alpha-windows-x86_64.zip` | Windows 10/11, x86-64 (not code-signed: SmartScreen will warn) |
 | `Destrega-0.1.0-alpha-linux-x86_64.tar.gz` | Linux x86-64 (needs gcc or clang; untested with the game) |
 
