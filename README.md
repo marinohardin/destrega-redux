@@ -102,12 +102,15 @@ Then run the build steps above (from the UCRT64 shell) and start the game with
 `SDL3.dll`, `zlib1.dll` and the GCC runtime DLLs from `C:\msys64\ucrt64\bin`
 next to `destrega.exe`.
 
-## Packaging and releases
+## Downloads, packaging and releases
 
-There are no downloadable playable builds: the game code in a build is translated from your own
-disc, so it cannot be redistributed. `tools/package_release.sh mac|win --personal` zips your own
-build for your own machines; CI only builds a non-playable stub. See `docs/RELEASES.md` for why,
-the options, and the macOS notarization steps. Third-party licences: `THIRD_PARTY_LICENSES.txt`.
+The [releases page](https://github.com/marinohardin/destrega-redux/releases) has **alpha** test
+builds of the launcher for macOS, Windows and Linux: they contain no game code or data, and turn
+your own disc into the game on first launch (see `docs/RELEASE_NOTES_0.1.0-alpha.md`). They are not
+user-friendly yet. A build made from your disc with the steps above holds translated game code and
+cannot be redistributed: `tools/package_release.sh mac|win --personal` zips it for your own
+machines only. See `docs/RELEASES.md` for the details and the macOS notarization steps.
+Third-party licences: `THIRD_PARTY_LICENSES.txt`.
 
 ## First launch
 
@@ -146,12 +149,12 @@ pad is player 2). Step far back until the charge bar turns blue to use magic.
 
 ## Status
 
-Version 0.1 (alpha). Boots, plays the intro FMV with audio, title, menus and every mode; fights,
+Version 0.1.0 (**alpha**). Boots, plays the intro FMV with audio, title, menus and every mode; fights,
 story, practice and VS are playable (60 Hz output; fights update at 30 fps, as on the original).
-Memory-card saves work. Rollback netplay works between Macs and between a Mac and Windows.
-Developed and tested on macOS (Apple Silicon); the Windows build is tested under Wine/CrossOver and
-the Linux build in CI (without the game). Work in progress: a native 3D renderer with a depth buffer
-and smooth 60 Hz motion (`docs/HLR_PLAN.md` on the `feature/hlr` branch). See `AGENTS.md` for
+Memory-card saves work. Rollback netplay works between Macs and between a Mac and Windows. The
+native 3D renderer draws stages and fighters (`docs/HLR_PLAN.md`; shadows, effects, 60 Hz motion and
+story scenes are in progress). Developed and tested on macOS (Apple Silicon); the Windows build is
+tested under Wine/CrossOver and the Linux build in CI (without the game). See `AGENTS.md` for
 internals and `tools/pr_check.sh` / `tools/run_tests.sh` for the tests.
 
 <sub>Licensed under the GPL-3.0 (`LICENSE`). Game data and code stay with their owners and are never part of this repository.</sub>

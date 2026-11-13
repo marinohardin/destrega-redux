@@ -50,13 +50,14 @@ if [ "$KIND" = launcher ]; then
     [ $# -ge 1 ] || { echo "package_release: launcher needs mac, win or linux" >&2; exit 1; }
     LKIND="$1"; shift
 fi
-OUT="$ROOT/dist"; APP=""; EXE=""; PERSONAL=0; DLLDIRS=(); LBIN=""; ZIGDIR=""
+OUT="$ROOT/dist"; APP=""; EXE=""; PERSONAL=0; DLLDIRS=(); LBIN=""; ZIGDIR=""; SIGNID="-"
 while [ $# -gt 0 ]; do
     case "$1" in
         --app) APP="$2"; shift 2 ;;
         --exe) EXE="$2"; shift 2 ;;
         --bin) LBIN="$2"; shift 2 ;;
         --zig) ZIGDIR="$2"; shift 2 ;;
+        --sign) SIGNID="$2"; shift 2 ;;
         --dll-dir) DLLDIRS+=("$2"); shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --personal) PERSONAL=1; shift ;;
@@ -129,21 +130,26 @@ if [ "$KIND" = launcher ]; then
     STAGE="$(mktemp -d "${TMPDIR:-/tmp}/destrega-pkg.XXXXXX")"
     trap 'rm -rf "$STAGE"' EXIT
     PKG="$STAGE/$NAME"; mkdir -p "$PKG" "$OUT"
-    cp "$ROOT/THIRD_PARTY_LICENSES.txt" "$PKG/"
+    cp "$ROOT/THIRD_PARTY_LICENSES.txt" "$ROOT/LICENSE" "$PKG/"
     cat > "$PKG/README.txt" <<EOF
 Destrega $VER ($OS, $ARCH)
+
+ALPHA RELEASE. This is an early test build for people comfortable with rough edges: it is not
+user-friendly yet, things will break, and settings or save formats may change between versions.
+Report problems at https://github.com/marinohardin/destrega-redux/issues
 
 No game is included. On first launch Destrega asks for your own disc image of the game (the
 North American release, SLUS-00732: .cue/.bin), imports it, and then prepares the game for this
 computer: it translates the game program on your disc and compiles it with the build tools in
 the "zig" folder. That takes a minute or two, once; later launches start straight away.
 
-Third-party licences: THIRD_PARTY_LICENSES.txt (Zig: zig/LICENSE)
+Destrega is free software under the GPL-3.0 (LICENSE). Third-party licences:
+THIRD_PARTY_LICENSES.txt (Zig: zig/LICENSE)
 EOF
     case "$LKIND" in
     mac)
         [ "$(uname -s)" = Darwin ] || die "mac packaging needs macOS"
-        "$ROOT/tools/make_app.sh" --bin "$LBIN" --out "$PKG/Destrega.app" --zig "$ZIGDIR" \
+        "$ROOT/tools/make_app.sh" --bin "$LBIN" --out "$PKG/Destrega.app" --zig "$ZIGDIR" --sign "$SIGNID" \
             --entitlements "$ROOT/tools/launcher.entitlements" >/dev/null
         codesign --verify --strict "$PKG/Destrega.app" || die "app bundle signature is invalid"
         python3 "$ROOT/tools/check_no_game_code.py" "$PKG" || die "the package holds game code"
