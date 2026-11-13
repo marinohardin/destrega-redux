@@ -338,7 +338,7 @@ Acceptance:
 - Widescreen edge: the builders never cull by screen position, so the effects of the extra 16:9 columns
   were already in the scene OT; in the guard band (`practice_milena`, checked by eye and by difference image) on and off differ only in
   the stage, no effect appears or vanishes at the old 4:3 edge.
-- `tools/pr_check.sh` (`PR_JOBS=2`): see the PR.
+- `tools/pr_check.sh` (`PR_JOBS=2`): PASS, 605 s, every step ok (groups renderer, menus, hlr, core).
 
 Not done: native effects seen only on Metal (not on Vulkan, D3D12 or a native driver); effects outside fights
 other than story's first scenes; per-effect depth from the game's own objects (the lift is a fixed
