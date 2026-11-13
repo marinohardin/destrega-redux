@@ -54,7 +54,7 @@ unit_tests() {
   cc_job memcard $CC runtime/memcard.c runtime/platform.c runtime/tests/test_memcard.c -o build/tests/test_memcard
   cc_job portmap $CC runtime/portmap.c runtime/settings.c runtime/platform.c runtime/platform_net.c runtime/tests/test_portmap.c -o build/tests/test_portmap
   cc_job input $CC runtime/input.c runtime/settings.c runtime/platform.c runtime/tests/test_input.c -o build/tests/test_input $SDLF -lm
-  cc_job hgpu $CC runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c runtime/platform.c runtime/tests/test_hires_gpu.c -o build/tests/test_hires_gpu $SDLF -lm
+  cc_job hgpu $CC runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c runtime/platform.c runtime/hlr/hlr_gpu.c runtime/tests/test_hires_gpu.c -o build/tests/test_hires_gpu $SDLF -lm
   for p in "${pids[@]}"; do wait $p; done
   for t in gte gpu hires pgxp spu mdec memcard input portmap; do
     printf '%-6s ' "$t"
