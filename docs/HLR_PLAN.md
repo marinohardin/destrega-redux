@@ -403,6 +403,15 @@ Not done: a person looking at it in a window (the windowed runs were scripted); 
 (nothing API-specific: copy, render target switch, existing pipelines); the HUD and the
 original-path parts at 60 Hz; more than 60 Hz.
 
+**Fixes after the first test build (2026-11-13).**
+- Torn fighters in the in-between frames during hits and knockdowns: vertices of faces that face the
+  camera in one update but not the next had no partner and stayed behind. Every model vertex's
+  position is now recorded each update (NOTES.md "HLR phase 6"). `practice_reyus` 4135-4165: unmatched
+  fighter vertices 14801 -> 0; frames 4140 / 4150 checked by eye against the old build.
+- An effect lifted in front of a fighter the PS1 draws over it (phase 5): such effects are now drawn
+  like shadows, before the fighters (NOTES.md). `vs_laon_gradd_gate` 3768-3786: the dust cloud under
+  the knocked-down fighter is behind him again, as large as in the original.
+
 ## Phase 7 results (2026-11-12)
 
 **Finding: story scenes need no new renderer.** EVENTOVL's scene loop `event_scene_loop` 8001c4dc

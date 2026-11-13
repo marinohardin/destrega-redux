@@ -435,6 +435,7 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     if (!f->nn || !g_hires || !g_hires->external) return false;
     HiresGpuInfo gi;
     if (!hires_gpu_info(&gi)) return false;
+    hlr_fx_lift(f);
     S.frames++;
     s_nmm = 0;
     /* 1. pre-walk */
@@ -565,7 +566,8 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
             it->ilo = it->ihi = -1;
             it->blend = (c->code & 2) ? (int)((c->tpage >> 5) & 3) : -1;
             it->tex_semi = tex && (c->code & 2);
-            it->fx = true;
+            it->fx = !c->under;
+            it->decal = c->under;   /* a fighter is drawn over it: placed and drawn like a shadow (hlr_fx_lift) */
             s_chrdone[i] = true;
             S.fx_items++;
             continue;
@@ -819,6 +821,10 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         gf->px0 = rect[0]; gf->py0 = rect[1]; gf->pw = rect[2]; gf->ph = rect[3];
         gf->samples = hlr_gpu_msaa_for(gi.target_format);
         gf->nearest_tex = s_look == HLR_LOOK_PS1;
+        if (f->nkp && (gf->kp = malloc((size_t)f->nkp * sizeof *gf->kp))) {
+            memcpy(gf->kp, f->kp, (size_t)f->nkp * sizeof *gf->kp);
+            gf->nkp = (u32)f->nkp;
+        }
     }
     GROW(s_pp, s_ppcap, np, 64);
     static Item **lst; static int lcap;

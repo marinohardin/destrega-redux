@@ -347,7 +347,7 @@ HlrGpuFrame *hlr_gpu_frame_new(void)
 
 void hlr_gpu_frame_unref(HlrGpuFrame *f)
 {
-    if (f && --f->refs == 0) { free(f->v); free(f->k); free(f); }
+    if (f && --f->refs == 0) { free(f->v); free(f->k); free(f->kp); free(f); }
 }
 
 HlrVtx *hlr_gpu_frame_vtx(HlrGpuFrame *f, u32 n)
@@ -567,6 +567,9 @@ static bool camera_cut(const HlrUniforms *a, const HlrUniforms *b)
     return dx * dx + dy * dy + dz * dz > tr * tr;
 }
 
+/* the position of table entry j of frame b: a drawn vertex, or (j >= nv) a keyed position */
+static inline const float *mpos(const HlrGpuFrame *b, u32 j) { return j < b->nv ? b->v[j].pos : b->kp[j - b->nv].p; }
+
 static HlrGpuFrame *interp_frame(HlrGpuFrame *a, HlrGpuFrame *b, float t)
 {
     if (s_mi && s_mi_a == a->serial && s_mi_b == (b ? b->serial : 0) && s_mi_t == t) return s_mi;
@@ -594,11 +597,20 @@ static HlrGpuFrame *interp_frame(HlrGpuFrame *a, HlrGpuFrame *b, float t)
         lerp_f(u->bk, b->u.bk, 4, t);
         /* b's keyed vertices */
         u32 cap = 1024;
-        while (cap < 2 * b->nv) cap <<= 1;
+        while (cap < 2 * (b->nv + b->nkp)) cap <<= 1;
         if (cap > s_mtab_cap) { free(s_mtab); s_mtab = malloc((size_t)cap * sizeof *s_mtab); s_mtab_cap = s_mtab ? cap : 0; }
         if (s_mtab) {
             memset(s_mtab, 0, (size_t)cap * sizeof *s_mtab);
             const u32 mask = cap - 1;
+            /* positions of every keyed vertex of b first (i >= b->nv: b->kp[i - b->nv]), then b's drawn
+             * vertices (the same positions for the same key) */
+            for (u32 i = 0; i < b->nkp; i++) {
+                const u64 k = b->kp[i].key;
+                u32 h = mhash(k) & mask;
+                while (s_mtab[h].key && s_mtab[h].key != k) h = (h + 1) & mask;
+                if (!s_mtab[h].key) { s_mtab[h].key = k; s_mtab[h].i = b->nv + i; }
+                else if (s_mtab[h].i != ~0u && memcmp(mpos(b, s_mtab[h].i), b->kp[i].p, sizeof b->kp[i].p)) s_mtab[h].i = ~0u;
+            }
             for (u32 i = 0; i < b->nv; i++) {
                 const u64 k = b->k[i];
                 if (!k) continue;
@@ -606,7 +618,7 @@ static HlrGpuFrame *interp_frame(HlrGpuFrame *a, HlrGpuFrame *b, float t)
                 while (s_mtab[h].key && s_mtab[h].key != k) h = (h + 1) & mask;
                 if (!s_mtab[h].key) { s_mtab[h].key = k; s_mtab[h].i = i; continue; }
                 const u32 j = s_mtab[h].i;
-                if (j != ~0u && memcmp(b->v[j].pos, b->v[i].pos, sizeof b->v[i].pos)) s_mtab[h].i = ~0u;
+                if (j != ~0u && memcmp(mpos(b, j), b->v[i].pos, sizeof b->v[i].pos)) s_mtab[h].i = ~0u;
             }
             static double snap = -1.0;
             if (snap < 0.0) snap = env_num("DESTREGA_HLR_MOTION_SNAP", 600.0);
@@ -620,15 +632,18 @@ static HlrGpuFrame *interp_frame(HlrGpuFrame *a, HlrGpuFrame *b, float t)
                 if (!s_mtab[h].key) continue;
                 const u32 j = s_mtab[h].i;
                 if (j == ~0u) { MS.ambiguous++; continue; }
-                const HlrVtx *vb = &b->v[j];
+                const float *pb = mpos(b, j);
                 HlrVtx *v = &f->v[i];
-                const double dx = vb->pos[0] - v->pos[0], dy = vb->pos[1] - v->pos[1], dz = vb->pos[2] - v->pos[2];
+                const double dx = pb[0] - v->pos[0], dy = pb[1] - v->pos[1], dz = pb[2] - v->pos[2];
                 const double d = sqrt(dx * dx + dy * dy + dz * dz);
                 if (d > snap) { MS.snapped++; continue; }
                 if (d > MS.max_step) MS.max_step = d;
                 MS.matched++;
-                lerp_f(v->pos, vb->pos, 3, t);
-                for (int c = 0; c < 4; c++) v->col[c] = (u8)lrintf((float)v->col[c] + ((float)vb->col[c] - (float)v->col[c]) * t);
+                lerp_f(v->pos, pb, 3, t);
+                if (j < b->nv) {    /* a colour only where b draws the vertex (else a's: lighting changes slowly) */
+                    const HlrVtx *vb = &b->v[j];
+                    for (int c = 0; c < 4; c++) v->col[c] = (u8)lrintf((float)v->col[c] + ((float)vb->col[c] - (float)v->col[c]) * t);
+                }
             }
         }
     }
