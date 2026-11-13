@@ -611,6 +611,43 @@ What drawing the fighters natively (`--hlr on`, parts `chars`; `runtime/hlr/hlr_
   equals the last one is held (output = input, trend 0): filtered step 0.000. Head flips on the
   Milena repro unchanged (mean 0.52 %, max 0.95 %; were 0.55 / 0.98).
 
+### HLR phase 7: story scenes
+
+What the story event scenes (EVENTOVL, P2 slot 0x8001a268; EVENT_SP, P1 slot) draw and how the HLR
+covers them (`story`, `story_continue_yes` scenarios, `story_win_first_fight` replay):
+- **No own character renderer** (verified (runtime: walk diagnostic below, audit; REA decompile of
+  8001c4dc likely)): the scene loop `event_scene_loop` 8001c4dc runs, per update, the camera
+  (`event_camera_track` 8001b320 -> GsRVIEW2 800cc5e0, then GsSetRefView2 800945f8, which writes the
+  WS matrix 800ed4c8), `event_ot_depth_range` 8001c324, `background_prims_add` 8003e32c,
+  `stage_render` 80044210, per actor `actor_render_culled` 80037360 (-> `fighter_render` 80037144 ->
+  `char_mesh_render` 80036b0c) and per actor an effect function from the EVENT_SP table 8001da38,
+  then `frame_submit`. Actors are ordinary 0x1dc-byte fighter structs. So phase 3's capture and audit
+  cover story characters unchanged, and the camera is the same WS matrix the HLR camera reads (0
+  models rejected for another camera in every run).
+- **Results** (`--no-interp --verify-overrides`): `story` (15600 frames, `--hlr audit`): hlr-audit
+  450964 packets / 4231 frames all 0; hlr-chars 6464 models, 0 mismatched vertices / colours / faces.
+  `story_win_first_fight` (26050 frames: intro, first fight, the event scenes after it; GPU 2x3):
+  `--hlr on` vs off per-frame state hash identical, replay ok (434 state hashes); hlr-audit 724897
+  packets / 8859 frames all 0; hlr-chars 14326 models, 0 mismatched, all attached to a native frame
+  (0 without a frame, 0 other camera), 461 character faces per frame in 3D, 1.26 passes per frame.
+  The float projection of the game's bones vs SXY reached max 474 px there (mean 1.98 px; 5.4 px max
+  in `story`): not an audit mismatch (the audit compares the GTE's own integer results); probably
+  a vertex the GTE saturated near the camera in a close-up (guess, not traced).
+  `story_continue_yes` (`--hlr audit`): 569780 packets / 5249 frames all 0; hlr-chars 8501 models,
+  0 mismatched.
+  `story` with `--hlr exact` vs off (GPU 2x3): dumps at 7200..12000 byte-identical, state hash
+  identical, 308763 packets drawn by the HLR, 0 stale.
+- **What stays on packets in event scenes** (verified (`DESTREGA_HLR_WALK_DIAG`, vblank 6500-26000)):
+  every character packet is captured. Others per walk: 1-2 FT4 billboards (code 2c / 2e) in
+  EVENTOVL's data page 8001dxxx (likely the EVENT_SP effect functions, via `effect_billboard_quad`
+  80055b70: phase 5's scope), one fixed code-0x80 + 0x00 pair at 800b8xxx (also in fights), and 2D
+  rects 62 / 66 + e1 at 800e7xxx (fades / letterbox, 2D). In the fight part: shadows (0x36) and
+  effects (phases 4 / 5).
+- `DESTREGA_HLR_WALK_DIAG=LO-HI[:BUCKET]` (libetc vblank count, bucket default 500; needs `--hlr on`
+  or `exact`, since audit installs no `ll_filter`): per bucket the packets of the linked-list walks
+  classed as captured stage / character / other (histogram by GP0 code and RAM page) / outside a
+  captured table.
+
 ### Fog, depth cue and lights per stage (verified (phase 1))
 
 `stage_env_setup` (8003fa44) runs once per stage, before the fight loop, with the stage index
@@ -943,10 +980,9 @@ Resolved in phase 1:
 - 8007ccdc: not a renderer.
 - The second camera matrix 800cc624: the identity rig coordinate.
 - `fighter_effects_render`'s overlay path: overlays call the shared builders.
+- Story EVENTOVL scene camera (phase 7): `event_camera_track` 8001b320 -> GsSetRefView2, see "HLR phase 7".
 
 Still open:
-- Story EVENTOVL scenes use `stage_render` and the stage builders (800401f8, 8003fcb8 and
-  800433c4 seen in `story`), but which overlay code sets their camera was not extracted.
 - Camera modes 2 and 3 never ran in any of the runs.
 - The stage data on disc (DATA.BNS stage packs) was not decoded; only the in-RAM layout.
 - Effect culling: 80055b70 has none (read in full). The other builders and the containers were

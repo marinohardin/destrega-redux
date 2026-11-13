@@ -294,8 +294,76 @@ static void external_noop(void *ctx, void *cmdbuf, void *colour_tex, int w, int 
     (void)ctx; (void)cmdbuf; (void)colour_tex; (void)w; (void)h;
 }
 
+/* ---- walk attribution (DESTREGA_HLR_WALK_DIAG=LO-HI[:BUCKET], libetc vblank count) ---------------
+ * Diagnostic only (phase 7, story scenes): every packet node the GPU linked-list walk visits is
+ * classed as a captured stage packet, a captured character face or "other"; others are counted by
+ * GP0 code and by RAM page (4 KiB) so their writer can be looked up. One line per BUCKET vblanks
+ * (default 500). Reads nothing but RAM and the frame store. */
+static struct {
+    int on;                             /* -1 = not read yet */
+    u32 lo, hi, bucket, cur;
+    u64 walks, stage, chr, other, outside;
+    u32 code[256];
+    struct { u32 page, n; u8 code; } pg[64];
+    int npg;
+} WD = { .on = -1 };
+
+static void walk_diag_flush(void)
+{
+    if (!WD.walks && !WD.other && !WD.stage) return;
+    char codes[512] = "", pages[1024] = "";
+    for (int c = 0; c < 256; c++) if (WD.code[c] && strlen(codes) < sizeof codes - 16)
+        snprintf(codes + strlen(codes), sizeof codes - strlen(codes), " %02x:%u", c, WD.code[c]);
+    for (int i = 0; i < WD.npg; i++) if (strlen(pages) < sizeof pages - 24)
+        snprintf(pages + strlen(pages), sizeof pages - strlen(pages), " %05x(%02x):%u",
+                 0x80000 | (WD.pg[i].page >> 12), WD.pg[i].code, WD.pg[i].n);
+    rt_log("hlr-walk-diag: vblank %u..%u: %llu walks; packets in a captured table: %llu stage, %llu character,"
+           " %llu other; %llu outside it; other codes%s; other pages%s", WD.cur, WD.cur + WD.bucket - 1,
+           (unsigned long long)WD.walks, (unsigned long long)WD.stage, (unsigned long long)WD.chr,
+           (unsigned long long)WD.other, (unsigned long long)WD.outside, codes, pages);
+    WD.walks = WD.stage = WD.chr = WD.other = WD.outside = 0;
+    memset(WD.code, 0, sizeof WD.code);
+    WD.npg = 0;
+}
+
+static void walk_diag(u32 node)
+{
+    if (WD.on < 0) {
+        const char *e = getenv("DESTREGA_HLR_WALK_DIAG");
+        WD.on = e != NULL;
+        WD.hi = ~0u; WD.bucket = 500;
+        if (e && strchr(e, '-')) { WD.lo = (u32)strtoul(e, NULL, 10); WD.hi = (u32)strtoul(strchr(e, '-') + 1, NULL, 10); }
+        if (e && strchr(e, ':')) WD.bucket = (u32)strtoul(strchr(e, ':') + 1, NULL, 10);
+        if (!WD.bucket) WD.bucket = 500;
+    }
+    if (!WD.on) return;
+    const u32 vbc = *(u32 *)(g_ram + 0xbf2b4);
+    if (vbc < WD.lo || vbc > WD.hi) return;
+    const u32 b = vbc / WD.bucket * WD.bucket;
+    if (b != WD.cur) { walk_diag_flush(); WD.cur = b; }
+    if (node == 0xffffffffu) { WD.walks++; return; }
+    node &= 0x1ffffc;
+    const u32 hdr = *(u32 *)(g_ram + node);
+    if (!(hdr >> 24)) return;           /* an empty node (ordering-table slot or a bare link) */
+    for (int i = 0; i < 2; i++)
+        if (s_fr[i].valid && node >= s_fr[i].ot && node < s_fr[i].ot + 4 * HLR_OT_SLOTS) return;
+    if (!s_active) { WD.outside++; return; }
+    const HlrPkt *p = hlr_frame_find(s_active, node);
+    if (p && p->chr >= 0) { WD.chr++; return; }
+    if (p) { WD.stage++; return; }
+    WD.other++;
+    const u8 code = (u8)(*(u32 *)(g_ram + node + 4) >> 24);
+    WD.code[code]++;
+    const u32 page = node & ~0xfffu;
+    int i = 0;
+    while (i < WD.npg && !(WD.pg[i].page == page && WD.pg[i].code == code)) i++;
+    if (i < WD.npg) WD.pg[i].n++;
+    else if (WD.npg < 64) { WD.pg[WD.npg].page = page; WD.pg[WD.npg].code = code; WD.pg[WD.npg].n = 1; WD.npg++; }
+}
+
 bool hlr_ll_filter(u32 node)
 {
+    walk_diag(node);
     if (node == 0xffffffffu) {              /* end of the walk: the frame has been drawn */
         hlr_native_end();
         if (s_active) { S.walked++; frame_clear(s_active); s_active = NULL; }
@@ -339,6 +407,7 @@ void hlr_get_stats(HlrStats *st) { *st = S; }
 
 void hlr_report(void)
 {
+    if (WD.on > 0) walk_diag_flush();
     if (s_mode == HLR_OFF && !S.captured) return;
     hlr_stage_report();
     hlr_char_report();
