@@ -99,6 +99,7 @@ fi
 tl_step memcard tools/test_memcard.sh
 tl_step menu tools/test_menu.sh
 tl_step savestate tools/test_savestate.sh
+tl_step bgm_loop python3 tools/test_bgm_loop.py -j "$JOBS"
 # input layer + settings file: custom bindings and synthetic host events == the --press run
 tl_step input python3 tools/test_input.py
 tl_step overlay_menu python3 tools/test_overlay_menu.py

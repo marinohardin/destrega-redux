@@ -239,7 +239,8 @@ the script has the exact patterns), each a small subset:
 - **core** (other `runtime/*.c|h`, `runtime/overrides/`, `recomp/`, `analysis/overrides.txt`,
   `extra_seeds.txt`, procedure / overlay lists, `CMakeLists.txt`): scenarios `vs_hills`, `story`,
   `option_game`, `practice`; replays `practice_gradd`, `opts_handicap_recover`,
-  `vs_falma_reyus_cave`; `test_savestate.sh`.
+  `vs_falma_reyus_cave`; `test_savestate.sh`; `test_bgm_loop.py` (a fight and a menu BGM played past
+  their loop point; `tools/xa_loop_check.py` finds a stuck loop in the `--wav`).
 - A group's own test scripts trigger it too; docs and other tools add nothing.
 
 **Full suite** (`tools/run_tests.sh`, the release suite; same coverage as ever): runs under
@@ -1826,6 +1827,11 @@ notarization steps) is in `docs/RELEASES.md`.
   on an off voice must widen that test. The reverb output filter relies on `rv_out_hist` holding
   0 at every even `rv_pos` (only `reverb_tick` writes it). Checks: `--wav` and `--state-hash`
   byte-identical to the previous build on a replay.
+- CD GetlocL must answer the last sector *read*, XA-ADPCM sectors included (`cdrom.c read_tick`):
+  the game polls it every 2 vblanks to find a BGM track's end and re-seek. Updated only for data
+  sectors, it stayed "past the end" after the re-seek and the game re-seeked every 9 vblanks forever
+  (one note of the BGM repeated). `DESTREGA_XA_TRACE=1` logs sectors and GetlocL answers; NOTES.md
+  "CD: GetlocL and the BGM loop".
 - GTE `mvmva_core` fast path assumes 16-bit matrix elements and vector components (the registers
   are stored sign-extended / saturated); a change that lets wider values in must drop it.
 - Fights run at 30 updates/s by design (`f_80027218(1)` -> `VSync(2)`); not a bug.

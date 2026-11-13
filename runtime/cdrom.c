@@ -71,7 +71,6 @@ static void cd_deliver(void) {
     if (p.type == 1) g_cd_int1_delivered++;
     if (p.slot >= 0) {
         memcpy(s_sector, s_secbuf[p.slot], SECTOR);
-        memcpy(s_last_header, s_sector + 12, 8);
         s_data_len = s_data_pos = 0;   /* FIFO now refers to the new sector */
     }
     memcpy(s_resp, p.resp, p.len);
@@ -92,6 +91,14 @@ void cdrom_reset_audio(void) { xa_reset(&s_xa); }
 /* ---- sector reading ---------------------------------------------------------- */
 
 static void read_tick(void);
+
+/* DESTREGA_XA_TRACE=1: log every sector the drive reads (LBA, mode, subheader, filter) and every
+ * GetlocL answer. Diagnostics only (host side, never touches emulated state). */
+static bool xa_trace(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DESTREGA_XA_TRACE") != NULL;
+    return on;
+}
 
 static u64 read_period(void) { return (s_mode & 0x80) ? READ_CYCLES_1X / 2 : READ_CYCLES_1X; }
 
@@ -117,10 +124,19 @@ static void read_tick(void) {
     s_secbuf_next = (s_secbuf_next + 1) % SECBUF_SLOTS;
     u8 *sec = s_secbuf[slot];
     cdrom_read_sector(lba, sec);
+    /* GetlocL reports the header + subheader of the sector the drive read last, whatever its
+     * type: XA-ADPCM sectors that go to the SPU count too. The game polls GetlocL every 2
+     * vblanks while its BGM streams and loops the track once the position passes the track's
+     * end. Updating this only for data sectors (at INT1) left it stale for the whole song, then
+     * at the padding data sectors after the end; after the game's re-seek it still said "past
+     * the end", so the game re-seeked every 9 vblanks forever (the stuck BGM loop, NOTES.md). */
+    memcpy(s_last_header, sec + 12, 8);
     u8 submode = sec[18];
     u8 file = sec[16], chan = sec[17];
     bool audio = (sec[15] == 2) && (submode & 0x04);
     sched_event(EVT_CDROM_READ, read_period(), read_tick);
+    if (xa_trace()) rt_log("xa: lba %u mode %02x sm %02x f %u c %u ci %02x filt %u/%u", lba, s_mode,
+                           submode, file, chan, sec[19], s_filter_file, s_filter_chan);
 
     if ((s_mode & 0x40) && audio) {
         /* XA-ADPCM: goes to the SPU, never to the data path */
@@ -209,6 +225,7 @@ static void execute(u8 cmd) {
         break;
     case 0x10: /* GetlocL */
         memcpy(r, s_last_header, 8); push_int(3, r, 8, ACK_DELAY);
+        if (xa_trace()) rt_log("xa: getlocl %02x:%02x:%02x m%u f %u c %u sm %02x ci %02x", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
         break;
     case 0x11: { /* GetlocP */
         u32 l = s_curloc + 150, rel = s_curloc;
