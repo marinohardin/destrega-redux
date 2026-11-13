@@ -83,6 +83,7 @@ static DestregaMenu *s_target;   /* menu items hold their target weakly */
     bool vchk;
     if (a && frontend_view_checked(a.UTF8String, &vchk))
         item.state = vchk ? NSControlStateValueOn : NSControlStateValueOff;
+    if ([a hasPrefix:@"hlr"]) return frontend_hlr_available();   /* View > 3D Scene: GPU renderer only */
     if ([a hasPrefix:@"renderer="]) {
         NSString *r = [a substringFromIndex:9];
         item.state = [r isEqualToString:@(frontend_renderer())] ? NSControlStateValueOn : NSControlStateValueOff;
@@ -397,23 +398,47 @@ void menu_init(void) {
         NSMenuItem *aaItem = [[NSMenuItem alloc] initWithTitle:@"Anti-aliasing" action:nil keyEquivalent:@""];
         aaItem.submenu = aa;
         [view insertItem:aaItem atIndex:5];
+        /* View > 3D Scene: Original (the game's own packets) or Native (the high-level renderer,
+         * runtime/hlr/; presentation only), and which parts it draws. Greyed out unless a GPU API
+         * is the renderer (validateMenuItem, frontend_hlr_available). */
+        NSMenu *scene = [[NSMenu alloc] initWithTitle:@"3D Scene"];
+        add(scene, @"Original", @"hlr=off", nil, 0);
+        add(scene, @"Native", @"hlr=on", nil, 0);
+        [scene addItem:[NSMenuItem separatorItem]];
+        add(scene, @"Stage", @"hlr-part=stage", nil, 0);
+        add(scene, @"Characters", @"hlr-part=chars", nil, 0);
+        add(scene, @"Smooth Character Motion", @"hlr-bones", nil, 0);   /* bone filter (hlr_char.c) */
+        [scene addItem:[NSMenuItem separatorItem]];
+        add(scene, @"Enhanced Look", @"hlr-look=enhanced", nil, 0);   /* per-pixel lighting, filtered textures */
+        add(scene, @"PS1 Look", @"hlr-look=ps1", nil, 0);             /* per-vertex, point-sampled */
+        [scene addItem:[NSMenuItem separatorItem]];
+        add(scene, @"Clip Near Polygons", @"hlr-near=clip", nil, 0);
+        add(scene, @"Drop Near Polygons (PS1)", @"hlr-near=ps1", nil, 0);
+        [scene addItem:[NSMenuItem separatorItem]];
+        add(scene, @"Edge Smoothing Off", @"hlr-msaa=1", nil, 0);
+        add(scene, @"Edge Smoothing 2x", @"hlr-msaa=2", nil, 0);
+        add(scene, @"Edge Smoothing 4x", @"hlr-msaa=4", nil, 0);
+        add(scene, @"Edge Smoothing 8x", @"hlr-msaa=8", nil, 0);
+        NSMenuItem *sceneItem = [[NSMenuItem alloc] initWithTitle:@"3D Scene" action:nil keyEquivalent:@""];
+        sceneItem.submenu = scene;
+        [view insertItem:sceneItem atIndex:6];
 
         /* Enter / Exit Full Screen (title follows the state; also Alt+Enter and F11, handled in
          * main.c's event loop so they work on every platform) */
-        [view insertItem:NSMenuItem.separatorItem atIndex:6];
+        [view insertItem:NSMenuItem.separatorItem atIndex:7];
         NSMenuItem *fs = [[NSMenuItem alloc] initWithTitle:@"Enter Full Screen" action:@selector(fire:)
                                               keyEquivalent:@"f"];
         fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         fs.target = s_target;
         fs.representedObject = @"fullscreen";
-        [view insertItem:fs atIndex:7];
+        [view insertItem:fs atIndex:8];
 
         /* View > Controls… (also Settings… in the application menu, Cmd+,) */
-        [view insertItem:NSMenuItem.separatorItem atIndex:8];
+        [view insertItem:NSMenuItem.separatorItem atIndex:9];
         NSMenuItem *ctl = [[NSMenuItem alloc] initWithTitle:@"Controls…" action:@selector(fire:) keyEquivalent:@""];
         ctl.target = s_target;
         ctl.representedObject = @"controls";
-        [view insertItem:ctl atIndex:9];
+        [view insertItem:ctl atIndex:10];
         NSMenu *app = bar.numberOfItems > 0 ? bar.itemArray[0].submenu : nil;
         if (app && app != file) {
             NSInteger at = app.numberOfItems > 0 ? 1 : 0;   /* after About */

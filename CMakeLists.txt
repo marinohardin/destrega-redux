@@ -102,7 +102,7 @@ add_executable(destrega
   runtime/overrides/widescreen.c runtime/overrides/char_mesh.c runtime/platform.c runtime/platform_net.c
   runtime/savestate.c runtime/replay.c runtime/netplay.c runtime/net.c runtime/smooth.c runtime/portmap.c
   runtime/netplay_ui.c runtime/input.c runtime/settings.c
-  runtime/menu_overlay.c)
+  runtime/menu_overlay.c runtime/hlr/hlr.c runtime/hlr/hlr_stage.c runtime/hlr/hlr_char.c runtime/hlr/hlr_native.c runtime/hlr/hlr_gpu.c)
 target_include_directories(destrega PRIVATE runtime ${GEN_INCLUDE} ${CMAKE_CURRENT_BINARY_DIR})
 # Emulation source identity for the netplay handshake (rule in tools/source_ident.py): the same
 # on every platform for the same sources.
@@ -237,7 +237,7 @@ if(DESTREGA_TESTS)
   # SDL_GPU backend vs software on random command streams (needs a GPU device; exit 77 =
   # skipped when there is none, e.g. a CI runner without Vulkan)
   add_executable(test_hires_gpu runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c
-                 runtime/platform.c runtime/tests/test_hires_gpu.c)
+                 runtime/platform.c runtime/hlr/hlr_gpu.c runtime/tests/test_hires_gpu.c)
   target_include_directories(test_hires_gpu PRIVATE runtime)
   target_compile_options(test_hires_gpu PRIVATE -O2 -Wall)
   target_link_libraries(test_hires_gpu PRIVATE SDL3::SDL3)
@@ -252,9 +252,29 @@ if(DESTREGA_TESTS)
   # fast precision (--gpu-precision fast): the same streams within a tolerance
   add_test(NAME hires_gpu_fast COMMAND test_hires_gpu fast auto WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(hires_gpu_fast PROPERTIES SKIP_RETURN_CODE 77)
+  # HLR: an empty external render pass mid-stream leaves the target unchanged
+  add_test(NAME hlr_gpu COMMAND test_hires_gpu external auto WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(hlr_gpu PROPERTIES SKIP_RETURN_CODE 77)
+  # HLR phase 2a without the disc: switches, a synthetic stage through the capture and audit,
+  # frame pairing in the linked-list filter, save-state drop, gpu.c suppression
+  add_executable(test_hlr runtime/hlr/hlr.c runtime/hlr/hlr_stage.c runtime/hlr/hlr_char.c runtime/hlr/hlr_native.c runtime/hlr/hlr_gpu.c
+                 runtime/gte.c runtime/gpu.c runtime/hires.c runtime/hires_gpu.c runtime/pgxp.c runtime/platform.c
+                 runtime/tests/test_hlr.c)
+  target_include_directories(test_hlr PRIVATE runtime)
+  target_compile_options(test_hlr PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(test_hlr PRIVATE SDL3::SDL3)
+  if(UNIX)
+    target_link_libraries(test_hlr PRIVATE m)
+  endif()
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(test_hlr PRIVATE pthread)
+  endif()
+  add_test(NAME hlr COMMAND test_hlr WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   if(APPLE)   # MoltenVK, when the Vulkan loader is installed (Homebrew vulkan-loader + molten-vk)
     add_test(NAME hires_gpu_vulkan COMMAND test_hires_gpu vulkan WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     set_tests_properties(hires_gpu_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME hlr_gpu_vulkan COMMAND test_hires_gpu external vulkan WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(hlr_gpu_vulkan PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 endif()
 

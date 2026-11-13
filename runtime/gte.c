@@ -692,6 +692,55 @@ void gte_restore(const GteState *s)
     g_flag = s->flag;
 }
 
+/* ---- host-owned GTE state (HLR, docs/HLR_PLAN.md 3.2) -----------------------
+ * Run the unchanged implementation on a GteState the caller owns: swap it in,
+ * run, swap back. The guest's registers, FLAG and PGXP FIFO tags are restored
+ * bit for bit, and PGXP production is off for the call (no pool entries).
+ * Not on the normal path: generated code never calls these. */
+typedef struct { GteState g; u32 tags[3]; bool pg; } GteSwap;
+
+static void swap_in(GteSwap *k, const GteState *s)
+{
+    gte_save(&k->g);
+    memcpy(k->tags, g_pgxp_gte, sizeof k->tags);
+    k->pg = g_pgxp;
+    g_pgxp = false;
+    gte_restore(s);
+}
+
+static void swap_out(GteSwap *k, GteState *s)
+{
+    if (s) gte_save(s);
+    gte_restore(&k->g);
+    memcpy(g_pgxp_gte, k->tags, sizeof k->tags);
+    g_pgxp = k->pg;
+}
+
+void gte_exec_on(GteState *s, u32 cmd)
+{
+    GteSwap k; swap_in(&k, s); gte_command(cmd); swap_out(&k, s);
+}
+
+void gte_write_data_on(GteState *s, int reg, u32 v)
+{
+    GteSwap k; swap_in(&k, s); gte_write_data(reg, v); swap_out(&k, s);
+}
+
+void gte_write_ctrl_on(GteState *s, int reg, u32 v)
+{
+    GteSwap k; swap_in(&k, s); gte_write_ctrl(reg, v); swap_out(&k, s);
+}
+
+u32 gte_read_data_on(GteState *s, int reg)
+{
+    GteSwap k; swap_in(&k, s); u32 v = gte_read_data(reg); swap_out(&k, NULL); return v;
+}
+
+u32 gte_read_ctrl_on(GteState *s, int reg)
+{
+    GteSwap k; swap_in(&k, s); u32 v = gte_read_ctrl(reg); swap_out(&k, NULL); return v;
+}
+
 /* ---- save states (savestate.h) ---------------------------------------------- */
 #include "savestate.h"
 void gte_state_io(StateIO *io) { SS_VAR(io, d); SS_VAR(io, c); SS_VAR(io, g_flag); }

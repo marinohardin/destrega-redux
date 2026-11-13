@@ -418,6 +418,199 @@ guard band (the runtime extends full-width fills / rects; these are polygons).
   so the command type is the builder selector, not the GPU code. Packet buffers:
   800c03cc -> 8011f424 and 800c03d0 -> 8012b7e4.
 
+### Stage builders in full: the audit model (verified (HLR phase 0 A))
+
+`--hlr audit` (`runtime/hlr/hlr_stage.c`, around the real `stage_render` pass in
+`overrides/widescreen.c`) re-runs every stage builder on a host GTE state (`gte_exec_on`) and
+compares the predicted packets word by word with the scene OT after the original ran. 0 mismatched
+packets on all 12 VS stages, practice and story (table below), so the rules here are exact:
+- **Visibility** (80043fd4, read in full): flags & 4: 4 bounding points (RTPT + RTPS), hidden if
+  every point has x < -256 or x >= 257, or y < -120 or y >= 121 (min/max over the points; x
+  bounds are `WS_IMM`); flags & 1: a sphere, MVMVA, hidden unless MAC3 > 0; neither: visible.
+  Then hidden if flags & 0x4000, or flags & 8 without flags & 0x8000, or (mode < 2 and
+  flags & 0x40), or (mode == 2 and flags & 0x100); mode = stage_render's a0. Object 0 is always
+  drawn. Packet buffer gp+0x5e8 (OT index 0) / gp+0x5e4 (index 1); the normal-index and
+  pre-lit colour streams are offsets from gp+0x5cc (800c03b4, `stage_normals`); gp = 800bfde8.
+- **Per polygon**: reject if max x < -254, min x >= 255, max y < -118 or min y >= 119 (screen is
+  centred, OFX = OFY = 0, so pixel = 256 + sx, 120 + sy), and if SZ < 400 (near cull).
+- **OT slot** (2048 slots, reverse; base `r32(0x800c0724 + idx * 0x14)`, idx = scratch
+  1f800000), from the polygon's SZ (unsigned compares): sz < near (1f80000c): sz * 341 /
+  (near + 1); sz < mid (1f800010): ((sz - near) << 10) / (mid - (near - 1)) + 341; sz < far
+  (1f800008): (sz - mid) * 683 / (far - (mid - 1)) + 1365; else 2047.
+- **IR0 quirks** (the depth-cue factor used for the colours; each matters for exact colours):
+  lit GT3 strips (0x34) keep the IR0 of the strip's first RTPT for the whole strip; lit GT4 strips
+  (0x3c) read IR0 when the colour is computed (after the last RTPS); independent quads save IR0
+  after the RTPT, before the 4th vertex's RTPS.
+- Strip fans: triangles alternate the carried vertex (`idx ^= 2`), SZ per vertex.
+- **Objects with flag 0x2000** (verified (HLR phase 2a audit); 800426c4 / 800433c4, sub builders
+  800423e0 / 80042fec read in full): types 0x34 / 0x35 (triangles) and 0x3c / 0x3d (quads) take
+  the polygon count only (no strips; a3 = prelit). Per polygon the packet advances 40 (tri) / 52
+  (quad) bytes and the stream 12 / 16, culled or not; culls and SZ < 400 as above; the colour
+  (lit NCDT/NCDS or prelit DPCT/DPCS) is computed before the size test. A polygon with an x span
+  >= 901, a y span >= 451, max y >= 513 or min y < -512 is **not linked** but split into four
+  (`a, ab, ca, bc...` midpoints; quads into four quads with the centre vertex): each quarter is a
+  12-byte stack vertex {x, y, z of the model vertex, u/v from the parent packet's UV words' low
+  halves, colour word}; midpoints use C `/2` (rounds toward 0) on x/y/z and `>> 1` per byte on u,
+  v and r/g/b (the code byte is the first vertex's); the quarter is projected again (RTPT, plus
+  RTPS for the 4th vertex), culled with the same bounds, its tpage (parent w6 high half) and CLUT
+  (w3 high) copied, OT slot from the SZ of vertices 0-2 only (quads), and written at the sub
+  cursor gp+0x5c4 (quads) / gp+0x5c0 (tris). At most 20 quarters of each kind per frame (counts
+  gp+0x5e0 / gp+0x5d8, reset by the prologue); a culled quarter does not advance the cursor or
+  the count. Prologue: when gp+0x5bc is non-zero the cursors are re-based to gp+0x5dc / gp+0x5d4
+  + this frame's packet buffer (-1 = none), else they keep last frame's value. Seen: gate (10
+  objects: 280 triangles, 130 quads), castle1 (305 objects, 2135 quads, 10 split, 20 quarters
+  linked), remains (4508 triangles, 644 quads), story (1344 quads). No stage splits a triangle,
+  so 800423e0's model is read but not exercised.
+
+| scenario | packets checked | mismatched | alt (0x2000) packets |
+|---|---:|---:|---:|
+| hills / cave / villa / canyon | 37,192 / 42,677 / 101,333 / 260,330 | 0 | 0 |
+| gate / castle1 / castle2 / throne | 84,654 / 68,154 / 154,356 / 103,154 | 0 | 0 / 2417 / 0 / 0 |
+| remains / hamlet / shrine / fortress | 51,206 / 98,884 / 145,636 / 131,040 | 0 | 494 / 0 / 0 / 0 |
+| practice / story / practice_milena repro | 60,408 / 494,731 / 32,370 | 0 | 0 / 49 / 0 |
+
+Each run: scenario frames + 600 (story 16200), `--no-interp --verify-overrides`; also 0
+unexplained packets, 0 missing, 0 OT slot heads different. Story's two GT4 packets that link to
+an alt packet (frames 3851/3852) are the only links into alt ranges. A deliberately broken
+builder produced mismatches (the probe sees errors). (The alt column is from phase 0, when the
+0x2000 objects were only recognised; since phase 2a they are predicted like the rest: 0 mismatched,
+0 unexplained, 0 missing on all 12 stages, practice and story, `tools/test_hlr.py audit`.) Per-frame `--state-hash` with `--hlr audit`
+on equals off (vs_hills 3700 frames; vs_castle1 widescreen 2x3 4100 frames; the Milena repro 3966
+frames).
+
+### HLR phase 2a: stage capture and per-node replay (verified (tests))
+
+How the native renderer gets the stage without touching emulation (`runtime/hlr/`, AGENTS.md "Native
+high-level renderer"): `stage_pre` (before the real pass of stage_render, `overrides/widescreen.c`)
+predicts every packet from the root, the GTE state the pass finds and the matrices / lights it loads
+(800ed4c8, 800cc6e0, 800cc6c0), on a copy of the GTE; `stage_post` audits RAM and the OT, and a
+clean frame becomes an `HlrFrame` (a copy of each linked packet's words; the predicted XY / colour
+words plus, for the words no builder computes (UV, CLUT, tpage, F3/F4 colours), the RAM words).
+Facts the pairing relies on (verified by the exact-dump and hash tests on every stage):
+- the scene OT of one index is built by exactly one stage pass and walked by exactly one GPU
+  linked-list DMA before it is built again (305 captures, 304 walks, 0 replaced in vs_castle1; the
+  last one is never walked because the run ends);
+- the stage packets are not rewritten between the pass and the DMA (0 stale packets in every run:
+  the walk compares each node's words with the capture before replacing it);
+- a frame whose audit fails is not captured and is drawn the old way (`frames not captured`: 0 in
+  every run so far); packets linked but never drawn by the HLR are those of the last, unwalked
+  capture (e.g. vs_hills 22443 of 22492).
+Cost: 0.37 ms host time per stage pass (one per game update) in the Hills fight, quick_check bench
+configuration (`hlr-cost:` line).
+
+### HLR phase 2b: the stage in native 3D
+
+What the native stage (`--hlr on`, AGENTS.md "Native high-level renderer") learned about the game:
+- **Stage model coordinates are world coordinates** (verified (audit + native draw on all 12
+  stages)): every object is drawn with the world-screen matrix 800ed4c8 (RT + TR) alone, so one
+  float camera per stage pass (`hlr_cam.h`, from the GTE control registers) places every polygon;
+  the native picture lines up with the original one on every stage key frame (`tools/hlr_diff.py`).
+- **The per-object visibility test culls on purpose** (verified (Throne VS key frame, diagnostics
+  `DESTREGA_HLR_DIAG`)): the flags & 4 test projects 4 points that do not bound the object. Throne's
+  VS camera stands behind / inside a wall object (view z 500-1200 in front of the eye) that this
+  test hides; drawn by the native frustum alone it covered the whole screen and the fighters. So an
+  object the test hides at 4:3 is drawn natively only if the same test with x bounds widened by the
+  guard band (-344 / 345) passes, i.e. what the widescreen shadow pass would show. Packets of an
+  object hidden this frame are not written: their UV / CLUT / page words are left from the last
+  frame it was drawn (or never written); a polygon whose command byte is not its own or whose page
+  is in the framebuffer is left out (counted, 0 seen after the widened test).
+- **GTE projection error vs the float camera** (verified (CTest `hlr`)): RTPS truncates the view
+  position to integers (IR1 / IR2) before the division, so SX can be up to H / z px off the exact
+  projection, plus the floor of SX. For z >= 4H (the fight stages' usual depths) the float camera is
+  within 0.70 px of SX + 0.5 over 6867 random on-screen vertices; near the eye (z ~ H) the GTE itself
+  is off by ~1-3 px, which the native stage does not reproduce (it is the source of the PS1 wobble).
+- **Stage key frames, native vs original** (4x6 16:9, Metal, MSAA 4x; `build/hlr2b/diff2/table.txt`,
+  not committed): 1.4 (Hills) to 4 (Canyon) passes per frame, 114-506 polygons per frame drawn, 0
+  walks given up, 0 failed passes. Pixels off by > 4 15-bit steps: 0.00-2.6 % (Throne 7.7 %: its
+  carpet and floor textures differ most under filtering); the differences are texture filtering
+  (trilinear + anisotropic and per-pixel lighting vs the 15-bit affine original), polygon edges
+  (MSAA) and gaps the original leaves in the guard band (Canyon: 6.5 % black pixels off, 3.9 % on,
+  the cliff at the left edge is filled). Characters, shadows and the HUD are byte-identical (black in
+  the difference images).
+  Direct3D 12 (DXIL, under CrossOver, Hills): the same 114 polygons in 1.40 passes per frame as
+  Metal; its key frames differ from Metal's in 0.107 % of the pixels by 1 15-bit step at most
+  (verified (runtime): `--hlr on`, both state hashes equal to `off`).
+
+### HLR phase 3: characters in native 3D
+
+What drawing the fighters natively (`--hlr on`, parts `chars`; `runtime/hlr/hlr_char.c`) learned:
+- **char_mesh_render 80036b0c is fully reproducible from RAM** (verified (audit, every call of 12
+  practice replays, vs_hills, story; synthetic model in CTest `hlr`)): a host GTE rebuilds the vertex
+  buffer 800c9d38 word for word (per part: S = WS * workm by MVMVA 0x4a49e012, TR' by MVMVA
+  0x4a480012, then RTPT / RTPS), the colour buffer 800cb7c8 (NCCT / NCCS with LLM = part +0x24,
+  LCM = part +0x44, RGBC 800bfe28: so each part has its own light colour matrix, verified by 0
+  mismatched colours), and the exact set of faces linked into each OT slot with their words.
+  Practice Milena: 613 models, 388637 vertices, 392927 colours, 494382 faces (197507 kept), all 0
+  mismatched. The vertex buffer restarts at its first entry on every call.
+- **Chains (`char_mesh_chains` 800367d8)** (likely (audit passes with this model)): model block
+  +0x14; per chain [0] part index, [1] count, then per segment a word (hi16 anchor, lo16 count)
+  and 8-byte world points, projected with WS alone and appended to the vertex buffer after the
+  parts' vertices. Hair / cloth.
+- **Face records**: tris 0x5c bytes, packet vertex order A, C, B; quads 0x78 bytes; OT slot from the
+  3-segment map (1f800008..10) of the average SZ (tris) / minimum SZ (quads) (verified (audit)).
+- **Float bones vs the game's integer SXY**: world position = workm * v / 4096 + t in float, through
+  the float camera: mean 0.89-0.92 px, max 1.7-2.4 px from the game's SXY (the integer chain and the
+  GTE's own truncation; verified (exit line)).
+- **Depth: characters write the stage's depth buffer** (decision, phase 3). Kept per-pass painter's
+  order would have kept the PS1's per-face OT order (the head flips are partly that) and phase 2b's
+  known limit (a fighter between two overlapping stage polygons). With shared depth the fighters'
+  own faces and fighter vs stage are resolved per pixel; shadows, effects and the HUD stay in
+  painter's order (their packets are "others"). Faces the game culled by its integer NCLIP but
+  that face the camera in float are drawn (no holes; char_mesh.c's PGXP extras are not needed then).
+- **Root bob is most of the jitter** (verified (DESTREGA_HLR_BONE_DIAG on the Milena repro)): with a
+  filter on the parts' matrices only, the head jitter barely changed; part 0's world translation
+  moves back and forth by a fraction of a unit each update and every other part rides on it.
+  Filtering part 0 in world space and the others relative to it fixed it.
+- **Bone filter results** (verified (measurement), Milena repro frames 3880-3950, 4x6, fast
+  precision): second difference of the projected vertices 0.193 px per update with the game's
+  bones, 0.045 with Holt smoothing (level 0.3, trend 0.15); step 0.264 -> 0.166 px. Head flips (% of
+  head pixels changing by > 48/255 per update, the metric of "Floor tile seams and face shimmer"):
+
+  | config | mean % | max % |
+  |---|---:|---:|
+  | HLR off | 2.65 | 5.25 |
+  | phase 2b (stage only) | 2.64 | |
+  | phase 3, `--hlr-bones game` | 0.93 | 2.18 |
+  | phase 3, `--hlr-bones smooth` (default) | 0.55 | 0.98 |
+
+  Smooth vs game during the practice move battery (frames 3000-3560): at most 0.33 % of the pixels
+  differ, no visible lag or tearing; 2018 filter snaps over the run (fast moves).
+- **Shadow pieces sit inside the fighter's OT range** (verified (DESTREGA_HLR_PASS_DIAG, Hills)):
+  the fighter's shadow is drawn as small semi-transparent GT3 packets (code 0x36, boxes of ~5x2 px)
+  whose OT slots fall between the slots of the same fighter's feet faces. With the native faces
+  ordered against every overlapping non-native packet, each of those pieces split the fighter into
+  another pass: 19.6 passes per frame and 10.9 ms/frame on Metal (off 4.5). The scheduler now (1)
+  tests exact GP0 boxes (2 px margin) instead of 32 px tiles and (2) lets a semi-transparent
+  non-native packet whose position lies strictly between a model's first and last linked face not
+  constrain that model's faces (they are depth-tested against each other anyway): 2.7 passes, 2.3
+  ms/frame. Consequence: such a shadow piece is ordered against the fighter as a whole (before or
+  after all of its faces) instead of between two foot faces; nothing visible in the contact sheets
+  (likely: only the 12 stage sheets and the character sheets were looked at).
+- **Seams around the fighters came from MSAA passes restarting from the resolve** (verified (dumps,
+  vs_gate frame 3300 at 4x6 16:9, Metal; `tools/check_hlr_seams.py`)). User report: thin bright
+  lines outlining rectangles and trapezoids on the floor around the fighters (Gate, Milena vs Doyle).
+  The shadow pieces above split the stage into passes around each fighter (2-3 per frame). Each pass
+  used to blit the resolved target into every MSAA sample, so on a floor edge shared by polygons of
+  two passes the second pass's edge pixels were averaged with the first pass's *resolved* pixel,
+  which on the far side of that edge held what the PS1 had under the floor (the replaced packets
+  are not drawn, so it is the background), giving a bright 1-2 px line along every pass boundary:
+  2 seams of 345 and 485 px in that frame, in fast and exact precision, with `--hlr-parts stage`
+  too, none with `--hlr-msaa 1` or `--hlr off`. Fix (hlr_gpu.c): the MSAA texture keeps its samples
+  for the whole frame (`RESOLVE_AND_STORE`, LOAD in later passes); a pass blits only the pixels
+  the target changed since the previous resolve (the original-path packets drawn in between), the
+  resolve textures ping-pong. After: 0 seams in fight and pause frames (515 of 762 MSAA passes
+  kept the previous samples in the run). `DESTREGA_HLR_TEST_NOKEEP=1` brings the old behaviour
+  back for the negative check of `test_hlr.py seams`. Known limit: a pixel the original path
+  changed between two passes takes the new value in every sample (its edge coverage is lost there).
+- **The game keeps drawing the fighters with frozen bones while paused** (verified (`hlr-chars:`
+  holds, Milena practice repro with Start at 3800)): `char_mesh_render` runs every update during the
+  pause with each part's matrix and translation unchanged (1092 part updates held in 55 vblanks). The
+  Holt filter's trend made the fighters coast on for ~30 updates after the pause started (3579
+  pixels of difference to the held run at the first paused frame, 24 still at the 28th update;
+  filtered step 0.011 px per update vs 0 for the game's bones). Now a model whose every part's input
+  equals the last one is held (output = input, trend 0): filtered step 0.000. Head flips on the
+  Milena repro unchanged (mean 0.52 %, max 0.95 %; were 0.55 / 0.98).
+
 ### Fog, depth cue and lights per stage (verified (phase 1))
 
 `stage_env_setup` (8003fa44) runs once per stage, before the fight loop, with the stage index
@@ -859,12 +1052,33 @@ floors; Milena's forehead and eye polygons jumping between shapes during her idl
   toggles. That matches the flip-accumulation maps, which follow texture edges rather than face
   boundaries. At 1x the integer positions mostly stay put (second difference p50 0), so the PS1
   hides it; PGXP's sub-pixel precision exposes it.
-  Source (guess): integer quantisation in the bone chain, either 12-bit rotation matrices or
-  integer bone translations in view space. One view unit at the head's w ~2870 is a fraction of a
-  pixel. Removing it would mean smoothing what the game computes (filtering bone matrices or
-  vertex positions over time), which is outside "presentation only"; PGXP cannot recover precision
-  the game never had. Mitigations that do stay presentation-only: a lower render scale or
-  Texture Filtering > Off makes it less visible, nothing removes it.
+  Source: not the bone chain's integer rounding (see the next point: the jitter is already in the
+  animation's local matrices and the root translation). PGXP cannot remove it; the native
+  character renderer (HLR phase 3) filters the bones on the host, presentation only, and cuts the
+  head flips from 2.65 % to 0.55 % (see "HLR phase 3: characters in native 3D").
+- **Bone chain and where the jitter comes from** (HLR phase 0 B / C, `tools/hlr_probe.py` on
+  `--ram-snap` dumps of the repro, frames 3870-3965, 48 game updates).
+  - Layout (verified: probe, all parts of both fighters in 67 snapshots, 2479 parts, 18626 chain
+    links): fighter +0xf0 part count, +0xf4 part array (0x70 each), part word 0 -> a
+    GsCOORDINATE2-like struct: +0 flg, +4 local MATRIX (t at +0x18), +0x24 workm (t at +0x38),
+    +0x44 param pointer (points at struct + 0x50: scale VECTOR 0x1000 x 3, rotate SVECTOR at
+    +0x10), +0x48 super (chain ends at a root struct). The structs are 0x16c apart (the param
+    block and more follow inline). **workm = super.workm x coord exactly**, with `>> 12`
+    (arithmetic) for rotation and translation plus the parent translation (max difference 0).
+    +0x4c is not a reliable `sub` link (garbage on leaf bones: guess). The param rotate angles do
+    **not** reproduce the local matrices in any Euler order or sign (error >= 364/4096): the
+    locals come from the animation data, the param block is stale or unused (likely).
+  - Head screen position (203 vertices of P1 in the head box at the first update; H = 856;
+    precise float projection) per update, mean per-vertex step / successive-step cosine of the
+    head centroid: game `workm` 0.224 px / -0.33; float product of the same local matrices
+    0.186 / -0.56; EMA alpha 0.5: 0.122 / 0.23 (lag < 1 update); EMA 0.3: 0.083 / 0.29 (lag ~1
+    update = 33 ms); centred 3-tap average 0.114 / 0.42 and 5-tap 0.082 / 0.57 (needs 1 / 2
+    updates of look-ahead); linear prediction 0.5 / 1 update ahead 0.407 / 0.600 (worse); EMA
+    0.3 then predict 1 update: 0.136 / -0.17. Float vs integer chain differ by 0.29 px mean.
+  - So (verified for this repro): the chain's integer rounding is **not** the source. The jitter
+    is already in the local matrices the animation produces (negative step cosine: the head
+    moves back and forth around a path). Re-deriving the chain in float removes 17 % of the
+    step; only temporal smoothing reduces it, and extrapolation amplifies it.
 
 ## Memory card
 

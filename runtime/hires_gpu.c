@@ -688,10 +688,12 @@ static void *vec_push(Vec *v, size_t k)
     return r;
 }
 
-enum { ST_DRAW, ST_VRAM_UP, ST_PUT_UP, ST_TCOPY, ST_TC_UP };
+enum { ST_DRAW, ST_VRAM_UP, ST_PUT_UP, ST_TCOPY, ST_TC_UP, ST_EXTERNAL };
 /* ST_TC_UP: one mip level of a texture-cache layer (key = layer, x = level, y = 1 for the STP
  * array, w = h = level size) */
-typedef struct { int type, key; u32 first, count; int x, y, w, h; size_t off; } Step;
+typedef void (*ExtFn)(void *ctx, void *cmdbuf, void *colour_tex, int w, int h);
+/* ST_EXTERNAL: HiresBackend.external (fn, ctx), run between passes */
+typedef struct { int type, key; u32 first, count; int x, y, w, h; size_t off; ExtFn fn; void *ctx; } Step;
 
 /* ---- state -------------------------------------------------------------------------- */
 
@@ -895,6 +897,7 @@ typedef struct {
     int next;             /* hash chain */
     u64 checked;          /* s_wclock when the content was last known to equal VRAM */
     u64 page_h, clut_h;   /* hashes of the VRAM it was decoded from */
+    u64 content_h;        /* fingerprint of the decoded level 0 (hires_gpu_tc_layer) */
     u64 last_frame;       /* LRU (s_tc_frame) */
 } TcEntry;
 static TcEntry s_tc[TC_MAX_LAYERS];
@@ -993,6 +996,15 @@ static void tc_decode(TcEntry *e, int layer)
     }
     u8 *base = s_arena.p;   /* arena_alloc may move it: take the pointer after all allocations */
     e->stp = tc_decode0(e, (u32 *)(base + ocol[0]), base + ostp[0]);
+    {   /* content fingerprint (FNV-1a over the decoded colour + STP texels): position independent */
+        const u32 *c0 = (const u32 *)(base + ocol[0]);
+        const u8 *s0 = base + ostp[0];
+        u64 h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < (size_t)TC_DIM * TC_DIM; i++) {
+            h = (h ^ (c0[i] | (u32)(s0[i] != 0) << 2)) * 0x100000001B3ull;
+        }
+        e->content_h = h;
+    }
     for (int l = 1, d = TC_DIM / 2; l < s_tc_levels; l++, d >>= 1) {
         const u8 *pc = base + ocol[l - 1], *ps = base + ostp[l - 1];
         u8 *nc = base + ocol[l], *ns = base + ostp[l];
@@ -1955,6 +1967,17 @@ static void be_fill(int x, int y, int w, int h, u16 c)
     mark_vram(x, y, w, h);
 }
 
+/* HiresBackend.external: a pass of the caller's own between this point's commands */
+static void be_external(ExtFn fn, void *ctx)
+{
+    if (!s_ready || !fn) return;
+    flush_puts();
+    close_group();
+    Step *st = add_step(ST_EXTERNAL);
+    st->fn = fn;
+    st->ctx = ctx;
+}
+
 static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, bool ms)
 {
     if (s_ready) {
@@ -2124,6 +2147,11 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
             SDL_PushGPUFragmentUniformData(cb, 0, &fu, sizeof fu);
             SDL_DrawGPUPrimitives(rp, st->count, 1, st->first, 0);
             s_st.draws++;
+        } else if (st->type == ST_EXTERNAL) {
+            if (rp) { SDL_EndGPURenderPass(rp); rp = NULL; }
+            if (cp) { SDL_EndGPUCopyPass(cp); cp = NULL; }
+            st->fn(st->ctx, cb, s_target, s_aw, s_ah);
+            s_st.externals++;
         } else {
             if (rp) { SDL_EndGPURenderPass(rp); rp = NULL; }
             if (!cp) cp = SDL_BeginGPUCopyPass(cb);
@@ -2355,10 +2383,49 @@ SDL_GPUTexture *hires_gpu_present(const HiresView *v)
 
 static const HiresBackend s_gpu = {
     "gpu", be_configure, be_tri, be_rect, be_line, be_fill, be_copy, be_put, be_view, be_read, be_destroy,
-    be_set_guard,
+    be_set_guard, be_external,
 };
 
 const HiresBackend *hires_gpu_backend(void) { return &s_gpu; }
+
+static int s_api = -1;              /* API of s_dev while initialised */
+
+/* ---- for external passes (hires_gpu.h "for an external pass") ------------------------------------- */
+#define MAX_SHUTDOWN_HOOKS 4
+static void (*s_shutdown_hooks[MAX_SHUTDOWN_HOOKS])(void);
+void hires_gpu_on_shutdown(void (*fn)(void))
+{
+    for (int i = 0; i < MAX_SHUTDOWN_HOOKS; i++) {
+        if (s_shutdown_hooks[i] == fn) return;
+        if (!s_shutdown_hooks[i]) { s_shutdown_hooks[i] = fn; return; }
+    }
+}
+
+bool hires_gpu_info(HiresGpuInfo *o)
+{
+    if (!s_ready || !s_dev || !s_target) return false;
+    memset(o, 0, sizeof *o);
+    o->dev = s_dev; o->api = s_api; o->shader_format = (unsigned)s_shfmt;
+    o->target_format = s_hp ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
+    o->full_colour = s_hp != 0;
+    o->Sx = s_Sx; o->Sy = s_Sy; o->rx = s_rx; o->ry = s_ry; o->rw = s_rw; o->rh = s_rh; o->gx = s_gx;
+    o->ox = s_ox; o->oy = s_oy; o->tw = s_tw; o->th = s_th; o->aw = s_aw; o->ah = s_ah;
+    o->tc_colour = s_tccol; o->tc_stp = s_tcstp; o->tc_sampler = s_tcsamp; o->nearest = s_samp;
+    return true;
+}
+
+int hires_gpu_tc_layer(int depth, unsigned tp_x, unsigned tp_y, unsigned clut_x, unsigned clut_y, unsigned tw,
+                       unsigned long long *content)
+{
+    if (!s_ready) return -1;
+    HiresPrim p;
+    memset(&p, 0, sizeof p);
+    p.tex = true; p.depth = depth; p.tp_x = tp_x; p.tp_y = tp_y; p.clut_x = clut_x; p.clut_y = clut_y;
+    p.tw_and_u = tw & 0xFF; p.tw_or_u = (tw >> 8) & 0xFF; p.tw_and_v = (tw >> 16) & 0xFF; p.tw_or_v = tw >> 24;
+    const int l = tc_lookup(&p);
+    if (l >= 0 && content) *content = s_tc[l].content_h;
+    return l;
+}
 
 /* ---- init ------------------------------------------------------------------------------------------ */
 
@@ -2508,7 +2575,6 @@ SDL_GPUDevice *hires_gpu_create_device(int api)
     return dev;
 }
 
-static int s_api = -1;              /* API of s_dev while initialised */
 static bool s_own_dev;              /* s_dev was created by hires_gpu_init(NULL) (headless) */
 int hires_gpu_api(void) { return s_inited ? s_api : -1; }
 
@@ -2547,6 +2613,7 @@ void hires_gpu_shutdown(void)
     if (s_ready) submit(false, 0, 0, 0, 0, false, 0, 0);
     for (int i = 0; i < 2; i++) wait_fence(&s_fences[i]);
     SDL_WaitForGPUIdle(s_dev);
+    for (int i = 0; i < MAX_SHUTDOWN_HOOKS; i++) if (s_shutdown_hooks[i]) s_shutdown_hooks[i]();
     be_destroy_force();
     for (int h = 0; h < 2; h++)
         for (int k = 0; k < NKEYS; k++)

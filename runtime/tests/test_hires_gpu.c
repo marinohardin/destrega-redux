@@ -21,6 +21,9 @@
 #include "hires.h"
 #include "hires_gpu.h"
 #include "pgxp.h"
+#include "hlr/hlr_gpu.h"
+#include "hlr/hlr_cam.h"
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +39,15 @@ void rt_log(const char *fmt, ...)
     vprintf(fmt, ap);
     va_end(ap);
     printf("\n");
+}
+void rt_fatal(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+    exit(1);
 }
 
 static int g_fail, g_pass;
@@ -221,6 +233,154 @@ typedef struct { int filter; bool full; int ssaa; const char *name; } Mode;
 static const Mode MODE_DEFAULT = { HIRES_TEX_NEAREST, false, 1, "" };
 static Mode s_mode = { HIRES_TEX_NEAREST, false, 1, "" };
 
+/* "external" mode (CTest hlr_gpu): an empty HiresBackend.external pass every N primitives, as
+ * the HLR inserts one where the walk enters a captured scene table; it splits groups and render
+ * passes but must leave the target exactly as before */
+static int s_external_every, s_external_calls;
+static void external_noop(void *ctx, void *cb, void *tex, int w, int h)
+{
+    (void)ctx; (void)cb; (void)w; (void)h;
+    if (tex) s_external_calls++;
+}
+
+
+/* "external" mode, part 2 (CTest hlr_gpu): the native stage pass itself (hlr_gpu.c). A cube of six
+ * flat-coloured faces at a known camera, drawn through hlr_gpu_external into a black 2x2 target,
+ * the back faces last: every visible face's centre must hold its colour exactly, the back faces'
+ * colours must not appear anywhere (depth test), the corners stay black; with MSAA the silhouette
+ * has resolved in-between colours, without it none. On the 15-bit target PS1 red is in the low
+ * five bits (the B5G5R5A1 channel swap). */
+static const u8 CUBE_COL[6][3] = { { 255, 0, 0 }, { 0, 255, 0 }, { 0, 0, 255 }, { 255, 255, 0 }, { 0, 255, 255 }, { 255, 0, 255 } };
+
+static void cube_rot(const float in[3], float o[3])
+{
+    const float a = 0.6f, b = 0.45f;   /* yaw, then pitch: three faces towards the camera */
+    const float x = cosf(a) * in[0] + sinf(a) * in[2], z = -sinf(a) * in[0] + cosf(a) * in[2];
+    o[0] = x;
+    o[1] = cosf(b) * in[1] - sinf(b) * z;
+    o[2] = sinf(b) * in[1] + cosf(b) * z;
+}
+
+static void run_cube(int msaa, bool full)
+{
+    char what[64];
+    snprintf(what, sizeof what, "cube %s, MSAA %d", full ? "RGBA8" : "15-bit", msaa);
+    hires_set_tex_filter(HIRES_TEX_NEAREST);
+    hires_set_colour(full);
+    hires_set_ssaa(1);
+    gpu_init();
+    g_pgxp = false;
+    hires_set_region(0, 0, 512, 480);
+    hires_set_backend(NULL, hires_gpu_backend());
+    hires_set_scale(0, 0);
+    hires_set_guard(0);
+    if (!hires_set_scale(2, 2)) { CHECK(0, "%s: cannot allocate", what); return; }
+    env();
+    gp0(0x02000000); gp0(0); gp0((240u << 16) | 512u);   /* black screen */
+    HiresGpuInfo gi;
+    CHECK(hires_gpu_info(&gi), "%s: no target info", what);
+    hlr_gpu_set_msaa(msaa);
+    /* camera: identity rotation, eye 1600 in front of the cube, H 300, drawing offset (256, 120) */
+    GteState gs;
+    memset(&gs, 0, sizeof gs);
+    gs.c[0] = 0x1000; gs.c[2] = 0x1000; gs.c[4] = 0x1000;
+    gs.c[7] = 1600; gs.c[26] = 300;
+    HlrCam k;
+    hlr_cam_from_gte(&k, &gs);
+    HlrGpuFrame *f = hlr_gpu_frame_new();
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) f->u.rt[r][c] = k.rt[r][c];
+    for (int c = 0; c < 3; c++) f->u.tr[c] = k.tr[c];
+    f->px0 = 0; f->py0 = 0; f->pw = 1024; f->ph = 480;
+    const int rect[4] = { f->px0, f->py0, f->pw, f->ph };
+    hlr_cam_clip(&k, 256, 120, (float)gi.Sx, (float)gi.Sy, (float)gi.ox, (float)gi.oy, rect, f->u.proj);
+    f->u.misc[0] = 16.0f; f->u.misc[1] = 1.0f; f->u.misc[2] = full ? 0.0f : 1.0f;
+    f->samples = hlr_gpu_msaa_for(gi.target_format);
+    /* faces: +x -x +y -y +z -z; corners of a 600-unit cube */
+    static const int axis[6] = { 0, 0, 1, 1, 2, 2 };
+    float centre[6][3];
+    bool front[6];
+    int order[6], nf = 0, nb = 0, back[6];
+    for (int i = 0; i < 6; i++) {
+        float n0[3] = { 0, 0, 0 }, n[3];
+        n0[axis[i]] = i & 1 ? -1.0f : 1.0f;
+        cube_rot(n0, n);
+        float c0[3] = { n0[0] * 300, n0[1] * 300, n0[2] * 300 }, view[3];
+        cube_rot(c0, centre[i]);
+        hlr_cam_view(&k, centre[i], view);
+        front[i] = n[0] * view[0] + n[1] * view[1] + n[2] * view[2] < 0;   /* faces the eye */
+        if (front[i]) order[nf++] = i; else back[nb++] = i;
+    }
+    for (int i = 0; i < nb; i++) order[nf + i] = back[i];
+    CHECK(nf == 3, "%s: %d faces towards the camera, expected 3", what, nf);
+    HlrVtx *v = hlr_gpu_frame_vtx(f, 36);
+    for (int fi = 0; fi < 6; fi++) {
+        const int i = order[fi], a = axis[i], b = (a + 1) % 3, c = (a + 2) % 3;
+        float q[4][3];
+        for (int j = 0; j < 4; j++) {
+            float p0[3];
+            p0[a] = i & 1 ? -300.0f : 300.0f;
+            p0[b] = (j & 1) ? 300.0f : -300.0f;
+            p0[c] = (j & 2) ? 300.0f : -300.0f;
+            cube_rot(p0, q[j]);
+        }
+        static const int tri[6] = { 0, 1, 2, 1, 3, 2 };
+        for (int j = 0; j < 6; j++) {
+            HlrVtx *o = &v[fi * 6 + j];
+            memset(o, 0, sizeof *o);
+            memcpy(o->pos, q[tri[j]], sizeof o->pos);
+            o->col[0] = CUBE_COL[i][0]; o->col[1] = CUBE_COL[i][1]; o->col[2] = CUBE_COL[i][2];
+            o->info = 0;   /* flat (HLR_SH_FLAT), untextured */
+        }
+    }
+    HlrGpuPass *ps = calloc(1, sizeof *ps);
+    ps->f = f; f->refs++;
+    ps->d = calloc(1, sizeof *ps->d); ps->nd = 1;
+    ps->d[0] = (HlrDraw){ 0, 36, -1 };
+    hires_gpu_backend()->external(hlr_gpu_external, ps);
+    HiresView hv;
+    const bool rd = hires_gpu_backend()->read(0, 0, 512, 240, &hv);
+    CHECK(rd, "%s: read back failed", what);
+    if (!rd) { hlr_gpu_frame_unref(f); return; }
+    HlrGpuStats st;
+    hlr_gpu_get_stats(&st);
+    CHECK(st.failed == 0, "%s: %llu passes failed", what, (unsigned long long)st.failed);
+    #define PIX(x, y) (full ? hv.px32[(size_t)(y) * (size_t)hv.stride + (size_t)(x)] : (u32)hv.pixels[(size_t)(y) * (size_t)hv.stride + (size_t)(x)])
+    /* the colour a face colour becomes in this target (15-bit: PS1 red in the low 5 bits) */
+    u32 want[7];
+    for (int i = 0; i < 6; i++)
+        want[i] = full ? (u32)CUBE_COL[i][0] | (u32)CUBE_COL[i][1] << 8 | (u32)CUBE_COL[i][2] << 16
+                       : (u32)(CUBE_COL[i][0] >> 3) | (u32)(CUBE_COL[i][1] >> 3) << 5 | (u32)(CUBE_COL[i][2] >> 3) << 10;
+    want[6] = 0;
+    for (int i = 0; i < 6; i++) {
+        if (!front[i]) continue;
+        float view[3], sx, sy;
+        hlr_cam_view(&k, centre[i], view);
+        hlr_cam_project(&k, view, &sx, &sy);
+        const int x = (int)floorf((256.0f + sx) * (float)gi.Sx), y = (int)floorf((120.0f + sy) * (float)gi.Sy);
+        const u32 got = PIX(x, y) & (full ? 0xffffffu : 0x7fffu);
+        CHECK(got == want[i], "%s: face %d centre (%d,%d) = %06x, want %06x", what, i, x, y, got, want[i]);
+    }
+    u64 hidden = 0, mixed = 0, lit = 0;
+    for (int y = 0; y < hv.h; y++)
+        for (int x = 0; x < hv.w; x++) {
+            const u32 p = PIX(x, y) & (full ? 0xffffffu : 0x7fffu);
+            int m = -1;
+            for (int i = 0; i < 7; i++) if (p == want[i]) m = i;
+            if (m >= 0 && m < 6 && !front[m]) hidden++;
+            if (m < 0) mixed++;
+            if (p) lit++;
+        }
+    CHECK(hidden == 0, "%s: %llu pixels of hidden faces (depth test)", what, (unsigned long long)hidden);
+    CHECK(PIX(0, 0) == 0 && PIX(hv.w - 1, hv.h - 1) == 0, "%s: corners not black", what);
+    CHECK(lit > 20000, "%s: only %llu pixels drawn", what, (unsigned long long)lit);
+    if (f->samples > 1) CHECK(mixed > 100, "%s: MSAA %d left no resolved edge pixels (%llu)", what, f->samples, (unsigned long long)mixed);
+    else CHECK(mixed == 0, "%s: %llu in-between colours without MSAA", what, (unsigned long long)mixed);
+    printf("  %-34s %llu px drawn, %llu edge blends, MSAA %d in effect\n", what, (unsigned long long)lit,
+           (unsigned long long)mixed, f->samples);
+    #undef PIX
+    hlr_gpu_frame_unref(f);
+}
+
 static void run_scale(int sx, int sy, int guard, int n)
 {
     char what[64];
@@ -236,6 +396,9 @@ static void run_scale(int sx, int sy, int guard, int n)
         else if (k < 8) rect();
         else if (k == 8) line();
         else misc();
+        /* the GPU backend is the shadow of the compare tee here: call it directly */
+        if (s_external_every && i % s_external_every == s_external_every - 1)
+            hires_gpu_backend()->external(external_noop, NULL);
     }
     if (s_fast_mode) { hires_gpu_tc_check(); compare_tol(what); }
     else compare(what, 0);
@@ -312,6 +475,33 @@ int main(int argc, char **argv)
         hires_set_scale(0, 0);
         hires_gpu_shutdown();
         CHECK(hires_gpu_api() < 0, "shutdown left the backend initialised");
+        printf("test_hires_gpu: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (!strcmp(drv, "external")) {
+        drv = argc > 2 ? argv[2] : "auto";
+        if (!hires_gpu_set_driver(drv)) {
+            if (hires_gpu_api_from_name(drv) >= 0) { printf("SKIP: %s is not offered on this platform\n", drv); return 77; }
+            printf("usage: test_hires_gpu external [auto|metal|vulkan|d3d12]\n");
+            return 2;
+        }
+        if (!hires_gpu_init(NULL)) { printf("SKIP: no usable SDL_GPU device (%s)\n", drv); return 77; }
+        s_external_every = 37;
+        static const int esc[][2] = { { 1, 1 }, { 2, 3 }, { 4, 6 } };
+        for (size_t i = 0; i < sizeof esc / sizeof esc[0]; i++) {
+            run_scale(esc[i][0], esc[i][1], 0, 800);
+            run_scale(esc[i][0], esc[i][1], 88, 800);
+        }
+        CHECK(s_external_calls > 0, "the external pass never ran");
+        printf("test_hires_gpu external: %d external passes run\n", s_external_calls);
+        s_external_every = 0;
+        static const int ms[] = { 1, 4 };
+        for (int full = 0; full < 2; full++)
+            for (size_t i = 0; i < sizeof ms / sizeof ms[0]; i++) run_cube(ms[i], full != 0);
+        hlr_gpu_set_msaa(4);
+        hires_set_backend(NULL, NULL);
+        hires_set_scale(0, 0);
+        hires_gpu_shutdown();
         printf("test_hires_gpu: %d passed, %d failed\n", g_pass, g_fail);
         return g_fail ? 1 : 0;
     }

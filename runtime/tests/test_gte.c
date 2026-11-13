@@ -4,6 +4,7 @@
 #include "psx.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int g_fail, g_pass;
 #define CHECK(cond, ...) do { if (cond) g_pass++; else { g_fail++; \
@@ -323,6 +324,65 @@ static void test_dpcs(void)
     EQ(gte_read_data(21), 0x55302010);
 }
 
+/* gte_exec_on: the guest GTE (registers, FLAG, PGXP FIFO tags, g_pgxp) is untouched and the
+ * host-owned state ends exactly as if the guest GTE had run the same commands. */
+#include "pgxp.h"
+static u32 rnd_state = 12345;
+static u32 rnd(void) { rnd_state = rnd_state * 1103515245u + 12345u; return (rnd_state >> 8) ^ (rnd_state << 13); }
+
+static void random_gte(void)
+{
+    for (int r = 0; r < 32; r++) if (r != 15 && r != 28 && r != 29 && r != 31) gte_write_data(r, rnd());
+    for (int r = 0; r < 31; r++) gte_write_ctrl(r, rnd() & (r == 26 ? 0x3ff : 0xffffffff));
+    gte_write_ctrl(26, 0x300 + (rnd() & 0xff)); /* H */
+}
+
+static void test_exec_on(void)
+{
+    static const u32 ops[] = {
+        0x4a180001, 0x4a280030, 0x4a080001, 0x4a400006, 0x4a780010, 0x4af8002a, 0x4ae80413,
+        0x4af80416, 0x4a486012, 0x4a49e012, 0x4a58002d, 0x4a68002e, 0x4aa00428, 0x4b90003d,
+        0x4b98003e, 0x4b28001b, 0x4b3f0011, 0x4a700029, 0x4b000013,
+    };
+    for (int round = 0; round < 300; round++) {
+        gte_init();
+        random_gte();
+        GteState host0, host, guest, after, ref;
+        gte_save(&host0);
+        host = host0;
+        random_gte();
+        gte_save(&guest);
+        g_pgxp = true;
+        g_pgxp_gte[0] = 11; g_pgxp_gte[1] = 22; g_pgxp_gte[2] = 33;
+        u32 seq[8], val[8];
+        for (int i = 0; i < 8; i++) { seq[i] = ops[rnd() % (sizeof ops / sizeof ops[0])]; val[i] = rnd(); }
+        u32 hv[8], hf[8];
+        for (int i = 0; i < 8; i++) {
+            gte_exec_on(&host, seq[i]);
+            hf[i] = gte_read_ctrl_on(&host, 31);
+            hv[i] = gte_read_data_on(&host, 22);
+            gte_write_data_on(&host, i & 1 ? 15 : 8, val[i]);
+            gte_write_ctrl_on(&host, (int)(val[i] % 31), val[i] ^ 0x5a5a5a5a);
+        }
+        gte_save(&after);
+        CHECK(!memcmp(&guest, &after, sizeof guest), "round %d: guest GTE changed", round);
+        CHECK(g_pgxp && g_pgxp_gte[0] == 11 && g_pgxp_gte[1] == 22 && g_pgxp_gte[2] == 33,
+              "round %d: PGXP tags or flag changed", round);
+        /* the same on the guest GTE (PGXP off, as gte_exec_on runs it) */
+        g_pgxp = false;
+        gte_restore(&host0);
+        int same = 1;
+        for (int i = 0; i < 8; i++) {
+            gte_command(seq[i]);
+            same &= gte_read_ctrl(31) == hf[i] && gte_read_data(22) == hv[i];
+            gte_write_data(i & 1 ? 15 : 8, val[i]);
+            gte_write_ctrl((int)(val[i] % 31), val[i] ^ 0x5a5a5a5a);
+        }
+        gte_save(&ref);
+        CHECK(same && !memcmp(&ref, &host, sizeof ref), "round %d: host result differs from guest", round);
+    }
+}
+
 int main(void)
 {
     test_regs();
@@ -333,6 +393,7 @@ int main(void)
     test_sqr_gpf();
     test_mvmva();
     test_dpcs();
+    test_exec_on();
     printf("test_gte: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

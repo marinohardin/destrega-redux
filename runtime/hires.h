@@ -97,6 +97,13 @@ typedef struct HiresBackend {
      * widened across the guard band (fades). view() then accepts x in [rx - gx, rx + rw + gx).
      * The 1x VRAM, and so all emulated state, never sees any of it. */
     void (*set_guard)(int gx);
+    /* Optional (NULL = unsupported): an external render pass at this point of the command stream
+     * (native high-level renderer, runtime/hlr/). Everything recorded before it is drawn first;
+     * fn then runs on the backend's GPU thread of work with its command buffer (SDL_GPUCommandBuffer *),
+     * the target texture (SDL_GPUTexture *) and the allocated target size, outside any render or copy
+     * pass; later commands draw over what it left (loaded, not cleared). fn may run later than
+     * this call (at the next submit), so ctx must stay valid until then. */
+    void (*external)(void (*fn)(void *ctx, void *cmdbuf, void *colour_tex, int w, int h), void *ctx);
 } HiresBackend;
 
 /* Active backend; NULL = hi-res off. Defined in gpu.c, set by hires_set_scale(). */

@@ -130,6 +130,13 @@ typedef struct { u32 d[32], c[32], flag; } GteState;
 void gte_save(GteState *s);              /* snapshot of all GTE registers */
 void gte_restore(const GteState *s);
 void gte_write_ctrl(int reg, u32 v);  /* ctc2 */
+/* The same operations on a caller-owned state (HLR audit; guest GTE and PGXP tags untouched,
+ * PGXP production off). Not for generated code. */
+void gte_exec_on(GteState *s, u32 cmd);
+void gte_write_data_on(GteState *s, int reg, u32 v);
+void gte_write_ctrl_on(GteState *s, int reg, u32 v);
+u32 gte_read_data_on(GteState *s, int reg);
+u32 gte_read_ctrl_on(GteState *s, int reg);
 
 /* ---- GPU (runtime/gpu.c) ------------------------------------------------- */
 
@@ -143,6 +150,19 @@ void gpu_shadow_packet(const u32 *w, int n, const struct PgxpVert *const *pv);
 void gpu_shadow_packet_in_area(const u32 *w, int n, const struct PgxpVert *const *pv);
 /* GP0 word with its PGXP precision tag (runtime/pgxp.h; 0 = none). */
 void gpu_write_gp0_tag(u32 v, u32 tag);
+/* Native high-level renderer (runtime/hlr/, presentation only). While on, the GP0 words that
+ * follow run on the 1x GPU exactly as always but polygons are not forwarded to the hi-res target
+ * (and not looked up / welded for PGXP): the HLR drew them. */
+void gpu_set_node_no_hires(bool on);
+/* Read-only: the GPU's current drawing offset, draw area (inclusive, 1x pixels) and texture window
+ * (and_u | or_u << 8 | and_v << 16 | or_v << 24, as the texture cache keys it). */
+typedef struct { int off_x, off_y, clip_x1, clip_y1, clip_x2, clip_y2; u32 tw; } GpuDrawEnv;
+void gpu_get_draw_env(GpuDrawEnv *e);
+/* Draw the polygon packet w[0..n) (GP0 words, no tag) into the hi-res target only, with the PGXP
+ * tags of its words, exactly as gpu_write_gp0_tag would forward it: the same 1x-sampled UV and
+ * colour ranges (tracked without drawing), the same precise vertices. No 1x VRAM write, no
+ * statistic or guest observation, and every piece of GPU state is restored. Only polygons. */
+void gpu_hires_replay(const u32 *w, int n, const u32 *tags);
 void gpu_write_gp1(u32 v);
 u32 gpu_read_data(void);              /* GPUREAD 0x1f801810 */
 u32 gpu_read_stat(void);              /* GPUSTAT 0x1f801814 */

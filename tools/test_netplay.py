@@ -33,6 +33,10 @@ OUT = os.path.join(ROOT, 'build', 'netplay')
 # name: (replay, delay, sim host->join, sim join->host, extra args for both, expectations)
 CASES = {
     'lan':        ('vs_tieme_rohzen_villa', 2, '2:1:0:0:1', '2:1:0:0:2', [], {}),
+    # one peer draws the stage through the native high-level renderer (presentation only, so the
+    # peers must stay in sync); its log must show packets drawn by the HLR and captures dropped on rollbacks
+    'lan_hlr':    ('vs_tieme_rohzen_villa', 2, '2:1:0:0:21', '2:1:0:0:22', [],
+                   {'host_extra': ['--renderer', 'gpu', '--scale', '2x3', '--hlr', 'on'], 'hlr': True}),
     'wan':        ('vs_milena_cougar_fortress', 2, '20:8:1:2:3', '20:8:1:2:4', [], {}),
     'lossy':      ('vs_zauber_doyle_throne', 2, '15:15:10:10:5', '15:15:10:10:6', [], {}),
     'asym':       ('vs_anjie_laon_canyon', 1, '35:5:2:0:7', '5:2:2:0:8', [], {}),
@@ -110,7 +114,7 @@ def run_case(name, port, pace):
     common = [BIN, '--headless', '--no-interp', '--frames', str(rp.frames), '--net-delay', str(delay),
               '--net-pace', str(pace), '--net-desync-dir', d, '--net-full-boot'] + extra + os.environ.get('NETPLAY_EXTRA', '').split()
     host = common + ['--press', R.fmt(rp.p1), '--host', str(port), '--net-sim', sim_h,
-                     '--net-hash-log', os.path.join(d, 'host.hash')]
+                     '--net-hash-log', os.path.join(d, 'host.hash')] + expect.get('host_extra', [])
     join = [BIN_JOIN] + common[1:] + ['--press', R.fmt(rp.p2), '--join', f'127.0.0.1:{port}', '--net-sim', sim_j,
                      '--net-hash-log', os.path.join(d, 'join.hash')]
     if expect.get('desync'):
@@ -186,9 +190,19 @@ def run_case(name, port, pace):
             if 'menu: REFUSED widescreen' in log or 'menu: REFUSED reveal' in log:
                 problems.append(f'{who}: refused a presentation-only action')
             if 'restart' in log.lower() and 'menu: load' in log: problems.append(f'{who}: load ran')
+    if expect.get('hlr'):
+        m = re.search(r'hlr: mode on.*?(\d+) dropped \((\d+) save-state loads\)', hlog)
+        nd = re.search(r'hlr-native-draw: (\d+) frames, [\d.]+ passes per frame, (\d+) polygons per frame.*?(\d+) failed', hlog)
+        if not m or not nd or 'not drawing' in hlog: problems.append('host: no HLR summary, or the stage was not drawn natively (GPU renderer?)')
+        elif int(nd.group(2)) == 0: problems.append('host: the native stage drew no polygon')
+        elif int(nd.group(3)): problems.append(f'host: {nd.group(3)} native GPU passes failed')
+        if 'hlr:' in jlog: problems.append('join: HLR summary in the plain peer')
     full = sum(1 for f in both if len(H[f]) > 1)
     dt = time.time() - t0
     msg = f'{len(both)} final frames equal on both peers and offline ({full} full-state hashes)'
+    if expect.get('hlr') and m and nd:
+        msg += (f'; host drew the stage natively in {nd.group(1)} frames ({nd.group(2)} polygons per frame), '
+                f'{m.group(2)} rollback loads dropped {m.group(1)} captures')
     if sh and sj:
         msg += (f'; rollbacks {int(sh["rollbacks"])}/{int(sj["rollbacks"])} (max depth {int(max(sh["max_depth"], sj["max_depth"]))}), '
                 f're-sim {max(sh["resim_ms_per_frame"], sj["resim_ms_per_frame"]):.3f} ms/vblank, '

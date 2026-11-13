@@ -32,6 +32,7 @@
 #include "game_syms.h"
 #include "hires.h"
 #include "pgxp.h"
+#include "hlr_hook.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -217,16 +218,33 @@ static void quads_extras(u32 a0)
 
 /* Not routed through override_call: the guest-visible part is the original function, run
  * unchanged after a read-only pass over its inputs. */
+/* the native high-level renderer draws the characters itself (runtime/hlr/hlr_char.c): no extras */
+static inline bool extras_wanted(void)
+{
+    return g_pgxp && g_hires && !(g_hlr.chars_native && g_hlr.chars_native());
+}
+
 void f_80036138(void)
 {
-    if (g_pgxp && g_hires) tris_extras(g_cpu.r[4]);
+    if (extras_wanted()) tris_extras(g_cpu.r[4]);
     f_80036138_orig();
 }
 
 void f_800363c8(void)
 {
-    if (g_pgxp && g_hires) quads_extras(g_cpu.r[4]);
+    if (extras_wanted()) quads_extras(g_cpu.r[4]);
     f_800363c8_orig();
+}
+
+/* char_mesh_render (80036b0c): a0 = model block, a1 = scene ordering table, a2 = 11. The native
+ * high-level renderer (hlr_hook.h) reads the model before and the buffers / packets the original
+ * wrote after; it only reads guest state (hlr_char.c). Not routed through override_call either. */
+void f_80036b0c(void)
+{
+    if (!g_hlr.char_pre) { f_80036b0c_orig(); return; }
+    g_hlr.char_pre(g_cpu.r[4], g_cpu.r[5]);
+    f_80036b0c_orig();
+    if (g_hlr.char_post) g_hlr.char_post();
 }
 
 void char_mesh_report(void)

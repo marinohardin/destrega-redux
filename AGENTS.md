@@ -236,6 +236,9 @@ the script has the exact patterns), each a small subset:
   `test_render_quality.sh` with `CASES="call169 cxbr43 glive"` (each plus its `off` reference).
 - **menus** (`menu_*`, `settings*`, `input*`, `controls_*`, `main.c`): `test_menu.sh` (its ~1 GB of
   scratch is deleted after a pass), `test_input.py`, `test_governor.py` when present.
+- **hlr** (`runtime/hlr/`, `hlr_hook.h`, `tools/test_hlr.py`, `runtime/tests/test_hlr.c`): CTest `hlr`,
+  `hlr_gpu`, `test_hlr.py` audit / chars (milena, laon) / exact / hash / rewind on a subset (castle1 remains gate, Metal), and
+  `test_netplay.py lan_hlr`.
 - **core** (other `runtime/*.c|h`, `runtime/overrides/`, `recomp/`, `analysis/overrides.txt`,
   `extra_seeds.txt`, procedure / overlay lists, `CMakeLists.txt`): scenarios `vs_hills`, `story`,
   `option_game`, `practice`; replays `practice_gradd`, `opts_handicap_recover`,
@@ -1512,7 +1515,7 @@ replay 4500 frames, 4x6 widescreen xbr full colour).
 - **Where**: `runtime/hires_gpu.c` (header comment "Fast precision"; `fast_tri`, the `s_fast`
   branches of `be_tri` / `be_rect`; MSL `vs_fast` / `fs_fast`) and `runtime/shaders/hires_fast.glsl`
   (Vulkan + D3D12; `python3 tools/gen_spirv.py` and `tools/gen_dxil.py` now build both GLSL files,
-  `--src hires_fast` one of them; `gen_dxil.py --check-fresh` checks both headers).
+  `--src hires_fast` one of them; `gen_dxil.py --check-fresh` checks every header, `hlr_dxil.h` included).
 - **What is approximate**: coverage (the GPU's fill rule and sub-pixel snapping on float vertices:
   polygon edges, shared-edge ties), u/v (float interpolation: texel choice at exact ties; vertex
   u/v are shifted to hires.c's sample point and the perspective case uses clip w = 1 / q there, so
@@ -1766,6 +1769,115 @@ Release form without game code (docs/RELEASES.md option A). The static build sta
   refused, and traps instead of using stdio): the Windows job downloads Zig 0.17.1 (sha256 checked)
   next to `build/launcher/destrega.exe` and requires the bundled Zig to build and load the DLL,
   then "is current" on a second run; the Linux jobs run it with their gcc / clang.
+
+## Native high-level renderer (`runtime/hlr/`, `--hlr`; docs/HLR_PLAN.md)
+
+Presentation only, in phases (plan and results: `docs/HLR_PLAN.md`; game facts: NOTES.md "Stage
+builders in full", "HLR phase 2a", "HLR phase 2b", "HLR phase 3"). Phase 2a: the stage is captured
+and redrawn exactly (`--hlr exact`). Phase 2b: `--hlr on` draws the stage in real 3D (below). Phase 3:
+the fighters too, in the same depth buffer (below).
+
+- **Hooks** (`runtime/hlr_hook.h`, table `g_hlr` in bus.c; all NULL = off): `stage_pre(mode)` /
+  `stage_post()` around the real pass of `stage_render` (`overrides/widescreen.c real_pass`),
+  `ll_filter(node)` per node of the GPU linked-list DMA (`bus.c`; `0xffffffff` = end of the walk),
+  `on_restore()` from `ss_restore`, `char_pre(model, ot)` / `char_post()` around every call of
+  `char_mesh_render` 80036b0c (`overrides/char_mesh.c`, a read-only wrapper), `chars_native()` (true
+  while the faces are drawn natively: char_mesh.c then adds no PGXP extras). Hooks only read guest RAM / scratchpad; GTE work runs on a copy
+  (`gte_exec_on`); they never call guest code or touch cycles, the scheduler, RAM or GPU state.
+- **Capture** (`hlr_stage.c`): predicts every stage packet (all builders incl. the 0x2000
+  subdivision ones), audits the prediction against RAM and the scene OT, and a clean frame becomes
+  an `HlrFrame` (copies of the packet words, keyed by the OT it was linked into; two slots). A
+  frame whose audit fails is not captured (`frames not captured`).
+- **Drawing** (`hlr.c hlr_ll_filter`): when the walk enters a captured table the frame becomes
+  active (and an empty `HiresBackend.external` pass is inserted: GPU backend only; phase 2b draws
+  the native stage there); each node that is a captured packet whose RAM words still equal the
+  capture is drawn into the hi-res target by `gpu_hires_replay` and sent to the 1x GPU only
+  (`gpu_set_node_no_hires`); a changed packet ("stale") goes the normal way. The end of the walk
+  consumes the frame; a save-state load or a mode / parts change drops every frame.
+- **Modes**: `off`; `audit` (prediction + checks, draws nothing differently); `exact` (any hi-res
+  backend; byte-identical to off); `on` (native 3D stage, needs the GPU renderer: Metal (MSL),
+  Vulkan (SPIR-V) or Direct3D 12 (DXIL, `hlr_dxil.h` from `gen_dxil.py --src hlr`)). Default: on in a window, off headless. `--hlr-parts
+  stage|chars|shadows|fx|story|all|none` (stage and chars exist). Settings `[display] hlr` (on|off),
+  `hlr_parts`; menu actions `hlr[=on|off]`, `hlr-part=stage|chars[:on|off]`; View > 3D Scene > Original /
+  Native, Stage, Characters, Smooth Character Motion (Mac, Windows; greyed unless a GPU API renders). `runtime/hlr/` is outside the
+  netplay build identity (`source_ident.py`), `hlr_hook.h` and the call sites are inside.
+- **Native 3D stage (`on`, phase 2b)**: the capture also records every stage polygon (model
+  vertices = world coordinates, normals / colours, its packet for UV / CLUT / page) of every object
+  the flag rules let through, also those the PS1 culled; an object the stage renderer's own 4-point
+  test culls at 4:3 only if the same test widened by the guard band passes (widescreen; `hlr_set_guard`
+  from main.c), because that test culls some covering objects on purpose (Throne's VS camera is
+  behind a wall). `hlr_native.c` schedules them into the GPU linked-list walk (header comment:
+  positions, overlap intervals against the non-stage packets' GP0 boxes, fewest passes) and
+  `hlr_gpu.c` draws each pass as a `HiresBackend.external` on the hi-res device: float camera from the
+  GTE state (`hlr_cam.h`; `hlr_cam_clip` gives the clip-space form for any pass rectangle, guard band
+  included), reverse-Z depth (D32, else D24) cleared per table, MSAA with resolve
+  (`SDL_GPUTextureSupportsSampleCount`, lowered to what the target format takes; the MSAA texture
+  keeps its samples across the passes of one frame: `RESOLVE_AND_STORE`, later passes LOAD it and
+  blit only the target pixels that changed since the previous resolve, two resolve textures
+  ping-pong. Restarting every pass from the resolve drew the floor's pass boundaries around the
+  fighters as thin bright seams; `tools/check_hlr_seams.py`, `test_hlr.py seams`), GTE fog and
+  lighting per pixel (enhanced) or per vertex (ps1 look), textures from the texture cache's layers
+  (`material_texture(key)`, keyed by content fingerprint for a later replacement pack; trilinear +
+  anisotropic, point-sampled in the ps1 look), opaque then semi-transparent (blend from the tpage).
+  The background gradient strips are drawn natively, stretched over the pass. The stage packets go
+  to the 1x GPU only. `stage_render` skips the widescreen shadow pass while the stage is drawn
+  natively (`g_hlr.stage_native`; still counts `g_ws_cull_hits`, so the presentation stays 16:9);
+  software renderer / HLR off keep it. Characters, shadows, effects and the HUD stay on the
+  original path and keep the PS1's order relative to each stage polygon; known limit: a character
+  the PS1 drew between two overlapping stage polygons gets the order of its pass.
+- **Native characters (`on`, phase 3; `hlr_char.c`, header comment)**: every `char_mesh_render`
+  call is audited on a host GTE (vertex buffer, NCCT colours, the faces linked per OT slot and their
+  words; `hlr-chars:` exit line, must be 0 mismatched). A clean model's faces join the stage's frame:
+  world positions from the bone matrices in float, the game's vertex colours (flat lighting as the
+  PS1 lit it), textures through `material_texture`; `hlr_native.c` draws them opaque in the stage's
+  passes with depth written, float backface test per triangle (faces the integer NCLIP dropped
+  but that face the camera are drawn); their packets go to the 1x GPU only. A changed packet
+  (stale) or a model whose audit fails is drawn the original way. Shadows, effects, HUD: original.
+  Scheduling: an other constrains an item only when their boxes overlap (2 px margin), and a
+  semi-transparent other sorted in between a fighter's own faces (its shadow's pieces) does not
+  constrain that fighter (without these a Hills fight needed 19.6 passes per frame);
+  `DESTREGA_HLR_PASS_DIAG=N` logs the walk nodes that split the passes of N frames with > 6.
+  **Bone filter** `--hlr-bones game|smooth` (default smooth; settings `[display] hlr_bones`, menu
+  action `hlr-bones[=game|smooth]`, none = toggle; View > 3D Scene > Smooth Character Motion): Holt
+  smoothing of every part's matrix and translation (part 0 in world space, the others relative to
+  it), snapping on large changes, no added delay; state dropped on `on_restore`, a mode change or a
+  model not drawn for > 3 updates; never feeds back. A model whose every part has the same input
+  as last update (pause, hit-stop) is held: output = input, trend 0 (`hlr_bone_filter_hold`; it used
+  to coast on for ~1 s after a pause). `DESTREGA_HLR_BONE_DIAG=1|LO-HI` (libetc vblank
+  count) prints `hlr-bones-diag:` (per-update step and jitter, game vs filtered).
+- **2b switches**: `--hlr-msaa 1|2|4|8` (default 4), `--hlr-near clip|ps1` (default clip: polygons
+  crossing the near plane are clipped by the GPU; ps1 drops what the PS1 dropped as too near),
+  `--hlr-look enhanced|ps1` (default enhanced); settings `[display] hlr_msaa`, `hlr_near`, `hlr_look`
+  (flags lock them); menu actions `hlr-msaa=N`, `hlr-near=clip|ps1`, `hlr-look=enhanced|ps1`; View >
+  3D Scene items (Enhanced / PS1 Look, Clip / Drop Near Polygons, Edge Smoothing Off / 2x / 4x / 8x).
+- Exit lines: `hlr-audit:` (+ `-kinds`, `-alt`), `hlr-cost:` (host ms per stage pass), `hlr:` (frames
+  captured / walked / dropped, packets drawn by the HLR, stale, external passes), `hlr-native:`
+  (polygons recorded), `hlr-native-draw:` (passes and polygons per frame, culled, near-dropped,
+  stale, without texture, suppressed, walks given up, GPU passes / draws / failed).
+  `DESTREGA_HLR_DIAG=N` logs the first N native polygons that cover more than a quarter of a pass.
+  `DESTREGA_HLR_TEST_DROP=N` leaves out every Nth packet, `DESTREGA_HLR_TEST_NOKEEP=1` restarts
+  every MSAA pass from the resolve (the old seams) (tests prove they notice).
+- **Tests**: CTest `hlr` (no disc; also the float camera against the GTE's RTPS: within 0.75 px
+  for z >= 4H, where the GTE's own integer view position moves SX by at most H / z) and `hlr_gpu` /
+  `hlr_gpu_vulkan` (`test_hires_gpu external [API]`: empty external passes leave GPU == software, and
+  a cube through `hlr_gpu_external`: face colours, depth test, MSAA resolve, 15-bit channel order;
+  `external d3d12` passes under CrossOver (vkd3d) with the same cube pixel counts as Metal and MoltenVK);
+  `tools/test_hlr.py [audit chars hash exact seams rewind]` (`seams`: vs_gate fight + pause in the
+  user configuration, `tools/check_hlr_seams.py` on --hlr on vs off dumps: no long thin bright line
+  only the HLR draws; plus the NOKEEP negative check) (env `STAGES`, `API`, `AUDIT_MODES`, `HASH`,
+  `CHARS`; `chars` = the `practice_<char>` replays with `--hlr audit`, every character's move set;
+  `hash` and `rewind` require the native draw line and native character faces); CTest `hlr` also
+  audits a synthetic fighter built on the guest GTE (faults must be caught) and the bone filter; `test_netplay.py lan_hlr`; pr_check group `hlr`.
+  `tools/hlr_diff.py` (not a test): every VS stage key frame off / on at 4x6 16:9, contact sheets
+  and a difference table in `build/hlr2b/diff/`; `--chars "milena laon ..."` does the same for
+  practice replays (fighters close up). Must hold: audit 0 everywhere, state hashes on ==
+  off, exact dumps byte-identical to off.
+- **Direct3D 12** (checked under CrossOver 26, vkd3d over MoltenVK; Windows build, vs_hills 4x6 16:9,
+  `--no-interp --verify-overrides`): `off` / `on` / `exact` per-frame state hashes equal to each other
+  and to Metal on the Mac; `exact` and `off` dumps byte-identical to each other and to Metal `off`;
+  `on` vs Metal `on`: 0.107 % of the pixels differ, by at most 1 15-bit step (8 of 255), none by
+  more; same polygon / pass counts (114 polygons, 1.40 passes per frame, 0 failed). Not run on a
+  native D3D12 driver or WARP.
 
 ## Releases (`docs/RELEASES.md`)
 

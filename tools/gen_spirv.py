@@ -33,6 +33,12 @@ SOURCES = {
         ('s_spv_vs_fast', 'VS_FAST', 'vert'),
         ('s_spv_fs_fast', 'FS_FAST', 'frag'),
     ]),
+    'hlr': ('hlr_spirv.h', [
+        ('s_spv_vs_hlr', 'VS_HLR', 'vert'),
+        ('s_spv_fs_hlr', 'FS_HLR', 'frag'),
+        ('s_spv_vs_hblit', 'VS_HBLIT', 'vert'),
+        ('s_spv_fs_hblit', 'FS_HBLIT', 'frag'),
+    ]),
 }
 
 def tool(name):

@@ -51,6 +51,8 @@ int frontend_graphics_apis(const char **names, const char **titles, int max);
 /* Check mark of a View-menu render-quality item ("tex-filter=bilinear", "smooth-colours",
  * "ssaa=2"): true and *checked set if `action` is one of them. */
 bool frontend_view_checked(const char *action, bool *checked);
+/* View > 3D Scene (native high-level renderer) is usable: a GPU API is the renderer */
+bool frontend_hlr_available(void);
 /* Whether the window is full screen (View > Enter/Exit Full Screen follows it). */
 bool frontend_fullscreen(void);
 #endif

@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "platform.h"
+#include "hlr_hook.h"
 
 int g_widescreen;                       /* shadow pass on (frontend_set_widescreen, main.c) */
 extern int g_widescreen_cull;           /* rt.c: WS_IMM() yields the widened bound */
@@ -249,9 +250,22 @@ void widescreen_enable(bool on)
 
 /* ---- the override ------------------------------------------------------------------- */
 
+/* The pass the game sees. The native high-level renderer (hlr_hook.h, runtime/hlr/hlr_stage.c)
+ * predicts its packets before and checks / captures them after; it only reads guest state. */
+static void real_pass(void)
+{
+    if (!g_hlr.stage_pre) { f_80044210_orig(); return; }
+    g_hlr.stage_pre(R4);
+    f_80044210_orig();
+    if (g_hlr.stage_post) g_hlr.stage_post();
+}
+
 static void stage_render(void)
 {
-    if (!g_widescreen || !g_hires || !g_hires_guard) { f_80044210_orig(); return; }
+    if (!g_widescreen || !g_hires || !g_hires_guard) { real_pass(); return; }
+    /* the native high-level renderer draws this stage in 3D with a camera that covers the guard
+     * band: no shadow pass (g_ws_cull_hits still tells the frontend a stage is being drawn) */
+    if (g_hlr.stage_native && g_hlr.stage_native()) { g_ws_cull_hits++; real_pass(); return; }
     if (!s_ll_hooked) { g_gpu_ll_hook = ll_hook; s_ll_hooked = true; }
     const u32 base = ot_base();
     u64 t0 = cpu_ns();
@@ -275,7 +289,7 @@ static void stage_render(void)
     for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].save) s_hooks[i].save();
     if (!mem_journal_begin()) {
         for (int i = 0; i < s_nhooks; i++) if (s_hooks[i].restore) s_hooks[i].restore();
-        f_80044210_orig();
+        real_pass();
         return;
     }
     /* 2. widened pass, sealed off from interrupts and hardware */
@@ -302,7 +316,7 @@ static void stage_render(void)
     }
 
     u64 t1 = cpu_ns();
-    f_80044210_orig();
+    real_pass();
     u64 t2 = cpu_ns();
     /* 4. extras for this table */
     ok = ok && collect(&s_b, base, false);
