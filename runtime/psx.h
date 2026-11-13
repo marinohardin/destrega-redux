@@ -219,6 +219,7 @@ int xa_decode_sector(XaDecoder *d, const u8 *sector, s16 *out, int max_frames);
 u8 cdrom_read8(u32 offset);           /* offset 0..3 from 0x1f801800 */
 void cdrom_write8(u32 offset, u8 v);
 u32 cdrom_dma_read(u32 *dst, u32 words);
+u32 cdrom_stream_lba(void);           /* sector the drive reads next, 0 when not reading (presentation: splash.c) */
 
 /* ---- Pads (BIOS HLE) ----------------------------------------------------- */
 
