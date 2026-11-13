@@ -10,6 +10,11 @@ were recompiled from which original bytes) and the disc. The rule:
     turns the game's code into C (recomp/*.py) and its inputs in analysis/ (seeds, overrides,
     overlay and procedure lists). A change to any of them can change emulated behaviour, so
     builds that differ there are refused, even if the change looks harmless.
+    The launcher's C port of the recompiler (runtime/launcher/recompiler.[ch]) is covered for
+    the same reason; the rest of runtime/launcher/ (finding a compiler, the progress window, the
+    module key) is not: it decides how the game module is built, never what it emulates. A
+    launcher build (DESTREGA_GAME_MODULE) and a static build of the same commit have the same
+    identity and the same recompiled-code table, and play together.
   - not covered: what only one platform compiles or what is presentation only and proven not to
     reach emulated state (native menus, the platform shims, the hi-res / GPU renderers and their
     shaders, Windows resources), the input layer and settings file (host keys -> pad bits; the
@@ -64,7 +69,8 @@ def files(root):
             if n.startswith("test_") or (exts and not n.endswith(exts)):
                 continue
             out.append(rel)
-    for rel in ("analysis/extra_seeds.txt", "analysis/overrides.txt", "analysis/widescreen_cull.txt",
+    for rel in ("runtime/launcher/recompiler.c", "runtime/launcher/recompiler.h",
+                "analysis/extra_seeds.txt", "analysis/overrides.txt", "analysis/widescreen_cull.txt",
                 "analysis/idle_loops.txt", "analysis/rea_list_procedures_main.json"):
         if os.path.isfile(os.path.join(root, rel)):
             out.append(rel)

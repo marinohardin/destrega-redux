@@ -29,7 +29,7 @@
  * and timing are exactly those of a run without this file (state hashes, replays, netplay).
  */
 #include "override.h"
-#include "gen_protos.h"
+#include "game_syms.h"
 #include "hires.h"
 #include "pgxp.h"
 #include <stdlib.h>

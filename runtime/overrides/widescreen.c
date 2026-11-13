@@ -36,7 +36,7 @@
  * simply does or does not run the shadow pass.
  */
 #include "override.h"
-#include "gen_protos.h"
+#include "game_syms.h"
 #include "hires.h"
 #include "widescreen.h"
 #include "pgxp.h"

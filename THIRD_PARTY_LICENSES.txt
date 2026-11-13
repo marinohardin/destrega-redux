@@ -76,6 +76,17 @@ Builds made with MSYS2 CLANG64 instead link LLVM's compiler runtime (Apache-2.0 
 LLVM-exception) and the Universal C Runtime of Windows.
 
 
+Zig (launcher packages only)                 MIT license
+----------------------------------------------------------
+Launcher packages (no game code; the game is compiled on your computer from your own disc on
+first launch) include an unmodified Zig release as the C compiler, in the "zig" folder
+(Destrega.app/Contents/Resources/zig on macOS). Its own licence is zig/LICENSE (MIT,
+Copyright (c) Zig contributors); the compiler contains LLVM/Clang (Apache License 2.0 with LLVM
+Exceptions) and ships C library headers and sources (musl, mingw-w64, glibc headers, macOS SDK
+headers, compiler-rt and others) under their own terms, listed in the Zig release. Destrega
+uses it only to run `zig cc` on the code it generates; nothing from Zig is linked into the
+Destrega executable.
+
 Not bundled
 ----------------------------------------------------------
 A Vulkan loader / driver (including MoltenVK on macOS, Mesa on Linux) is used only if the

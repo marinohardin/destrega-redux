@@ -131,6 +131,40 @@ jobs:
           cat out.txt
           test $rc = 1 && grep -q "no data pack" out.txt
           ldd ./build/ci/destrega.exe | grep -iv "windows\\\\system32" || true
+      # Launcher layout (docs/RELEASES.md option A): the executable holds no game code; the player's
+      # first launch compiles the game module with the bundled Zig. Wine cannot run zig cc (NtLockFile),
+      # so this real Windows runner is where the bundled compiler is tested: --game-selftest builds a
+      # module from the stub sources (no disc, no game code) through the same compile / link / load path.
+      - name: Launcher build (no game code)
+        run: |
+          cmake -S . -B build/launcher -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DDESTREGA_GAME_MODULE=ON -DDESTREGA_DEV_GAME_MODULE=OFF
+          cmake --build build/launcher -j4
+          python3 tools/check_no_game_code.py build/launcher/destrega.exe
+      - name: Launcher self-test with the bundled Zig
+        run: |
+          zv=0.17.1
+          zsum=b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e
+          zdir="$RUNNER_TEMP/zigdl"
+          mkdir -p "$zdir"
+          curl -fsSL --retry 5 --retry-all-errors -o "$zdir/zig.zip" "https://ziglang.org/download/$zv/zig-x86_64-windows-$zv.zip"
+          echo "$zsum  $zdir/zig.zip" | sha256sum -c -
+          python3 -m zipfile -e "$zdir/zig.zip" "$zdir"
+          rm -rf build/launcher/zig
+          mv "$zdir/zig-x86_64-windows-$zv" build/launcher/zig
+          st="$RUNNER_TEMP/selftest"
+          mkdir -p "$st/gen"
+          cp tools/ci/stub_gen/stub.c tools/ci/stub_gen/gen_protos.h "$st/gen/"
+          printf 'set(GEN_SOURCES\n  ${GEN_DIR}/stub.c\n)\n' > "$st/gen/files.cmake"
+          set +e
+          ./build/launcher/destrega.exe --headless --data-dir "$st/data" --game-selftest "$st/gen" > st1.txt 2>&1
+          rc1=$?
+          ./build/launcher/destrega.exe --headless --data-dir "$st/data" --game-selftest "$st/gen" > st2.txt 2>&1
+          rc2=$?
+          set -e
+          cat st1.txt; echo "exit $rc1"; cat st2.txt; echo "exit $rc2"
+          test $rc1 = 0 && grep -q "bundled zig" st1.txt && grep -q "self-test passed" st1.txt
+          test $rc2 = 0 && grep -q "is current" st2.txt && grep -q "self-test passed" st2.txt
+          ls -l "$st/data/game/"
       - name: Package the stub build
         run: tools/package_release.sh win --exe build/ci/destrega.exe
       - uses: actions/upload-artifact@v4
@@ -216,6 +250,28 @@ jobs:
           set -e
           cat out.txt
           test $rc = 1 && grep -q "no data pack" out.txt
+      # The launcher layout (docs/RELEASES.md option A) needs no gen/ at all: the executable holds
+      # no game code by construction. Built and checked here, never packaged or uploaded.
+      - name: Launcher build (no game code)
+        run: |
+          cmake -S . -B build/launcher -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_PREFIX_PATH=$HOME/sdl3 -DDESTREGA_GAME_MODULE=ON -DDESTREGA_DEV_GAME_MODULE=OFF
+          cmake --build build/launcher
+          python3 tools/check_no_game_code.py build/launcher/destrega
+          LD_LIBRARY_PATH=$HOME/sdl3/lib ./build/launcher/destrega --help 2>&1 | grep -q -- --game-cc
+          # the module build path with this job's compiler (no disc: the stub sources)
+          st=$RUNNER_TEMP/selftest
+          mkdir -p $st/gen
+          cp tools/ci/stub_gen/stub.c tools/ci/stub_gen/gen_protos.h $st/gen/
+          printf 'set(GEN_SOURCES\n  ${GEN_DIR}/stub.c\n)\n' > $st/gen/files.cmake
+          set +e
+          LD_LIBRARY_PATH=$HOME/sdl3/lib ./build/launcher/destrega --headless --data-dir $st/data --game-cc ${{ matrix.cc }} --game-selftest $st/gen > st.txt 2>&1
+          rc=$?
+          set -e
+          cat st.txt; echo "exit $rc"
+          if [ $rc != 0 ] && command -v gdb >/dev/null; then
+            LD_LIBRARY_PATH=$HOME/sdl3/lib gdb -batch -ex run -ex bt --args ./build/launcher/destrega --headless --data-dir $st/data2 --game-cc ${{ matrix.cc }} --game-selftest $st/gen 2>&1 | tail -40
+          fi
+          test $rc = 0 && grep -q "self-test passed" st.txt
 
   macos:
     name: macOS (stub app bundle)
