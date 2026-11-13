@@ -377,8 +377,9 @@ void hlr_report(void)
             rt_log("hlr-native-chars: %.0f character faces per frame drawn in 3D, %.0f per frame facing away (float test)",
                    (double)N.chr_items / (double)N.frames, (double)N.chr_back / (double)N.frames);
         if (N.shadow_items)
-            rt_log("hlr-native-shadows: %.0f shadow triangles per frame drawn in 3D (depth-biased decals)",
-                   (double)N.shadow_items / (double)N.frames);
+            rt_log("hlr-native-shadows: %.0f shadow triangles per frame drawn in 3D (depth-biased decals); "
+                   "%.1f fighter vertices per frame lifted above the floor",
+                   (double)N.shadow_items / (double)N.frames, (double)N.floor_lifted / (double)N.frames);
         if (N.fx_items)
             rt_log("hlr-native-fx: %.1f effect polygons per frame drawn in 3D (depth tested, PS1 order among effects), %.2f pass points per frame added for them",
                    (double)N.fx_items / (double)N.frames, (double)N.fx_points / (double)N.frames);

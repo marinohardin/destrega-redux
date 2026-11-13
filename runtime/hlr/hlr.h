@@ -155,6 +155,7 @@ typedef struct {
     u64 hidden_bad;     /* polygons of objects the PS1 skipped whose packet words were never written */
     u64 chr_items, chr_back;    /* character faces drawn natively, faces found facing away (float) */
     u64 shadow_items;           /* shadow (decal) triangles drawn natively */
+    u64 floor_lifted;           /* fighter vertices moved above the floor under their shadow */
     u64 fx_items, fx_points;    /* effect polygons drawn natively, pass points added for them */
 } HlrNativeStats;
 void hlr_native_get_stats(HlrNativeStats *st);
