@@ -110,4 +110,28 @@ int hires_gpu_tc_layer(int depth, unsigned tp_x, unsigned tp_y, unsigned clut_x,
 /* Called by hires_gpu_shutdown before the device goes away (release what was made on it). */
 void hires_gpu_on_shutdown(void (*fn)(void));
 
+/* ---- motion at 60 Hz (docs/HLR_PLAN.md phase 6; header comment "Motion" in hires_gpu.c) ----------
+ * Fights update every second vblank, so each picture is presented twice. With a motion provider set,
+ * the backend records every command between vblanks; at the second presentation of an update (the
+ * next one is already drawn into the other buffer) it copies the target, redraws the shown update's
+ * commands into the copy with every external pass replaced by the provider's in-between pass
+ * (t = 0.5 between the shown update and the next) and presents the copy. Presentation only. */
+typedef void (*HgpuExtFn)(void *ctx, void *cmdbuf, void *colour_tex, int w, int h);
+typedef struct HgpuMotion {
+    /* a token for an external pass about to be queued (NULL: it cannot be replayed) */
+    void *(*keep)(HgpuExtFn fn, void *ctx);
+    void (*drop)(void *tok);
+    /* the pass to draw instead of token a's at time t towards token b's update; *ctx is consumed by
+     * *fn like an external's. False: nothing to draw (the replay is abandoned before it starts). */
+    bool (*subst)(void *a, void *b, float t, HgpuExtFn *fn, void **ctx);
+} HgpuMotion;
+void hires_gpu_set_motion(const HgpuMotion *m);     /* NULL = off (drops the recordings) */
+/* once per vblank, before the frame's first view: the display area in 1x VRAM */
+void hires_gpu_motion_vblank(int x, int y, int w, int h);
+typedef struct {
+    unsigned long long vblanks, recorded, replays, ops_replayed;
+    unsigned long long no_pair, not_shown, no_token, overflow, failed;
+} HgpuMotionStats;
+void hires_gpu_motion_stats(HgpuMotionStats *st);
+
 #endif

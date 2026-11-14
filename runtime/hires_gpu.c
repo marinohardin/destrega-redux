@@ -688,7 +688,9 @@ static void *vec_push(Vec *v, size_t k)
     return r;
 }
 
-enum { ST_DRAW, ST_VRAM_UP, ST_PUT_UP, ST_TCOPY, ST_TC_UP, ST_EXTERNAL };
+enum { ST_DRAW, ST_VRAM_UP, ST_PUT_UP, ST_TCOPY, ST_TC_UP, ST_EXTERNAL, ST_RT, ST_ALTCOPY };
+/* ST_RT: the steps after it draw into the target (key 0) or the motion copy s_alt (key 1);
+ * ST_ALTCOPY: target -> s_alt (motion, header comment "Motion") */
 /* ST_TC_UP: one mip level of a texture-cache layer (key = layer, x = level, y = 1 for the STP
  * array, w = h = level size) */
 typedef void (*ExtFn)(void *ctx, void *cmdbuf, void *colour_tex, int w, int h);
@@ -703,6 +705,10 @@ static SDL_GPUGraphicsPipeline *s_fpipe[2][NKEYS];                    /* fast pr
 static bool s_fast;            /* fast precision: tris and rects with the fast shaders (hires_gpu_set_fast) */
 static SDL_GPUSampler *s_samp;
 static SDL_GPUTexture *s_vramtex, *s_target, *s_temp, *s_puttex, *s_present;
+static SDL_GPUTexture *s_alt;  /* motion: the in-between picture (s_target's size and format) */
+static bool s_view_alt;        /* this vblank's view is s_alt (motion replayed) */
+static bool s_mreplay;         /* motion: replaying recorded commands into s_alt */
+static inline SDL_GPUTexture *view_tex(void) { return s_view_alt && s_alt ? s_alt : s_target; }
 static int s_pw, s_ph;
 static SDL_GPUBuffer *s_vbuf, *s_pbuf, *s_fvbuf, *s_fpbuf;
 static u32 s_vbuf_cap, s_pbuf_cap, s_fvbuf_cap, s_fpbuf_cap;
@@ -791,7 +797,8 @@ static void tc_stamp(u64 cm, int by0, int by1)
 
 static void mark_vram(int x, int y, int w, int h)
 {
-    if (w <= 0 || h <= 0 || g_hires_shadow) return;   /* guard-band packets never touch VRAM */
+    if (w <= 0 || h <= 0 || g_hires_shadow || s_mreplay) return;   /* guard-band packets never touch VRAM;
+                                                                   * a motion replay redraws, VRAM is unchanged */
     u64 cm = block_cols(x, w);
     int by0 = (y & 511) >> 4, by1 = ((y & 511) + imin(h, VRAM_H) - 1) >> 4;
     if (by1 - by0 >= 31) { by0 = 0; by1 = 31; }
@@ -1478,6 +1485,56 @@ static inline void guard_clip(HiresPrim *p)
 /* never in full precision (same as hires.c) */
 static inline bool dither_on(const HiresPrim *p) { return p->dither && !s_hp && ((s_Sx == 1 && s_Sy == 1) || hires_get_dither()); }
 
+/* ---- motion at 60 Hz: recording (header comment "Motion") ---------------------------------------- */
+
+enum { MO_TRI, MO_RECT, MO_LINE, MO_FILL, MO_COPY, MO_PUT, MO_EXT };
+typedef struct {
+    u8 type, shadow, b0, b1;    /* shadow: g_hires_shadow when it was queued */
+    int a[6];
+    u32 c[6];
+    HiresPrim p;                /* tri, rect, line */
+    HiresVtx v[3];              /* tri */
+    void *tok;                  /* external: the provider's token */
+} MOp;
+#define MREC_MAX_OPS 65536      /* more (an FMV's per-pixel puts) = not replayable */
+typedef struct { Vec ops; int y0, y1; u64 vb; bool overflow, untok; int ntok; } MRec;
+static const HgpuMotion *s_motion;
+static MRec s_mrec[3] = { { .ops = { .esz = sizeof(MOp) } }, { .ops = { .esz = sizeof(MOp) } }, { .ops = { .esz = sizeof(MOp) } } };
+static MRec *s_mcur = &s_mrec[0], *s_mh0 = &s_mrec[1], *s_mh1 = &s_mrec[2];   /* recording, newest, older */
+static u64 s_mvb;               /* hires_gpu_motion_vblank count */
+static HgpuMotionStats s_mst;
+
+static inline bool mrec_on(void) { return s_motion && !s_mreplay; }
+static MOp *mrec_push(int type)
+{
+    MRec *r = s_mcur;
+    if (r->overflow) return NULL;
+    if (r->ops.n >= MREC_MAX_OPS) { r->overflow = true; return NULL; }
+    MOp *o = vec_push(&r->ops, 1);
+    o->type = (u8)type; o->shadow = g_hires_shadow; o->tok = NULL;
+    return o;
+}
+static void mrec_y(int y0, int y1)
+{
+    MRec *r = s_mcur;
+    if (y0 < r->y0) r->y0 = y0;
+    if (y1 > r->y1) r->y1 = y1;
+}
+static void mrec_clear(MRec *r)
+{
+    MOp *o = r->ops.p;
+    for (size_t i = 0; i < r->ops.n; i++)
+        if (o[i].type == MO_EXT && o[i].tok && s_motion) s_motion->drop(o[i].tok);
+    r->ops.n = 0;
+    r->y0 = 1 << 30; r->y1 = -(1 << 30);
+    r->vb = 0; r->overflow = r->untok = false; r->ntok = 0;
+}
+static void mrec_clear_all(void)
+{
+    for (int i = 0; i < 3; i++) mrec_clear(&s_mrec[i]);
+    s_view_alt = false;
+}
+
 /* ---- CPU->VRAM pixels ------------------------------------------------------------------- */
 
 static void flush_puts(void)
@@ -1509,10 +1566,13 @@ static void flush_puts(void)
 static void be_put(int x, int y, u16 v, bool mc, bool ms)
 {
     x &= 1023; y &= 511;
-    s_dirty[y >> 4] |= 1ull << (x >> 4);
-    s_bst[y >> 4][x >> 4] = s_tst[y >> 8][x >> 6] = ++s_wclock;
+    if (!s_mreplay) {
+        s_dirty[y >> 4] |= 1ull << (x >> 4);
+        s_bst[y >> 4][x >> 4] = s_tst[y >> 8][x >> 6] = ++s_wclock;
+    }
     if (!s_ready) return;
     if (x < s_rx || y < s_ry || x >= s_rx + s_rw || y >= s_ry + s_rh) return;
+    if (mrec_on()) { MOp *o = mrec_push(MO_PUT); if (o) { o->a[0] = x; o->a[1] = y; o->c[0] = v; o->b0 = mc; o->b1 = ms; } mrec_y(y, y); }
     u32 *d = &s_put[(size_t)(y - s_ry) * s_rw + (x - s_rx)];
     if (s_put_n && (mc != s_put_mc || ms != s_put_ms || (mc && ms && (*d & 0x10000)))) flush_puts();
     if (!s_put_n) { s_pbx0 = s_pbx1 = x; s_pby0 = s_pby1 = y; }
@@ -1561,6 +1621,7 @@ static bool conservative_tri(GVtx v[3])
 static void be_tri(const HiresPrim *p, const HiresVtx vin[3])
 {
     if (!s_ready) return;
+    if (mrec_on()) { MOp *o = mrec_push(MO_TRI); if (o) { o->p = *p; memcpy(o->v, vin, sizeof o->v); } mrec_y(p->clip_y1, p->clip_y2); }
     flush_puts();
     const int Sx = s_Sx, Sy = s_Sy;
     s32 miny = vin[0].y, maxy = vin[0].y, minx = vin[0].x, maxx = vin[0].x;
@@ -1753,6 +1814,14 @@ static void be_rect(const HiresPrim *p, int x, int y, int w, int h, u32 r, u32 g
                     u32 u0, u32 v0, bool fx, bool fy)
 {
     if (!s_ready) return;
+    if (mrec_on()) {
+        MOp *o = mrec_push(MO_RECT);
+        if (o) {
+            o->p = *p; o->a[0] = x; o->a[1] = y; o->a[2] = w; o->a[3] = h;
+            o->c[0] = r; o->c[1] = g8; o->c[2] = b; o->c[3] = u0; o->c[4] = v0; o->b0 = fx; o->b1 = fy;
+        }
+        mrec_y(p->clip_y1, p->clip_y2);
+    }
     flush_puts();
     int xs = imax(x, p->clip_x1), xe = imin(x + w, p->clip_x2 + 1);
     int ys = imax(y, p->clip_y1), ye = imin(y + h, p->clip_y2 + 1);
@@ -1869,6 +1938,11 @@ static inline u32 lclamp(s32 v, u32 c0, u32 c1, int sh)
 static void be_line(const HiresPrim *p, int x0, int y0, u32 c0, int x1, int y1, u32 c1)
 {
     if (!s_ready) return;
+    if (mrec_on()) {
+        MOp *o = mrec_push(MO_LINE);
+        if (o) { o->p = *p; o->a[0] = x0; o->a[1] = y0; o->a[2] = x1; o->a[3] = y1; o->c[0] = c0; o->c[1] = c1; }
+        mrec_y(p->clip_y1, p->clip_y2);
+    }
     flush_puts();
     {
         int lx0 = imax(imin(x0, x1), p->clip_x1), lx1 = imin(x0 > x1 ? x0 : x1, p->clip_x2);
@@ -1942,6 +2016,12 @@ static int region_pieces(int x, int y, int w, int h, int out[4][4])
 
 static void be_fill(int x, int y, int w, int h, u16 c)
 {
+    int mpc[4][4];
+    if (s_ready && mrec_on() && region_pieces(x, y, w, h, mpc)) {
+        MOp *o = mrec_push(MO_FILL);
+        if (o) { o->a[0] = x; o->a[1] = y; o->a[2] = w; o->a[3] = h; o->c[0] = c; }
+        mrec_y(y & 511, (y & 511) + h - 1);
+    }
     if (s_ready) {
         flush_puts();
         int pc[4][4];
@@ -1971,6 +2051,13 @@ static void be_fill(int x, int y, int w, int h, u16 c)
 static void be_external(ExtFn fn, void *ctx)
 {
     if (!s_ready || !fn) return;
+    if (mrec_on()) {
+        MOp *o = mrec_push(MO_EXT);
+        if (o) {
+            o->tok = s_motion->keep(fn, ctx);
+            if (o->tok) s_mcur->ntok++; else s_mcur->untok = true;
+        }
+    }
     flush_puts();
     close_group();
     Step *st = add_step(ST_EXTERNAL);
@@ -1980,6 +2067,14 @@ static void be_external(ExtFn fn, void *ctx)
 
 static void be_copy(int sx, int sy, int dx, int dy, int wd, int ht, bool mc, bool ms)
 {
+    int mpc[4][4];
+    if (s_ready && mrec_on() && region_pieces(dx, dy, wd, ht, mpc)) {
+        MOp *o = mrec_push(MO_COPY);
+        if (o) { o->a[0] = sx; o->a[1] = sy; o->a[2] = dx; o->a[3] = dy; o->a[4] = wd; o->a[5] = ht; o->b0 = mc; o->b1 = ms; }
+        /* a copy onto itself changes nothing: the game copies 2x1 at (0,0) onto itself once per update
+         * (both buffers), which would make every update look as if it drew into the shown one */
+        if (sx != dx || sy != dy) mrec_y(dy & 511, (dy & 511) + ht - 1);
+    }
     if (s_ready) {
         flush_puts();
         int pc[4][4];
@@ -2108,13 +2203,14 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
     }
     const Step *steps = s_steps.p;
     int cur_key = -1;
+    SDL_GPUTexture *tgt = s_target;   /* ST_RT switches it (motion) */
     const float vk[4] = { 2.0f / (float)s_aw, 2.0f / (float)s_ah, 0, 0 };
     for (size_t i = 0; i < s_steps.n; i++) {
         const Step *st = &steps[i];
         if (st->type == ST_DRAW) {
             if (cp) { SDL_EndGPUCopyPass(cp); cp = NULL; }
             if (!rp) {
-                SDL_GPUColorTargetInfo ct = { .texture = s_target, .load_op = SDL_GPU_LOADOP_LOAD, .store_op = SDL_GPU_STOREOP_STORE };
+                SDL_GPUColorTargetInfo ct = { .texture = tgt, .load_op = SDL_GPU_LOADOP_LOAD, .store_op = SDL_GPU_STOREOP_STORE };
                 rp = SDL_BeginGPURenderPass(cb, &ct, 1, NULL);
                 s_st.passes++;
                 cur_key = -1;
@@ -2150,13 +2246,21 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
         } else if (st->type == ST_EXTERNAL) {
             if (rp) { SDL_EndGPURenderPass(rp); rp = NULL; }
             if (cp) { SDL_EndGPUCopyPass(cp); cp = NULL; }
-            st->fn(st->ctx, cb, s_target, s_aw, s_ah);
+            st->fn(st->ctx, cb, tgt, s_aw, s_ah);
             s_st.externals++;
+        } else if (st->type == ST_RT) {
+            if (rp) { SDL_EndGPURenderPass(rp); rp = NULL; }
+            tgt = st->key && s_alt ? s_alt : s_target;
         } else {
             if (rp) { SDL_EndGPURenderPass(rp); rp = NULL; }
             if (!cp) cp = SDL_BeginGPUCopyPass(cb);
-            if (st->type == ST_TCOPY) {
-                SDL_GPUTextureLocation src = { .texture = s_target, .x = 0, .y = (u32)st->y };
+            if (st->type == ST_ALTCOPY) {
+                if (s_alt) {
+                    SDL_GPUTextureLocation src = { .texture = s_target }, dst = { .texture = s_alt };
+                    SDL_CopyGPUTextureToTexture(cp, &src, &dst, (u32)s_tw, (u32)s_th, 1, false);
+                }
+            } else if (st->type == ST_TCOPY) {
+                SDL_GPUTextureLocation src = { .texture = tgt, .x = 0, .y = (u32)st->y };
                 SDL_GPUTextureLocation dst = { .texture = s_temp, .x = 0, .y = (u32)st->y };
                 SDL_CopyGPUTextureToTexture(cp, &src, &dst, (u32)s_tw, (u32)st->h, 1, false);
             } else if (st->type == ST_TC_UP) {
@@ -2180,7 +2284,7 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
         SDL_GPUColorTargetInfo ct = { .texture = s_present, .load_op = SDL_GPU_LOADOP_DONT_CARE, .store_op = SDL_GPU_STOREOP_STORE };
         rp = SDL_BeginGPURenderPass(cb, &ct, 1, NULL);
         SDL_BindGPUGraphicsPipeline(rp, s_present_pipe);
-        SDL_GPUTextureSamplerBinding tsb = { s_target, s_samp };
+        SDL_GPUTextureSamplerBinding tsb = { view_tex(), s_samp };
         SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
         const int pu[4] = { px, py, s_ssaa_present, s_hp };
         SDL_PushGPUFragmentUniformData(cb, 0, pu, sizeof pu);
@@ -2193,7 +2297,7 @@ static bool submit(bool readback, int rx, int ry, int rw, int rh, bool present, 
         const u32 bytes = (u32)rw * (u32)rh * (s_hp ? 4 : 2);
         s_down = ensure_tbuf(s_down, &s_down_cap, bytes, SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD);
         if (!cp) cp = SDL_BeginGPUCopyPass(cb);
-        SDL_GPUTextureRegion src = { .texture = s_target, .x = (u32)rx, .y = (u32)ry, .w = (u32)rw, .h = (u32)rh, .d = 1 };
+        SDL_GPUTextureRegion src = { .texture = view_tex(), .x = (u32)rx, .y = (u32)ry, .w = (u32)rw, .h = (u32)rh, .d = 1 };
         SDL_GPUTextureTransferInfo dst = { .transfer_buffer = s_down, .offset = 0 };
         SDL_DownloadFromGPUTexture(cp, &src, &dst);
         s_st.readbacks++;
@@ -2233,6 +2337,9 @@ static void release_target(void)
 {
     for (int i = 0; i < 2; i++) wait_fence(&s_fences[i]);
     if (s_target) SDL_ReleaseGPUTexture(s_dev, s_target);
+    if (s_alt) SDL_ReleaseGPUTexture(s_dev, s_alt);
+    s_alt = NULL;
+    s_view_alt = false;
     if (s_temp) SDL_ReleaseGPUTexture(s_dev, s_temp);
     if (s_puttex) SDL_ReleaseGPUTexture(s_dev, s_puttex);
     s_target = s_temp = s_puttex = NULL;
@@ -2244,6 +2351,7 @@ static void release_target(void)
 static void be_destroy_force(void)
 {
     reset_lists();
+    mrec_clear_all();
     for (int k = 0; k < NGKEYS; k++) s_gv[k].n = 0;
     memset(s_gm, 0, sizeof s_gm);
     s_gused = 0;
@@ -2334,7 +2442,7 @@ static bool view_rect(int x, int y, int w, int h, HiresView *out)
     out->h = h * s_Sy;
     out->scale_x = s_Sx;
     out->scale_y = s_Sy;
-    out->gpu = s_target;
+    out->gpu = view_tex();
     out->gx = x * s_Sx - s_ox;
     out->gy = y * s_Sy - s_oy;
     return true;
@@ -2387,6 +2495,129 @@ static const HiresBackend s_gpu = {
 };
 
 const HiresBackend *hires_gpu_backend(void) { return &s_gpu; }
+
+/* ---- motion at 60 Hz: the replay (docs/HLR_PLAN.md phase 6) -------------------------------------------
+ * Motion. A fight updates every second vblank into alternating buffers (y 0 / y 240) and each update
+ * is presented twice; when it is presented the second time the next update is already drawn into
+ * the other buffer (measured: NOTES.md "HLR phase 6"). With a provider set (hires_gpu_set_motion,
+ * the native renderer), every command the backend gets between two hires_gpu_motion_vblank calls is
+ * recorded (MOp: the prim and vertices as passed, g_hires_shadow, a provider token per external
+ * pass). A vblank with nothing recorded, whose older recording (two vblanks before the newer one)
+ * drew inside the displayed area and whose newer one (the vblank before) drew outside it, is the
+ * second presentation: the target is copied into s_alt (ST_ALTCOPY), the older recording is drawn
+ * again into s_alt (ST_RT; nothing marks VRAM: s_mreplay) with each external replaced by the
+ * provider's pass at t (subst: the shown update's frame moved half way towards the next one) and
+ * this vblank's view, present and readback use s_alt. The replay draws the update over its own
+ * picture, which is exact because a fight update's recording starts with the draw environment's
+ * clear (a fill of the whole buffer): every command then sees the destination it saw the first
+ * time, semi-transparent ones included; with DESTREGA_HLR_MOTION_T=0 the replay is byte-identical
+ * to the original frame (tools/test_hlr.py motion). Textures are sampled from the current VRAM (the next
+ * update's uploads are already in it; presentation only). Emulated state is never touched. */
+static float motion_t(void)
+{
+    static float t = -1.0f;
+    if (t < 0.0f) {
+        const char *e = getenv("DESTREGA_HLR_MOTION_T");    /* tests: 0 = the shown update itself */
+        t = e ? (float)atof(e) : 0.5f;
+        if (!(t >= 0.0f && t <= 1.0f)) t = 0.5f;
+    }
+    return t;
+}
+static int motion_diag(void)
+{
+    static int d = -1;
+    if (d < 0) { const char *e = getenv("DESTREGA_HLR_MOTION_DIAG"); d = e ? atoi(e) : 0; }
+    return d;
+}
+
+void hires_gpu_set_motion(const HgpuMotion *m)
+{
+    if (m == s_motion) return;
+    mrec_clear_all();       /* drops the old provider's tokens */
+    s_motion = m;
+    s_dirty_present = true;
+}
+
+void hires_gpu_motion_stats(HgpuMotionStats *st) { *st = s_mst; }
+
+static void *first_token(const MRec *r)
+{
+    const MOp *o = r->ops.p;
+    for (size_t i = 0; i < r->ops.n; i++) if (o[i].type == MO_EXT && o[i].tok) return o[i].tok;
+    return NULL;
+}
+
+static bool motion_replay(const MRec *a, const MRec *b)
+{
+    if (!s_alt) {
+        s_alt = make_tex(s_hp ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM, s_aw, s_ah,
+                         SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        if (!s_alt) { rt_log("hires-gpu: motion: cannot allocate the in-between target: %s", SDL_GetError()); return false; }
+    }
+    void *next = first_token(b);
+    const float t = motion_t();
+    flush_puts();
+    close_group();
+    add_step(ST_ALTCOPY);
+    add_step(ST_RT)->key = 1;
+    const bool sh = g_hires_shadow;
+    s_mreplay = true;
+    const MOp *o = a->ops.p;
+    for (size_t i = 0; i < a->ops.n; i++, o++) {
+        g_hires_shadow = o->shadow;
+        switch (o->type) {
+        case MO_TRI: be_tri(&o->p, o->v); break;
+        case MO_RECT: be_rect(&o->p, o->a[0], o->a[1], o->a[2], o->a[3], o->c[0], o->c[1], o->c[2], o->c[3], o->c[4], o->b0, o->b1); break;
+        case MO_LINE: be_line(&o->p, o->a[0], o->a[1], o->c[0], o->a[2], o->a[3], o->c[1]); break;
+        case MO_FILL: be_fill(o->a[0], o->a[1], o->a[2], o->a[3], (u16)o->c[0]); break;
+        case MO_COPY: be_copy(o->a[0], o->a[1], o->a[2], o->a[3], o->a[4], o->a[5], o->b0, o->b1); break;
+        case MO_PUT: be_put(o->a[0], o->a[1], (u16)o->c[0], o->b0, o->b1); break;
+        case MO_EXT: {
+            HgpuExtFn fn = NULL;
+            void *ctx = NULL;
+            if (o->tok && s_motion->subst(o->tok, next, t, &fn, &ctx)) be_external(fn, ctx);
+            else s_mst.failed++;
+            break;
+        }
+        }
+    }
+    flush_puts();
+    close_group();
+    g_hires_shadow = sh;
+    s_mreplay = false;
+    add_step(ST_RT)->key = 0;
+    s_mst.ops_replayed += a->ops.n;
+    return true;
+}
+
+void hires_gpu_motion_vblank(int x, int y, int w, int h)
+{
+    s_mvb++;
+    if (s_view_alt) { s_view_alt = false; s_dirty_present = true; }
+    if (!s_motion || !s_ready) return;
+    s_mst.vblanks++;
+    MRec *c = s_mcur;
+    if (c->ops.n || c->overflow) {      /* this vblank drew: it becomes the newest recording */
+        c->vb = s_mvb;
+        MRec *old = s_mh1;
+        mrec_clear(old);
+        s_mh1 = s_mh0; s_mh0 = c; s_mcur = old;
+        s_mst.recorded++;
+        return;
+    }
+    const MRec *a = s_mh1, *b = s_mh0;
+    const char *why = NULL;
+    if (!a->ops.n || !b->ops.n || b->vb + 1 != s_mvb || a->vb + 2 != b->vb) { why = "no pair"; s_mst.no_pair++; }
+    else if (a->y0 < y || a->y1 >= y + h || !(b->y1 < y || b->y0 >= y + h)) { why = "not shown"; s_mst.not_shown++; }
+    else if (a->overflow || b->overflow) { why = "overflow"; s_mst.overflow++; }
+    else if (a->untok || !a->ntok || b->untok || !b->ntok) { why = "no token"; s_mst.no_token++; }
+    else if (!motion_replay(a, b)) { why = "failed"; s_mst.failed++; }
+    else { s_view_alt = true; s_dirty_present = true; s_mst.replays++; }
+    if (motion_diag() > 0 && (why || motion_diag() > 1))
+        rt_log("hires-motion: vblank %llu display y%d+%d: %s (older vb %llu y%d..%d %zu ops %d passes, newer vb %llu y%d..%d)",
+               (unsigned long long)s_mvb, y, h, why ? why : "replayed", (unsigned long long)a->vb, a->y0, a->y1,
+               a->ops.n, a->ntok, (unsigned long long)b->vb, b->y0, b->y1);
+}
 
 static int s_api = -1;              /* API of s_dev while initialised */
 

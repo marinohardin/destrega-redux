@@ -30,6 +30,7 @@
 #include "hlr.h"
 #include "../hires_gpu.h"
 #include <SDL3/SDL.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../shaders/hlr_spirv.h"
@@ -113,6 +114,7 @@ static int s_tex_w, s_tex_h, s_tex_fmt, s_tex_samples;
 static int s_msaa_req = 4;
 static HlrGpuStats S;
 static u64 s_serial;
+static u64 s_up_serial;            /* frame whose vertices s_vbuf holds (0 = none) */
 
 void hlr_gpu_get_stats(HlrGpuStats *st) { *st = S; }
 void hlr_gpu_set_msaa(int n) { s_msaa_req = n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 1; }
@@ -139,6 +141,7 @@ static void release_all(void)
     if (s_psamp) SDL_ReleaseGPUSampler(s_dev, s_psamp);
     s_psamp = NULL;
     s_vbuf = NULL; s_tbuf = NULL; s_vbuf_cap = s_tbuf_cap = 0;
+    s_up_serial = 0;
     s_dev = NULL;
     s_failed = false;
 }
@@ -344,7 +347,7 @@ HlrGpuFrame *hlr_gpu_frame_new(void)
 
 void hlr_gpu_frame_unref(HlrGpuFrame *f)
 {
-    if (f && --f->refs == 0) { free(f->v); free(f); }
+    if (f && --f->refs == 0) { free(f->v); free(f->k); free(f->kp); free(f); }
 }
 
 HlrVtx *hlr_gpu_frame_vtx(HlrGpuFrame *f, u32 n)
@@ -352,10 +355,12 @@ HlrVtx *hlr_gpu_frame_vtx(HlrGpuFrame *f, u32 n)
     if (f->nv + n > f->vcap) {
         while (f->nv + n > f->vcap) f->vcap = f->vcap ? f->vcap * 2 : 16384;
         f->v = realloc(f->v, (size_t)f->vcap * sizeof *f->v);
-        if (!f->v) rt_fatal("hlr-gpu: out of memory");
+        f->k = realloc(f->k, (size_t)f->vcap * sizeof *f->k);
+        if (!f->v || !f->k) rt_fatal("hlr-gpu: out of memory");
     }
     HlrVtx *v = f->v + f->nv;
     memset(v, 0, (size_t)n * sizeof *v);
+    memset(f->k + f->nv, 0, (size_t)n * sizeof *f->k);
     f->nv += n;
     return v;
 }
@@ -407,7 +412,8 @@ void hlr_gpu_external(void *ctx, void *cmdbuf, void *colour_tex, int w, int h)
     const int samples = f->samples > 1 ? f->samples : 1;
     PipeSet *pp = ok ? pipes(gi.target_format, samples) : NULL;
     ok = ok && pp && pass_textures(f->pw, f->ph, gi.target_format, samples);
-    if (ok && !f->uploaded) { ok = upload(cb, f); f->uploaded = ok; }
+    /* the vertex buffer is shared: a frame drawn between another frame's passes (motion) uploads again */
+    if (ok && s_up_serial != f->serial) { ok = upload(cb, f); s_up_serial = ok ? f->serial : 0; }
     if (!ok) { S.failed++; goto out; }
     {
         /* 1. target rectangle -> colour texture (without MSAA; with MSAA the blit below reads it) */
@@ -489,3 +495,179 @@ out:
     free(ps->d);
     free(ps);
 }
+
+/* ---- motion at 60 Hz (docs/HLR_PLAN.md phase 6; hires_gpu.c "Motion") ---------------------------------
+ * A token is a copy of an external pass (its draw list, a reference to its frame). The in-between
+ * frame I(a, b, t) is a's vertices and draw lists with:
+ *   - every keyed vertex (characters, shadows, effects: HlrChr.key) whose key b has once, at
+ *     a + (b - a) * t, colour too; a key b lacks or has at two different places keeps a's; a step
+ *     longer than DESTREGA_HLR_MOTION_SNAP world units (default 600: a throw, a respawned effect)
+ *     keeps a's too;
+ *   - the stage and background strips (key 0) as they are: the world does not move, the camera does;
+ *   - the uniforms (camera rotation and translation, projection, fog, far colour, light matrices)
+ *     interpolated the same way, unless the camera cut (DESTREGA_HLR_MOTION_CUT: rotation entries
+ *     differing by more than 0.25 or the translation by more than 4000 units), then a's.
+ * One I is kept for the pair (all passes of the frame share it: MSAA samples and depth carry over
+ * between them as in a's own passes). */
+typedef struct { u64 key; u32 i; } MSlot;   /* i = ~0u: ambiguous */
+static HlrMotionStats MS;
+static HlrGpuFrame *s_mi;
+static u64 s_mi_a, s_mi_b;
+static float s_mi_t = -1.0f;
+static MSlot *s_mtab;
+static u32 s_mtab_cap;
+
+void hlr_gpu_motion_stats(HlrMotionStats *st) { *st = MS; }
+
+static void *m_keep(HgpuExtFn fn, void *ctx)
+{
+    if (fn != hlr_gpu_external || !ctx) return NULL;
+    const HlrGpuPass *ps = ctx;
+    HlrGpuPass *c = malloc(sizeof *c);
+    if (!c) return NULL;
+    c->f = ps->f;
+    c->nd = ps->nd;
+    c->d = ps->nd ? malloc((size_t)ps->nd * sizeof *c->d) : NULL;
+    if (ps->nd && !c->d) { free(c); return NULL; }
+    if (ps->nd) memcpy(c->d, ps->d, (size_t)ps->nd * sizeof *c->d);
+    c->f->refs++;
+    return c;
+}
+
+static void m_drop(void *tok)
+{
+    HlrGpuPass *c = tok;
+    if (!c) return;
+    hlr_gpu_frame_unref(c->f);
+    free(c->d);
+    free(c);
+}
+
+static double env_num(const char *name, double def)
+{
+    const char *e = getenv(name);
+    return e && *e ? atof(e) : def;
+}
+
+static inline u32 mhash(u64 k) { k ^= k >> 33; k *= 0xff51afd7ed558ccdull; k ^= k >> 33; return (u32)k; }
+
+static void lerp_f(float *a, const float *b, int n, float t) { for (int i = 0; i < n; i++) a[i] += (b[i] - a[i]) * t; }
+
+static bool camera_cut(const HlrUniforms *a, const HlrUniforms *b)
+{
+    static double rot = -1.0, tr = -1.0;
+    if (rot < 0.0) {
+        const char *e = getenv("DESTREGA_HLR_MOTION_CUT");     /* "ROT,TRANS" */
+        rot = 0.25; tr = 4000.0;
+        if (e && *e) { rot = atof(e); const char *c = strchr(e, ','); if (c) tr = atof(c + 1); }
+    }
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) if (fabs((double)a->rt[r][c] - b->rt[r][c]) > rot) return true;
+    const double dx = a->tr[0] - b->tr[0], dy = a->tr[1] - b->tr[1], dz = a->tr[2] - b->tr[2];
+    return dx * dx + dy * dy + dz * dz > tr * tr;
+}
+
+/* the position of table entry j of frame b: a drawn vertex, or (j >= nv) a keyed position */
+static inline const float *mpos(const HlrGpuFrame *b, u32 j) { return j < b->nv ? b->v[j].pos : b->kp[j - b->nv].p; }
+
+static HlrGpuFrame *interp_frame(HlrGpuFrame *a, HlrGpuFrame *b, float t)
+{
+    if (s_mi && s_mi_a == a->serial && s_mi_b == (b ? b->serial : 0) && s_mi_t == t) return s_mi;
+    if (s_mi) hlr_gpu_frame_unref(s_mi);
+    HlrGpuFrame *f = hlr_gpu_frame_new();
+    if (a->nv) { hlr_gpu_frame_vtx(f, a->nv); memcpy(f->v, a->v, (size_t)a->nv * sizeof *f->v); }
+    f->u = a->u;
+    f->px0 = a->px0; f->py0 = a->py0; f->pw = a->pw; f->ph = a->ph;
+    f->samples = a->samples; f->nearest_tex = a->nearest_tex;
+    MS.frames++;
+    if (!b) MS.unpaired++;
+    /* the two updates are drawn into different buffers (y 0 / 240): the rectangles differ in position,
+     * proj is relative to the rectangle (hlr_cam_clip: draw offset and rectangle move together) */
+    else if (b->pw != a->pw || b->ph != a->ph || b->samples != a->samples) MS.refused++;
+    else if (camera_cut(&a->u, &b->u)) MS.cuts++;
+    else {
+        HlrUniforms *u = &f->u;
+        lerp_f(&u->rt[0][0], &b->u.rt[0][0], 12, t);
+        lerp_f(u->tr, b->u.tr, 4, t);
+        lerp_f(u->proj, b->u.proj, 4, t);
+        lerp_f(u->fog, b->u.fog, 4, t);
+        lerp_f(u->fc, b->u.fc, 4, t);
+        lerp_f(&u->llm[0][0], &b->u.llm[0][0], 12, t);
+        lerp_f(&u->lcm[0][0], &b->u.lcm[0][0], 12, t);
+        lerp_f(u->bk, b->u.bk, 4, t);
+        /* b's keyed vertices */
+        u32 cap = 1024;
+        while (cap < 2 * (b->nv + b->nkp)) cap <<= 1;
+        if (cap > s_mtab_cap) { free(s_mtab); s_mtab = malloc((size_t)cap * sizeof *s_mtab); s_mtab_cap = s_mtab ? cap : 0; }
+        if (s_mtab) {
+            memset(s_mtab, 0, (size_t)cap * sizeof *s_mtab);
+            const u32 mask = cap - 1;
+            /* positions of every keyed vertex of b first (i >= b->nv: b->kp[i - b->nv]), then b's drawn
+             * vertices (the same positions for the same key) */
+            for (u32 i = 0; i < b->nkp; i++) {
+                const u64 k = b->kp[i].key;
+                u32 h = mhash(k) & mask;
+                while (s_mtab[h].key && s_mtab[h].key != k) h = (h + 1) & mask;
+                if (!s_mtab[h].key) { s_mtab[h].key = k; s_mtab[h].i = b->nv + i; }
+                else if (s_mtab[h].i != ~0u && memcmp(mpos(b, s_mtab[h].i), b->kp[i].p, sizeof b->kp[i].p)) s_mtab[h].i = ~0u;
+            }
+            for (u32 i = 0; i < b->nv; i++) {
+                const u64 k = b->k[i];
+                if (!k) continue;
+                u32 h = mhash(k) & mask;
+                while (s_mtab[h].key && s_mtab[h].key != k) h = (h + 1) & mask;
+                if (!s_mtab[h].key) { s_mtab[h].key = k; s_mtab[h].i = i; continue; }
+                const u32 j = s_mtab[h].i;
+                if (j != ~0u && memcmp(mpos(b, j), b->v[i].pos, sizeof b->v[i].pos)) s_mtab[h].i = ~0u;
+            }
+            static double snap = -1.0;
+            if (snap < 0.0) snap = env_num("DESTREGA_HLR_MOTION_SNAP", 600.0);
+            for (u32 i = 0; i < a->nv; i++) {
+                MS.verts++;
+                const u64 k = a->k[i];
+                if (!k) continue;
+                MS.keyed++;
+                u32 h = mhash(k) & mask;
+                while (s_mtab[h].key && s_mtab[h].key != k) h = (h + 1) & mask;
+                if (!s_mtab[h].key) continue;
+                const u32 j = s_mtab[h].i;
+                if (j == ~0u) { MS.ambiguous++; continue; }
+                const float *pb = mpos(b, j);
+                HlrVtx *v = &f->v[i];
+                const double dx = pb[0] - v->pos[0], dy = pb[1] - v->pos[1], dz = pb[2] - v->pos[2];
+                const double d = sqrt(dx * dx + dy * dy + dz * dz);
+                if (d > snap) { MS.snapped++; continue; }
+                if (d > MS.max_step) MS.max_step = d;
+                MS.matched++;
+                lerp_f(v->pos, pb, 3, t);
+                if (j < b->nv) {    /* a colour only where b draws the vertex (else a's: lighting changes slowly) */
+                    const HlrVtx *vb = &b->v[j];
+                    for (int c = 0; c < 4; c++) v->col[c] = (u8)lrintf((float)v->col[c] + ((float)vb->col[c] - (float)v->col[c]) * t);
+                }
+            }
+        }
+    }
+    s_mi = f; s_mi_a = a->serial; s_mi_b = b ? b->serial : 0; s_mi_t = t;
+    return f;
+}
+
+static bool m_subst(void *ta, void *tb, float t, HgpuExtFn *fn, void **ctx)
+{
+    const HlrGpuPass *A = ta, *B = tb;
+    if (!A) return false;
+    HlrGpuFrame *f = interp_frame(A->f, B ? B->f : NULL, t);
+    HlrGpuPass *p = malloc(sizeof *p);
+    if (!p) return false;
+    p->nd = A->nd;
+    p->d = A->nd ? malloc((size_t)A->nd * sizeof *p->d) : NULL;
+    if (A->nd && !p->d) { free(p); return false; }
+    if (A->nd) memcpy(p->d, A->d, (size_t)A->nd * sizeof *p->d);
+    p->f = f;
+    f->refs++;
+    *fn = hlr_gpu_external;
+    *ctx = p;
+    return true;
+}
+
+static const HgpuMotion k_motion = { m_keep, m_drop, m_subst };
+const struct HgpuMotion *hlr_gpu_motion_provider(void) { return &k_motion; }

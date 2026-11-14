@@ -39,15 +39,23 @@ enum { HLR_DRAW_OPAQUE_NOZ = 4 };
 typedef struct { u32 first, count; int blend; } HlrDraw;   /* blend -1 = opaque (depth write), 0..3 semi,
                                                              * HLR_DRAW_OPAQUE_NOZ opaque without depth write */
 
+#ifndef HLR_KPOS_DEFINED      /* also in hlr.h */
+#define HLR_KPOS_DEFINED
+typedef struct { u64 key; float p[3]; } HlrKpos;
+#endif
+
 /* a frame's geometry, shared by its passes (reference counted: freed after the last pass ran) */
 typedef struct HlrGpuFrame {
     int refs;
     HlrVtx *v; u32 nv, vcap;
+    u64 *k;                 /* per vertex: what it is across updates (HlrChr.key; 0 = static world /
+                             * screen: moves with the camera only), for motion (phase 6) */
+    HlrKpos *kp; u32 nkp;   /* keyed positions of vertices this frame does not draw (HlrFrame.kp) */
     HlrUniforms u;
     int px0, py0, pw, ph;   /* the passes' rectangle in target pixels */
     int samples;            /* MSAA sample count in effect */
     bool nearest_tex;       /* point-sampled level 0 (--hlr-look ps1) instead of trilinear + anisotropic */
-    bool uploaded, cleared;
+    bool cleared;
     u64 serial;
 } HlrGpuFrame;
 
@@ -68,3 +76,11 @@ HlrVtx *hlr_gpu_frame_vtx(HlrGpuFrame *f, u32 n);   /* n more vertices at the en
 void hlr_gpu_external(void *ctx, void *cmdbuf, void *colour_tex, int w, int h);
 typedef struct { u64 passes, draws, tris, msaa_passes, msaa_kept, uploads, upload_bytes, failed; } HlrGpuStats;
 void hlr_gpu_get_stats(HlrGpuStats *st);
+
+/* motion at 60 Hz (phase 6): the provider for hires_gpu_set_motion. Its in-between pass draws the
+ * shown update's frame with every keyed vertex moved towards the same vertex of the next update's
+ * frame, and the camera, fog and light uniforms interpolated the same way. */
+struct HgpuMotion;
+const struct HgpuMotion *hlr_gpu_motion_provider(void);
+typedef struct { u64 frames, verts, keyed, matched, snapped, ambiguous, cuts, refused, unpaired; double max_step; } HlrMotionStats;
+void hlr_gpu_motion_stats(HlrMotionStats *st);

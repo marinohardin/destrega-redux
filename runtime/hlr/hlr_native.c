@@ -57,7 +57,8 @@
 enum { W_SLOT, W_STAGE, W_STRIP, W_OTHER, W_NONE, W_CHAR };
 typedef struct { u32 node; u8 kind; s32 nat; } WNode;
 typedef struct { int x0, y0, x1, y1; } IBox;      /* 1x VRAM pixels, inclusive */
-typedef struct { int pos; IBox b; int chr; bool semi; } Other;   /* chr: a character packet (-1 = none); semi: a semi-transparent primitive */
+typedef struct { int pos; IBox b; int chr; bool semi, sub; } Other;   /* chr: a character packet (-1 = none); semi: a semi-transparent primitive;
+                                                                      * sub: a subtractive gouraud textured triangle (a shadow piece the PS1 way) */
 typedef struct {
     int pos, lo, hi, t;
     int ilo, ihi;                   /* character face: its model's first / last linked face (walk positions) */
@@ -94,9 +95,100 @@ static int s_pos, s_next;                                    /* walk position, n
 static bool s_on;                                            /* a native walk is in progress */
 static HlrNativeStats S;
 /* depth bias of the shadow decals, world units towards the camera (DESTREGA_HLR_SHADOW_BIAS): the
- * shadow mesh is draped over the floor at its vertices only, so between them it lies up to a few
- * units under or over the native floor's triangles */
+ * shadow mesh is draped over the floor at its vertices only, so between them the native floor can
+ * rise well above it: on slopes and ridges (Relics, Castle 1, Shrine) a 40-unit bias let the floor
+ * cut pieces out of the shadow, changing as the fighter moved (seen as flicker), and a shadow beside
+ * a steep wall vanished; 200 still lost part of one on a Relics slope edge. 400 (fighters are ~1500
+ * tall) keeps them whole, as the PS1 draws them over the floor by OT order. */
 static float s_decal_bias = -1.0f;
+#define GROW(p, cap, need, init) do { if ((need) > (cap)) { int c_ = (cap) ? (cap) : (init); while (c_ < (need)) c_ *= 2; \
+    void *q_ = realloc((p), (size_t)c_ * sizeof *(p)); if (!q_) rt_fatal("hlr-native: out of memory"); (p) = q_; (cap) = c_; } } while (0)
+
+/* fighters above the floor: lying down, a fighter is laid flat at the floor height under its centre,
+ * so on a slope its limbs sink into the native floor by up to ~200 world units (the Relics bridge,
+ * CONTINUE?) and the depth test hides them; the PS1 draws the fighter over the floor by OT order.
+ * The shadow mesh is the floor under each fighter (draped by the game, hlr_shadow.c), so a fighter
+ * vertex under it slides along its line of sight towards the eye until it is s_lift_margin above it:
+ * the same pixel, a smaller depth. Not under a shadow (or shadows off): unchanged. */
+typedef struct { float x[3], y[3], z[3], x0, x1, z0, z1; } FloorTri;
+static FloorTri *s_ft; static int s_nft, s_ftcap;
+static float s_eye[3];                                       /* camera position in world units */
+static bool s_eye_ok;
+static float s_lift_margin = -1.0f;                          /* DESTREGA_HLR_FLOOR_MARGIN, world units; 0 = off */
+
+/* the floor's height (Y grows downwards) under x, z; false outside every shadow triangle */
+static bool floor_y(float x, float z, float *y)
+{
+    bool hit = false;
+    for (int i = 0; i < s_nft; i++) {
+        const FloorTri *t = &s_ft[i];
+        if (x < t->x0 || x > t->x1 || z < t->z0 || z > t->z1) continue;
+        const float d = (t->x[1] - t->x[0]) * (t->z[2] - t->z[0]) - (t->x[2] - t->x[0]) * (t->z[1] - t->z[0]);
+        if (d == 0.0f) continue;
+        const float a = ((t->x[1] - x) * (t->z[2] - z) - (t->x[2] - x) * (t->z[1] - z)) / d;
+        const float b = ((t->x[2] - x) * (t->z[0] - z) - (t->x[0] - x) * (t->z[2] - z)) / d;
+        const float c = 1.0f - a - b;
+        if (a < -1e-4f || b < -1e-4f || c < -1e-4f) continue;
+        const float h = a * t->y[0] + b * t->y[1] + c * t->y[2];
+        if (!hit || h < *y) *y = h;                          /* the highest surface (overlapping shadows) */
+        hit = true;
+    }
+    return hit;
+}
+
+static void chr_lifted(const float p[3], float o[3])
+{
+    o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
+    if (!s_eye_ok || !s_nft || s_eye[1] >= p[1]) return;    /* the eye must be above the vertex */
+    float s = 0.0f;
+    for (int it = 0; it < 4; it++) {                         /* the floor under the moved point, refined */
+        const float q[3] = { p[0] + (s_eye[0] - p[0]) * s, p[1] + (s_eye[1] - p[1]) * s, p[2] + (s_eye[2] - p[2]) * s };
+        float fy;
+        if (!floor_y(q[0], q[2], &fy)) break;
+        const float ns = (p[1] - (fy - s_lift_margin)) / (p[1] - s_eye[1]);   /* q.y = floor - margin */
+        if (ns <= s) break;
+        s = ns > 0.5f ? 0.5f : ns;
+    }
+    if (s <= 0.0f) return;
+    for (int i = 0; i < 3; i++) o[i] = p[i] + (s_eye[i] - p[i]) * s;
+    S.floor_lifted++;
+}
+
+/* per frame: the eye (RT * eye / 4096 + TR = 0) and the shadow triangles */
+static void floor_begin(const HlrFrame *f, const HlrCam *k)
+{
+    if (s_lift_margin < 0) { const char *e = getenv("DESTREGA_HLR_FLOOR_MARGIN"); s_lift_margin = e ? (float)atof(e) : 8.0f; }
+    s_nft = 0; s_eye_ok = false;
+    if (s_lift_margin <= 0.0f) return;
+    const float (*m)[3] = k->rt;
+#define DET3(t) ((t)[0][0] * ((t)[1][1] * (t)[2][2] - (t)[1][2] * (t)[2][1]) - (t)[0][1] * ((t)[1][0] * (t)[2][2] - (t)[1][2] * (t)[2][0]) \
+                + (t)[0][2] * ((t)[1][0] * (t)[2][1] - (t)[1][1] * (t)[2][0]))
+    const float det = DET3(m);
+    if (det == 0.0f) return;
+    for (int c = 0; c < 3; c++) {                            /* Cramer's rule */
+        float t[3][3];
+        for (int r = 0; r < 3; r++) for (int j = 0; j < 3; j++) t[r][j] = j == c ? -k->tr[r] : m[r][j];
+        s_eye[c] = DET3(t) / det;
+    }
+#undef DET3
+    s_eye_ok = true;
+    for (int i = 0; i < f->nc; i++) {
+        const HlrChr *c = &f->chr[i];
+        if (!c->decal || c->fx || c->nv < 3) continue;
+        GROW(s_ft, s_ftcap, s_nft + 1, 256);
+        FloorTri *t = &s_ft[s_nft++];
+        for (int j = 0; j < 3; j++) { t->x[j] = c->v[j][0]; t->y[j] = c->v[j][1]; t->z[j] = c->v[j][2]; }
+        t->x0 = fminf(t->x[0], fminf(t->x[1], t->x[2])); t->x1 = fmaxf(t->x[0], fmaxf(t->x[1], t->x[2]));
+        t->z0 = fminf(t->z[0], fminf(t->z[1], t->z[2])); t->z1 = fmaxf(t->z[0], fmaxf(t->z[1], t->z[2]));
+    }
+    for (int i = 0; i < f->nfl; i++) {    /* shadows drawn the PS1 way: their mesh as the floor only */
+        GROW(s_ft, s_ftcap, s_nft + 1, 256);
+        FloorTri *t = &s_ft[s_nft++];
+        for (int j = 0; j < 3; j++) { t->x[j] = f->floor[i][3 * j]; t->y[j] = f->floor[i][3 * j + 1]; t->z[j] = f->floor[i][3 * j + 2]; }
+        t->x0 = fminf(t->x[0], fminf(t->x[1], t->x[2])); t->x1 = fmaxf(t->x[0], fmaxf(t->x[1], t->x[2]));
+        t->z0 = fminf(t->z[0], fminf(t->z[1], t->z[2])); t->z1 = fmaxf(t->z[0], fmaxf(t->z[1], t->z[2]));
+    }
+}
 
 void hlr_set_near(int m) { s_near = m == HLR_NEAR_PS1 ? HLR_NEAR_PS1 : HLR_NEAR_CLIP; }
 int hlr_get_near(void) { return s_near; }
@@ -104,8 +196,6 @@ void hlr_set_look(int m) { s_look = m == HLR_LOOK_PS1 ? HLR_LOOK_PS1 : HLR_LOOK_
 int hlr_get_look(void) { return s_look; }
 void hlr_native_get_stats(HlrNativeStats *st) { *st = S; }
 
-#define GROW(p, cap, need, init) do { if ((need) > (cap)) { int c_ = (cap) ? (cap) : (init); while (c_ < (need)) c_ *= 2; \
-    void *q_ = realloc((p), (size_t)c_ * sizeof *(p)); if (!q_) rt_fatal("hlr-native: out of memory"); (p) = q_; (cap) = c_; } } while (0)
 
 static inline u32 rw(u32 a) { return *(const u32 *)(g_ram + (a & 0x1ffffc)); }
 static inline int sext11(u32 v) { return (int)((v & 0x7ff) ^ 0x400) - 0x400; }
@@ -265,16 +355,23 @@ static bool ovl(const IBox *a, const IBox *b)
  * end up under the feet where the PS1 painted a piece over them (a few pixels at the contact).
  * Effects the PS1 drew over the whole fighter (sparks, trails: after its last face) still count. */
 static inline bool skip(const Other *o, const Item *it) { return o->semi && o->pos > it->ilo && o->pos < it->ihi; }
-static void bracket_box(const int *l, int n, const Item *it, int *lo, int *hi)
+/* *after: the last shadow piece drawn the PS1 way (Other.sub) that a face skipped. A 2D piece is not
+ * depth tested, so drawn after the native face it darkens it: a fallen fighter lies among its
+ * shadow's OT slots, and the whole body went dark (shadows the PS1 way, fighters native). The face
+ * is drawn after every such piece instead, as with native shadows (interval()). */
+static void bracket_box(const int *l, int n, const Item *it, int *lo, int *hi, int *after)
 {
     const int pos = it->pos;
     int a = 0, e = n;
     while (a < e) { const int m = (a + e) / 2; if (s_o[l[m]].pos < pos) a = m + 1; else e = m; }
     for (int i = a - 1; i >= 0 && s_o[l[i]].pos > *lo; i--)
-        if (ovl(&s_o[l[i]].b, &it->b) && !skip(&s_o[l[i]], it)) { *lo = s_o[l[i]].pos; break; }
+        if (ovl(&s_o[l[i]].b, &it->b) && (s_o[l[i]].sub || !skip(&s_o[l[i]], it))) { *lo = s_o[l[i]].pos; break; }
     while (a < n && s_o[l[a]].pos <= pos) a++;
     for (int i = a; i < n && s_o[l[i]].pos < *hi; i++)
-        if (ovl(&s_o[l[i]].b, &it->b) && !skip(&s_o[l[i]], it)) { *hi = s_o[l[i]].pos; break; }
+        if (ovl(&s_o[l[i]].b, &it->b)) {
+            if (!skip(&s_o[l[i]], it)) { *hi = s_o[l[i]].pos; break; }
+            if (s_o[l[i]].sub && s_o[l[i]].pos > *after) *after = s_o[l[i]].pos;
+        }
 }
 
 static void interval(Item *it)
@@ -288,11 +385,13 @@ static void interval(Item *it)
     if (b.x1 > x1) b.x1 = x1;
     if (b.y1 > y1) b.y1 = y1;
     if (b.x0 > b.x1 || b.y0 > b.y1) return;
+    int after = -1;
     for (int ty = (b.y0 - s_gy0) / TILE; ty <= (b.y1 - s_gy0) / TILE; ty++)
         for (int tx = (b.x0 - s_gx0) / TILE; tx <= (b.x1 - s_gx0) / TILE; tx++) {
             const int t = ty * s_gnx + tx;
-            bracket_box(s_tlist + s_tstart[t], s_tstart[t + 1] - s_tstart[t], it, &it->lo, &it->hi);
+            bracket_box(s_tlist + s_tstart[t], s_tstart[t + 1] - s_tstart[t], it, &it->lo, &it->hi, &after);
         }
+    if (after > it->lo && after < it->hi) it->lo = after;
 }
 
 static int cmp_hi(const void *a, const void *b)
@@ -361,11 +460,15 @@ static void put_chr(HlrGpuFrame *gf, const HlrFrame *f, const Item *it, int sel)
     }
     const u32 uvr = umin | umax << 8 | vmin << 16 | vmax << 24;
     const u32 info = it->info | (u32)sel << HV_SEL_SH;
+    u64 *key = gf->k + (v - gf->v);
+    const bool lift = s_nft && !c->decal && !c->fx;
     for (int t = 0; t < 2; t++) {
         if (!(it->tris >> t & 1)) continue;
         for (int k = 0; k < 3; k++, v++) {
             const int i = tri[t][k];
-            v->pos[0] = c->v[i][0]; v->pos[1] = c->v[i][1]; v->pos[2] = c->v[i][2];
+            *key++ = c->key[i];
+            if (lift) chr_lifted(c->v[i], v->pos);
+            else { v->pos[0] = c->v[i][0]; v->pos[1] = c->v[i][1]; v->pos[2] = c->v[i][2]; }
             v->nrm[0] = v->nrm[1] = v->nrm[2] = 0.0f;
             const u32 col = c->col[i];
             v->col[0] = (u8)col; v->col[1] = (u8)(col >> 8); v->col[2] = (u8)(col >> 16); v->col[3] = 255;
@@ -433,6 +536,7 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
     if (!f->nn || !g_hires || !g_hires->external) return false;
     HiresGpuInfo gi;
     if (!hires_gpu_info(&gi)) return false;
+    hlr_fx_lift(f);
     S.frames++;
     s_nmm = 0;
     /* 1. pre-walk */
@@ -476,13 +580,14 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
                 w->kind = W_OTHER;
                 if (r == BB_FULL) { GROW(s_full, s_fcap, s_nfull + 1, 256); s_full[s_nfull++] = s_nw; }
                 else { GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = -1;
-                       const u32 op0 = rw(a + 4) >> 24; s_o[s_no].semi = op0 >= 0x20 && op0 < 0x80 && (op0 & 2); s_no++; }
+                       const u32 op0 = rw(a + 4) >> 24; s_o[s_no].semi = op0 >= 0x20 && op0 < 0x80 && (op0 & 2);
+                       s_o[s_no].sub = (op0 & 0xfe) == 0x36 && n >= 9 && ((rw(a + 24) >> 21) & 3) == 2; s_no++; }
             }
         } else if (w->kind == W_CHAR) {
             /* an other unless the face is drawn natively (decided below, before the grid is built) */
             IBox b;
             if (gp0_bbox(a, (int)n, &e, &b) == BB_BOX) {
-                GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = w->nat; s_o[s_no].semi = false; s_no++;
+                GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = w->nat; s_o[s_no].semi = false; s_o[s_no].sub = false; s_no++;
             }
         }
         if (w->kind == W_STRIP && !se_set) { se = e; se_set = true; }
@@ -563,7 +668,8 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
             it->ilo = it->ihi = -1;
             it->blend = (c->code & 2) ? (int)((c->tpage >> 5) & 3) : -1;
             it->tex_semi = tex && (c->code & 2);
-            it->fx = true;
+            it->fx = !c->under;
+            it->decal = c->under;   /* a fighter is drawn over it: placed and drawn like a shadow (hlr_fx_lift) */
             s_chrdone[i] = true;
             S.fx_items++;
             continue;
@@ -811,12 +917,21 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
         U->misc[0] = near;
         U->misc[1] = s_look == HLR_LOOK_ENHANCED ? 1.0f : 0.0f;
         U->misc[2] = gi.full_colour ? 0.0f : 1.0f;
-        if (s_decal_bias < 0) { const char *e = getenv("DESTREGA_HLR_SHADOW_BIAS"); s_decal_bias = e ? (float)atof(e) : 40.0f; }
+        if (s_decal_bias < 0) { const char *e = getenv("DESTREGA_HLR_SHADOW_BIAS"); s_decal_bias = e ? (float)atof(e) : 400.0f; }
         U->misc[3] = s_decal_bias;
         U->fog[0] = k->h * 65536.0f; U->fog[1] = k->dqa; U->fog[2] = k->dqb; U->fog[3] = 1.0f;
         gf->px0 = rect[0]; gf->py0 = rect[1]; gf->pw = rect[2]; gf->ph = rect[3];
         gf->samples = hlr_gpu_msaa_for(gi.target_format);
         gf->nearest_tex = s_look == HLR_LOOK_PS1;
+        floor_begin(f, k);
+        if (f->nkp && (gf->kp = malloc((size_t)f->nkp * sizeof *gf->kp))) {
+            memcpy(gf->kp, f->kp, (size_t)f->nkp * sizeof *gf->kp);
+            gf->nkp = (u32)f->nkp;
+            /* the fighters' undrawn vertices (60 Hz motion) get the same lift as the drawn ones */
+            if (s_nft)
+                for (u32 i = 0; i < gf->nkp; i++)
+                    if (gf->kp[i].key >> 62 == 1) { float q[3]; chr_lifted(gf->kp[i].p, q); memcpy(gf->kp[i].p, q, sizeof q); }
+        }
     }
     GROW(s_pp, s_ppcap, np, 64);
     static Item **lst; static int lcap;

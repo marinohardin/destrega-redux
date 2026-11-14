@@ -189,13 +189,8 @@ void hlr_fx_post(void)
     if (!cam_inverse(&f->cam, inv)) { S.cam_diff++; return; }
     u32 words[12];
     for (int j = 0; j < b->len; j++) words[j] = r32(pkt + 4 + 4 * (u32)j);
-    /* view-space vertices, then the lift: the PS1 sorts an effect into the OT and draws it over
-     * whatever came before, so a billboard that reaches into the floor (most do: they are screen
-     * aligned and as tall as a fighter) is never cut by it. Here every vertex slides along its own
-     * view ray towards the camera by the polygon's size (its longest diagonal, times
-     * DESTREGA_HLR_FX_LIFT, default 1): the projection is unchanged (x/z, y/z stay the same), and
-     * only geometry nearer than the effect's own extent can hide it (a wall between it and the
-     * camera still does). */
+    /* view-space vertices; the lift towards the camera (by the polygon's size) is applied later by
+     * hlr_fx_lift, once the update's fighters are known */
     float o[4][3];
     for (int j = 0; j < b->nv; j++) {
         const u32 a = j < 3 ? V + 8 * (u32)j : V + 0x18;
@@ -209,20 +204,12 @@ void hlr_fx_post(void)
             const double d = dx * dx + dy * dy + dz * dz;
             if (d > ext) ext = d;
         }
-    ext = sqrt(ext) * fx_lift();
     HlrChr *hc = hlr_frame_add_chr(f);
+    hc->lift = (float)(sqrt(ext) * fx_lift());
     for (int j = 0; j < b->nv; j++) {
-        const double z = o[j][2];
-        double sc = 1.0;
-        if (z > 0.0) {
-            double zt = z - ext;
-            if (zt < z * 0.25) zt = z * 0.25;          /* never nearer than a quarter of its depth */
-            if (zt < 32.0) zt = z < 32.0 ? z : 32.0;    /* nor into the near plane (16) */
-            sc = zt / z;
-            if (sc < 1.0) S.lifted++;
-        }
-        const double q[3] = { o[j][0] * sc - f->cam.tr[0], o[j][1] * sc - f->cam.tr[1], o[j][2] * sc - f->cam.tr[2] };
+        const double q[3] = { o[j][0] - f->cam.tr[0], o[j][1] - f->cam.tr[1], o[j][2] - f->cam.tr[2] };
         for (int r = 0; r < 3; r++) hc->v[j][r] = (float)(inv[r][0] * q[0] + inv[r][1] * q[1] + inv[r][2] * q[2]);
+        hc->key[j] = 3ull << 62 | (u64)(s_obj & 0x1fffff) << 16 | (u64)bi << 8 | (u64)j;
     }
     /* colours (0x00BBGGRR), UV, CLUT, page by packet layout (word index - 1 into words[]) */
     switch (b->kind) {
@@ -267,6 +254,77 @@ void hlr_fx_post(void)
     }
 }
 
+/* The lift: the PS1 sorts an effect into the OT and draws it over whatever came before, so a billboard
+ * that reaches into the floor (most do: they are screen aligned and as tall as a fighter) is never cut
+ * by it. Here every vertex slides along its own view ray towards the camera by the polygon's size (its
+ * longest diagonal, times DESTREGA_HLR_FX_LIFT, default 1): the projection is unchanged (x/z, y/z stay
+ * the same), and only geometry nearer than the effect's own extent can hide it (a wall between it and
+ * the camera still does).
+ * An effect the PS1 draws a fighter over (a face of a fighter in a nearer OT slot, drawn later, whose
+ * screen box overlaps the effect's) is marked `under`: the native walk draws it like a shadow, before
+ * the fighters and without writing depth, so they cover it as on the PS1 (a dust cloud as large as a
+ * fighter lying in it, lifted by its size, used to be drawn over the fighter). */
+typedef struct { float x0, y0, x1, y1, zmax; s16 slot; } FBox;
+static bool view_box(const HlrCam *k, const float (*v)[3], int nv, FBox *b)
+{
+    b->x0 = b->y0 = 1e30f; b->x1 = b->y1 = -1e30f; b->zmax = 0.0f;
+    for (int j = 0; j < nv; j++) {
+        float o[3];
+        hlr_cam_view(k, v[j], o);
+        if (o[2] <= 1.0f) return false;
+        const float x = o[0] / o[2], y = o[1] / o[2];
+        if (x < b->x0) b->x0 = x;
+        if (x > b->x1) b->x1 = x;
+        if (y < b->y0) b->y0 = y;
+        if (y > b->y1) b->y1 = y;
+        if (o[2] > b->zmax) b->zmax = o[2];
+    }
+    return true;
+}
+
+void hlr_fx_lift(HlrFrame *f)
+{
+    static FBox *fb; static int fcap;
+    int nf = 0, nfx = 0;
+    for (int i = 0; i < f->nc; i++) nfx += f->chr[i].fx;
+    if (!nfx) return;
+    if (f->nc > fcap) { fcap = f->nc; fb = realloc(fb, (size_t)fcap * sizeof *fb); if (!fb) rt_fatal("hlr: out of memory"); }
+    for (int i = 0; i < f->nc; i++) {
+        const HlrChr *c = &f->chr[i];
+        if (c->fx || c->key[0] >> 62 != 1) continue;      /* fighter faces only (not shadows, effects) */
+        if (!view_box(&f->cam, (const float (*)[3])c->v, c->nv, &fb[nf])) continue;
+        fb[nf++].slot = c->slot;
+    }
+    double inv[3][3];
+    if (!cam_inverse(&f->cam, inv)) return;
+    for (int i = 0; i < f->nc; i++) {
+        HlrChr *c = &f->chr[i];
+        if (!c->fx || c->lift < 0.0f) continue;     /* -1: done (a frame can be walked twice) */
+        FBox e;
+        if (!view_box(&f->cam, (const float (*)[3])c->v, c->nv, &e)) continue;
+        c->under = 0;
+        for (int j = 0; j < nf && !c->under; j++) {
+            const FBox *b = &fb[j];
+            if (b->slot < c->slot && b->x1 >= e.x0 && b->x0 <= e.x1 && b->y1 >= e.y0 && b->y0 <= e.y1) c->under = 1;
+        }
+        S.held += c->under;
+        for (int j = 0; j < c->nv; j++) {
+            float o[3];
+            hlr_cam_view(&f->cam, c->v[j], o);
+            const double z = o[2];
+            double zt = z - c->lift;
+            if (zt < z * 0.25) zt = z * 0.25;          /* never nearer than a quarter of its depth */
+            if (zt < 32.0) zt = z < 32.0 ? z : 32.0;    /* nor into the near plane (16) */
+            const double sc = zt / z;
+            if (sc >= 1.0) continue;
+            S.lifted++;
+            const double q[3] = { o[0] * sc - f->cam.tr[0], o[1] * sc - f->cam.tr[1], o[2] * sc - f->cam.tr[2] };
+            for (int r = 0; r < 3; r++) c->v[j][r] = (float)(inv[r][0] * q[0] + inv[r][1] * q[1] + inv[r][2] * q[2]);
+        }
+        c->lift = -1.0f;
+    }
+}
+
 void hlr_fx_report(void)
 {
     u64 calls = 0, skipped = 0;
@@ -286,7 +344,7 @@ void hlr_fx_report(void)
     rt_log("hlr-fx: per builder: %s", buf);
     if (hlr_get_mode() == HLR_ON)
         rt_log("hlr-fx: %llu attached to a native frame, %llu without a frame, %llu with another camera; semi modes %x;"
-               " %llu vertices lifted towards the camera (x %.2f of the polygon's size)",
+               " %llu vertices lifted towards the camera (x %.2f of the polygon's size), %llu polygons drawn under a fighter (before it)",
                (unsigned long long)S.attached, (unsigned long long)S.no_frame, (unsigned long long)S.cam_diff, s_semi_modes,
-               (unsigned long long)S.lifted, fx_lift());
+               (unsigned long long)S.lifted, fx_lift(), (unsigned long long)S.held);
 }

@@ -410,6 +410,7 @@ void menu_init(void) {
         add(scene, @"Shadows", @"hlr-part=shadows", nil, 0);
         add(scene, @"Effects", @"hlr-part=fx", nil, 0);
         add(scene, @"Smooth Character Motion", @"hlr-bones", nil, 0);   /* bone filter (hlr_char.c) */
+        add(scene, @"60 Hz Motion", @"hlr-motion", nil, 0);   /* in-between frames in fights (hires_gpu.c "Motion") */
         [scene addItem:[NSMenuItem separatorItem]];
         add(scene, @"Enhanced Look", @"hlr-look=enhanced", nil, 0);   /* per-pixel lighting, filtered textures */
         add(scene, @"PS1 Look", @"hlr-look=ps1", nil, 0);             /* per-vertex, point-sampled */

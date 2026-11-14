@@ -212,6 +212,7 @@ void menu_init(void) {
     add(scene, "Shadows", "hlr-part=shadows");
     add(scene, "Effects", "hlr-part=fx");
     add(scene, "Smooth Character Motion", "hlr-bones");
+    add(scene, "60 Hz Motion", "hlr-motion");
     AppendMenuW(scene, MF_SEPARATOR, 0, NULL);
     add(scene, "Enhanced Look", "hlr-look=enhanced");
     add(scene, "PS1 Look", "hlr-look=ps1");

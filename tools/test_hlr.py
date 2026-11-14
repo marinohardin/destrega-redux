@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b, 3 and 4. Needs the disc.
+"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b, 3, 4, 5 and 6. Needs the disc.
 
-  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact seams rewind (default: all)
+  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact seams rewind motion (default: all)
   CASES="hash exact" STAGES="castle1" ...    environment selection (tools/pr_check.sh group hlr)
 
   audit   --hlr audit on all 12 VS stages, practice and story: every stage packet the game links is
@@ -33,6 +33,10 @@
   rewind  --savestate-rewind 37:23 with --hlr on (GPU, 2x3) vs a plain run with the HLR off: equal
           per-frame complete-state hashes, the HLR dropped its captures on every load and drew the
           stage natively.
+  motion  60 Hz motion (phase 6), vs_hills fight at 2x3: --hlr-motion off, on with
+          DESTREGA_HLR_MOTION_T=0 and on: equal state hashes, t=0 dumps byte-identical to off, t=0.5
+          differs exactly in the frames where off repeats an update, in-between pictures made with
+          keyed vertices moved and none failed.
 
 Runs under nice, at most JOBS (default 2) game processes. Output in build/hlr_test/.
 """
@@ -368,7 +372,43 @@ def case_rewind(pool):
                  f'native stage in {nl[1] if nl else "?"} frames ({nl[0] if nl else "?"} polygons per frame)')]
 
 
-CASES = {'audit': case_audit, 'chars': case_chars, 'hash': case_hash, 'exact': case_exact, 'seams': case_seams, 'rewind': case_rewind}
+# ---- motion -----------------------------------------------------------------------------------------
+def case_motion(pool):
+    """60 Hz motion (phase 6): off, on at t = 0 and on at t = 0.5 over 40 fight frames of vs_hills."""
+    scn, k, frames = 'vs_hills', 3040, 3080
+    base = ['--renderer', 'gpu', '--scale', '2x3', '--no-interp', '--hlr', 'on', '--dump-from', str(k), '--dump-every', '1']
+    jobs = {'off': (['--hlr-motion', 'off'], None), 't0': (['--hlr-motion', 'on'], {'DESTREGA_HLR_MOTION_T': '0'}),
+            'on': (['--hlr-motion', 'on'], None)}
+    def one(kv):
+        name, (extra, env) = kv
+        d = os.path.join(OUT, 'motion_' + name)
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(d):
+            os.remove(os.path.join(d, f))
+        return run('motion_' + name, scn, frames, base + extra + ['--dump', d, '--state-hash', d + '.hash'], env=env)
+    res = dict(zip(jobs, pool.map(one, jobs.items())))
+    if any(rc for rc, _ in res.values()):
+        return [(False, 'motion: exit ' + ' / '.join(str(rc) for rc, _ in res.values()))]
+    d = {n: os.path.join(OUT, 'motion_' + n) for n in jobs}
+    hashes = same_files(d['off'] + '.hash', d['t0'] + '.hash') and same_files(d['off'] + '.hash', d['on'] + '.hash')
+    names = sorted(f for f in os.listdir(d['off']) if f.startswith('frame_0'))
+    t0_diff = [f for f in names if not same_files(os.path.join(d['off'], f), os.path.join(d['t0'], f))]
+    on_diff = [f for f in names if not same_files(os.path.join(d['off'], f), os.path.join(d['on'], f))]
+    # off shows each update twice; on: those second presentations differ, the first ones do not
+    rep = [f for i, f in enumerate(names) if i and same_files(os.path.join(d['off'], names[i - 1]), os.path.join(d['off'], f))]
+    m = re.search(r'hlr-motion: \d+ vblanks, \d+ with a new picture, (\d+) in-between pictures.*?(\d+) failed', res['on'][1])
+    mf = re.search(r'hlr-motion-frames: .*?moved (\d+)', res['on'][1])
+    ok = (hashes and not t0_diff and len(names) >= 40 and rep and set(on_diff) == set(rep) and m and int(m.group(1)) > 0
+          and int(m.group(2)) == 0 and mf and int(mf.group(1)) > 0)
+    return [(ok, f'motion: state hashes {"equal" if hashes else "DIFFER"} (off, t=0, t=0.5); t=0 frames identical to off: '
+                 f'{len(names) - len(t0_diff)}/{len(names)}; t=0.5 differs in {len(on_diff)} frames, off repeats an update in '
+                 f'{len(rep)} ({"the same" if set(on_diff) == set(rep) else "NOT the same"}); '
+                 f'{m.group(1) if m else "?"} in-between pictures, {m.group(2) if m else "?"} failed, '
+                 f'{mf.group(1) if mf else "?"} vertices moved')]
+
+
+CASES = {'audit': case_audit, 'chars': case_chars, 'hash': case_hash, 'exact': case_exact, 'seams': case_seams, 'rewind': case_rewind,
+         'motion': case_motion}
 
 
 def main():
@@ -378,7 +418,7 @@ def main():
         i = args.index('-j')
         jobs = int(args[i + 1])
         del args[i:i + 2]
-    names = args or os.environ.get('CASES', 'audit chars hash exact seams rewind').split()
+    names = args or os.environ.get('CASES', 'audit chars hash exact seams rewind motion').split()
     for n in names:
         if n not in CASES:
             sys.exit(f'test_hlr: unknown case {n} ({" ".join(CASES)})')

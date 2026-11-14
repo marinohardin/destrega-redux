@@ -716,12 +716,38 @@ How to read the table:
   its first vertex's SZ; all triangles are linked (no backface test). The texture page is 0059:
   **semi mode 2 (B - F, subtractive)**, 4-bit, CLUT 7d11 (the same on every stage seen).
 - **Native drawing (phase 4):** the 64 triangles become depth-tested decals on the native floor
-  (pipeline 5 of `hlr_gpu.c`: no depth write; vertex depth pulled 40 world units towards the camera,
-  `DESTREGA_HLR_SHADOW_BIAS`). The mesh is draped only at its vertices (spacing ~100), so across a
+  (pipeline 5 of `hlr_gpu.c`: no depth write; vertex depth pulled towards the camera,
+  `DESTREGA_HLR_SHADOW_BIAS`, 40 world units at first, 400 since the first test build, see below). The mesh is draped only at its vertices (spacing ~100), so across a
   ridge of the floor it lies inside the floor: with 8 units the Canyon floor cut a shadow along a
   straight line; 40 removes it. Drawn after the stage polygons and before the fighters of their pass
   (and never in a pass after the first one with fighter faces), so the feet cover the shadow as on
   the PS1, where the shadow's OT slot is behind the fighter's.
+- **Bias 40 was too small (verified, first test build 2026-11-13).** On sloped and stepped floors
+  (Relics, Castle 1, Shrine) the floor still cut pieces out of shadows, and the pieces changed as the
+  fighters moved: the flicker a player reported. Relics, one frame, shadow pixels lost: 15899 at 40,
+  1407 at 100, 826 at 200, none visible at 400; Castle 1 and Shrine shadows are whole at 400.
+  400 is safe because the shadows are drawn before the fighters and never write depth, and on the
+  PS1 the shadow is drawn over the floor by OT order anyway.
+- **Fallen fighters sink into sloped floors (verified, `story_continue_yes` frame 16700, 2x3 PGXP
+  widescreen).** A knocked-down fighter is laid flat at the floor height under its centre; on a slope
+  its limbs go up to ~200 world units below the native floor, the depth test hides them and the
+  shadow (drawn on that floor) shows where the legs should be. The PS1 draws the whole fighter over
+  the floor by OT order. `hlr_native.c` now lifts every fighter vertex that lies within 8 units
+  (`DESTREGA_HLR_FLOOR_MARGIN`, 0 = off) of the floor surface or below it, where the floor is the
+  highest shadow triangle under the vertex, along its view ray towards the eye: the screen position
+  is unchanged, only the depth moves, so the fighter's outline is exactly the PS1's. Keyed vertices
+  for the 60 Hz in-between frames are lifted the same way. Only where a shadow exists, i.e. under
+  fighters. ~38.5 vertices per frame lifted at that frame (`hlr-native-shadows:` exit line); legs and
+  hands visible as on the PS1.
+- **The same with shadows the PS1 way (`--hlr-parts stage,chars`; verified, same frame).** The lift
+  had no floor there: the shadow mesh was only captured when shadows are native. `hlr_shadow.c` now
+  also keeps it as a floor-only list (`HlrFrame.floor`, nothing drawn or suppressed) whenever the
+  fighters are native. The body was then still dark: the PS1-drawn shadow pieces sit in the OT among
+  the lying fighter's faces, the pass schedule ignored them for those faces (`skip()`), and a 2D
+  piece drawn after a native face is not depth tested, so it darkened the whole body. A subtractive
+  gouraud textured triangle (`Other.sub`: command 0x36/0x37, semi mode 2, the shadow's form) skipped
+  that way now pushes the face's pass after it, so the fighter covers its shadow as with native
+  shadows; 1.41 passes per frame on that run.
 
 ### Effects
 
@@ -843,6 +869,54 @@ How to read the table:
   draws them over everything sorted before them, so the capture slides every vertex along its view
   ray towards the camera by the polygon's longest diagonal (`DESTREGA_HLR_FX_LIFT`, default 1):
   the projection is unchanged and only geometry nearer than the effect's own size can still hide it.
+
+### HLR phase 6: 60 Hz motion (what the frames look like to the presenter)
+
+Facts the in-between frames rely on (verified: `DESTREGA_HLR_MOTION_DIAG=1` logs every decision with
+the y ranges each vblank drew, vs_hills, vs_castle1, practice_milena, vs_gate):
+- In a fight every update draws exactly once, into one buffer: y 0..239 and y 240..479 alternate. The
+  vblank after it draws nothing. The display shows the buffer of the update drawn two vblanks
+  earlier, so when an update is presented for the second time, the next update is already complete
+  in the other buffer. An in-between picture at t = 0.5 therefore adds no latency (the plan's
+  `interp` / `extrap` choice in HLR_PLAN 4.8 does not arise).
+- Each update, in both buffers, also issues one VRAM copy of 2x1 pixels from (0,0) onto itself.
+  It changes nothing. It is probably the 0x80 packet counted in OT A at the phase 1 probe (likely);
+  the writer was not looked up. The motion recorder ignores self-copies for the "which buffer did
+  this update draw" test, because this copy made every update look as if it touched the shown buffer.
+- Outside fights (menus, character select, story text) the game draws every vblank: there is no
+  pair of recordings two vblanks apart, so nothing is interpolated (`hlr-motion: ... without a pair`).
+
+How it works (presentation only; header comment "Motion" in `hires_gpu.c`, provider in `hlr_gpu.c`):
+`hires_gpu.c` records every command of a vblank (tri / rect / line / fill / copy / put and the HLR's
+external passes, which the provider keeps alive with a reference). At a vblank that draws nothing,
+if the older recording drew into the shown buffer and the newer one outside it, the target is copied,
+the older recording is redrawn into the copy with every external pass replaced by an in-between
+frame (`interp_frame`), and the copy is presented. The in-between frame lerps the camera
+uniforms and every keyed vertex (`HlrChr.key`: fighter vertex by model + index, shadow vertex by
+fighter + index, effect vertex by object + builder slot) towards the same key in the next update.
+Stage polygons move with the camera only. Keys present twice in the next update are ambiguous (none
+seen), steps above 600 world units snap, a camera jump is a cut (no lerp). Everything not drawn by
+the HLR (HUD, 2D, background strips) keeps the shown update's picture: at t = 0 the replay is
+byte-identical to the original frame (tested, see HLR_PLAN "Phase 6 results").
+
+**Fighter faces come and go between updates (verified, `practice_reyus` frames 4135-4165).** The
+character renderer only sends the faces that face the camera, so a vertex no face of the next update
+uses has no partner there. At first the in-between frame matched only the vertices of drawn faces:
+14801 vertices of 33 in-between frames had none during a hit and a knockdown, kept the shown update's
+position while their neighbours moved, and stretched the faces between them (an arm as a dark stick
+behind the body, legs split at the hip; a fallen fighter looked as if it lay in a wrong shadow).
+Each update now also records the world position of every vertex of each model, drawn or not
+(`HlrFrame.kp`, `hlr_frame_add_kpos`, only with motion on): 0 fighter vertices unmatched since. The
+1620 still unmatched are effects and shadows that appear or vanish between the two updates.
+
+**Effects the PS1 draws a fighter over (verified, `vs_laon_gradd_gate` frames 3768-3786).** A dust
+cloud the size of a fighter, under a fighter knocked to the ground, sits in a farther OT slot than the
+fighter's faces, so the PS1 draws the fighter over it. Phase 5 moved every effect towards the camera by
+its own size (so the floor does not cut it), which put this one in front of the fighter's legs. Now
+`hlr_fx_lift` (run before the native walk, when the update's fighters are known) marks an effect
+`under` when a fighter face in a nearer slot overlaps it on screen; the walk draws it like a shadow
+(before the fighters, no depth write), so the fighter covers it as on the PS1, and the floor still
+does not cut it. 1205 of 4461 effect polygons in that replay's first 3800 frames.
 
 ### Packet attribution: which function wrote each drawn packet (verified (phase 1))
 
