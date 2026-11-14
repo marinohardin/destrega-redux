@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b, 3, 4, 5 and 6. Needs the disc.
+"""Native high-level renderer (runtime/hlr/, docs/HLR_PLAN.md) checks, phases 2a, 2b, 3, 4, 5, 6 and 7. Needs the disc.
 
-  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact seams rewind motion (default: all)
+  tools/test_hlr.py [CASE...] [-j N]        CASES: audit chars hash exact seams rewind motion story (default: all
+                                            but story, which is heavy: ~4 min of two game processes)
   CASES="hash exact" STAGES="castle1" ...    environment selection (tools/pr_check.sh group hlr)
 
   audit   --hlr audit on all 12 VS stages, practice and story: every stage packet the game links is
@@ -30,6 +31,13 @@
           only the HLR draws (MSAA passes that restarted from the resolve drew the floor's pass
           boundaries around the fighters as such lines). Negative check: DESTREGA_HLR_TEST_NOKEEP=1
           brings the old behaviour back and the check must find seams in every frame.
+  story   story scenes (phase 7; EVENTOVL's event loop 8001c4dc draws its actors through the
+          main-exe fighter_render / char_mesh_render): --hlr audit on story_continue_yes and the
+          story_win_first_fight replay (the scenes after the first fight too): stage and character
+          audits 0; --hlr exact vs off on the story scenario's crawl and event-scene key frames
+          (7200..12000, 2x3): dumps and state hashes byte-identical; the replay with --hlr on vs off
+          (GPU, 2x3): per-frame state hashes identical, characters drawn in 3D and every model
+          attached to the stage's frame (0 without a frame, 0 with another camera).
   rewind  --savestate-rewind 37:23 with --hlr on (GPU, 2x3) vs a plain run with the HLR off: equal
           per-frame complete-state hashes, the HLR dropped its captures on every load and drew the
           stage natively.
@@ -407,8 +415,94 @@ def case_motion(pool):
                  f'{mf.group(1) if mf else "?"} vertices moved')]
 
 
+# ---- story (phase 7) ---------------------------------------------------------------------------------
+STORY_REPLAY = 'story_win_first_fight'
+
+
+def run_replay(tag, name, extra):
+    import replays
+    rp = replays.REPLAYS[name]
+    log = os.path.join(OUT, tag + '.log')
+    cmd = ['nice', '-n', '10', BIN, '--headless', '--no-interp', '--verify-overrides', '--replay', rp.path] + extra
+    with open(log, 'w') as f:
+        rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=ROOT)
+    return rc, open(log, errors='replace').read()
+
+
+def story_audit(item):
+    kind, name = item
+    if kind == 'scn':
+        s = scenarios.SCENARIOS[name]
+        rc, log = run('story_audit_' + name, name, s.frames, ['--no-interp', '--hlr', 'audit'])
+    else:
+        rc, log = run_replay('story_audit_' + name, name, ['--hlr', 'audit'])
+    m = re.search(r'hlr-audit: \d+ items, (\d+) packets, (\d+) mismatched, (\d+) unexplained packets \((\d+) frames;'
+                  r'.*?; (\d+) missing; (\d+) slot heads differ; .*?; (\d+) bad walks', log)
+    cok, ctext = chars_audit(log)
+    if rc or not m:
+        return False, f'story audit {name}: exit {rc}{"" if m else ", no audit line"}'
+    pk, mis, un, fr, miss, heads, bad = map(int, m.groups())
+    ok = fr > 0 and pk > 0 and mis == un == miss == heads == bad == 0 and bool(cok)
+    return ok, (f'story audit {name}: {fr} frames, {pk} stage packets, {mis} mismatched, {un} unexplained, '
+                f'{miss} missing; {ctext}')
+
+
+def story_exact(_):
+    scn, first, every, last = 'story', 7200, 1200, 12000   # dumps land on multiples of --dump-every
+    out = {}
+    for mode in ('off', 'exact'):
+        tag = f'story_exact_{mode}'
+        d = os.path.join(OUT, tag)
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(d):
+            os.remove(os.path.join(d, f))
+        args = ['--renderer', 'gpu', '--scale', '2x3', '--no-interp', '--hlr', mode,
+                '--state-hash', os.path.join(OUT, tag + '.hash'),
+                '--dump', d, '--dump-from', str(first), '--dump-every', str(every)]
+        out[mode] = run(tag, scn, last + 20, args)
+    (rc0, _), (rc1, log1) = out['off'], out['exact']
+    if rc0 or rc1:
+        return False, f'story exact: exit {rc0} / {rc1}'
+    d0, d1 = (os.path.join(OUT, f'story_exact_{m}') for m in ('off', 'exact'))
+    frames = [f'frame_{k:06d}.png' for k in range(first, last + 1, every)]
+    missing = [f for f in frames if not os.path.exists(os.path.join(d0, f))]
+    diff = [f for f in frames if not same_files(os.path.join(d0, f), os.path.join(d1, f))]
+    hsame = same_files(os.path.join(OUT, 'story_exact_off.hash'), os.path.join(OUT, 'story_exact_exact.hash'))
+    hl = hlr_line(log1)
+    ok = not diff and not missing and hsame and hl and hl[1] > 0 and hl[2] == 0
+    what = ('MISSING: ' + ' '.join(missing)) if missing else ('identical' if not diff else 'DIFFER: ' + ' '.join(diff))
+    return ok, (f'story exact: {len(frames)} key frames {frames[0][6:12]}..{frames[-1][6:12]} '
+                f'{what}, state hash '
+                f'{"identical" if hsame else "DIFFERS"}; HLR drew {hl[1] if hl else "?"} packets, '
+                f'{hl[2] if hl else "?"} stale')
+
+
+def story_hash(_):
+    res = {}
+    for mode in ('off', 'on'):
+        tag = f'story_hash_{mode}'
+        res[mode] = run_replay(tag, STORY_REPLAY, ['--renderer', 'gpu', '--scale', '2x3', '--hlr', mode,
+                                                    '--state-hash', os.path.join(OUT, tag + '.hash')])
+    (rc0, _), (rc1, log1) = res['off'], res['on']
+    if rc0 or rc1:
+        return False, f'story hash: exit {rc0} / {rc1}'
+    same = same_files(os.path.join(OUT, 'story_hash_off.hash'), os.path.join(OUT, 'story_hash_on.hash'))
+    nl, cn = native_line(log1), chars_native(log1)
+    ok = same and nl and nl[0] > 0 and nl[2] == 0 and cn and cn[0] > 0 and cn[1] > 0 and cn[2] == cn[3] == 0
+    return ok, (f'story hash {STORY_REPLAY}: state hash {"identical" if same else "DIFFERS"}; native stage in '
+                f'{nl[1] if nl else "?"} frames, {nl[2] if nl else "?"} failed GPU passes; characters '
+                f'{cn[0] if cn else "?"} faces per frame in 3D, {cn[1] if cn else "?"} models attached, '
+                f'{cn[2] if cn else "?"} without a frame, {cn[3] if cn else "?"} with another camera')
+
+
+def case_story(pool):
+    items = [(story_audit, ('scn', 'story_continue_yes')), (story_audit, ('replay', STORY_REPLAY)),
+             (story_exact, None), (story_hash, None)]
+    return list(pool.map(lambda it: it[0](it[1]), items))
+
+
 CASES = {'audit': case_audit, 'chars': case_chars, 'hash': case_hash, 'exact': case_exact, 'seams': case_seams, 'rewind': case_rewind,
-         'motion': case_motion}
+         'motion': case_motion, 'story': case_story}
 
 
 def main():
