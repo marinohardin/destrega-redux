@@ -113,6 +113,8 @@ typedef struct HlrFrame {
     HlrNat *nat; int nn, ncap;      /* native polygons (mode on) */
     HlrChr *chr; int nc, chcap;     /* character faces (mode on, phase 3) */
     HlrKpos *kp; int nkp, kpcap;    /* every keyed vertex's position, drawn or not (motion, phase 6) */
+    float (*floor)[9]; int nfl, flcap;  /* shadow triangles (world x y z per vertex) captured only as the
+                                         * floor under the fighters, when the shadows are drawn the PS1 way */
     HlrCam cam;         /* the float camera of the pass (hlr_cam.h) */
 } HlrFrame;
 
@@ -120,7 +122,9 @@ typedef struct HlrFrame {
 HlrFrame *hlr_frame_begin(u32 ot);              /* empty frame for this table (replaces an unwalked one) */
 HlrPkt *hlr_frame_add(HlrFrame *f, u32 addr, int kind, const u32 *words, int n);
 HlrNat *hlr_frame_add_nat(HlrFrame *f);      /* a zeroed native polygon */
-HlrChr *hlr_frame_add_chr(HlrFrame *f);      /* a zeroed character face */
+HlrChr *hlr_frame_add_chr(HlrFrame *f);
+void hlr_frame_add_floor(HlrFrame *f, const float v[9]);   /* a floor-only shadow triangle */
+bool hlr_chars_native(void);      /* a zeroed character face */
 void hlr_frame_add_kpos(HlrFrame *f, u64 key, const float p[3]);
 HlrFrame *hlr_frame_for_ot(u32 ot);             /* the committed, not yet walked frame of that table */
 void hlr_frame_reindex(HlrFrame *f);            /* after packets were added to a committed frame */

@@ -57,7 +57,8 @@
 enum { W_SLOT, W_STAGE, W_STRIP, W_OTHER, W_NONE, W_CHAR };
 typedef struct { u32 node; u8 kind; s32 nat; } WNode;
 typedef struct { int x0, y0, x1, y1; } IBox;      /* 1x VRAM pixels, inclusive */
-typedef struct { int pos; IBox b; int chr; bool semi; } Other;   /* chr: a character packet (-1 = none); semi: a semi-transparent primitive */
+typedef struct { int pos; IBox b; int chr; bool semi, sub; } Other;   /* chr: a character packet (-1 = none); semi: a semi-transparent primitive;
+                                                                      * sub: a subtractive gouraud textured triangle (a shadow piece the PS1 way) */
 typedef struct {
     int pos, lo, hi, t;
     int ilo, ihi;                   /* character face: its model's first / last linked face (walk positions) */
@@ -177,6 +178,13 @@ static void floor_begin(const HlrFrame *f, const HlrCam *k)
         GROW(s_ft, s_ftcap, s_nft + 1, 256);
         FloorTri *t = &s_ft[s_nft++];
         for (int j = 0; j < 3; j++) { t->x[j] = c->v[j][0]; t->y[j] = c->v[j][1]; t->z[j] = c->v[j][2]; }
+        t->x0 = fminf(t->x[0], fminf(t->x[1], t->x[2])); t->x1 = fmaxf(t->x[0], fmaxf(t->x[1], t->x[2]));
+        t->z0 = fminf(t->z[0], fminf(t->z[1], t->z[2])); t->z1 = fmaxf(t->z[0], fmaxf(t->z[1], t->z[2]));
+    }
+    for (int i = 0; i < f->nfl; i++) {    /* shadows drawn the PS1 way: their mesh as the floor only */
+        GROW(s_ft, s_ftcap, s_nft + 1, 256);
+        FloorTri *t = &s_ft[s_nft++];
+        for (int j = 0; j < 3; j++) { t->x[j] = f->floor[i][3 * j]; t->y[j] = f->floor[i][3 * j + 1]; t->z[j] = f->floor[i][3 * j + 2]; }
         t->x0 = fminf(t->x[0], fminf(t->x[1], t->x[2])); t->x1 = fmaxf(t->x[0], fmaxf(t->x[1], t->x[2]));
         t->z0 = fminf(t->z[0], fminf(t->z[1], t->z[2])); t->z1 = fmaxf(t->z[0], fmaxf(t->z[1], t->z[2]));
     }
@@ -347,16 +355,23 @@ static bool ovl(const IBox *a, const IBox *b)
  * end up under the feet where the PS1 painted a piece over them (a few pixels at the contact).
  * Effects the PS1 drew over the whole fighter (sparks, trails: after its last face) still count. */
 static inline bool skip(const Other *o, const Item *it) { return o->semi && o->pos > it->ilo && o->pos < it->ihi; }
-static void bracket_box(const int *l, int n, const Item *it, int *lo, int *hi)
+/* *after: the last shadow piece drawn the PS1 way (Other.sub) that a face skipped. A 2D piece is not
+ * depth tested, so drawn after the native face it darkens it: a fallen fighter lies among its
+ * shadow's OT slots, and the whole body went dark (shadows the PS1 way, fighters native). The face
+ * is drawn after every such piece instead, as with native shadows (interval()). */
+static void bracket_box(const int *l, int n, const Item *it, int *lo, int *hi, int *after)
 {
     const int pos = it->pos;
     int a = 0, e = n;
     while (a < e) { const int m = (a + e) / 2; if (s_o[l[m]].pos < pos) a = m + 1; else e = m; }
     for (int i = a - 1; i >= 0 && s_o[l[i]].pos > *lo; i--)
-        if (ovl(&s_o[l[i]].b, &it->b) && !skip(&s_o[l[i]], it)) { *lo = s_o[l[i]].pos; break; }
+        if (ovl(&s_o[l[i]].b, &it->b) && (s_o[l[i]].sub || !skip(&s_o[l[i]], it))) { *lo = s_o[l[i]].pos; break; }
     while (a < n && s_o[l[a]].pos <= pos) a++;
     for (int i = a; i < n && s_o[l[i]].pos < *hi; i++)
-        if (ovl(&s_o[l[i]].b, &it->b) && !skip(&s_o[l[i]], it)) { *hi = s_o[l[i]].pos; break; }
+        if (ovl(&s_o[l[i]].b, &it->b)) {
+            if (!skip(&s_o[l[i]], it)) { *hi = s_o[l[i]].pos; break; }
+            if (s_o[l[i]].sub && s_o[l[i]].pos > *after) *after = s_o[l[i]].pos;
+        }
 }
 
 static void interval(Item *it)
@@ -370,11 +385,13 @@ static void interval(Item *it)
     if (b.x1 > x1) b.x1 = x1;
     if (b.y1 > y1) b.y1 = y1;
     if (b.x0 > b.x1 || b.y0 > b.y1) return;
+    int after = -1;
     for (int ty = (b.y0 - s_gy0) / TILE; ty <= (b.y1 - s_gy0) / TILE; ty++)
         for (int tx = (b.x0 - s_gx0) / TILE; tx <= (b.x1 - s_gx0) / TILE; tx++) {
             const int t = ty * s_gnx + tx;
-            bracket_box(s_tlist + s_tstart[t], s_tstart[t + 1] - s_tstart[t], it, &it->lo, &it->hi);
+            bracket_box(s_tlist + s_tstart[t], s_tstart[t + 1] - s_tstart[t], it, &it->lo, &it->hi, &after);
         }
+    if (after > it->lo && after < it->hi) it->lo = after;
 }
 
 static int cmp_hi(const void *a, const void *b)
@@ -563,13 +580,14 @@ bool hlr_native_begin(HlrFrame *f, u32 entry)
                 w->kind = W_OTHER;
                 if (r == BB_FULL) { GROW(s_full, s_fcap, s_nfull + 1, 256); s_full[s_nfull++] = s_nw; }
                 else { GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = -1;
-                       const u32 op0 = rw(a + 4) >> 24; s_o[s_no].semi = op0 >= 0x20 && op0 < 0x80 && (op0 & 2); s_no++; }
+                       const u32 op0 = rw(a + 4) >> 24; s_o[s_no].semi = op0 >= 0x20 && op0 < 0x80 && (op0 & 2);
+                       s_o[s_no].sub = (op0 & 0xfe) == 0x36 && n >= 9 && ((rw(a + 24) >> 21) & 3) == 2; s_no++; }
             }
         } else if (w->kind == W_CHAR) {
             /* an other unless the face is drawn natively (decided below, before the grid is built) */
             IBox b;
             if (gp0_bbox(a, (int)n, &e, &b) == BB_BOX) {
-                GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = w->nat; s_o[s_no].semi = false; s_no++;
+                GROW(s_o, s_ocap, s_no + 1, 1024); s_o[s_no].pos = s_nw; s_o[s_no].b = b; s_o[s_no].chr = w->nat; s_o[s_no].semi = false; s_o[s_no].sub = false; s_no++;
             }
         }
         if (w->kind == W_STRIP && !se_set) { se = e; se_set = true; }

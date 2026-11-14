@@ -417,6 +417,9 @@ original-path parts at 60 Hz; more than 60 Hz.
   PS1 (NOTES.md "Fallen fighters sink into sloped floors").
 - Shadow flicker on sloped / stepped floors: the decal bias (40) let the floor cut pieces out of the
   shadows. Now 400 (Relics: 15899 lost pixels at 40, none visible at 400; Castle 1, Shrine whole).
+- Still dark fallen fighters with shadows the PS1 way (`hlr_parts = stage,chars`, the tester's
+  setting): the floor lift now also gets the shadow mesh in that mode, and PS1-drawn shadow pieces
+  interleaved with a fighter's faces are scheduled before the faces (NOTES.md).
 
 ## Phase 7 results (2026-11-12)
 

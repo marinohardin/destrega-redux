@@ -41,7 +41,8 @@ static inline bool in_ram(u32 a) { return (a & 0x1fffffff) < 0x200000; }
 static HlrShadowStats S;
 static GteState G;
 static u32 s_fighter, s_ot, s_buf;
-static bool s_run, s_draw;
+static bool s_run, s_draw, s_floor;   /* s_floor: shadows the PS1 way, fighters native: keep the mesh
+                                       * only as the floor the fighters must stay above (hlr_native.c) */
 static u64 s_last_seq;
 static int s_in_update;
 static u32 s_code, s_tpage, s_clut, s_kinds;    /* the packets' command / page / CLUT seen (bit 0: one, bit 1: several) */
@@ -76,6 +77,7 @@ void hlr_shadow_pre(u32 fighter, u32 ot, u32 buf)
     s_run = false;
     if (hlr_get_mode() == HLR_OFF) return;
     s_draw = hlr_shadows_native();
+    s_floor = !s_draw && hlr_chars_native();
     s_fighter = fighter; s_ot = ot & 0x1ffffc; s_buf = buf;
     s_run = true;
 }
@@ -112,10 +114,10 @@ void hlr_shadow_post(void)
     const u32 g3 = (u32)(grey & 0xff) * 0x010101u;
 
     /* 3. the triangles */
-    HlrFrame *f = s_draw ? hlr_frame_for_ot(s_ot) : NULL;
-    if (s_draw && !f) S.no_frame++;
+    HlrFrame *f = s_draw || s_floor ? hlr_frame_for_ot(s_ot) : NULL;
+    if ((s_draw || s_floor) && !f) S.no_frame++;
     if (f && f->seq != s_last_seq) { s_last_seq = f->seq; s_in_update = 0; }
-    const int first_chr = f ? f->nc : 0, first_pkt = f ? f->np : 0;
+    const int first_chr = f ? f->nc : 0, first_pkt = f ? f->np : 0, first_fl = f ? f->nfl : 0;
     const u32 half = scr(SCR_IDX) ? 0x28u : 0u;
     for (int t = 0; t < SH_NT && !bad; t++) {
         const u32 rec = s_buf + SH_REC * (u32)t, pkt = (rec + half) & 0x1ffffc;
@@ -139,6 +141,15 @@ void hlr_shadow_post(void)
             else if (c != s_code || tp != s_tpage || cl != s_clut) s_kinds |= 2;
         }
         if (!f) continue;
+        if (s_floor) {
+            float fv[9];
+            for (int j = 0; j < 3; j++) {
+                const u32 w = SH_WORLD + 8 * (u32)vi[j];
+                fv[3 * j] = (float)r16s(w); fv[3 * j + 1] = (float)r16s(w + 2); fv[3 * j + 2] = (float)r16s(w + 4);
+            }
+            hlr_frame_add_floor(f, fv);
+            continue;
+        }
         HlrChr *hc = hlr_frame_add_chr(f);
         memset(hc, 0, sizeof *hc);
         for (int j = 0; j < 3; j++) {
@@ -161,7 +172,7 @@ void hlr_shadow_post(void)
     }
     if (bad) {
         S.frames_bad++;
-        if (f) { f->nc = first_chr; f->np = first_pkt; }
+        if (f) { f->nc = first_chr; f->np = first_pkt; f->nfl = first_fl; }
         return;
     }
     S.audited++;
@@ -174,8 +185,8 @@ void hlr_shadow_post(void)
             same &= k.tr[r] == f->cam.tr[r];
         }
         same &= k.h == f->cam.h && k.ofx == f->cam.ofx && k.ofy == f->cam.ofy;
-        if (!same) { S.cam_diff++; f->nc = first_chr; f->np = first_pkt; return; }
-        hlr_frame_reindex(f);
+        if (!same) { S.cam_diff++; f->nc = first_chr; f->np = first_pkt; f->nfl = first_fl; return; }
+        if (!s_floor) hlr_frame_reindex(f);
         S.attached++;
         s_in_update++;
     }

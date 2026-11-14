@@ -776,6 +776,15 @@ How to read the table:
   for the 60 Hz in-between frames are lifted the same way. Only where a shadow exists, i.e. under
   fighters. ~38.5 vertices per frame lifted at that frame (`hlr-native-shadows:` exit line); legs and
   hands visible as on the PS1.
+- **The same with shadows the PS1 way (`--hlr-parts stage,chars`; verified, same frame).** The lift
+  had no floor there: the shadow mesh was only captured when shadows are native. `hlr_shadow.c` now
+  also keeps it as a floor-only list (`HlrFrame.floor`, nothing drawn or suppressed) whenever the
+  fighters are native. The body was then still dark: the PS1-drawn shadow pieces sit in the OT among
+  the lying fighter's faces, the pass schedule ignored them for those faces (`skip()`), and a 2D
+  piece drawn after a native face is not depth tested, so it darkened the whole body. A subtractive
+  gouraud textured triangle (`Other.sub`: command 0x36/0x37, semi mode 2, the shadow's form) skipped
+  that way now pushes the face's pass after it, so the fighter covers its shadow as with native
+  shadows; 1.41 passes per frame on that run.
 
 ### Effects
 
