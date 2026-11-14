@@ -30,6 +30,8 @@ CROSSOVER = os.path.expanduser('~/Applications/CrossOver.app/Contents/SharedSupp
                                'CrossOver-Hosted Application/wine')
 WINE = os.environ.get('WINE') or (CROSSOVER if os.path.exists(CROSSOVER) else shutil.which('wine') or '')
 WINE_ARGS = os.environ.get('WINE_ARGS', '--bottle destrega-test --no-gui' if 'CrossOver' in WINE else '').split()
+# NETPLAY_WINE_EXTRA: more options for both peers of a session, e.g. "--renderer gpu --hlr on"
+EXTRA = os.environ.get('NETPLAY_WINE_EXTRA', '').split()
 WIN_EXE = os.path.join(ROOT, os.environ.get('WIN_EXE', 'build/win/destrega.exe'))
 BIN = T.BIN
 PAK = os.environ.get('PAK') or (os.path.expanduser('~/Library/Application Support/Destrega/destrega.pak')
@@ -101,7 +103,7 @@ def run_session(name, port, pace):
     frames, disc_at = 4800, 3300
     # windowed: --net-portmap off, a loopback test must never ask the real router for a port
     mode = ['--renderer', 'software', '--no-memcard', '--no-settings', '--net-portmap', 'off'] if WINDOWED else ['--headless', '--net-pace', str(pace)]
-    common = mode + ['--no-interp', '--frames', str(frames),
+    common = mode + EXTRA + ['--no-interp', '--frames', str(frames),
               '--net-desync-dir', ('path', d)]
     host = common + ['--press', R.fmt(p1), '--net-sim', sim_h, '--net-hash-log', ('path', os.path.join(d, 'host.hash')),
                      '--menu-action', f'300:netplay-host={port},2']
