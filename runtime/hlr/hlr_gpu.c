@@ -59,7 +59,8 @@ static const char s_msl[] =
 "  HVO o; float3 p = in.pos;\n"
 "  float vx = dot(u.rt0.xyz, p) + u.tr.x, vy = dot(u.rt1.xyz, p) + u.tr.y, vz = dot(u.rt2.xyz, p) + u.tr.z;\n"
 "  if ((in.info & 0x1000u) != 0u) { o.pos = float4(p.xy, 0.0, 1.0); vz = 1.0; }\n"
-"  else o.pos = float4(u.proj.x * vx + u.proj.y * vz, u.proj.z * vy + u.proj.w * vz, u.misc.x, vz);\n"
+"  else o.pos = float4(u.proj.x * vx + u.proj.y * vz, u.proj.z * vy + u.proj.w * vz,\n"
+"                     (in.info & 0x8000u) != 0u ? u.misc.x * vz / max(vz - u.misc.w, 0.5 * u.misc.x) : u.misc.x, vz);\n"
 "  uint shade = (in.info >> 10) & 3u;\n"
 "  o.nrm = in.nrm; o.raw = in.col.rgb; o.vz = vz; o.uv = in.uv; o.uvr = in.uvr; o.info = in.info;\n"
 "  o.vcol = h_shade(u, shade, in.col.rgb, in.nrm, vz);\n"
@@ -92,7 +93,7 @@ static const char s_msl[] =
 "  if (u.off.z != 0 && all(c == pv.read(uint2(in.pos.xy)))) discard_fragment();\n"
 "  return c; }\n";
 
-enum { NBLEND = 5 };                /* opaque, modes 0..3 */
+enum { NBLEND = 6 };                /* opaque, modes 0..3, opaque without depth write (decals) */
 typedef struct { int fmt, samples; SDL_GPUGraphicsPipeline *p[NBLEND], *blit; } PipeSet;
 
 static SDL_GPUDevice *s_dev;        /* the device everything below was made on */
@@ -236,7 +237,7 @@ int hlr_gpu_msaa_for(int fmt)
 static void blend_state(int k, SDL_GPUColorTargetBlendState *b)
 {
     memset(b, 0, sizeof *b);
-    if (k == 0) return;
+    if (k == 0 || k == 5) return;      /* opaque (5: decal texels without STP, no depth write) */
     b->enable_blend = true;
     b->color_blend_op = SDL_GPU_BLENDOP_ADD;
     b->alpha_blend_op = SDL_GPU_BLENDOP_ADD;
@@ -279,7 +280,7 @@ static PipeSet *pipes(int fmt, int samples)
             .rasterizer_state = { .fill_mode = SDL_GPU_FILLMODE_FILL, .cull_mode = SDL_GPU_CULLMODE_NONE },
             .multisample_state = { .sample_count = sc_of(samples) },
             .depth_stencil_state = { .compare_op = SDL_GPU_COMPAREOP_GREATER_OR_EQUAL, .enable_depth_test = !blit,
-                                     .enable_depth_write = k == 0 },
+                                     .enable_depth_write = k == 0 },   /* k 5: opaque, depth tested only */
             .target_info = { .color_target_descriptions = &cd, .num_color_targets = 1,
                              .depth_stencil_format = s_dfmt, .has_depth_stencil_target = true },
         };
@@ -459,7 +460,7 @@ void hlr_gpu_external(void *ctx, void *cmdbuf, void *colour_tex, int w, int h)
         for (int i = 0; i < ps->nd; i++) {
             const HlrDraw *d = &ps->d[i];
             if (!d->count) continue;
-            const int k = d->blend < 0 ? 0 : 1 + (d->blend & 3);
+            const int k = d->blend < 0 ? 0 : d->blend == HLR_DRAW_OPAQUE_NOZ ? 5 : 1 + (d->blend & 3);
             if (k != bound) {
                 SDL_BindGPUGraphicsPipeline(rp, pp->p[k]);
                 SDL_BindGPUVertexBuffers(rp, 0, &vb, 1);

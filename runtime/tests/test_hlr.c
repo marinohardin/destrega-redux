@@ -685,6 +685,88 @@ static void test_char_audit(void)
     hlr_set_mode(HLR_OFF);
 }
 
+/* ---- shadows (phase 4): a synthetic fighter_shadow_render on the guest GTE ------------------- */
+#define SH_FIGHTER 0x80150000u
+#define SH_BUF     0x80160000u
+#define SH_WORLD_A 0x800e70f0u
+#define SH_SCR_A   0x800e6f80u
+
+static u32 sh_slot(u32 z)
+{
+    const u32 near = 1000, mid = 4000, far = 16000;
+    if (z < near) return z * 0x155u / (near + 1);
+    if (z < mid) return ((z - near) * 0x400u) / (mid - (near - 1)) + 0x155;
+    if (z < far) return ((z - mid) * 0x2abu) / (far - (mid - 1)) + 0x555;
+    return 0x7ff;
+}
+
+/* fault: 1 a wrong screen vertex, 2 a wrong grey, 3 a triangle not linked, 4 another matrix in RAM */
+static void shadow_frame(int fault)
+{
+    memset(g_ram, 0, RAM_SIZE);
+    memset(g_scratch, 0, sizeof g_scratch);
+    *(u32 *)(g_scratch + 0x0c) = 1000;
+    *(u32 *)(g_scratch + 0x10) = 4000;
+    *(u32 *)(g_scratch + 0x08) = 16000;
+    const u32 rt[8] = { 0x1000, 0, 0x1000, 0, 0x1000, 0, 0, 0 };
+    for (int i = 0; i < 8; i++) wr(0x800ed4c8u + 4 * (u32)i, rt[i]);
+    if (fault == 4) wr(0x800ed4c8u, 0x1001);
+    for (u32 i = 0; i < 2048; i++) wr(OT + 4 * i, 0x00ffffffu);
+    gte_camera();
+    const int y0 = 120;
+    wr(SH_FIGHTER + 0x3c, (u32)(y0 - 300));       /* 30 above the ground: grey 0x80 - 30 */
+    if (g_hlr.shadow_pre) g_hlr.shadow_pre(SH_FIGHTER, OT, SH_BUF);
+    /* the game: 45 vertices on a sloped floor, RTPS each */
+    u32 sxy[45], sz[45];
+    for (int i = 0; i < 45; i++) {
+        const int x = i == 0 ? 0 : -200 + 10 * (i % 41), z = 1800 + (i == 0 ? 0 : 20 * (i % 13)), y = y0 + (i == 0 ? 0 : z / 40 - 45);
+        wr16(SH_WORLD_A + 8 * (u32)i, (u32)x); wr16(SH_WORLD_A + 8 * (u32)i + 2, (u32)y); wr16(SH_WORLD_A + 8 * (u32)i + 4, (u32)z);
+        gte_write_data(0, (u16)x | (u32)(u16)y << 16); gte_write_data(1, (u32)(u16)z);
+        gte_command(0x4a180001);
+        sxy[i] = gte_read_data(14); sz[i] = gte_read_data(19);
+        wr(SH_SCR_A + 8 * (u32)i, sxy[i] + (fault == 1 && i == 5 ? 1 : 0)); wr(SH_SCR_A + 8 * (u32)i + 4, sz[i]);
+    }
+    const u32 grey = 0x80 - 30;
+    for (int t = 0; t < 64; t++) {
+        const u32 rec = SH_BUF + 0x58 * (u32)t, pkt = rec;
+        const int vi[3] = { 0, 1 + t % 44, 1 + (t + 1) % 44 };
+        for (int j = 0; j < 3; j++) wr16(rec + 0x50 + 2 * (u32)j, (u32)vi[j]);
+        const u32 g = (fault == 2 && t == 7 ? grey + 1 : grey) * 0x010101u;
+        wr(pkt + 4, 0x36000000u | g);  wr(pkt + 8, sxy[vi[0]]);  wr(pkt + 12, 0x7d110000u | 0x0404);
+        wr(pkt + 16, g);               wr(pkt + 20, sxy[vi[1]]); wr(pkt + 24, 0x00590000u | 0x0434);
+        wr(pkt + 28, g);               wr(pkt + 32, sxy[vi[2]]); wr(pkt + 36, 0x3404);
+        if (fault == 3 && t == 20) { wr(pkt, 0x09ffffffu); continue; }
+        const u32 slot = sh_slot(sz[vi[0]]);
+        wr(pkt, (rd(OT + 4 * slot) & 0xffffff) | 0x09000000u);
+        wr(OT + 4 * slot, pkt & 0xffffff);
+    }
+    if (g_hlr.shadow_post) g_hlr.shadow_post();
+}
+
+static void test_shadow_audit(void)
+{
+    hlr_set_mode(HLR_AUDIT);
+    HlrShadowStats a, b;
+    hlr_shadow_get_stats(&a);
+    shadow_frame(0);
+    hlr_shadow_get_stats(&b);
+    CHECK(b.audited == a.audited + 1 && b.frames_bad == a.frames_bad, "clean shadow audited (%llu, rejected %llu)",
+          (unsigned long long)(b.audited - a.audited), (unsigned long long)(b.frames_bad - a.frames_bad));
+    CHECK(b.vtx - a.vtx == 45 && b.faces - a.faces == 64, "%llu vertices, %llu triangles",
+          (unsigned long long)(b.vtx - a.vtx), (unsigned long long)(b.faces - a.faces));
+    a = b; shadow_frame(1); hlr_shadow_get_stats(&b);
+    CHECK(b.vtx_bad == a.vtx_bad + 1 && b.frames_bad == a.frames_bad + 1, "a wrong screen vertex is found");
+    a = b; shadow_frame(2); hlr_shadow_get_stats(&b);
+    CHECK(b.grey_bad > a.grey_bad && b.frames_bad == a.frames_bad + 1, "a wrong grey is found");
+    a = b; shadow_frame(3); hlr_shadow_get_stats(&b);
+    CHECK(b.link_bad == a.link_bad + 1 && b.frames_bad == a.frames_bad + 1, "an unlinked triangle is found");
+    a = b; shadow_frame(4); hlr_shadow_get_stats(&b);
+    CHECK(b.ws_bad == a.ws_bad + 1 && b.frames_bad == a.frames_bad + 1, "another world-screen matrix is found");
+    a = b; shadow_frame(0); hlr_shadow_get_stats(&b);
+    CHECK(b.audited == a.audited + 1 && b.frames_bad == a.frames_bad, "clean again");
+    hlr_set_mode(HLR_OFF);
+}
+
 /* the bone filter: smooths jitter, gives way to real motion at once, starts from the input */
 static void test_bone_filter(void)
 {
@@ -743,6 +825,7 @@ int main(int argc, char **argv)
     printf("suppression\n"); test_suppression();
     printf("float camera\n"); test_float_camera();
     printf("characters\n"); test_char_audit();
+    printf("shadows\n"); test_shadow_audit();
     printf("bone filter\n"); test_bone_filter();
     printf("test_hlr: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

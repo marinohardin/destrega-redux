@@ -706,6 +706,22 @@ How to read the table:
   0x18; the draw mode selects subtractive blending (B-F, likely: matches the GPU command counts
   above). OT slot from the first vertex's SZ. NCLIP is computed but its result is not used.
   It is a **terrain-draped decal**: in a depth-buffered renderer it lies exactly on the floor.
+- **Verified (HLR phase 4, `runtime/hlr/hlr_shadow.c` audit on all 30 replays and the HLR
+  scenarios):** after the function returns, a host RTPS of each of the 45 world vertices (800e70f0,
+  {x, y, z, pad} shorts) with the GTE's RT/TR (equal to the world-screen matrix 800ed4c8) gives
+  800e6f80 word for word; every one of the 64 triangles (indices as shorts at record + 0x50 /
+  0x52 / 0x54, record = a2 + i*0x58, this frame's copy at + 0x28 when scratch 1f800000 is set) holds
+  those SXY in words 2 / 5 / 8, one grey in the colour bytes of words 1 / 4 / 7 (0x80 - (y of vertex
+  0 - fighter +0x3c) / 10, at least 0x18), command 0x36, and is linked at the 3-segment OT slot of
+  its first vertex's SZ; all triangles are linked (no backface test). The texture page is 0059:
+  **semi mode 2 (B - F, subtractive)**, 4-bit, CLUT 7d11 (the same on every stage seen).
+- **Native drawing (phase 4):** the 64 triangles become depth-tested decals on the native floor
+  (pipeline 5 of `hlr_gpu.c`: no depth write; vertex depth pulled 40 world units towards the camera,
+  `DESTREGA_HLR_SHADOW_BIAS`). The mesh is draped only at its vertices (spacing ~100), so across a
+  ridge of the floor it lies inside the floor: with 8 units the Canyon floor cut a shadow along a
+  straight line; 40 removes it. Drawn after the stage polygons and before the fighters of their pass
+  (and never in a pass after the first one with fighter faces), so the feet cover the shadow as on
+  the PS1, where the shadow's OT slot is behind the fighter's.
 
 ### Effects
 

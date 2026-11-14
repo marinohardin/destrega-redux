@@ -23,6 +23,10 @@ typedef struct HlrHooks {
     void (*char_post)(void);
     /* true: characters are drawn natively in 3D, so char_mesh.c adds no PGXP extra faces */
     bool (*chars_native)(void);
+    /* fighter_shadow_render (8007ec5c), around the original (overrides/char_mesh.c); fighter = its
+     * a0, ot = a1 (the scene ordering table), buf = a2 (the 64 packet records) */
+    void (*shadow_pre)(uint32_t fighter, uint32_t ot, uint32_t buf);
+    void (*shadow_post)(void);
     /* GPU linked-list DMA (bus.c), per node (RAM offset of its header) before its words are
      * written, and once with 0xffffffff at the end of the walk. Returns true when the node's
      * words must reach the 1x GPU only (the HLR drew its own version into the hi-res target). */

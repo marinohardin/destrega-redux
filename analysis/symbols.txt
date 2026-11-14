@@ -103,7 +103,7 @@
 8007ccdc  func   -                          verified  probe      not a renderer: called from fighters_render, writes no packets; with game_mode 800e3794 == 6 updates per-fighter counters at *(800e3440 + 772) (likely: code)
 8007d25c  func   hud_update                 likely    rea        per game_mode HUD logic: health/gauge bars 8007c178 / 8007c3f8 and mode-specific parts
 8007d6f4  func   round_timer_and_judge      likely    rea        advances round_time by 2 per update, ends the round on time limit (30/60/99 s by time_limit_setting) or KO, counts round wins
-8007ec5c  func   fighter_shadow_render      likely    rea        45-vertex ground-draped shadow mesh (ground_height), 64 semi GT3 (0x36) into the scene OT; also verified/probe: RTPS in a loop, ~10% of fight GTE vertices; 128 x 0x36 in the scene OT at fight frame 4201 (2 fighters)
+8007ec5c  func   fighter_shadow_render      verified  test       45-vertex ground-draped shadow mesh (ground_height), 64 semi GT3 (0x36, tpage 0059: semi mode 2 = B-F, 4-bit, CLUT 7d11) into the scene OT; HLR phase 4 audit (hlr_shadow.c) reproduces every vertex, word, grey and OT slot on the replay library; override wrapper (char_mesh.c); also verified/probe: RTPS in a loop, ~10% of fight GTE vertices; 128 x 0x36 in the scene OT at fight frame 4201 (2 fighters)
 80087114  func   camera_mode1               verified  probe      camera mode 1 (800c0248 == 1, the round intro; with 800876c0): camera_from_fighters then camera_apply 8003e52c
 800876c0  func   camera_mode1_b             verified  probe      second function of camera mode 1 (round intro)
 80087a00  func   camera_mode2               likely    code       camera mode 2 (800c0248 == 2); not seen at runtime
@@ -203,8 +203,8 @@
 800e3788  data   round_wins                 verified  trace      s32 x2 (P1 at 800e3788, P2 at 800e378c): rounds won; +1 for the other fighter at each KO (incremented by round_timer_and_judge, rea), back to 0 after a fighter reaches 2 (match over; replays.py match_gradd_celia_hills)
 800e3794  data   game_mode                  guess     rea        compared with 1, 4, 5, 6, 10 by the round code; 1 seems to disable the time limit (practice?)
 800e379c  data   round_time                 verified  trace      u32 elapsed round time, +2 per 30 Hz update (= vblanks), frozen from the KO until the next round, 0 at round start; compared with limit * 60 (rea); netplay.c predicts remote input only while it advances (in_round), verified by tools/test_netplay.py "match"
-800e6f80  data   shadow_screen_verts        likely    rea        45 x {SXY, SZ} of the shadow mesh
-800e70f0  data   shadow_world_verts         likely    rea        45 shadow vertices draped on the ground
+800e6f80  data   shadow_screen_verts        verified  test       45 x {SXY, SZ} of the shadow mesh: RTPS (world-screen matrix 800ed4c8) of shadow_world_verts, word for word (hlr_shadow.c audit)
+800e70f0  data   shadow_world_verts         verified  test       45 x {x, y, z, pad} shorts, stride 8, draped on the ground; vertex 0 = centre (its y = ground height used for the grey) (hlr_shadow.c audit)
 800e7560  data   rand_seed                  verified  code       rand()/srand() seed = the game RNG state; that it picks the 1P-battle opponent/stage is likely (NOTES.md, scenarios); also verified/trace: advances during fights, also with no input (CPU AI and round-end code)
 800ed488  data   camera_matrix_copy         likely    rea        copy of GsWSMATRIX made by GsSetRefView2
 800ed4a8  data   billboard_matrix           verified  probe      identity rotation; effects use it with translation = WS * position (view-aligned billboards; use: likely/rea)

@@ -7,6 +7,7 @@ void f_800363c8_orig(void);
 void f_80036b0c_orig(void);
 void f_80044210_orig(void);
 void f_800465a4_orig(void);
+void f_8007ec5c_orig(void);
 void f_80044918(void);
 void f_80045414(void);
 void f_80095188(void);

@@ -19,6 +19,7 @@ enum {
     HV_SHADE_SH = 10,       /* 2 bits: HLR_SH_FLAT / LIT / PRELIT */
     HV_SCREEN = 1u << 12,   /* pos is already in NDC, no depth (background strips) */
     HV_SEL_SH = 13,         /* 2 bits: 0 every texel, 1 texels without STP, 2 STP texels only */
+    HV_DECAL = 1u << 15,    /* depth biased towards the camera by misc[3] world units (shadows on the floor) */
 };
 
 /* uniforms (vertex and fragment, the same block; std140-compatible: float4s only) */
@@ -26,13 +27,17 @@ typedef struct {
     float rt[3][4], tr[4];
     float proj[4];          /* ax, bx, ay, by: x_clip = ax * vx + bx * vz, y_clip = ay * vy + by * vz */
     float misc[4];          /* z_clip (the near plane), per-pixel shading (1) or per vertex (0),
-                             * 1 = 15-bit target (PS1 red goes to .b, as the hi-res shaders write it), 0 */
+                             * 1 = 15-bit target (PS1 red goes to .b, as the hi-res shaders write it),
+                             * the decal depth bias (world units: HV_DECAL vertices are drawn as if that
+                             * much nearer) */
     float fog[4];           /* H * 65536, DQA, DQB, fog on */
     float fc[4];            /* far colour 0..1 */
     float llm[3][4], lcm[3][4], bk[4];
 } HlrUniforms;
 
-typedef struct { u32 first, count; int blend; } HlrDraw;   /* blend -1 = opaque (depth write), 0..3 */
+enum { HLR_DRAW_OPAQUE_NOZ = 4 };
+typedef struct { u32 first, count; int blend; } HlrDraw;   /* blend -1 = opaque (depth write), 0..3 semi,
+                                                             * HLR_DRAW_OPAQUE_NOZ opaque without depth write */
 
 /* a frame's geometry, shared by its passes (reference counted: freed after the last pass ran) */
 typedef struct HlrGpuFrame {

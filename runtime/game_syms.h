@@ -10,6 +10,7 @@ extern GameExports g_game;
 #define f_80036b0c_orig (g_game.fn_f_80036b0c_orig)
 #define f_80044210_orig (g_game.fn_f_80044210_orig)
 #define f_800465a4_orig (g_game.fn_f_800465a4_orig)
+#define f_8007ec5c_orig (g_game.fn_f_8007ec5c_orig)
 #define f_80044918 (g_game.fn_f_80044918)
 #define f_80045414 (g_game.fn_f_80045414)
 #define f_80095188 (g_game.fn_f_80095188)

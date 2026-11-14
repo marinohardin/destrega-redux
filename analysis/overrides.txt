@@ -3,3 +3,4 @@
 80036138  # char_mesh_tris_to_ot: PGXP faces dropped by the integer backface test (runtime/overrides/char_mesh.c)
 800363c8  # char_mesh_quads_to_ot: the same for quads
 80036b0c  # char_mesh_render: native high-level renderer character capture (runtime/overrides/char_mesh.c, runtime/hlr/hlr_char.c)
+8007ec5c  # fighter_shadow_render: native high-level renderer shadow capture (runtime/overrides/char_mesh.c, runtime/hlr/hlr_shadow.c)
