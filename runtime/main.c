@@ -1474,8 +1474,18 @@ static void settings_apply(const char *dir) {
     }
     if (!s_hlr_parts_given && (v = settings_get("display", "hlr_parts"))) {
         unsigned parts;
-        if (hlr_parse_parts(v, &parts)) hlr_set_parts(parts);
-        else rt_log("settings: display.hlr_parts: all, none or a list of stage,chars,shadows,fx,story");
+        if (hlr_parse_parts(v, &parts)) {
+            /* parts implemented after the file was written start on (a 0.1.0 file says "stage,chars",
+             * its whole set then, and would keep shadows and effects on the 2D path for good);
+             * hlr_parts_known is the implemented set when it was saved, absent = 0.1.0's */
+            unsigned known = HLR_PART_STAGE | HLR_PART_CHARS;
+            const char *k = settings_get("display", "hlr_parts_known");
+            if (k && !hlr_parse_parts(k, &known)) known = HLR_PART_STAGE | HLR_PART_CHARS;
+            if (HLR_PARTS_IMPLEMENTED & ~known)
+                rt_log("settings: display.hlr_parts: %s added (implemented since the file was written)",
+                       hlr_parts_name(HLR_PARTS_IMPLEMENTED & ~known));
+            hlr_set_parts(parts | (HLR_PARTS_IMPLEMENTED & ~known));
+        } else rt_log("settings: display.hlr_parts: all, none or a list of stage,chars,shadows,fx,story");
     }
     if (!s_hlr_msaa_given && (v = settings_get("display", "hlr_msaa"))) {
         const int n = atoi(v);
@@ -1531,7 +1541,10 @@ static void settings_note_view(const char *name) {
     else if (!strcmp(name, "tex-cache")) settings_set_bool("display", "tex_cache", hires_gpu_get_tex_cache() != HGPU_TC_OFF);
     else if (!strcmp(name, "hlr") && (hlr_get_mode() == HLR_OFF || hlr_get_mode() == HLR_ON))
         settings_set("display", "hlr", hlr_mode_name(hlr_get_mode()));
-    else if (!strcmp(name, "hlr-part")) settings_set("display", "hlr_parts", hlr_parts_name(hlr_get_parts()));
+    else if (!strcmp(name, "hlr-part")) {
+        settings_set("display", "hlr_parts", hlr_parts_name(hlr_get_parts()));
+        settings_set("display", "hlr_parts_known", hlr_parts_name(HLR_PARTS_IMPLEMENTED));
+    }
     else if (!strcmp(name, "hlr-msaa")) {
         char n[8];
         snprintf(n, sizeof n, "%d", hlr_gpu_get_msaa());
