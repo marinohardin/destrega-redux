@@ -797,6 +797,53 @@ How to read the table:
 - Fading is done through the vertex colour, which works with additive (B+F) and subtractive
   (B-F) blending; B-F dominates the game's semi-transparent triangles (GPU counts above).
 
+#### Effect builders in full: the audit model (HLR phase 5)
+
+(verified: generated C read in full for all ten, and the `runtime/hlr/hlr_fx.c` audit on every
+`practice_<char>` replay and the VS stages: 0 wrong)
+- All ten builders 80055820..80056b40 take **a0 = the effect object, a1 = the scene OT**; nothing
+  else. The packet is in the object itself: `obj + idx * S`, idx = scratch 1f800000 (the double
+  buffer index), S = 4 * (packet length + 1). The points are SVECTORs at `obj + 2 S`: RTPT on the
+  first three; the quads add an RTPS of `obj + 2 S + 0x18` (the 4th XY is SXY2 after it). The GTE's
+  RT / TR are whatever the caller loaded (the billboard rotation and WS * position).
+- OT slot: the minimum SZ of the polygon's vertices (signed compares) through the 3-segment map
+  (near 1f80000c, mid 1f800010, far 1f800008); the packet's tag gets the slot's old head and the
+  length, the slot points at the packet.
+- The untextured ones (80056348, 8005650c G3; 80056704, 80056908 G4; 80056b40 F3) also write a
+  2-word draw-mode prim at `obj + idx * 8 + M` (M = 0x74, 0x74, 0x94, 0x94, 0x4c): tag = packet |
+  0x01000000, word 1 an **e1** word (its semi-mode bits pick the blend of the untextured polygon).
+  The slot points at the mode prim, the mode prim at the packet: the walk meets the e1 first.
+- Five have a **facing test** first (800559b0 at +0x58, 80055d48 +0x70, 8005650c +0x50, 80056908
+  +0x68, and 80055d48 / 80056908 are the quads): MVMVA 0x4a486012 (RT * V0, no translation) on the
+  SVECTOR at that offset; the polygon is built only if (s32) MAC3 > 0. Nothing else is culled.
+
+  | builder | type | facing test | length | e1 prim | XY words |
+  |---|---|---|---|---|---|
+  | 80055820 | FT3 | - | 7 | - | 2, 4, 6 |
+  | 800559b0 | FT3 | +0x58 | 7 | - | 2, 4, 6 |
+  | 80055b70 | FT4 | - | 9 | - | 2, 4, 6, 8 |
+  | 80055d48 | FT4 | +0x70 | 9 | - | 2, 4, 6, 8 |
+  | 80055f54 | GT4 | - | 12 | - | 2, 5, 8, 11 |
+  | 80056348 | G3 | - | 6 | +0x74 | 2, 4, 6 |
+  | 8005650c | G3 | +0x50 | 6 | +0x74 | 2, 4, 6 |
+  | 80056704 | G4 | - | 8 | +0x94 | 2, 4, 6, 8 |
+  | 80056908 | G4 | +0x68 | 8 | +0x94 | 2, 4, 6, 8 |
+  | 80056b40 | F3 | - | 4 | +0x4c | 2, 3, 4 |
+
+- All ten run in the 12 `practice_<char>` replays (verified: audit counters, polygons built):
+  80055b70 121295, 80056704 87359, 80056908 32132, 8005650c 19586, 80056348 16025, 80055820 10148,
+  80055d48 4452, 80056b40 3453, 80055f54 2022, 800559b0 1040; 0 wrong vertex, word, link or e1.
+  In Milena's run the semi-transparent effects use semi modes 1 (B + F) and 3 (B + F / 4) (exit line
+  `semi modes a` in `--hlr on`).
+- **Native drawing (phase 5).** Each effect polygon becomes an item of the stage's frame drawn in
+  the scene's depth buffer: depth tested, never writing depth, in the PS1's order among the effects
+  (each takes the earliest pass point that keeps that order). The billboards are screen aligned and
+  as tall as a fighter, so most of them reach into the floor: drawn at their true depth the floor
+  cut them along straight lines (Milena's ice crystals lost their lower-left corners). The PS1
+  draws them over everything sorted before them, so the capture slides every vertex along its view
+  ray towards the camera by the polygon's longest diagonal (`DESTREGA_HLR_FX_LIFT`, default 1):
+  the projection is unchanged and only geometry nearer than the effect's own size can still hide it.
+
 ### Packet attribution: which function wrote each drawn packet (verified (phase 1))
 
 For every node of the GPU linked-list DMA, the probe recorded which guest function last wrote

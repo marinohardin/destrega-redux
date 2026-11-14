@@ -767,6 +767,97 @@ static void test_shadow_audit(void)
     hlr_set_mode(HLR_OFF);
 }
 
+/* ---- effects (phase 5): two of the builders (80055b70 FT4; 80056908 G4 + draw mode, facing
+ * test) written plainly on the guest GTE ----------------------------------------------------- */
+#define FX_OBJ 0x80170000u
+
+/* fault: 1 a wrong XY, 2 another tag length, 3 linked into another slot, 4 no e1 draw-mode word,
+ * 5 facing away (G4: the game draws nothing; counted, not an error) */
+static void fx_frame(u32 builder, int fault)
+{
+    memset(g_ram, 0, RAM_SIZE);
+    memset(g_scratch, 0, sizeof g_scratch);
+    *(u32 *)(g_scratch + 0x0c) = 1000;
+    *(u32 *)(g_scratch + 0x10) = 4000;
+    *(u32 *)(g_scratch + 0x08) = 16000;
+    for (u32 i = 0; i < 2048; i++) wr(OT + 4 * i, 0x00ffffffu);
+    gte_camera();
+    const bool g4 = builder == 0x80056908u;
+    const u32 len = g4 ? 8 : 9, S4 = 4 * (len + 1), V = FX_OBJ + 2 * S4, pkt = FX_OBJ;
+    const int xs[4] = { -40, 40, -40, 40 }, ys[4] = { -30, -30, 50, 50 }, zs[4] = { 1500, 1520, 1540, 1560 };
+    for (int j = 0; j < 4; j++) {
+        const u32 a = j < 3 ? V + 8 * (u32)j : V + 0x18;
+        wr16(a, (u32)xs[j]); wr16(a + 2, (u32)ys[j]); wr16(a + 4, (u32)zs[j]);
+    }
+    if (g4) { wr16(FX_OBJ + 0x68 + 4, fault == 5 ? (u32)(u16)-100 : 100); }   /* the facing test's normal: z */
+    if (g_hlr.fx_pre) g_hlr.fx_pre(builder, FX_OBJ, OT);
+    do {
+        if (g4) {
+            gte_write_data(0, rd(FX_OBJ + 0x68)); gte_write_data(1, rd(FX_OBJ + 0x6c));
+            gte_command(0x4a486012);
+            if ((s32)gte_read_data(27) <= 0) break;
+        }
+        for (int j = 0; j < 6; j++) gte_write_data(j, rd(V + 4 * (u32)j));
+        gte_command(0x4a280030);
+        u32 sxy[4], sz[4];
+        for (int j = 0; j < 3; j++) { sxy[j] = gte_read_data(12 + j); sz[j] = gte_read_data(17 + j); }
+        gte_write_data(0, rd(V + 0x18)); gte_write_data(1, rd(V + 0x1c));
+        gte_command(0x4a180001);
+        sxy[3] = gte_read_data(14); sz[3] = gte_read_data(19);
+        if (fault == 1) sxy[2] += 1;
+        if (g4) {
+            for (int j = 0; j < 4; j++) { wr(pkt + 4 + 8 * (u32)j, (j ? 0 : 0x38000000u) | (0x102030u + 0x10u * (u32)j)); wr(pkt + 8 + 8 * (u32)j, sxy[j]); }
+        } else {
+            wr(pkt + 4, 0x2e808080u);
+            for (int j = 0; j < 4; j++) { wr(pkt + 8 + 8 * (u32)j, sxy[j]); wr(pkt + 12 + 8 * (u32)j, (j == 0 ? 0x7d110000u : j == 1 ? 0x00590000u : 0) | (u32)(j * 0x0808)); }
+        }
+        u32 zmin = sz[0];
+        for (int j = 1; j < 4; j++) if (sz[j] < zmin) zmin = sz[j];
+        const u32 slot = sh_slot(zmin) + (fault == 3 ? 1 : 0);
+        const u32 tl = fault == 2 ? len + 1 : len;
+        if (g4) {
+            const u32 mp = FX_OBJ + 0x94;
+            wr(pkt, (rd(OT + 4 * slot) & 0xffffff) | tl << 24);
+            wr(mp, (pkt & 0xffffff) | 0x01000000u); wr(mp + 4, fault == 4 ? 0xe2000000u : 0xe1000020u);
+            wr(OT + 4 * slot, mp & 0xffffff);
+        } else {
+            wr(pkt, (rd(OT + 4 * slot) & 0xffffff) | tl << 24);
+            wr(OT + 4 * slot, pkt & 0xffffff);
+        }
+    } while (0);
+    if (g_hlr.fx_post) g_hlr.fx_post();
+}
+
+static void test_fx_audit(void)
+{
+    hlr_set_mode(HLR_AUDIT);
+    HlrFxStats a, b;
+    for (int bi = 0; bi < 2; bi++) {
+        const u32 bu = bi ? 0x80056908u : 0x80055b70u;
+        const char *nm = bi ? "G4 + draw mode" : "FT4";
+        hlr_fx_get_stats(&a); fx_frame(bu, 0); hlr_fx_get_stats(&b);
+        CHECK(b.audited == a.audited + 1 && b.frames_bad == a.frames_bad && b.vtx - a.vtx == 4,
+              "%s: clean effect audited (%llu, rejected %llu, %llu vertices)", nm, (unsigned long long)(b.audited - a.audited),
+              (unsigned long long)(b.frames_bad - a.frames_bad), (unsigned long long)(b.vtx - a.vtx));
+        a = b; fx_frame(bu, 1); hlr_fx_get_stats(&b);
+        CHECK(b.vtx_bad == a.vtx_bad + 1 && b.frames_bad == a.frames_bad + 1, "%s: a wrong XY is found", nm);
+        a = b; fx_frame(bu, 2); hlr_fx_get_stats(&b);
+        CHECK(b.word_bad == a.word_bad + 1 && b.frames_bad == a.frames_bad + 1, "%s: another tag length is found", nm);
+        a = b; fx_frame(bu, 3); hlr_fx_get_stats(&b);
+        CHECK(b.link_bad == a.link_bad + 1 && b.frames_bad == a.frames_bad + 1, "%s: another OT slot is found", nm);
+        if (bi) {
+            a = b; fx_frame(bu, 4); hlr_fx_get_stats(&b);
+            CHECK(b.mode_bad == a.mode_bad + 1 && b.frames_bad == a.frames_bad + 1, "%s: a missing e1 word is found", nm);
+            a = b; fx_frame(bu, 5); hlr_fx_get_stats(&b);
+            CHECK(b.skipped[8] == a.skipped[8] + 1 && b.audited == a.audited && b.frames_bad == a.frames_bad,
+                  "%s: facing away = not drawn, not an error", nm);
+        }
+        a = b; fx_frame(bu, 0); hlr_fx_get_stats(&b);
+        CHECK(b.audited == a.audited + 1 && b.frames_bad == a.frames_bad, "%s: clean again", nm);
+    }
+    hlr_set_mode(HLR_OFF);
+}
+
 /* the bone filter: smooths jitter, gives way to real motion at once, starts from the input */
 static void test_bone_filter(void)
 {
@@ -826,6 +917,7 @@ int main(int argc, char **argv)
     printf("float camera\n"); test_float_camera();
     printf("characters\n"); test_char_audit();
     printf("shadows\n"); test_shadow_audit();
+    printf("effects\n"); test_fx_audit();
     printf("bone filter\n"); test_bone_filter();
     printf("test_hlr: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

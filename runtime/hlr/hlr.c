@@ -110,6 +110,12 @@ bool hlr_shadows_native(void)
     return (s_parts & HLR_PART_SHADOWS) && (s_parts & HLR_PART_STAGE) && hlr_native();
 }
 
+/* effects join the stage's frame too (drawn in its passes, depth tested against it) */
+bool hlr_fx_native(void)
+{
+    return (s_parts & HLR_PART_FX) && (s_parts & HLR_PART_STAGE) && hlr_native();
+}
+
 void hlr_set_mode(int mode)
 {
     if (mode < HLR_OFF || mode > HLR_AUDIT) mode = HLR_OFF;
@@ -127,6 +133,8 @@ void hlr_set_mode(int mode)
     g_hlr.chars_native = mode == HLR_ON ? hlr_chars_native : NULL;
     g_hlr.shadow_pre = hlr_shadow_pre;
     g_hlr.shadow_post = hlr_shadow_post;
+    g_hlr.fx_pre = hlr_fx_pre;
+    g_hlr.fx_post = hlr_fx_post;
 }
 
 int hlr_get_mode(void) { return s_mode; }
@@ -327,6 +335,7 @@ void hlr_report(void)
     hlr_stage_report();
     hlr_char_report();
     hlr_shadow_report();
+    hlr_fx_report();
     if (s_mode == HLR_AUDIT) return;
     u64 left = 0;
     for (int i = 0; i < 2; i++) if (s_fr[i].valid) left++;
@@ -350,6 +359,9 @@ void hlr_report(void)
         if (N.shadow_items)
             rt_log("hlr-native-shadows: %.0f shadow triangles per frame drawn in 3D (depth-biased decals)",
                    (double)N.shadow_items / (double)N.frames);
+        if (N.fx_items)
+            rt_log("hlr-native-fx: %.1f effect polygons per frame drawn in 3D (depth tested, PS1 order among effects), %.2f pass points per frame added for them",
+                   (double)N.fx_items / (double)N.frames, (double)N.fx_points / (double)N.frames);
         rt_log("hlr-native-draw: %llu frames, %.2f passes per frame, %.0f polygons per frame drawn in 3D"
                " (near %s, look %s, MSAA %dx); %llu culled by the camera, %llu dropped as too near, %llu stale,"
                " %llu without texture, %llu of skipped objects without packet words; %llu packets suppressed; %llu walks given up; GPU %llu passes"
