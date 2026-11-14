@@ -160,7 +160,7 @@ bool hlr_draws(void)
 /* ---- frame store ------------------------------------------------------------------------ */
 static void frame_clear(HlrFrame *f)
 {
-    f->valid = false; f->np = 0; f->nw = 0; f->nn = 0; f->nc = 0; f->nkp = 0;
+    f->valid = false; f->np = 0; f->nw = 0; f->nn = 0; f->nc = 0; f->nkp = 0; f->nfl = 0;
 }
 
 HlrFrame *hlr_frame_begin(u32 ot)
@@ -214,6 +214,16 @@ HlrNat *hlr_frame_add_nat(HlrFrame *f)
     HlrNat *n = &f->nat[f->nn++];
     memset(n, 0, sizeof *n);
     return n;
+}
+
+void hlr_frame_add_floor(HlrFrame *f, const float v[9])
+{
+    if (f->nfl == f->flcap) {
+        f->flcap = f->flcap ? f->flcap * 2 : 256;
+        f->floor = realloc(f->floor, (size_t)f->flcap * sizeof *f->floor);
+        if (!f->floor) rt_fatal("hlr: out of memory");
+    }
+    memcpy(f->floor[f->nfl++], v, 9 * sizeof(float));
 }
 
 HlrChr *hlr_frame_add_chr(HlrFrame *f)
