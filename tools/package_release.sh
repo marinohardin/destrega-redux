@@ -261,7 +261,8 @@ EOF
             cp -L "$LIB" "$PKG/lib/libSDL3.so.0"
             check_pkg "$PKG"
             ZIP="$OUT/$NAME.tar.gz"; rm -f "$ZIP"
-            tar -C "$STAGE" -czf "$ZIP" "$NAME"
+            # macOS tar would add ._ AppleDouble files for extended attributes
+            COPYFILE_DISABLE=1 tar -C "$STAGE" --no-mac-metadata --no-xattrs -czf "$ZIP" "$NAME"
             check_pkg "$ZIP"
         else
             ZIP="$OUT/$NAME.AppImage"

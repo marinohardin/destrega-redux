@@ -50,8 +50,8 @@ the feature list. 0.1.2 and 0.1.1 run the same emulation and can play each other
 ## Known limitations
 
 - Tested mainly on macOS (Apple Silicon). Windows was tested under Wine/CrossOver only, not on a
-  real Windows machine. The Linux build is new: it was built in an Ubuntu 22.04 container and
-  checked there, but not played on a Linux desktop.
+  real Windows machine. The Linux build is new: in a clean Ubuntu 22.04 container it replays recorded
+  matches frame for frame like the Mac build, but nobody has played it on a Linux desktop yet.
 - Automatic port opening has only been tested against a simulated router.
 - The Windows build is not code-signed.
 
