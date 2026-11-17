@@ -38,11 +38,22 @@ the launcher (option A below) for that reason.
 Built from the merge commit with the release tag checked out (the version comes from
 `tools/version.py describe`, so tag first, locally at least):
 
-1. `cmake --build build/cmake` (macOS app), `cmake --build build/win` (Windows cross build, see
-   AGENTS.md), `tools/build_linux_docker.sh` (Linux x86-64 in an Ubuntu 22.04 container, glibc
-   2.35; SDL3 built once into `build/linux-deps/`).
-2. `tools/package_release.sh release mac --sign "Developer ID Application: ..." --notarize PROFILE`
-   -> `Destrega-<ver>-macos-arm64.dmg` (signed, notarized, stapled; no extra entitlements).
+Keep the working tree clean while building: an uncommitted file makes `version.py` add `.dirty`
+to the version (package names, the Windows VERSIONINFO).
+
+1. `tools/build_mac_release.sh` (macOS arm64 for macOS 13+ in `build/rel-mac/`; SDL3 built once
+   from source into `build/mac-deps/` with the same deployment target), `cmake --build build/win`
+   (Windows cross build, see AGENTS.md), `tools/build_linux_docker.sh` (Linux x86-64 in an
+   Ubuntu 22.04 container, glibc 2.35; SDL3 built once into `build/linux-deps/`).
+   Not `build/cmake` for the Mac: Homebrew's SDL3 and a build without a deployment target are
+   made for the build machine's macOS, so the app needs that version or later (the 0.1.0 and
+   0.1.1 DMGs needed macOS 27 while their notes said 13+). `package_release.sh` refuses an app
+   whose executable or bundled dylib needs a macOS newer than `MAC_MIN_OS` (default 13.0).
+2. `tools/package_release.sh release mac --sign IDENTITY --notarize PROFILE` (IDENTITY: the
+   "Developer ID Application" certificate's name or its SHA-1 hash from `security find-identity
+   -v -p codesigning`) -> `Destrega-<ver>-macos-arm64.dmg` (signed, notarized, stapled; no extra
+   entitlements). Nothing tests it on an older macOS here; the compiler's availability warnings
+   (none) are the only check that no newer API is called unguarded.
 3. `tools/package_release.sh release win --dll-dir build/win-deps/prefix/bin`
    -> `Destrega-<ver>-windows-x86_64.zip` (exe + SDL3.dll; MinGW links the rest statically).
 4. `tools/package_release.sh release linux --bin build/linux/destrega --lib

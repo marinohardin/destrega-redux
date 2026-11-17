@@ -1961,7 +1961,8 @@ artifacts still contain only the stub and the launcher. Release packages are mad
 runs `tools/check_no_game_data.py` (game-data file names, byte windows sampled from every file
 of the extracted disc) on everything it packages. The README's notice, FAQ, "How it works" and
 Legal notice say what the download contains; keep them true. Recipe, options and notarization:
-`docs/RELEASES.md`. Linux release builds: `tools/build_linux_docker.sh` (Ubuntu 22.04 amd64
+`docs/RELEASES.md`. macOS release builds: `tools/build_mac_release.sh` (macOS 13+, `build/rel-mac/`; never
+`build/cmake`, whose Homebrew SDL3 needs the build machine's macOS). Linux release builds: `tools/build_linux_docker.sh` (Ubuntu 22.04 amd64
 container, SDL3 cached in `build/linux-deps/`).
 
 - `tools/package_release.sh release mac|win|linux` (the published form since 0.1.2): see
