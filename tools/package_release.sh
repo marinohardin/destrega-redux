@@ -15,7 +15,9 @@
 #   unless the executable is a full game build (not the CI stub, not a launcher) and
 #   tools/check_no_game_data.py finds nothing in the staged files (it compares them with the
 #   extracted disc: --disc DIR, default ./disc, required). Named Destrega-<version>-<os>-<arch>.
-#     mac    --bin build/cmake/destrega (default); a disk image with Destrega.app (made by
+#     mac    --bin build/rel-mac/destrega (default; made by tools/build_mac_release.sh, refused
+#            if it or a bundled dylib needs a macOS newer than MAC_MIN_OS, default 13.0, which
+#            the release notes promise); a disk image with Destrega.app (made by
 #            tools/make_app.sh), an Applications shortcut, README and licences. --sign IDENTITY
 #            (Developer ID Application: ...) signs app and image; --notarize PROFILE (an
 #            `xcrun notarytool store-credentials` keychain profile) notarizes and staples both.
@@ -80,7 +82,7 @@ while [ $# -gt 0 ]; do
         --disc) DISC="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --personal) PERSONAL=1; shift ;;
-        -h|--help) sed -n 2,57p "$0"; exit 0 ;;
+        -h|--help) sed -n 2,59p "$0"; exit 0 ;;
         *) echo "package_release: unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -139,7 +141,7 @@ if [ "$KIND" = launcher ] || [ "$KIND" = release ]; then
         [ -x "$ZIGDIR/zig" ] || [ -f "$ZIGDIR/zig.exe" ] || die "no zig executable in $ZIGDIR"
         DEFMAC="$ROOT/build/launcher/destrega"; DEFWIN="$ROOT/build/win-launcher/destrega.exe"
     else
-        DEFMAC="$ROOT/build/cmake/destrega"; DEFWIN="$ROOT/build/win/destrega.exe"
+        DEFMAC="$ROOT/build/rel-mac/destrega"; DEFWIN="$ROOT/build/win/destrega.exe"
     fi
     case "$LKIND" in
         mac)   [ -n "$LBIN" ] || LBIN="$DEFMAC"; OS=macos; ARCH="$(uname -m)" ;;
@@ -222,6 +224,16 @@ EOF
         [ "$KIND" = launcher ] && MAKEAPP+=(--zig "$ZIGDIR" --entitlements "$ROOT/tools/launcher.entitlements")
         "$ROOT/tools/make_app.sh" "${MAKEAPP[@]}" >/dev/null
         codesign --verify --strict "$PKG/Destrega.app" || die "app bundle signature is invalid"
+        if [ "$KIND" = release ]; then
+            # the notes promise macOS MAC_MIN_OS+; Homebrew's SDL3 / no deployment target = this Mac's OS
+            MAXOS="${MAC_MIN_OS:-13.0}"
+            for f in "$PKG/Destrega.app/Contents/MacOS/destrega" "$PKG/Destrega.app/Contents/Frameworks/"*; do
+                [ -f "$f" ] || continue
+                m="$(otool -l "$f" | awk '/LC_BUILD_VERSION/{x=1} x&&/minos/{print $2; exit}')"
+                [ "$(printf '%s\n%s\n' "$m" "$MAXOS" | sort -V | tail -1)" = "$MAXOS" ] ||
+                    die "$(basename "$f") needs macOS $m, newer than $MAXOS (build with tools/build_mac_release.sh)"
+            done
+        fi
         check_pkg "$PKG"
         notarize() {    # $1 = file to submit (zip or dmg)
             xcrun notarytool submit "$1" --keychain-profile "$NOTARY" --wait --timeout 60m \

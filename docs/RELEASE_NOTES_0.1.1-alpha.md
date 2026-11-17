@@ -17,7 +17,7 @@ why they are large; Linux uses your gcc or clang).
 
 | File | For |
 |---|---|
-| `Destrega-0.1.1-alpha-macos-arm64.dmg` | macOS 13+ on Apple Silicon (signed and notarized): open it and drag Destrega to Applications |
+| `Destrega-0.1.1-alpha-macos-arm64.dmg` | macOS 27 or later on Apple Silicon (signed and notarized; corrected: these notes first said macOS 13+, but this build needs macOS 27. 0.1.2-alpha runs on macOS 13+): open it and drag Destrega to Applications |
 | `Destrega-0.1.1-alpha-windows-x86_64.zip` | Windows 10/11, x86-64 (not code-signed: SmartScreen will warn) |
 | `Destrega-0.1.1-alpha-linux-x86_64.tar.gz` | Linux x86-64 (needs gcc or clang; untested with the game) |
 
