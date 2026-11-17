@@ -1,31 +1,65 @@
 # Releases and distribution
 
-## The constraint
+## The policy (owner decision 2026-11-16, from 0.1.2-alpha on)
 
-`gen/*.c` is a translation of the game's executable (`SLUS_007.32`), produced by
-`recomp/recomp.py` from the user's own disc. It is derived from copyrighted code, so a binary
-that contains it is too. CI has no disc, and must not have one. Therefore:
+A release is the program as built on a machine that has the disc: the runtime plus `gen/*.c`
+(the code `recomp/recomp.py` translated from the game's executable, `SLUS_007.32`), compiled for
+each platform. This follows the model of other static-recompilation ports such as
+[Takedawn](https://github.com/xenophobentx/takedawn): the download contains the game's
+translated code, which is a grey area the project accepts, and **never any game data**.
 
-- no workflow, release page or artifact may contain a normal (playable) build;
-- the repository, CI logs and artifacts never contain `gen/`, `disc/` or any game data;
-- everything the project publishes is the runtime, the recompiler, tools and docs.
+- **Never in a release, the repository, CI logs or artifacts:** disc images, the data pack,
+  any file from the disc (stages, characters, textures, models, sound, music, films, overlays),
+  memory-card images, or anything decoded from them (pictures, shader caches, dumps). The
+  README screenshots in `docs/screenshots/` are the one exception, in the repository only.
+- **Never in the repository, CI logs or artifacts:** `gen/` (the translated C). It exists only on
+  the release machine and reaches users only compiled into the executable.
+- CI has no disc and must never get one; it keeps building the stub and the launcher.
+- Every release package is checked by `tools/check_no_game_data.py` against the extracted disc
+  (`package_release.sh release` runs it and refuses to package otherwise).
+- The README's notices ("Destrega Redux is an unofficial, non-commercial fan project...", the
+  FAQ "Does Destrega Redux include the game?", "How it works" and the Legal notice) say plainly
+  what the download contains. Keep them true when a release changes.
 
-Today a playable build only exists on a machine that has the disc: the user builds it
-(`README.md`), and may package it for their own machines with `tools/package_release.sh --personal`.
+Until 0.1.1 the policy was stricter (no game code in any published file); 0.1.0 and 0.1.1 shipped
+the launcher (option A below) for that reason.
 
 ## Options considered
 
 | | Idea | Verdict |
 |---|---|---|
-| **A** | Release = runtime + recompiler; first launch generates and compiles the game code from the user's disc | Legally clean, but needs a C compiler on every player's machine (Xcode tools, MinGW/clang). Unrealistic unless a toolchain is bundled (a Zig or clang distribution, 50-150 MB per OS) and first launch takes minutes. |
-| **B** | User builds locally; CI builds only the stub to prove everything compiles and packages | Clean, works today. Cost: players must build. |
-| **C** | Runtime loads/translates the game code from the disc at run time (an interpreter or dynarec for the MIPS executable, or generated code kept as data) | The only design that gives a true "download, point at your disc, play" release. Big redesign: the project is deliberately native C, netplay determinism depends on it, and the MIPS interpreter is being removed. |
+| **A** | Release = runtime + recompiler; first launch generates and compiles the game code from the user's disc | Kept no game code in the download, but bundles a C compiler (Zig, ~50-150 MB per OS) and takes minutes on first launch; the Windows first-launch build was never run on real Windows. Shipped in 0.1.0 / 0.1.1; the code is kept. |
+| **B** | User builds locally; CI builds only the stub to prove everything compiles and packages | Works; players must build. Still how development works. |
+| **C** | Runtime loads/translates the game code from the disc at run time (an interpreter or dynarec) | Big redesign: the project is deliberately native C, netplay determinism depends on it. Not planned. |
+| **D** | Release = the prebuilt game build (translated code compiled in), no game data; first launch imports the disc | **The release form since 0.1.2.** Small download, no compiler, starts at once, everyone runs the tested binary. Built on the release machine for all three platforms. |
 
-**Status:** B is implemented (below), and so is the bundled-toolchain variant of **A** (next
-section): a downloadable package with no game code that builds the game on the player's
-machine. C stays a separate project.
+## Release packages (`tools/package_release.sh release mac|win|linux`)
 
-## Option A: the launcher (`-DDESTREGA_GAME_MODULE=ON`)
+Built from the merge commit with the release tag checked out (the version comes from
+`tools/version.py describe`, so tag first, locally at least):
+
+1. `cmake --build build/cmake` (macOS app), `cmake --build build/win` (Windows cross build, see
+   AGENTS.md), `tools/build_linux_docker.sh` (Linux x86-64 in an Ubuntu 22.04 container, glibc
+   2.35; SDL3 built once into `build/linux-deps/`).
+2. `tools/package_release.sh release mac --sign "Developer ID Application: ..." --notarize PROFILE`
+   -> `Destrega-<ver>-macos-arm64.dmg` (signed, notarized, stapled; no extra entitlements).
+3. `tools/package_release.sh release win --dll-dir build/win-deps/prefix/bin`
+   -> `Destrega-<ver>-windows-x86_64.zip` (exe + SDL3.dll; MinGW links the rest statically).
+4. `tools/package_release.sh release linux --bin build/linux/destrega --lib
+   build/linux-deps/sdl3/lib/libSDL3.so.0` -> `Destrega-<ver>-linux-x86_64.tar.gz` (RUNPATH
+   `$ORIGIN/lib`, README from `docs/README-LINUX.txt`).
+5. Each run refuses a stub or launcher binary and a binary with too few recompiled functions,
+   checks the staged files (and the Windows zip / Linux tarball) with `check_no_game_data.py`
+   and writes a `.sha256`. Then `SHA256SUMS.txt` and `gh release create`.
+
+`check_no_game_data.py` fails on game-data file names (`*.pak`, `*.bin`, `*.cue`, `*.iso`,
+`*.mcd`, `*.BNS`, `*.XA`, `SLUS_*`, `SYSTEM.CNF`, anything under `disc/`, every name in the disc
+listing) and on any of ~3300 64-byte windows sampled from every file of the extracted disc
+appearing in a packaged file (whole files and large pieces; it is a sample, not a proof). The
+executable contains no disc bytes: it holds the code compiled for the host, and the runtime loads
+the game's own executable and data from the player's data pack.
+
+## Option A: the launcher (`-DDESTREGA_GAME_MODULE=ON`; 0.1.0 / 0.1.1, kept)
 
 A launcher build is the runtime alone; the game code is a **game module** (a shared library) that
 the launcher builds on first launch from the player's own disc and loads at start-up. AGENTS.md
@@ -54,7 +88,7 @@ the launcher builds on first launch from the player's own disc and loads at star
   the netplay identity (recompiled-code table + emulation sources) is the same, so launcher and
   static builds of one commit play together.
 
-### What remains before a launcher release
+### What remained open for the launcher (not pursued since 0.1.2)
 
 - A licence review of the bundled Zig (MIT; it
   contains LLVM and C library headers/sources under their own terms, `THIRD_PARTY_LICENSES.txt`).
@@ -83,8 +117,9 @@ the launcher builds on first launch from the player's own disc and loads at star
 
 ## What is implemented
 
-- `tools/package_release.sh mac|win` packages a finished build on the machine that built it.
-  A game build needs `--personal` and is named `...-PERSONAL-DO-NOT-REDISTRIBUTE.zip`.
+- `tools/package_release.sh release mac|win|linux`: the published packages (above).
+- `tools/package_release.sh mac|win` zips a finished build without the release checks, for your
+  own machines: a game build needs `--personal` and is named `...-PERSONAL-DO-NOT-REDISTRIBUTE.zip`.
   A stub build (detected by a marker string in `tools/ci/stub_gen/stub.c`) is named
   `Destrega-STUB-NOT-PLAYABLE-...zip` and contains a `NOT-PLAYABLE.txt`.
 - CI (`.github/workflows/build.yml`) builds and packages the **stub** on Windows and macOS and

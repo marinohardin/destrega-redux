@@ -1952,9 +1952,20 @@ read-only wrappers; in `analysis/overrides.txt`, game ABI version 4). Hooks only
 
 ## Releases (`docs/RELEASES.md`)
 
-`gen/` is translated game code and is **never** published: CI has no disc, and no workflow,
-artifact or GitHub Release may contain a playable build. Design (options A/B/C, recommendation,
-notarization steps) is in `docs/RELEASES.md`.
+**Policy (owner decision 2026-11-16):** a GitHub Release holds the prebuilt game build (the
+runtime with the translated game code compiled in) and **never any game data**: no disc image,
+data pack, file from the disc, memory card or anything decoded from them. `gen/` itself (the
+translated C) is never committed, logged or uploaded, and CI never gets a disc: workflows and
+artifacts still contain only the stub and the launcher. Release packages are made with
+`tools/package_release.sh release mac|win|linux`, which refuses a stub / launcher binary and
+runs `tools/check_no_game_data.py` (game-data file names, byte windows sampled from every file
+of the extracted disc) on everything it packages. The README's notice, FAQ, "How it works" and
+Legal notice say what the download contains; keep them true. Recipe, options and notarization:
+`docs/RELEASES.md`. Linux release builds: `tools/build_linux_docker.sh` (Ubuntu 22.04 amd64
+container, SDL3 cached in `build/linux-deps/`).
+
+- `tools/package_release.sh release mac|win|linux` (the published form since 0.1.2): see
+  `docs/RELEASES.md` "Release packages".
 
 - `tools/package_release.sh mac|win` zips a finished build on the machine that built it (Mac:
   `Destrega.app` via `ditto`; Windows: exe + DLLs found next to it / `--dll-dir` / `$MINGW_PREFIX/bin`,

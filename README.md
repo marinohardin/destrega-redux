@@ -2,6 +2,17 @@
 
 The PlayStation fighting game *Destrega* (Koei, 1998), with frame-for-frame identical gameplay, better graphics, widescreen, and online rollback netplay, for Windows/Mac/Linux.
 
+> [!IMPORTANT]
+> Destrega Redux is an unofficial, non-commercial fan project. It is not affiliated with,
+> endorsed by or sponsored by Koei Tecmo or Sony Interactive Entertainment. All trademarks
+> belong to their owners.
+>
+> No game data is included or distributed: no disc images, no textures, models, sound, music or
+> films, and no memory-card saves. To play you need your own, legally obtained disc of the
+> supported retail release for the PlayStation: North America (NTSC-U, SLUS-00732). Destrega Redux
+> checks a copy of it and takes the game data from there. Please do not ask for game files or disc
+> images, and do not share them. See the full [legal notice](#legal-notice).
+
 - **Better graphics**: high-resolution rendering (up to 4x6 the original resolution, with
   automatic scaling to what your computer can keep up with), a GPU renderer on Metal, Vulkan and
   Direct3D 12, 16:9 widescreen fights, sub-pixel vertices and perspective-correct textures (no
@@ -24,7 +35,7 @@ smoothed textures and full-precision colour.*
 
 
 You need your own copy of the game: the North American release (SLUS-00732)
-as a MODE2/2352 `.cue`/`.bin`. Nothing from the game is in this repository.
+as a MODE2/2352 `.cue`/`.bin`. No game data is in this repository or in the downloads.
 
 ## Requirements (all platforms)
 
@@ -105,12 +116,33 @@ next to `destrega.exe`.
 ## Downloads, packaging and releases
 
 The [releases page](https://github.com/marinohardin/destrega-redux/releases) has **alpha** test
-builds of the launcher for macOS, Windows and Linux: they contain no game code or data, and turn
-your own disc into the game on first launch (see `docs/RELEASE_NOTES_0.1.0-alpha.md`). They are not
-user-friendly yet. A build made from your disc with the steps above holds translated game code and
-cannot be redistributed: `tools/package_release.sh mac|win --personal` zips it for your own
-machines only. See `docs/RELEASES.md` for the details and the macOS notarization steps.
-Third-party licences: `THIRD_PARTY_LICENSES.txt`.
+builds for macOS (Apple Silicon), Windows and Linux (x86-64). Download the one for your computer,
+start it and point it at your disc image; it checks the image, imports it once and you play. The
+download is only the program: it contains the game's translated code and no game data (see
+[How it works](#how-it-works)). The alpha builds are not user-friendly yet. See `docs/RELEASES.md`
+for how a release is built and checked (`tools/package_release.sh release`) and the macOS
+notarization steps. Third-party licences: `THIRD_PARTY_LICENSES.txt`.
+
+### Does Destrega Redux include the game?
+
+No. It includes the program, which contains the game's translated code and no game data. Stages,
+characters, sound, music and films come from your own disc.
+
+### How it works
+
+Destrega Redux is a static recompilation. A recompiler reads the game's MIPS executable, finds its
+functions and translates them to C, and a compiler turns that C into a native program for x86-64
+or arm64. The game's calls to the PlayStation's system software and hardware are answered by a
+runtime: memory, the CD drive, timers, controllers, memory cards, the sound chip, the video
+decoder and the graphics chip, which it draws at a higher resolution with Metal, Vulkan or
+Direct3D 12.
+
+No game logic is rewritten by hand to change the game. The few functions written as readable C
+(`analysis/overrides.txt`) are checked against the translated original; the widescreen and
+graphics options change only what is drawn, never what the game computes.
+
+The program contains the translated code of the game's executable. It contains none of the
+game's data.
 
 ## First launch
 
@@ -149,7 +181,7 @@ pad is player 2). Step far back until the charge bar turns blue to use magic.
 
 ## Status
 
-Version 0.1.0 (**alpha**). Boots, plays the intro FMV with audio, title, menus and every mode; fights,
+Version 0.1.2 (**alpha**). Boots, plays the intro FMV with audio, title, menus and every mode; fights,
 story, practice and VS are playable (60 Hz output; fights update at 30 fps, as on the original).
 Memory-card saves work. Rollback netplay works between Macs and between a Mac and Windows. The
 native 3D renderer draws stages and fighters (`docs/HLR_PLAN.md`; shadows, effects, 60 Hz motion and
@@ -157,4 +189,25 @@ story scenes are in progress). Developed and tested on macOS (Apple Silicon); th
 tested under Wine/CrossOver and the Linux build in CI (without the game). See `AGENTS.md` for
 internals and `tools/pr_check.sh` / `tools/run_tests.sh` for the tests.
 
-<sub>Licensed under the GPL-3.0 (`LICENSE`). Game data and code stay with their owners and are never part of this repository.</sub>
+## Legal notice
+
+Destrega Redux is an unofficial fan project, offered free of charge. It is not affiliated with,
+endorsed by or sponsored by Koei Tecmo Games Co., Ltd. or Sony Interactive Entertainment Inc.
+
+*Destrega* is a game by Koei (today Koei Tecmo); its name and Koei's belong to their owners.
+PlayStation is a trademark of Sony Interactive Entertainment Inc. All other names, including Mac,
+macOS, Windows, Linux, Metal, Vulkan and Direct3D, belong to their owners. They are used here only
+to say what Destrega Redux works with. The game is named only to say which game this project runs.
+No logo, box art or other artwork of the game is used. The Destrega Redux icon is original
+artwork, generated by `tools/make_icon.py`, and no console maker's artwork or font is used in it.
+
+No game data is included or distributed. The downloads contain the program, which holds code
+translated from the game's executable, and no textures, models, sound, music, films, disc files
+or memory-card saves. To play you need your own, legally obtained disc of the game, and Destrega
+Redux takes the data from your copy of it.
+
+The screenshots on this page show Destrega Redux running on my machines. The game content visible
+in them belongs to its owners.
+
+The software is provided "as is", without warranty of any kind, as set out in the GPL-3.0
+(`LICENSE`).
